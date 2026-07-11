@@ -2,9 +2,11 @@ use crate::{codex, models::SessionSummary, storage::Store};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fs;
+use std::path::{Path, PathBuf};
 
 pub fn rebuild(store: &Store) -> anyhow::Result<Vec<SessionSummary>> {
     let mut by_thread = HashMap::<String, SessionSummary>::new();
+    let indexed_titles = read_indexed_titles(&codex::home().join("session_index.jsonl"));
     for session in codex::list_sessions(None)? {
         merge(&mut by_thread, session);
     }
@@ -14,17 +16,28 @@ pub fn rebuild(store: &Store) -> anyhow::Result<Vec<SessionSummary>> {
         };
         let mut meta = None;
         let mut has_user_event = false;
+        let mut first_user_title = None;
+        let mut is_subagent = false;
         for line in text.lines() {
             let Ok(record) = serde_json::from_str::<Value>(line) else {
                 continue;
             };
             if record.get("type").and_then(Value::as_str) == Some("session_meta") {
                 meta = record.get("payload").cloned();
+                is_subagent = record.pointer("/payload/source/subagent").is_some();
             }
-            has_user_event |= matches!(
+            if matches!(
                 record.pointer("/payload/type").and_then(Value::as_str),
                 Some("user_message" | "user_input")
-            );
+            ) {
+                has_user_event = true;
+                if first_user_title.is_none() {
+                    first_user_title = user_title(&record);
+                }
+            }
+        }
+        if is_subagent {
+            continue;
         }
         let Some(meta) = meta else { continue };
         let Some(id) = meta.get("id").and_then(Value::as_str) else {
@@ -47,11 +60,12 @@ pub fn rebuild(store: &Store) -> anyhow::Result<Vec<SessionSummary>> {
         let session = SessionSummary {
             identity: format!("rollout:{}", path.display()),
             id: id.to_string(),
-            title: meta
-                .get("title")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
+            title: indexed_titles
+                .get(id)
+                .cloned()
+                .or(first_user_title)
+                .or_else(|| project_name(meta.get("cwd").and_then(Value::as_str)))
+                .unwrap_or_default(),
             provider: provider.clone(),
             cwd: meta
                 .get("cwd")
@@ -72,6 +86,56 @@ pub fn rebuild(store: &Store) -> anyhow::Result<Vec<SessionSummary>> {
     sessions.sort_by_key(|session| std::cmp::Reverse(session.updated_at));
     store.replace_unified_sessions(&sessions)?;
     Ok(sessions)
+}
+
+fn read_indexed_titles(path: &Path) -> HashMap<String, String> {
+    let Ok(text) = fs::read_to_string(path) else {
+        return HashMap::new();
+    };
+    text.lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter_map(|value| {
+            let id = value
+                .get("id")
+                .or_else(|| value.get("thread_id"))
+                .and_then(Value::as_str)?;
+            let title = value
+                .get("title")
+                .or_else(|| value.get("display_title"))
+                .and_then(Value::as_str)?
+                .trim();
+            (!title.is_empty()).then(|| (id.to_string(), title.to_string()))
+        })
+        .collect()
+}
+
+fn user_title(record: &Value) -> Option<String> {
+    let text = record
+        .pointer("/payload/message")
+        .or_else(|| record.pointer("/payload/text"))
+        .or_else(|| record.pointer("/payload/content"))
+        .and_then(Value::as_str)?
+        .trim();
+    if text.starts_with("# AGENTS.md")
+        || text.starts_with("<environment_context>")
+        || text.starts_with("<environment_context ")
+    {
+        return None;
+    }
+    let text = text
+        .split_once("## My request for Codex:")
+        .map(|(_, request)| request.trim())
+        .unwrap_or(text);
+    let title = text.lines().find(|line| !line.trim().is_empty())?.trim();
+    (!title.starts_with("# Context from my IDE setup:")).then(|| title.chars().take(160).collect())
+}
+
+fn project_name(cwd: Option<&str>) -> Option<String> {
+    let cwd = cwd?.trim_start_matches(r"\\?\").replace('\\', "/");
+    PathBuf::from(cwd)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_owned)
 }
 
 fn merge(target: &mut HashMap<String, SessionSummary>, next: SessionSummary) {
@@ -145,5 +209,19 @@ mod tests {
         assert_eq!(result.title, "Title");
         assert_eq!(result.cwd, "C:/work");
         assert!(result.archived && result.has_user_event);
+    }
+
+    #[test]
+    fn title_filter_ignores_injected_context_and_extracts_ide_request() {
+        assert!(
+            user_title(&serde_json::json!({
+                "payload":{"message":"<environment_context>hidden</environment_context>"}
+            }))
+            .is_none()
+        );
+        let value = serde_json::json!({
+            "payload":{"message":"# Context from my IDE setup:\nanything\n## My request for Codex:\nFix the route"}
+        });
+        assert_eq!(user_title(&value).as_deref(), Some("Fix the route"));
     }
 }

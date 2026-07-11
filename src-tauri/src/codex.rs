@@ -522,6 +522,12 @@ pub fn restore_provider_backup(backup_path: &str) -> Result<(), AppError> {
 pub fn repair(provider: &str) -> Result<RepairResult, AppError> {
     crate::provider_sync::synchronize(&home(), provider)
 }
+pub fn restore_sessions_exact(
+    provider: &str,
+    thread_ids: &[String],
+) -> Result<RepairResult, AppError> {
+    crate::provider_sync::restore_exact(&home(), provider, thread_ids)
+}
 pub fn delete_sessions(ids: &[String]) -> anyhow::Result<usize> {
     let mut n = 0;
     for p in databases() {

@@ -885,17 +885,28 @@ function SessionsPage({
       <CardHeader>
         <CardTitle>统一会话历史</CardTitle>
         <CardDescription>
-          来自 Codex SQLite 的最近记录。第三方与官方账号切换后都使用 custom
-          会话桶。
+          合并 rollout、session_index.jsonl 与已识别 SQLite
+          目录。切到第三方时会登记原本属于 OpenAI
+          的会话，切回官方只按该账本精确恢复，不会猜测 custom 会话的来源。
         </CardDescription>
       </CardHeader>
       <CardContent>
+        <Alert className="mb-4">
+          <ShieldCheck />
+          <AlertTitle>原始数据仍是唯一真相来源</AlertTitle>
+          <AlertDescription>
+            此处的统一列表是可重建索引；SQLite 中的显式标题优先，随后使用 Codex
+            会话索引、真实首条用户消息和项目目录名。subagent
+            与环境注入记录会被排除。
+          </AlertDescription>
+        </Alert>
         {sessions.length ? (
           <Table>
             <TableHeader>
               <TableRow>
                 <TableHead>标题</TableHead>
                 <TableHead>Provider</TableHead>
+                <TableHead>原始归属</TableHead>
                 <TableHead>项目</TableHead>
                 <TableHead className="text-right">操作</TableHead>
               </TableRow>
@@ -906,6 +917,11 @@ function SessionsPage({
                   <TableCell>{session.title || session.id}</TableCell>
                   <TableCell>
                     <Badge variant="outline">{session.provider || "-"}</Badge>
+                  </TableCell>
+                  <TableCell>
+                    <Badge variant="secondary">
+                      {session.originalProvider || "-"}
+                    </Badge>
                   </TableCell>
                   <TableCell className="max-w-64 truncate">
                     {session.cwd || "-"}

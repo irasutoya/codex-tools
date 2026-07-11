@@ -74,7 +74,12 @@ impl Store {
                last_indexed_at INTEGER NOT NULL
              );
              CREATE INDEX IF NOT EXISTS idx_unified_sessions_thread ON unified_sessions(thread_id);
-             CREATE INDEX IF NOT EXISTS idx_unified_sessions_updated ON unified_sessions(updated_at DESC);",
+             CREATE INDEX IF NOT EXISTS idx_unified_sessions_updated ON unified_sessions(updated_at DESC);
+             CREATE TABLE IF NOT EXISTS session_provider_origins(
+               codex_home TEXT NOT NULL, thread_id TEXT NOT NULL,
+               original_provider TEXT NOT NULL, captured_at INTEGER NOT NULL,
+               PRIMARY KEY(codex_home,thread_id)
+             );",
         )?;
         migrate_legacy_keys(&db)?;
         Ok(store)
@@ -431,6 +436,55 @@ impl Store {
         }
         tx.commit()?;
         Ok(())
+    }
+
+    pub fn remember_session_origins(
+        &self,
+        codex_home: &Path,
+        thread_ids: &[String],
+        provider: &str,
+    ) -> anyhow::Result<usize> {
+        let mut db = self.connect()?;
+        let tx = db.transaction()?;
+        let mut inserted = 0;
+        for id in thread_ids {
+            inserted += tx.execute(
+                "INSERT OR IGNORE INTO session_provider_origins(
+                   codex_home,thread_id,original_provider,captured_at
+                 ) VALUES(?1,?2,?3,strftime('%s','now'))",
+                params![codex_home.display().to_string(), id, provider],
+            )?;
+        }
+        tx.commit()?;
+        Ok(inserted)
+    }
+
+    pub fn session_origins(
+        &self,
+        codex_home: &Path,
+        provider: &str,
+    ) -> anyhow::Result<Vec<String>> {
+        let db = self.connect()?;
+        let mut statement = db.prepare(
+            "SELECT thread_id FROM session_provider_origins
+             WHERE codex_home=?1 AND original_provider=?2 ORDER BY captured_at,thread_id",
+        )?;
+        let rows = statement
+            .query_map(params![codex_home.display().to_string(), provider], |row| {
+                row.get(0)
+            })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn forget_session_origins(
+        &self,
+        codex_home: &Path,
+        provider: &str,
+    ) -> anyhow::Result<usize> {
+        Ok(self.connect()?.execute(
+            "DELETE FROM session_provider_origins WHERE codex_home=?1 AND original_provider=?2",
+            params![codex_home.display().to_string(), provider],
+        )?)
     }
 
     pub fn unified_sessions(&self, query: Option<&str>) -> anyhow::Result<Vec<SessionSummary>> {

@@ -195,6 +195,18 @@ async fn activate_provider(
     }
     let _ = force;
     let previous = store.active_state()?;
+    let official_threads = if codex::is_official_mode() {
+        session_index::rebuild(&store)?
+            .into_iter()
+            .filter(|session| session.provider == "openai" || session.original_provider == "openai")
+            .map(|session| session.id)
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    if !official_threads.is_empty() {
+        store.remember_session_origins(&codex::home(), &official_threads, "openai")?;
+    }
     let endpoint = if provider.protocol == ProviderProtocol::ChatCompletions {
         Some(proxy.prepare(&provider, &account).await?)
     } else {
@@ -270,19 +282,33 @@ async fn activate_official_account(
         ));
     }
     let backup = codex::restore_official_account(&account)?;
+    let origins = store.session_origins(&codex::home(), "openai")?;
+    let mut result = match codex::restore_sessions_exact("openai", &origins) {
+        Ok(result) => result,
+        Err(error) => {
+            let rollback = codex::restore_provider_backup(&backup);
+            return match rollback {
+                Ok(()) => Err(error),
+                Err(rollback) => Err(AppError::Backup(format!(
+                    "恢复官方历史失败：{error}；配置回滚失败：{rollback}"
+                ))),
+            };
+        }
+    };
     if let Err(error) = store.activate_official(&account_id) {
         let _ = codex::restore_provider_backup(&backup);
         return Err(error.into());
     }
+    store.forget_session_origins(&codex::home(), "openai")?;
     proxy.stop().await;
-    Ok(RepairResult {
-        backup_path: backup,
-        databases_repaired: 0,
-        rows_updated: 0,
-        warnings: vec![
-            "已切换官方账号；本次只更新 auth.json 与 config.toml，未修改会话数据库。".into(),
-        ],
-    })
+    result.warnings.push(format!(
+        "已切换官方账号，并按迁移账本恢复了 {} 个会话的官方归属。",
+        origins.len()
+    ));
+    if result.backup_path.is_empty() {
+        result.backup_path = backup;
+    }
+    Ok(result)
 }
 
 #[tauri::command]
@@ -390,7 +416,7 @@ async fn activate_openai_account(
     store: State<'_, Store>,
     proxy: State<'_, ProxyManager>,
     id: String,
-) -> Result<String, AppError> {
+) -> Result<RepairResult, AppError> {
     let account = store.auth_account(&id)?;
     if account.service != AuthService::OpenAi {
         return Err(AppError::InvalidConfig("所选账号不是 OpenAI 账号".into()));
@@ -400,9 +426,30 @@ async fn activate_openai_account(
         .as_ref()
         .ok_or(AppError::OfficialAuthMissing)?;
     let backup = codex::restore_official_snapshot(auth, account.config_snapshot.as_deref())?;
+    let origins = store.session_origins(&codex::home(), "openai")?;
+    let mut result = match codex::restore_sessions_exact("openai", &origins) {
+        Ok(result) => result,
+        Err(error) => {
+            let rollback = codex::restore_provider_backup(&backup);
+            return match rollback {
+                Ok(()) => Err(error),
+                Err(rollback) => Err(AppError::Backup(format!(
+                    "恢复官方历史失败：{error}；配置回滚失败：{rollback}"
+                ))),
+            };
+        }
+    };
     store.activate_auth_account(&id)?;
+    store.forget_session_origins(&codex::home(), "openai")?;
     proxy.stop().await;
-    Ok(backup)
+    result.warnings.push(format!(
+        "已恢复官方认证和配置；仅按迁移账本恢复了 {} 个会话的官方归属。",
+        origins.len()
+    ));
+    if result.backup_path.is_empty() {
+        result.backup_path = backup;
+    }
+    Ok(result)
 }
 
 #[tauri::command]
