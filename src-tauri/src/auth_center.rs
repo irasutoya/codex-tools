@@ -2,9 +2,11 @@ use crate::models::{
     AppError, AuthAccount, AuthService, OpenAiDeviceAuthorization, OpenAiDevicePoll,
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use reqwest::header::{CONTENT_TYPE, USER_AGENT};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::HashMap;
+use std::time::Duration;
 use tokio::sync::Mutex;
 
 const CODEX_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
@@ -13,6 +15,11 @@ const DEVICE_POLL_URL: &str = "https://auth.openai.com/api/accounts/deviceauth/t
 const TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 const VERIFICATION_URL: &str = "https://auth.openai.com/codex/device";
 const REDIRECT_URI: &str = "https://auth.openai.com/deviceauth/callback";
+// OpenAI currently validates the Device Auth client fingerprint. Keep this aligned with the
+// cc-switch Codex OAuth implementation instead of using the desktop application's generic UA.
+const CODEX_OAUTH_USER_AGENT: &str = "cc-switch-codex-oauth";
+const JSON_CONTENT_TYPE: &str = "application/json";
+const FORM_CONTENT_TYPE: &str = "application/x-www-form-urlencoded";
 
 #[derive(Clone)]
 struct PendingDeviceAuth {
@@ -56,9 +63,10 @@ struct TokenResponse {
 
 impl AuthCenter {
     pub async fn start_openai(&self) -> Result<OpenAiDeviceAuthorization, AppError> {
-        let response = reqwest::Client::new()
+        let response = oauth_client()?
             .post(DEVICE_START_URL)
-            .header("User-Agent", "codex-tools")
+            .header(CONTENT_TYPE, JSON_CONTENT_TYPE)
+            .header(USER_AGENT, CODEX_OAUTH_USER_AGENT)
             .json(&json!({"client_id": CODEX_CLIENT_ID}))
             .send()
             .await
@@ -106,9 +114,10 @@ impl AuthCenter {
             self.pending.lock().await.remove(operation_id);
             return Ok(OpenAiDevicePoll::Expired);
         }
-        let response = reqwest::Client::new()
+        let response = oauth_client()?
             .post(DEVICE_POLL_URL)
-            .header("User-Agent", "codex-tools")
+            .header(CONTENT_TYPE, JSON_CONTENT_TYPE)
+            .header(USER_AGENT, CODEX_OAUTH_USER_AGENT)
             .json(&json!({
                 "device_auth_id": pending.device_auth_id,
                 "user_code": pending.user_code,
@@ -116,18 +125,18 @@ impl AuthCenter {
             .send()
             .await
             .map_err(safe_network_error)?;
-        match response.status().as_u16() {
-            403 | 404 => return Ok(OpenAiDevicePoll::Pending),
-            410 => {
+        match classify_poll_status(response.status().as_u16()) {
+            PollStatus::Pending => return Ok(OpenAiDevicePoll::Pending),
+            PollStatus::Expired => {
                 self.pending.lock().await.remove(operation_id);
                 return Ok(OpenAiDevicePoll::Expired);
             }
-            status if !(200..300).contains(&status) => {
+            PollStatus::Failed(status) => {
                 return Err(AppError::InvalidConfig(format!(
                     "OpenAI 设备登录轮询失败（HTTP {status}）"
                 )));
             }
-            _ => {}
+            PollStatus::Complete => {}
         }
         let code: DevicePollResponse = response.json().await.map_err(safe_network_error)?;
         let tokens = exchange_code(&code.authorization_code, &code.code_verifier).await?;
@@ -156,9 +165,10 @@ impl AuthCenter {
                 .clone()
         };
         let _guard = lock.lock().await;
-        let response = reqwest::Client::new()
+        let response = oauth_client()?
             .post(TOKEN_URL)
-            .header("User-Agent", "codex-tools")
+            .header(CONTENT_TYPE, FORM_CONTENT_TYPE)
+            .header(USER_AGENT, CODEX_OAUTH_USER_AGENT)
             .form(&[
                 ("grant_type", "refresh_token"),
                 ("refresh_token", refresh_token.as_str()),
@@ -180,9 +190,10 @@ impl AuthCenter {
 }
 
 async fn exchange_code(code: &str, verifier: &str) -> Result<TokenResponse, AppError> {
-    let response = reqwest::Client::new()
+    let response = oauth_client()?
         .post(TOKEN_URL)
-        .header("User-Agent", "codex-tools")
+        .header(CONTENT_TYPE, FORM_CONTENT_TYPE)
+        .header(USER_AGENT, CODEX_OAUTH_USER_AGENT)
         .form(&[
             ("grant_type", "authorization_code"),
             ("code", code),
@@ -200,6 +211,33 @@ async fn exchange_code(code: &str, verifier: &str) -> Result<TokenResponse, AppE
         )));
     }
     response.json().await.map_err(safe_network_error)
+}
+
+fn oauth_client() -> Result<reqwest::Client, AppError> {
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(30))
+        .timeout(Duration::from_secs(600))
+        .pool_max_idle_per_host(10)
+        .tcp_keepalive(Duration::from_secs(60))
+        .build()
+        .map_err(safe_network_error)
+}
+
+#[derive(Debug, PartialEq)]
+enum PollStatus {
+    Pending,
+    Expired,
+    Complete,
+    Failed(u16),
+}
+
+fn classify_poll_status(status: u16) -> PollStatus {
+    match status {
+        403 | 404 => PollStatus::Pending,
+        410 => PollStatus::Expired,
+        200..=299 => PollStatus::Complete,
+        value => PollStatus::Failed(value),
+    }
 }
 
 fn account_from_tokens(
@@ -319,5 +357,21 @@ mod tests {
             extract_identity(&tokens),
             Some(("acct-1".into(), Some("a@example.com".into())))
         );
+    }
+
+    #[test]
+    fn matches_cc_switch_oauth_request_fingerprint() {
+        assert_eq!(CODEX_OAUTH_USER_AGENT, "cc-switch-codex-oauth");
+        assert_eq!(JSON_CONTENT_TYPE, "application/json");
+        assert_eq!(FORM_CONTENT_TYPE, "application/x-www-form-urlencoded");
+    }
+
+    #[test]
+    fn maps_device_poll_status_like_cc_switch() {
+        assert_eq!(classify_poll_status(403), PollStatus::Pending);
+        assert_eq!(classify_poll_status(404), PollStatus::Pending);
+        assert_eq!(classify_poll_status(410), PollStatus::Expired);
+        assert_eq!(classify_poll_status(200), PollStatus::Complete);
+        assert_eq!(classify_poll_status(429), PollStatus::Failed(429));
     }
 }
