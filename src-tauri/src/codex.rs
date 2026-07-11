@@ -10,6 +10,7 @@ use toml_edit::{DocumentMut, Item, Table, value};
 use walkdir::WalkDir;
 
 pub const MANAGED_PROVIDER_ID: &str = "custom";
+pub const MODEL_CATALOG_FILENAME: &str = "codex-tools-model-catalog.json";
 
 pub fn home() -> PathBuf {
     dirs::home_dir()
@@ -269,7 +270,12 @@ fn backup(label: &str) -> anyhow::Result<PathBuf> {
             uuid::Uuid::new_v4().simple()
         ));
     fs::create_dir_all(&root)?;
-    for name in ["config.toml", "auth.json", ".codex-global-state.json"] {
+    for name in [
+        "config.toml",
+        "auth.json",
+        MODEL_CATALOG_FILENAME,
+        ".codex-global-state.json",
+    ] {
         let src = home().join(name);
         if src.exists() {
             fs::copy(src, root.join(name))?;
@@ -284,49 +290,12 @@ fn backup(label: &str) -> anyhow::Result<PathBuf> {
 }
 #[allow(dead_code)]
 pub fn apply_provider(p: &ProviderProfile, account: &ProviderAccount) -> Result<String, AppError> {
-    if p.name.trim().is_empty()
-        || p.base_url.trim().is_empty()
-        || account
-            .api_key
-            .as_deref()
-            .unwrap_or_default()
-            .trim()
-            .is_empty()
-        || p.default_model.trim().is_empty()
-    {
-        return Err(AppError::InvalidConfig(
-            "名称、URL、Key 和模型不能为空".into(),
-        ));
-    }
     if p.protocol == ProviderProtocol::ChatCompletions {
         return Err(AppError::InvalidConfig(
-            "Chat Completions 需要本地协议代理；当前构建尚未启动代理".into(),
+            "Chat Completions 需要先启动本地协议代理".into(),
         ));
     }
-    let b = backup("provider").map_err(|e| AppError::Backup(e.to_string()))?;
-    let path = home().join("config.toml");
-    let old = fs::read_to_string(&path).unwrap_or_default();
-    let mut doc = old
-        .parse::<DocumentMut>()
-        .map_err(|e| AppError::InvalidConfig(e.to_string()))?;
-    let id = MANAGED_PROVIDER_ID;
-    doc["model_provider"] = value(id);
-    doc["model"] = value(&p.default_model);
-    if !doc.as_table().contains_key("model_providers") {
-        doc["model_providers"] = Item::Table(Table::new())
-    }
-    let providers = doc["model_providers"]
-        .as_table_mut()
-        .ok_or_else(|| AppError::InvalidConfig("model_providers 必须是 table".into()))?;
-    let mut t = Table::new();
-    t["name"] = value(&p.name);
-    t["wire_api"] = value("responses");
-    t["base_url"] = value(p.base_url.trim_end_matches('/'));
-    t["requires_openai_auth"] = value(true);
-    t["experimental_bearer_token"] = value(account.api_key.as_deref().unwrap_or_default());
-    providers[id] = Item::Table(t);
-    atomic_write(&path, doc.to_string().as_bytes())?;
-    Ok(b.display().to_string())
+    apply_provider_with_proxy(p, account, None)
 }
 pub fn apply_provider_with_proxy(
     p: &ProviderProfile,
@@ -348,39 +317,39 @@ pub fn apply_provider_with_proxy(
         ));
     }
     let backup_path = backup("provider").map_err(|e| AppError::Backup(e.to_string()))?;
-    let path = home().join("config.toml");
-    let old = fs::read_to_string(&path).unwrap_or_default();
-    let mut doc = old
-        .parse::<DocumentMut>()
-        .map_err(|e| AppError::InvalidConfig(e.to_string()))?;
-    let id = MANAGED_PROVIDER_ID;
-    doc["model_provider"] = value(id);
-    doc["model"] = value(&p.default_model);
-    if !doc.as_table().contains_key("model_providers") {
-        doc["model_providers"] = Item::Table(Table::new());
-    }
-    let providers = doc["model_providers"]
-        .as_table_mut()
-        .ok_or_else(|| AppError::InvalidConfig("model_providers must be a table".into()))?;
-    let mut table = Table::new();
-    table["name"] = value(&p.name);
-    table["wire_api"] = value("responses");
-    table["requires_openai_auth"] = value(true);
     let token = match p.protocol {
-        ProviderProtocol::Responses => {
-            table["base_url"] = value(p.base_url.trim_end_matches('/'));
-            account.api_key.clone().unwrap_or_default()
-        }
+        ProviderProtocol::Responses => account.api_key.clone().unwrap_or_default(),
         ProviderProtocol::ChatCompletions => {
             let endpoint = proxy.ok_or_else(|| AppError::Proxy("proxy is not running".into()))?;
-            table["base_url"] = value(endpoint.base_url.trim_end_matches('/'));
             endpoint.token.clone()
         }
     };
-    table["experimental_bearer_token"] = value(&token);
-    providers[id] = Item::Table(table);
+    let base_url = match p.protocol {
+        ProviderProtocol::Responses => p.base_url.trim_end_matches('/'),
+        ProviderProtocol::ChatCompletions => proxy
+            .ok_or_else(|| AppError::Proxy("proxy is not running".into()))?
+            .base_url
+            .trim_end_matches('/'),
+    };
+    let config = build_managed_config(p, account, base_url, &token)?;
+    let auth = build_managed_auth(&token);
+    let catalog = build_model_catalog(p);
     let update = (|| -> Result<(), AppError> {
-        atomic_write(&path, doc.to_string().as_bytes())?;
+        fs::create_dir_all(home()).map_err(|error| AppError::Internal(error.to_string()))?;
+        atomic_write(
+            &home().join(MODEL_CATALOG_FILENAME),
+            &serde_json::to_vec_pretty(&catalog)
+                .map_err(|error| AppError::Internal(error.to_string()))?,
+        )
+        .map_err(|error| AppError::Internal(error.to_string()))?;
+        atomic_write(
+            &home().join("auth.json"),
+            &serde_json::to_vec_pretty(&auth)
+                .map_err(|error| AppError::Internal(error.to_string()))?,
+        )
+        .map_err(|error| AppError::Internal(error.to_string()))?;
+        atomic_write(&home().join("config.toml"), config.as_bytes())
+            .map_err(|error| AppError::Internal(error.to_string()))?;
         Ok(())
     })();
     match update {
@@ -392,6 +361,124 @@ pub fn apply_provider_with_proxy(
             ))),
         },
     }
+}
+
+fn build_managed_config(
+    provider: &ProviderProfile,
+    account: &ProviderAccount,
+    base_url: &str,
+    token: &str,
+) -> Result<String, AppError> {
+    let mut doc = DocumentMut::new();
+    doc["model_provider"] = value(MANAGED_PROVIDER_ID);
+    doc["model"] = value(provider.default_model.trim());
+    doc["model_catalog_json"] = value(MODEL_CATALOG_FILENAME);
+    if let Some(context_window) = provider.context_window.filter(|value| *value > 0) {
+        doc["model_context_window"] = value(
+            i64::try_from(context_window)
+                .map_err(|_| AppError::InvalidConfig("上下文窗口数值过大".into()))?,
+        );
+    }
+    if let Some(threshold) = provider.auto_compact_threshold.filter(|value| *value > 0) {
+        doc["model_auto_compact_token_limit"] = value(
+            i64::try_from(threshold)
+                .map_err(|_| AppError::InvalidConfig("自动压缩阈值数值过大".into()))?,
+        );
+    }
+
+    let mut providers = Table::new();
+    let mut managed = Table::new();
+    managed["name"] = value(provider.name.trim());
+    managed["base_url"] = value(base_url);
+    managed["wire_api"] = value("responses");
+    managed["requires_openai_auth"] = value(true);
+    managed["experimental_bearer_token"] = value(token);
+    if provider.protocol == ProviderProtocol::Responses {
+        let headers = merged_header_table(&provider.headers, &account.headers);
+        if !headers.is_empty() {
+            managed["http_headers"] = Item::Table(headers);
+        }
+    }
+    providers[MANAGED_PROVIDER_ID] = Item::Table(managed);
+    doc["model_providers"] = Item::Table(providers);
+    Ok(doc.to_string())
+}
+
+fn merged_header_table(provider: &serde_json::Value, account: &serde_json::Value) -> Table {
+    let mut headers = std::collections::BTreeMap::new();
+    for source in [provider, account] {
+        if let Some(values) = source.as_object() {
+            for (name, value) in values {
+                if let Some(value) = value.as_str() {
+                    let name = name.trim();
+                    if !name.is_empty() && !value.is_empty() {
+                        headers.insert(name.to_string(), value.to_string());
+                    }
+                }
+            }
+        }
+    }
+    let mut table = Table::new();
+    for (name, header_value) in headers {
+        table[&name] = value(header_value);
+    }
+    table
+}
+
+fn build_managed_auth(token: &str) -> serde_json::Value {
+    serde_json::json!({
+        "OPENAI_API_KEY": token,
+    })
+}
+
+fn build_model_catalog(provider: &ProviderProfile) -> serde_json::Value {
+    let context_window = provider
+        .context_window
+        .filter(|value| *value > 0)
+        .unwrap_or(128_000);
+    let mut models = vec![provider.default_model.trim().to_string()];
+    models.extend(provider.models.iter().map(|model| model.trim().to_string()));
+    let mut seen = std::collections::HashSet::new();
+    let models = models
+        .into_iter()
+        .filter(|model| !model.is_empty() && seen.insert(model.clone()))
+        .enumerate()
+        .map(|(priority, model)| {
+            serde_json::json!({
+                "slug": model,
+                "display_name": model,
+                "description": format!("{} · {}", provider.name.trim(), model),
+                "base_instructions": "You are Codex, a coding agent. You and the user share the same workspace and collaborate to achieve the user's goals.",
+                "default_reasoning_level": "none",
+                "supported_reasoning_levels": [
+                    {
+                        "effort": "none",
+                        "description": "Disable Thinking"
+                    }
+                ],
+                "shell_type": "shell_command",
+                "visibility": "list",
+                "supported_in_api": true,
+                "priority": priority,
+                "supports_reasoning_summaries": false,
+                "default_reasoning_summary": "none",
+                "support_verbosity": false,
+                "truncation_policy": {
+                    "mode": "bytes",
+                    "limit": 10000
+                },
+                "supports_parallel_tool_calls": false,
+                "supports_image_detail_original": false,
+                "context_window": context_window,
+                "max_context_window": context_window,
+                "effective_context_window_percent": 95,
+                "experimental_supported_tools": [],
+                "input_modalities": ["text"],
+                "supports_search_tool": false
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({ "models": models })
 }
 
 pub fn capture_official_config() -> String {
@@ -412,35 +499,21 @@ pub fn is_official_mode() -> bool {
 
 pub fn restore_official_snapshot(
     auth: &serde_json::Value,
-    config_snapshot: Option<&str>,
+    _config_snapshot: Option<&str>,
 ) -> Result<String, AppError> {
     let backup_path =
         backup("official-account").map_err(|error| AppError::Backup(error.to_string()))?;
-    let config_path = home().join("config.toml");
-    let config = config_snapshot.unwrap_or_default();
     let update = (|| -> Result<(), AppError> {
-        if config.is_empty() {
-            let current = fs::read_to_string(&config_path).unwrap_or_default();
-            let mut doc = current
-                .parse::<DocumentMut>()
-                .map_err(|error| AppError::InvalidConfig(error.to_string()))?;
-            doc.as_table_mut().remove("model_provider");
-            doc.as_table_mut().remove("model");
-            if let Some(providers) = doc.get_mut("model_providers").and_then(Item::as_table_mut) {
-                providers.remove(MANAGED_PROVIDER_ID);
-            }
-            atomic_write(&config_path, doc.to_string().as_bytes())?;
-        } else {
-            config
-                .parse::<DocumentMut>()
-                .map_err(|error| AppError::InvalidConfig(error.to_string()))?;
-            atomic_write(&config_path, config.as_bytes())?;
-        }
+        atomic_write(&home().join("config.toml"), b"")?;
         atomic_write(
             &home().join("auth.json"),
             &serde_json::to_vec_pretty(auth)
                 .map_err(|error| AppError::Internal(error.to_string()))?,
         )?;
+        let catalog = home().join(MODEL_CATALOG_FILENAME);
+        if catalog.exists() {
+            fs::remove_file(catalog).map_err(|error| AppError::Internal(error.to_string()))?;
+        }
         Ok(())
     })();
     match update {
@@ -454,7 +527,7 @@ pub fn restore_official_snapshot(
 
 pub fn restore_provider_backup(backup_path: &str) -> Result<(), AppError> {
     let backup_path = Path::new(backup_path);
-    for name in ["config.toml", "auth.json"] {
+    for name in ["config.toml", "auth.json", MODEL_CATALOG_FILENAME] {
         let source = backup_path.join(name);
         if source.exists() {
             let bytes = fs::read(&source).map_err(|error| AppError::Backup(error.to_string()))?;
@@ -528,6 +601,7 @@ pub fn export_sessions(ids: &[String], target: &Path) -> anyhow::Result<String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn current_catalog_query_uses_named_sort_alias() {
@@ -550,5 +624,97 @@ mod tests {
             .unwrap();
         assert_eq!(row, ("thread-1".into(), "Title".into(), 123));
         assert!(sql.contains("ORDER BY sort_updated"));
+    }
+
+    fn test_provider() -> ProviderProfile {
+        ProviderProfile {
+            id: "provider-1".into(),
+            name: "Example Gateway".into(),
+            protocol: ProviderProtocol::Responses,
+            base_url: "https://example.test/v1".into(),
+            default_model: "model-a".into(),
+            models: vec!["model-b".into(), "model-a".into(), " ".into()],
+            headers: json!({"X-Provider": "provider", "X-Override": "provider"}),
+            timeout_secs: 30,
+            context_window: Some(64_000),
+            auto_compact_threshold: Some(48_000),
+            enabled: true,
+            active: false,
+            active_account_id: None,
+            account_count: 1,
+        }
+    }
+
+    fn test_account() -> ProviderAccount {
+        ProviderAccount {
+            id: "account-1".into(),
+            provider_id: Some("provider-1".into()),
+            name: "Account".into(),
+            auth_kind: AccountAuthKind::ApiKey,
+            api_key: Some("secret-key".into()),
+            auth_json: None,
+            headers: json!({"X-Account": "account", "X-Override": "account"}),
+            active: false,
+            email: None,
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    #[test]
+    fn provider_switch_rebuilds_minimal_config() {
+        let config = build_managed_config(
+            &test_provider(),
+            &test_account(),
+            "https://example.test/v1",
+            "secret-key",
+        )
+        .unwrap();
+        let parsed = config.parse::<DocumentMut>().unwrap();
+        assert_eq!(
+            parsed.get("model_provider").and_then(Item::as_str),
+            Some(MANAGED_PROVIDER_ID)
+        );
+        assert_eq!(
+            parsed.get("model_catalog_json").and_then(Item::as_str),
+            Some(MODEL_CATALOG_FILENAME)
+        );
+        assert_eq!(
+            parsed
+                .get("model_providers")
+                .and_then(Item::as_table)
+                .and_then(|providers| providers.get(MANAGED_PROVIDER_ID))
+                .and_then(Item::as_table)
+                .and_then(|provider| provider.get("http_headers"))
+                .and_then(Item::as_table)
+                .and_then(|headers| headers.get("X-Override"))
+                .and_then(Item::as_str),
+            Some("account")
+        );
+        assert!(parsed.get("mcp_servers").is_none());
+        assert!(parsed.get("features").is_none());
+    }
+
+    #[test]
+    fn model_catalog_contains_default_and_deduplicated_models() {
+        let catalog = build_model_catalog(&test_provider());
+        let models = catalog["models"].as_array().unwrap();
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0]["slug"], "model-a");
+        assert_eq!(models[1]["slug"], "model-b");
+        assert_eq!(models[0]["context_window"], 64_000);
+        assert!(
+            models[0]["base_instructions"]
+                .as_str()
+                .is_some_and(|v| !v.is_empty())
+        );
+    }
+
+    #[test]
+    fn third_party_auth_is_rebuilt_with_only_active_key() {
+        assert_eq!(
+            build_managed_auth("secret-key"),
+            json!({"OPENAI_API_KEY": "secret-key"})
+        );
     }
 }
