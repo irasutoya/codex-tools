@@ -10,7 +10,20 @@ use auth_center::AuthCenter;
 use models::*;
 use protocol_proxy::ProxyManager;
 use storage::Store;
-use tauri::{Manager, State};
+use tauri::menu::{Menu, MenuItem};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+use tauri::{Manager, State, WindowEvent};
+
+const TRAY_SHOW_ID: &str = "tray_show";
+const TRAY_EXIT_ID: &str = "tray_exit";
+
+fn show_main_window(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.unminimize();
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+}
 
 #[tauri::command]
 fn list_providers(store: State<Store>) -> Result<Vec<ProviderProfile>, AppError> {
@@ -398,16 +411,53 @@ pub fn run() {
     let store = Store::open().expect("无法初始化应用数据库");
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _, _| {
-            if let Some(window) = app.get_webview_window("main") {
-                let _ = window.show();
-                let _ = window.set_focus();
-            }
+            show_main_window(app);
         }))
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .manage(store)
         .manage(ProxyManager::default())
         .manage(AuthCenter::default())
+        .setup(|app| {
+            let show =
+                MenuItem::with_id(app, TRAY_SHOW_ID, "打开 Codex Tools", true, None::<&str>)?;
+            let exit = MenuItem::with_id(app, TRAY_EXIT_ID, "退出", true, None::<&str>)?;
+            let menu = Menu::with_items(app, &[&show, &exit])?;
+            let mut tray = TrayIconBuilder::with_id("main")
+                .menu(&menu)
+                .tooltip("Codex Tools")
+                .show_menu_on_left_click(false)
+                .on_menu_event(|app, event| match event.id.as_ref() {
+                    TRAY_SHOW_ID => show_main_window(app),
+                    TRAY_EXIT_ID => app.exit(0),
+                    _ => {}
+                })
+                .on_tray_icon_event(|tray, event| {
+                    if let TrayIconEvent::Click {
+                        button: MouseButton::Left,
+                        button_state: MouseButtonState::Up,
+                        ..
+                    } = event
+                    {
+                        show_main_window(tray.app_handle());
+                    }
+                });
+            if let Some(icon) = app.default_window_icon().cloned() {
+                tray = tray.icon(icon);
+            }
+            tray.build(app)?;
+            Ok(())
+        })
+        .on_window_event(|window, event| match event {
+            WindowEvent::CloseRequested { api, .. } => {
+                api.prevent_close();
+                let _ = window.hide();
+            }
+            WindowEvent::Resized(_) if window.is_minimized().unwrap_or(false) => {
+                let _ = window.hide();
+            }
+            _ => {}
+        })
         .invoke_handler(tauri::generate_handler![
             get_dashboard,
             list_providers,
