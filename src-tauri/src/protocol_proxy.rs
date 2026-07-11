@@ -1,8 +1,18 @@
-use crate::models::{AppError, ProviderAccount, ProviderProfile};
+use crate::models::{
+    AppError, ProviderAccount, ProviderProfile, RouteConsoleSnapshot, RouteLogEntry,
+};
 use futures_util::StreamExt;
 use reqwest::header::{HeaderName, HeaderValue};
 use serde_json::{Value, json};
-use std::{collections::BTreeMap, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeMap, VecDeque},
+    net::SocketAddr,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -22,6 +32,7 @@ pub struct ProxyEndpoint {
 struct RunningProxy {
     endpoint: ProxyEndpoint,
     shutdown: oneshot::Sender<()>,
+    telemetry: Arc<ProxyTelemetry>,
 }
 
 #[derive(Default)]
@@ -43,6 +54,22 @@ struct ProxyConfig {
     headers: Value,
     token: String,
     timeout: Duration,
+    telemetry: Arc<ProxyTelemetry>,
+}
+
+struct ProxyTelemetry {
+    upstream_url: String,
+    provider_name: String,
+    account_name: String,
+    model: String,
+    started_at: i64,
+    request_count: AtomicU64,
+    success_count: AtomicU64,
+    error_count: AtomicU64,
+    active_requests: AtomicU64,
+    last_latency_ms: AtomicU64,
+    next_log_id: AtomicU64,
+    logs: Mutex<VecDeque<RouteLogEntry>>,
 }
 
 impl ProxyManager {
@@ -66,15 +93,31 @@ impl ProxyManager {
             base_url: format!("http://127.0.0.1:{}/v1", address.port()),
             token: token.clone(),
         };
+        let upstream_url = format!(
+            "{}/chat/completions",
+            provider.base_url.trim_end_matches('/')
+        );
+        let telemetry = Arc::new(ProxyTelemetry {
+            upstream_url: upstream_url.clone(),
+            provider_name: provider.name.clone(),
+            account_name: account.name.clone(),
+            model: provider.default_model.clone(),
+            started_at: chrono::Utc::now().timestamp(),
+            request_count: AtomicU64::new(0),
+            success_count: AtomicU64::new(0),
+            error_count: AtomicU64::new(0),
+            active_requests: AtomicU64::new(0),
+            last_latency_ms: AtomicU64::new(0),
+            next_log_id: AtomicU64::new(1),
+            logs: Mutex::new(VecDeque::with_capacity(200)),
+        });
         let config = Arc::new(ProxyConfig {
-            upstream_url: format!(
-                "{}/chat/completions",
-                provider.base_url.trim_end_matches('/')
-            ),
+            upstream_url,
             api_key: account.api_key.clone().unwrap_or_default(),
             headers: merge_headers(&provider.headers, &account.headers),
             token,
             timeout: Duration::from_secs(provider.timeout_secs.max(1)),
+            telemetry: telemetry.clone(),
         });
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
 
@@ -86,7 +129,35 @@ impl ProxyManager {
                         let Ok((stream, peer)) = accepted else { break };
                         let config = config.clone();
                         tokio::spawn(async move {
-                            let _ = handle_connection(stream, peer, config).await;
+                            let started = std::time::Instant::now();
+                            config.telemetry.request_count.fetch_add(1, Ordering::Relaxed);
+                            config.telemetry.active_requests.fetch_add(1, Ordering::Relaxed);
+                            let result = handle_connection(stream, peer, config.clone()).await;
+                            config.telemetry.active_requests.fetch_sub(1, Ordering::Relaxed);
+                            let latency = started.elapsed().as_millis() as u64;
+                            config.telemetry.last_latency_ms.store(latency, Ordering::Relaxed);
+                            let (status, message) = match result {
+                                Ok(()) => {
+                                    config.telemetry.success_count.fetch_add(1, Ordering::Relaxed);
+                                    (200, None)
+                                }
+                                Err(_) => {
+                                    config.telemetry.error_count.fetch_add(1, Ordering::Relaxed);
+                                    (500, Some("代理内部错误（敏感详情已隐藏）".into()))
+                                }
+                            };
+                            let id = config.telemetry.next_log_id.fetch_add(1, Ordering::Relaxed);
+                            let mut logs = config.telemetry.logs.lock().await;
+                            if logs.len() >= 200 { logs.pop_front(); }
+                            logs.push_back(RouteLogEntry {
+                                id,
+                                timestamp: chrono::Utc::now().timestamp(),
+                                method: "POST".into(),
+                                path: "/v1/responses".into(),
+                                status,
+                                latency_ms: latency,
+                                message,
+                            });
                         });
                     }
                 }
@@ -100,6 +171,7 @@ impl ProxyManager {
         state.pending = Some(RunningProxy {
             endpoint: endpoint.clone(),
             shutdown: shutdown_tx,
+            telemetry,
         });
         Ok(endpoint)
     }
@@ -139,6 +211,45 @@ impl ProxyManager {
             .current
             .as_ref()
             .map(|proxy| proxy.endpoint.clone())
+    }
+
+    pub async fn console(&self) -> RouteConsoleSnapshot {
+        let state = self.inner.lock().await;
+        let Some(proxy) = state.current.as_ref() else {
+            return RouteConsoleSnapshot::default();
+        };
+        let telemetry = &proxy.telemetry;
+        RouteConsoleSnapshot {
+            running: true,
+            base_url: Some(proxy.endpoint.base_url.clone()),
+            upstream_url: Some(telemetry.upstream_url.clone()),
+            provider_name: Some(telemetry.provider_name.clone()),
+            account_name: Some(telemetry.account_name.clone()),
+            model: Some(telemetry.model.clone()),
+            started_at: Some(telemetry.started_at),
+            request_count: telemetry.request_count.load(Ordering::Relaxed),
+            success_count: telemetry.success_count.load(Ordering::Relaxed),
+            error_count: telemetry.error_count.load(Ordering::Relaxed),
+            active_requests: telemetry.active_requests.load(Ordering::Relaxed),
+            last_latency_ms: match telemetry.last_latency_ms.load(Ordering::Relaxed) {
+                0 => None,
+                value => Some(value),
+            },
+            logs: telemetry.logs.lock().await.iter().cloned().collect(),
+        }
+    }
+
+    pub async fn clear_logs(&self) {
+        let telemetry = self
+            .inner
+            .lock()
+            .await
+            .current
+            .as_ref()
+            .map(|proxy| proxy.telemetry.clone());
+        if let Some(telemetry) = telemetry {
+            telemetry.logs.lock().await.clear();
+        }
     }
 }
 

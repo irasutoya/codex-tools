@@ -8,6 +8,7 @@ import {
   FileArchive,
   Gauge,
   KeyRound,
+  Network,
   Plus,
   RefreshCw,
   Server,
@@ -15,6 +16,7 @@ import {
   ShieldCheck,
   Trash2,
   UserRound,
+  CodeXml,
 } from "lucide-react"
 import { toast } from "sonner"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
@@ -104,18 +106,22 @@ import {
 import { call } from "@/lib/tauri"
 import type {
   Account,
+  AuthAccount,
   Dashboard,
   Page,
   Protocol,
   Provider,
   RepairScan,
+  RouteConsole,
   Session,
 } from "@/types"
 const nav: [Page, string, React.ComponentType][] = [
   ["dashboard", "概览", Gauge],
   ["providers", "Provider 与账号", Server],
+  ["auth", "OAuth 认证中心", KeyRound],
   ["sessions", "会话历史", FileArchive],
   ["repair", "数据库修复", Database],
+  ["routes", "本地路由", Network],
   ["settings", "诊断与设置", Settings],
 ]
 
@@ -125,6 +131,8 @@ export default function App() {
   const [providers, setProviders] = useState<Provider[]>([])
   const [accounts, setAccounts] = useState<Account[]>([])
   const [sessions, setSessions] = useState<Session[]>([])
+  const [authAccounts, setAuthAccounts] = useState<AuthAccount[]>([])
+  const [route, setRoute] = useState<RouteConsole>()
   const [scan, setScan] = useState<RepairScan>()
   const [editingProvider, setEditingProvider] = useState<Provider>()
   const [editingAccount, setEditingAccount] = useState<Account>()
@@ -145,18 +153,24 @@ export default function App() {
         nextAccounts,
         nextSessions,
         nextScan,
+        nextAuthAccounts,
+        nextRoute,
       ] = await Promise.all([
         call<Dashboard>("get_dashboard"),
         call<Provider[]>("list_providers"),
         call<Account[]>("list_provider_accounts"),
         call<Session[]>("list_sessions"),
         call<RepairScan>("scan_codex_data"),
+        call<AuthAccount[]>("list_auth_accounts"),
+        call<RouteConsole>("get_route_console"),
       ])
       setDashboard(nextDashboard)
       setProviders(nextProviders)
       setAccounts(nextAccounts)
       setSessions(nextSessions)
       setScan(nextScan)
+      setAuthAccounts(nextAuthAccounts)
+      setRoute(nextRoute)
     } catch (error) {
       toast.error(String(error))
     }
@@ -414,8 +428,19 @@ export default function App() {
                 onDelete={setDeletingSession}
               />
             )}
+            {page === "auth" && (
+              <AuthCenterPage
+                accounts={authAccounts}
+                busy={busy}
+                onBusy={setBusy}
+                onReload={reload}
+              />
+            )}
             {page === "repair" && (
               <RepairPage scan={scan} busy={busy} onRepair={repair} />
+            )}
+            {page === "routes" && (
+              <RouteConsolePage route={route} onReload={reload} />
             )}
             {page === "settings" && <SettingsPage dashboard={dashboard} />}
           </main>
@@ -923,6 +948,309 @@ function SessionsPage({
         )}
       </CardContent>
     </Card>
+  )
+}
+
+function AuthCenterPage({
+  accounts,
+  busy,
+  onBusy,
+  onReload,
+}: {
+  accounts: AuthAccount[]
+  busy: boolean
+  onBusy: (value: boolean) => void
+  onReload: () => Promise<void>
+}) {
+  const [clientId, setClientId] = useState("")
+  const [device, setDevice] = useState<{
+    operationId: string
+    userCode: string
+    verificationUri: string
+  }>()
+  const captureOpenAi = async () => {
+    onBusy(true)
+    try {
+      await call("capture_openai_account", { name: "OpenAI 官方账号" })
+      toast.success("已保存当前 Codex 官方登录与配置快照")
+      await onReload()
+    } catch (error) {
+      toast.error(String(error))
+    } finally {
+      onBusy(false)
+    }
+  }
+  const startGitHub = async () => {
+    onBusy(true)
+    try {
+      const next = await call<{
+        operationId: string
+        userCode: string
+        verificationUri: string
+      }>("start_github_device_auth", {
+        clientId,
+        scopes: ["read:user", "user:email"],
+      })
+      setDevice(next)
+      toast.success("设备授权已创建，请在 GitHub 完成确认")
+    } catch (error) {
+      toast.error(String(error))
+    } finally {
+      onBusy(false)
+    }
+  }
+  const completeGitHub = async () => {
+    if (!device) return
+    onBusy(true)
+    try {
+      await call("complete_github_device_auth", {
+        operationId: device.operationId,
+      })
+      setDevice(undefined)
+      toast.success("GitHub 账号已添加")
+      await onReload()
+    } catch (error) {
+      toast.error(String(error))
+    } finally {
+      onBusy(false)
+    }
+  }
+  const activateOpenAi = async (id: string) => {
+    onBusy(true)
+    try {
+      await call("activate_openai_account", { id })
+      toast.success("已恢复 OpenAI 官方登录")
+      await onReload()
+    } catch (error) {
+      toast.error(String(error))
+    } finally {
+      onBusy(false)
+    }
+  }
+  return (
+    <>
+      <Alert>
+        <ShieldCheck />
+        <AlertTitle>认证与模型路由分离</AlertTitle>
+        <AlertDescription>
+          OpenAI 快照可直接恢复到 Codex。GitHub 登录只保存身份与授权，不会伪装成
+          OpenAI 凭据；使用 GitHub Models 时仍需单独配置兼容 Provider。
+        </AlertDescription>
+      </Alert>
+      <div className="grid gap-4 xl:grid-cols-2">
+        <Card>
+          <CardHeader>
+            <CardTitle>OpenAI / Codex</CardTitle>
+            <CardDescription>
+              捕获当前 auth.json 和官方配置；切换第三方前也会自动保存一次。
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="flex flex-col gap-3">
+            {accounts
+              .filter((account) => account.service === "open_ai")
+              .map((account) => (
+                <div
+                  key={account.id}
+                  className="flex items-center justify-between rounded-lg border p-3"
+                >
+                  <div>
+                    <div className="font-medium">{account.name}</div>
+                    <div className="text-sm text-muted-foreground">
+                      {account.email || "官方登录快照"}
+                    </div>
+                  </div>
+                  <div className="flex gap-2">
+                    {account.active && <Badge>当前</Badge>}
+                    <Button
+                      size="sm"
+                      disabled={busy || account.active}
+                      onClick={() => void activateOpenAi(account.id)}
+                    >
+                      恢复到 Codex
+                    </Button>
+                  </div>
+                </div>
+              ))}
+          </CardContent>
+          <CardFooter>
+            <Button disabled={busy} onClick={() => void captureOpenAi()}>
+              <KeyRound data-icon="inline-start" />
+              保存当前官方登录
+            </Button>
+          </CardFooter>
+        </Card>
+        <Card>
+          <CardHeader>
+            <CardTitle>GitHub Device Flow</CardTitle>
+            <CardDescription>
+              使用你自己的 GitHub OAuth App Client
+              ID；令牌按当前项目约定明文保存在本机数据库。
+            </CardDescription>
+          </CardHeader>
+          <CardContent>
+            <FieldGroup>
+              <Field>
+                <FieldLabel>OAuth App Client ID</FieldLabel>
+                <Input
+                  value={clientId}
+                  onChange={(event) => setClientId(event.target.value)}
+                />
+              </Field>
+              {device && (
+                <Alert>
+                  <CodeXml />
+                  <AlertTitle>授权码：{device.userCode}</AlertTitle>
+                  <AlertDescription>{device.verificationUri}</AlertDescription>
+                </Alert>
+              )}
+              {accounts
+                .filter((account) => account.service === "github")
+                .map((account) => (
+                  <div
+                    key={account.id}
+                    className="flex items-center gap-3 rounded-lg border p-3"
+                  >
+                    <CodeXml />
+                    <div>
+                      <div className="font-medium">{account.name}</div>
+                      <div className="text-sm text-muted-foreground">
+                        @{account.login}
+                      </div>
+                    </div>
+                  </div>
+                ))}
+            </FieldGroup>
+          </CardContent>
+          <CardFooter className="flex gap-2">
+            <Button
+              variant="outline"
+              disabled={busy || !clientId}
+              onClick={() => void startGitHub()}
+            >
+              开始授权
+            </Button>
+            {device && (
+              <Button disabled={busy} onClick={() => void completeGitHub()}>
+                我已授权，完成添加
+              </Button>
+            )}
+          </CardFooter>
+        </Card>
+      </div>
+    </>
+  )
+}
+
+function RouteConsolePage({
+  route,
+  onReload,
+}: {
+  route?: RouteConsole
+  onReload: () => Promise<void>
+}) {
+  const stop = async () => {
+    try {
+      await call("stop_local_route")
+      toast.success("本地路由已停止")
+      await onReload()
+    } catch (error) {
+      toast.error(String(error))
+    }
+  }
+  const clear = async () => {
+    await call("clear_route_logs")
+    await onReload()
+  }
+  if (!route?.running) {
+    return (
+      <Empty>
+        <EmptyHeader>
+          <EmptyMedia variant="icon">
+            <Network />
+          </EmptyMedia>
+          <EmptyTitle>本地路由未运行</EmptyTitle>
+          <EmptyDescription>
+            激活 Chat Completions Provider 后，会自动启动仅监听 127.0.0.1
+            的协议路由。
+          </EmptyDescription>
+        </EmptyHeader>
+      </Empty>
+    )
+  }
+  return (
+    <>
+      <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
+        {[
+          ["请求", route.requestCount],
+          ["成功", route.successCount],
+          ["错误", route.errorCount],
+          ["最近延迟", `${route.lastLatencyMs ?? 0} ms`],
+        ].map(([label, value]) => (
+          <Card key={label}>
+            <CardHeader>
+              <CardDescription>{label}</CardDescription>
+              <CardTitle>{value}</CardTitle>
+            </CardHeader>
+          </Card>
+        ))}
+      </div>
+      <Card>
+        <CardHeader>
+          <CardTitle>
+            {route.providerName} / {route.model}
+          </CardTitle>
+          <CardDescription>
+            {route.baseUrl} → {route.upstreamUrl}
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          {route.logs.length ? (
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>时间</TableHead>
+                  <TableHead>请求</TableHead>
+                  <TableHead>状态</TableHead>
+                  <TableHead>耗时</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {route.logs.map((entry) => (
+                  <TableRow key={entry.id}>
+                    <TableCell>
+                      {new Date(entry.timestamp * 1000).toLocaleTimeString()}
+                    </TableCell>
+                    <TableCell className="font-mono text-xs">
+                      {entry.method} {entry.path}
+                    </TableCell>
+                    <TableCell>
+                      <Badge
+                        variant={
+                          entry.status < 400 ? "secondary" : "destructive"
+                        }
+                      >
+                        {entry.status}
+                      </Badge>
+                    </TableCell>
+                    <TableCell>{entry.latencyMs} ms</TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          ) : (
+            <div className="text-sm text-muted-foreground">暂无请求记录。</div>
+          )}
+        </CardContent>
+        <CardFooter className="flex gap-2">
+          <Button variant="outline" onClick={() => void clear()}>
+            清空日志
+          </Button>
+          <Button variant="destructive" onClick={() => void stop()}>
+            停止路由
+          </Button>
+        </CardFooter>
+      </Card>
+    </>
   )
 }
 

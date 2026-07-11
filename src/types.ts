@@ -1,5 +1,11 @@
 export type Page =
-  "dashboard" | "providers" | "sessions" | "repair" | "settings"
+  | "dashboard"
+  | "providers"
+  | "auth"
+  | "sessions"
+  | "repair"
+  | "routes"
+  | "settings"
 
 export type Protocol = "responses" | "chat_completions"
 
@@ -44,6 +50,7 @@ export type Dashboard = {
 }
 
 export type Session = {
+  identity: string
   id: string
   title: string
   provider: string
@@ -51,6 +58,54 @@ export type Session = {
   archived: boolean
   updatedAt: number
   sourceDb: string
+  sourceRollout?: string
+  originalProvider: string
+  hasUserEvent: boolean
+}
+
+export type AuthAccount = {
+  id: string
+  service: "open_ai" | "github"
+  name: string
+  login?: string
+  email?: string
+  scopes: string[]
+  expiresAt?: number
+  active: boolean
+  createdAt: number
+  updatedAt: number
+}
+
+export type GitHubDeviceAuthorization = {
+  operationId: string
+  userCode: string
+  verificationUri: string
+  expiresAt: number
+  intervalSecs: number
+}
+
+export type RouteConsole = {
+  running: boolean
+  baseUrl?: string
+  upstreamUrl?: string
+  providerName?: string
+  accountName?: string
+  model?: string
+  startedAt?: number
+  requestCount: number
+  successCount: number
+  errorCount: number
+  activeRequests: number
+  lastLatencyMs?: number
+  logs: {
+    id: number
+    timestamp: number
+    method: string
+    path: string
+    status: number
+    latencyMs: number
+    message?: string
+  }[]
 }
 
 export type RepairScan = {

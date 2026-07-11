@@ -1,9 +1,12 @@
+mod auth_center;
 mod codex;
 mod models;
 mod protocol_proxy;
 mod provider_sync;
+mod session_index;
 mod storage;
 
+use auth_center::AuthCenter;
 use models::*;
 use protocol_proxy::ProxyManager;
 use storage::Store;
@@ -183,6 +186,7 @@ async fn activate_provider(
     let _guard = proxy.activation_guard().await;
     let provider = store.provider(&id)?;
     let account = store.account(&account_id)?;
+    preserve_current_official_login(&store)?;
     if !provider.enabled {
         return Err(AppError::InvalidConfig("Provider 已禁用".into()));
     }
@@ -304,8 +308,146 @@ fn repair_codex_data(operation_id: String) -> Result<RepairResult, AppError> {
 }
 
 #[tauri::command]
-fn list_sessions(query: Option<String>) -> Result<Vec<SessionSummary>, AppError> {
-    codex::list_sessions(query).map_err(Into::into)
+fn list_sessions(
+    store: State<Store>,
+    query: Option<String>,
+) -> Result<Vec<SessionSummary>, AppError> {
+    session_index::rebuild(&store)?;
+    store.unified_sessions(query.as_deref()).map_err(Into::into)
+}
+
+fn preserve_current_official_login(store: &Store) -> Result<(), AppError> {
+    if !codex::is_official_mode() {
+        return Ok(());
+    }
+    let Ok(auth) = codex::capture_official_auth() else {
+        return Ok(());
+    };
+    if store.auth_accounts()?.iter().any(|account| {
+        account.service == AuthService::OpenAi && account.credential.as_ref() == Some(&auth)
+    }) {
+        return Ok(());
+    }
+    let now = chrono::Utc::now().timestamp();
+    store.save_auth_account(&AuthAccount {
+        id: uuid::Uuid::new_v4().to_string(),
+        service: AuthService::OpenAi,
+        name: "自动保存的 OpenAI 登录".into(),
+        login: None,
+        email: auth
+            .pointer("/tokens/id_token/email")
+            .or_else(|| auth.pointer("/email"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        credential: Some(auth),
+        config_snapshot: Some(codex::capture_official_config()),
+        scopes: Vec::new(),
+        expires_at: None,
+        active: false,
+        created_at: now,
+        updated_at: now,
+    })?;
+    Ok(())
+}
+
+#[tauri::command]
+fn list_auth_accounts(store: State<Store>) -> Result<Vec<AuthAccount>, AppError> {
+    store.auth_accounts().map_err(Into::into)
+}
+
+#[tauri::command]
+fn capture_openai_account(store: State<Store>, name: String) -> Result<AuthAccount, AppError> {
+    let auth = codex::capture_official_auth()?;
+    let now = chrono::Utc::now().timestamp();
+    let account = AuthAccount {
+        id: uuid::Uuid::new_v4().to_string(),
+        service: AuthService::OpenAi,
+        name: if name.trim().is_empty() {
+            "OpenAI 官方账号".into()
+        } else {
+            name
+        },
+        login: None,
+        email: auth
+            .pointer("/tokens/id_token/email")
+            .or_else(|| auth.pointer("/email"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        credential: Some(auth),
+        config_snapshot: Some(codex::capture_official_config()),
+        scopes: Vec::new(),
+        expires_at: None,
+        active: false,
+        created_at: now,
+        updated_at: now,
+    };
+    store.save_auth_account(&account)?;
+    Ok(account)
+}
+
+#[tauri::command]
+async fn activate_openai_account(
+    store: State<'_, Store>,
+    proxy: State<'_, ProxyManager>,
+    id: String,
+) -> Result<String, AppError> {
+    let account = store.auth_account(&id)?;
+    if account.service != AuthService::OpenAi {
+        return Err(AppError::InvalidConfig("所选账号不是 OpenAI 账号".into()));
+    }
+    let auth = account
+        .credential
+        .as_ref()
+        .ok_or(AppError::OfficialAuthMissing)?;
+    let backup = codex::restore_official_snapshot(auth, account.config_snapshot.as_deref())?;
+    store.activate_auth_account(&id)?;
+    proxy.stop().await;
+    Ok(backup)
+}
+
+#[tauri::command]
+fn delete_auth_account(store: State<Store>, id: String) -> Result<(), AppError> {
+    store.delete_auth_account(&id)?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn start_github_device_auth(
+    center: State<'_, AuthCenter>,
+    client_id: String,
+    scopes: Vec<String>,
+) -> Result<GitHubDeviceAuthorization, AppError> {
+    center.start_github(&client_id, &scopes).await
+}
+
+#[tauri::command]
+async fn complete_github_device_auth(
+    center: State<'_, AuthCenter>,
+    store: State<'_, Store>,
+    operation_id: String,
+) -> Result<AuthAccount, AppError> {
+    let account = center.complete_github(&operation_id).await?;
+    store.save_auth_account(&account)?;
+    Ok(account)
+}
+
+#[tauri::command]
+async fn get_route_console(
+    proxy: State<'_, ProxyManager>,
+) -> Result<RouteConsoleSnapshot, AppError> {
+    Ok(proxy.console().await)
+}
+
+#[tauri::command]
+async fn stop_local_route(proxy: State<'_, ProxyManager>) -> Result<(), AppError> {
+    proxy.stop().await;
+    Ok(())
+}
+
+#[tauri::command]
+async fn clear_route_logs(proxy: State<'_, ProxyManager>) -> Result<(), AppError> {
+    proxy.clear_logs().await;
+    Ok(())
 }
 #[tauri::command]
 fn delete_sessions_permanently(ids: Vec<String>) -> Result<usize, AppError> {
@@ -320,7 +462,7 @@ fn export_sessions(ids: Vec<String>, target: String) -> Result<String, AppError>
 fn get_dashboard(store: State<Store>) -> Result<Dashboard, AppError> {
     let providers = store.providers()?;
     let scan = codex::scan();
-    let sessions = codex::list_sessions(None).unwrap_or_default();
+    let sessions = session_index::rebuild(&store).unwrap_or_default();
     Ok(Dashboard {
         provider_count: providers.len() as u64,
         active_provider: providers.into_iter().find(|p| p.active).map(|p| p.name),
@@ -362,6 +504,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .manage(store)
         .manage(ProxyManager::default())
+        .manage(AuthCenter::default())
         .invoke_handler(tauri::generate_handler![
             get_dashboard,
             list_providers,
@@ -380,7 +523,16 @@ pub fn run() {
             list_sessions,
             export_sessions,
             delete_sessions_permanently,
-            get_diagnostics
+            get_diagnostics,
+            list_auth_accounts,
+            capture_openai_account,
+            activate_openai_account,
+            delete_auth_account,
+            start_github_device_auth,
+            complete_github_device_auth,
+            get_route_console,
+            stop_local_route,
+            clear_route_logs
         ])
         .run(tauri::generate_context!())
         .expect("运行 Codex Tools 失败");

@@ -104,6 +104,7 @@ pub struct Dashboard {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionSummary {
+    pub identity: String,
     pub id: String,
     pub title: String,
     pub provider: String,
@@ -111,6 +112,79 @@ pub struct SessionSummary {
     pub archived: bool,
     pub updated_at: i64,
     pub source_db: String,
+    pub source_rollout: Option<String>,
+    pub original_provider: String,
+    pub has_user_event: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthService {
+    OpenAi,
+    GitHub,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthAccount {
+    pub id: String,
+    pub service: AuthService,
+    pub name: String,
+    pub login: Option<String>,
+    pub email: Option<String>,
+    #[serde(default)]
+    pub credential: Option<serde_json::Value>,
+    #[serde(default)]
+    pub config_snapshot: Option<String>,
+    #[serde(default)]
+    pub scopes: Vec<String>,
+    pub expires_at: Option<i64>,
+    #[serde(default)]
+    pub active: bool,
+    #[serde(default)]
+    pub created_at: i64,
+    #[serde(default)]
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitHubDeviceAuthorization {
+    pub operation_id: String,
+    pub user_code: String,
+    pub verification_uri: String,
+    pub expires_at: i64,
+    pub interval_secs: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RouteLogEntry {
+    pub id: u64,
+    pub timestamp: i64,
+    pub method: String,
+    pub path: String,
+    pub status: u16,
+    pub latency_ms: u64,
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct RouteConsoleSnapshot {
+    pub running: bool,
+    pub base_url: Option<String>,
+    pub upstream_url: Option<String>,
+    pub provider_name: Option<String>,
+    pub account_name: Option<String>,
+    pub model: Option<String>,
+    pub started_at: Option<i64>,
+    pub request_count: u64,
+    pub success_count: u64,
+    pub error_count: u64,
+    pub active_requests: u64,
+    pub last_latency_ms: Option<u64>,
+    pub logs: Vec<RouteLogEntry>,
 }
 
 #[derive(Debug, Serialize)]

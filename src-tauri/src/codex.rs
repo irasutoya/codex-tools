@@ -144,6 +144,7 @@ pub fn list_sessions(query: Option<String>) -> anyhow::Result<Vec<SessionSummary
         let mut st = db.prepare(&sql)?;
         let rows = st.query_map([], |r| {
             Ok(SessionSummary {
+                identity: format!("{}#{}", path.display(), r.get::<_, String>(0)?),
                 id: r.get(0)?,
                 title: r.get::<_, String>(1).unwrap_or_default(),
                 provider: r.get::<_, String>(2).unwrap_or_default(),
@@ -151,6 +152,9 @@ pub fn list_sessions(query: Option<String>) -> anyhow::Result<Vec<SessionSummary
                 archived: r.get::<_, i64>(4).unwrap_or(0) != 0,
                 updated_at: r.get::<_, i64>(5).unwrap_or(0),
                 source_db: path.display().to_string(),
+                source_rollout: None,
+                original_provider: r.get::<_, String>(2).unwrap_or_default(),
+                has_user_event: false,
             })
         })?;
         for row in rows.flatten() {
@@ -394,6 +398,64 @@ pub fn capture_official_auth() -> Result<serde_json::Value, AppError> {
     let path = home().join("auth.json");
     let text = fs::read_to_string(path).map_err(|_| AppError::OfficialAuthMissing)?;
     serde_json::from_str(&text).map_err(|error| AppError::InvalidConfig(error.to_string()))
+}
+
+pub fn capture_official_config() -> String {
+    fs::read_to_string(home().join("config.toml")).unwrap_or_default()
+}
+
+pub fn is_official_mode() -> bool {
+    let config = capture_official_config();
+    let Ok(doc) = config.parse::<DocumentMut>() else {
+        return false;
+    };
+    doc.get("model_provider")
+        .and_then(Item::as_str)
+        .is_none_or(|provider| {
+            provider != MANAGED_PROVIDER_ID && !provider.starts_with("codex_tools_")
+        })
+}
+
+pub fn restore_official_snapshot(
+    auth: &serde_json::Value,
+    config_snapshot: Option<&str>,
+) -> Result<String, AppError> {
+    let backup_path =
+        backup("official-account").map_err(|error| AppError::Backup(error.to_string()))?;
+    let config_path = home().join("config.toml");
+    let config = config_snapshot.unwrap_or_default();
+    let update = (|| -> Result<(), AppError> {
+        if config.is_empty() {
+            let current = fs::read_to_string(&config_path).unwrap_or_default();
+            let mut doc = current
+                .parse::<DocumentMut>()
+                .map_err(|error| AppError::InvalidConfig(error.to_string()))?;
+            doc.as_table_mut().remove("model_provider");
+            doc.as_table_mut().remove("model");
+            if let Some(providers) = doc.get_mut("model_providers").and_then(Item::as_table_mut) {
+                providers.remove(MANAGED_PROVIDER_ID);
+            }
+            atomic_write(&config_path, doc.to_string().as_bytes())?;
+        } else {
+            config
+                .parse::<DocumentMut>()
+                .map_err(|error| AppError::InvalidConfig(error.to_string()))?;
+            atomic_write(&config_path, config.as_bytes())?;
+        }
+        atomic_write(
+            &home().join("auth.json"),
+            &serde_json::to_vec_pretty(auth)
+                .map_err(|error| AppError::Internal(error.to_string()))?,
+        )?;
+        Ok(())
+    })();
+    match update {
+        Ok(()) => Ok(backup_path.display().to_string()),
+        Err(error) => {
+            restore_provider_backup(&backup_path.display().to_string())?;
+            Err(error)
+        }
+    }
 }
 
 pub fn restore_official_account(account: &ProviderAccount) -> Result<String, AppError> {
