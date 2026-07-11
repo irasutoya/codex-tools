@@ -140,34 +140,7 @@ pub fn list_sessions(query: Option<String>) -> anyhow::Result<Vec<SessionSummary
         } else {
             continue;
         };
-        let title = if cols.contains(&"title".into()) {
-            "title"
-        } else {
-            "''"
-        };
-        let provider = if cols.contains(&"model_provider".into()) {
-            "model_provider"
-        } else {
-            "''"
-        };
-        let cwd = if cols.contains(&"cwd".into()) {
-            "cwd"
-        } else {
-            "''"
-        };
-        let archived = if cols.contains(&"archived".into()) {
-            "archived"
-        } else {
-            "0"
-        };
-        let updated = if cols.contains(&"updated_at".into()) {
-            "updated_at"
-        } else {
-            "0"
-        };
-        let sql = format!(
-            "SELECT {id},{title},{provider},{cwd},{archived},{updated} FROM {table} ORDER BY {updated} DESC LIMIT 1000"
-        );
+        let sql = session_list_query(table, id, &cols);
         let mut st = db.prepare(&sql)?;
         let rows = st.query_map([], |r| {
             Ok(SessionSummary {
@@ -191,6 +164,41 @@ pub fn list_sessions(query: Option<String>) -> anyhow::Result<Vec<SessionSummary
         }
     }
     Ok(out)
+}
+
+fn session_list_query(table: &str, id: &str, cols: &[String]) -> String {
+    let title = if cols.contains(&"title".into()) {
+        "title"
+    } else if cols.contains(&"display_title".into()) {
+        "display_title"
+    } else {
+        "''"
+    };
+    let provider = if cols.contains(&"model_provider".into()) {
+        "model_provider"
+    } else {
+        "''"
+    };
+    let cwd = if cols.contains(&"cwd".into()) {
+        "cwd"
+    } else {
+        "''"
+    };
+    let archived = if cols.contains(&"archived".into()) {
+        "archived"
+    } else {
+        "0"
+    };
+    let updated = if cols.contains(&"updated_at".into()) {
+        "updated_at"
+    } else if cols.contains(&"source_updated_at".into()) {
+        "CAST(source_updated_at AS INTEGER)"
+    } else {
+        "0"
+    };
+    format!(
+        "SELECT {id},{title},{provider},{cwd},{archived},{updated} AS sort_updated FROM {table} ORDER BY sort_updated DESC LIMIT 1000"
+    )
 }
 fn atomic_write(path: &Path, data: &[u8]) -> anyhow::Result<()> {
     use std::io::Write;
@@ -496,4 +504,32 @@ pub fn export_sessions(ids: &[String], target: &Path) -> anyhow::Result<String> 
     }
     fs::write(target, &text)?;
     Ok(target.display().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn current_catalog_query_uses_named_sort_alias() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE local_thread_catalog(
+                thread_id TEXT PRIMARY KEY,
+                display_title TEXT NOT NULL,
+                model_provider TEXT NOT NULL,
+                cwd TEXT NOT NULL,
+                source_updated_at REAL NOT NULL
+            );
+            INSERT INTO local_thread_catalog VALUES('thread-1','Title','custom','C:/work',123.0);",
+        )
+        .unwrap();
+        let columns = table_columns(&db, "local_thread_catalog");
+        let sql = session_list_query("local_thread_catalog", "thread_id", &columns);
+        let row: (String, String, i64) = db
+            .query_row(&sql, [], |row| Ok((row.get(0)?, row.get(1)?, row.get(5)?)))
+            .unwrap();
+        assert_eq!(row, ("thread-1".into(), "Title".into(), 123));
+        assert!(sql.contains("ORDER BY sort_updated"));
+    }
 }
