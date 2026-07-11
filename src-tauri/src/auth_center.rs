@@ -15,9 +15,8 @@ const DEVICE_POLL_URL: &str = "https://auth.openai.com/api/accounts/deviceauth/t
 const TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 const VERIFICATION_URL: &str = "https://auth.openai.com/codex/device";
 const REDIRECT_URI: &str = "https://auth.openai.com/deviceauth/callback";
-// OpenAI currently validates the Device Auth client fingerprint. Keep this aligned with the
-// cc-switch Codex OAuth implementation instead of using the desktop application's generic UA.
-const CODEX_OAUTH_USER_AGENT: &str = "cc-switch-codex-oauth";
+// Device Auth uses a stable, product-specific fingerprint across polling and token refresh.
+const CODEX_OAUTH_USER_AGENT: &str = "codex-tools-device-auth";
 const JSON_CONTENT_TYPE: &str = "application/json";
 const FORM_CONTENT_TYPE: &str = "application/x-www-form-urlencoded";
 
@@ -360,14 +359,14 @@ mod tests {
     }
 
     #[test]
-    fn matches_cc_switch_oauth_request_fingerprint() {
-        assert_eq!(CODEX_OAUTH_USER_AGENT, "cc-switch-codex-oauth");
+    fn uses_stable_oauth_request_fingerprint() {
+        assert_eq!(CODEX_OAUTH_USER_AGENT, "codex-tools-device-auth");
         assert_eq!(JSON_CONTENT_TYPE, "application/json");
         assert_eq!(FORM_CONTENT_TYPE, "application/x-www-form-urlencoded");
     }
 
     #[test]
-    fn maps_device_poll_status_like_cc_switch() {
+    fn maps_device_poll_status() {
         assert_eq!(classify_poll_status(403), PollStatus::Pending);
         assert_eq!(classify_poll_status(404), PollStatus::Pending);
         assert_eq!(classify_poll_status(410), PollStatus::Expired);

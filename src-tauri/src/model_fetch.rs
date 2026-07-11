@@ -124,7 +124,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn follows_cc_switch_candidate_order() {
+    fn follows_models_endpoint_candidate_order() {
         assert_eq!(
             build_models_url_candidates("https://example.test/v1").unwrap(),
             vec!["https://example.test/v1/models"]

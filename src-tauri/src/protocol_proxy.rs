@@ -8,8 +8,9 @@ use reqwest::{
     header::{HeaderMap, HeaderName, HeaderValue},
 };
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::{
-    collections::{BTreeMap, BTreeSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     net::SocketAddr,
     sync::{
         Arc,
@@ -27,6 +28,204 @@ const MAX_HEADER_BYTES: usize = 32 * 1024;
 const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
 const MAX_ERROR_BYTES: usize = 8 * 1024;
 const MAX_CONCURRENT_REQUESTS: usize = 64;
+const TOOL_SEARCH_PROXY_NAME: &str = "tool_search";
+const CUSTOM_TOOL_INPUT_FIELD: &str = "input";
+const CHAT_TOOL_NAME_MAX_LEN: usize = 64;
+const CUSTOM_TOOL_INPUT_DESCRIPTION: &str = "Raw string input for the original custom tool. Preserve formatting exactly and follow the original tool definition embedded in the description.";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CodexToolKind {
+    Function,
+    Namespace,
+    Custom,
+    ToolSearch,
+}
+
+#[derive(Debug, Clone)]
+struct CodexToolSpec {
+    kind: CodexToolKind,
+    name: String,
+    namespace: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct CodexToolContext {
+    chat_tools: Vec<Value>,
+    seen_names: HashSet<String>,
+    specs: HashMap<String, CodexToolSpec>,
+}
+
+impl CodexToolContext {
+    fn add(&mut self, chat_name: String, spec: CodexToolSpec, tool: Value) {
+        if chat_name.is_empty() || !self.seen_names.insert(chat_name.clone()) {
+            return;
+        }
+        self.specs.insert(chat_name, spec);
+        self.chat_tools.push(tool);
+    }
+
+    fn add_function(&mut self, tool: &Value, namespace: Option<&str>) {
+        let Some(name) = tool.get("name").and_then(Value::as_str) else {
+            return;
+        };
+        let chat_name = namespace
+            .map(|value| flatten_namespace_name(value, name))
+            .unwrap_or_else(|| name.to_string());
+        let parameters = tool
+            .get("parameters")
+            .cloned()
+            .unwrap_or_else(|| json!({"type":"object","properties":{}}));
+        let mut function = json!({
+            "name":chat_name,
+            "description":tool.get("description").cloned().unwrap_or(Value::Null),
+            "parameters":parameters
+        });
+        if let Some(strict) = tool.get("strict") {
+            function["strict"] = strict.clone();
+        }
+        let chat_tool = json!({"type":"function","function":function});
+        self.add(
+            chat_name,
+            CodexToolSpec {
+                kind: if namespace.is_some() {
+                    CodexToolKind::Namespace
+                } else {
+                    CodexToolKind::Function
+                },
+                name: name.to_string(),
+                namespace: namespace.map(str::to_owned),
+            },
+            chat_tool,
+        );
+    }
+
+    fn add_custom(&mut self, tool: &Value) {
+        let Some(name) = tool.get("name").and_then(Value::as_str) else {
+            return;
+        };
+        let description = format!(
+            "Original tool definition:\n```json\n{}\n```",
+            canonical_json_string(tool)
+        );
+        self.add(
+            name.to_string(),
+            CodexToolSpec {
+                kind: CodexToolKind::Custom,
+                name: name.to_string(),
+                namespace: None,
+            },
+            json!({"type":"function","function":{
+                "name":name,
+                "description":description,
+                "parameters":{"type":"object","properties":{
+                    CUSTOM_TOOL_INPUT_FIELD:{"type":"string","description":CUSTOM_TOOL_INPUT_DESCRIPTION}
+                },"required":[CUSTOM_TOOL_INPUT_FIELD]}
+            }}),
+        );
+    }
+
+    fn add_tool_search(&mut self) {
+        self.add(
+            TOOL_SEARCH_PROXY_NAME.into(),
+            CodexToolSpec {
+                kind: CodexToolKind::ToolSearch,
+                name: TOOL_SEARCH_PROXY_NAME.into(),
+                namespace: None,
+            },
+            json!({"type":"function","function":{
+                "name":TOOL_SEARCH_PROXY_NAME,
+                "description":"Search and load Codex tools, plugins, connectors, and MCP namespaces for the current task.",
+                "parameters":{"type":"object","properties":{
+                    "query":{"type":"string"},"limit":{"type":"integer"}
+                },"required":["query"]}
+            }}),
+        );
+    }
+
+    fn add_response_tool(&mut self, tool: &Value) {
+        match tool.get("type").and_then(Value::as_str) {
+            Some("function") => self.add_function(tool, None),
+            Some("custom") => self.add_custom(tool),
+            Some("tool_search") => self.add_tool_search(),
+            Some("namespace") => {
+                if let (Some(namespace), Some(children)) = (
+                    tool.get("name").and_then(Value::as_str),
+                    tool.get("tools")
+                        .or_else(|| tool.get("children"))
+                        .and_then(Value::as_array),
+                ) {
+                    for child in children {
+                        if child.get("type").and_then(Value::as_str) == Some("function") {
+                            self.add_function(child, Some(namespace));
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn flatten_namespace_name(namespace: &str, name: &str) -> String {
+    let full_name = format!("{namespace}__{name}");
+    if full_name.len() <= CHAT_TOOL_NAME_MAX_LEN {
+        return full_name;
+    }
+    let hash = Sha256::digest(full_name.as_bytes())
+        .iter()
+        .take(8)
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let suffix = format!("__{hash}");
+    let prefix_len = CHAT_TOOL_NAME_MAX_LEN.saturating_sub(suffix.len());
+    let mut prefix = String::new();
+    for ch in full_name.chars() {
+        if prefix.len() + ch.len_utf8() > prefix_len {
+            break;
+        }
+        prefix.push(ch);
+    }
+    format!("{prefix}{suffix}")
+}
+
+fn build_tool_context(input: &Value) -> CodexToolContext {
+    let mut context = CodexToolContext::default();
+    for tool in input
+        .get("tools")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        context.add_response_tool(tool);
+    }
+    if let Some(history) = input.get("input") {
+        collect_tool_search_output_tools(history, &mut context);
+    }
+    context
+}
+
+fn collect_tool_search_output_tools(value: &Value, context: &mut CodexToolContext) {
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                collect_tool_search_output_tools(item, context);
+            }
+        }
+        Value::Object(object) => {
+            if object.get("type").and_then(Value::as_str) == Some("tool_search_output")
+                && let Some(tools) = object.get("tools").and_then(Value::as_array)
+            {
+                for tool in tools {
+                    context.add_response_tool(tool);
+                }
+            }
+            for child in object.values() {
+                collect_tool_search_output_tools(child, context);
+            }
+        }
+        _ => {}
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct ProxyEndpoint {
@@ -408,13 +607,14 @@ async fn handle_connection(
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let reasoning = resolve_reasoning_config(&config.provider, &input);
-    let upstream_body = match responses_to_chat_with_reasoning(&input, reasoning.as_ref()) {
-        Ok(value) => value,
-        Err(message) => {
-            write_json_error(&mut stream, 400, "invalid_request", &message).await?;
-            return Ok(400);
-        }
-    };
+    let (upstream_body, tool_context) =
+        match responses_to_chat_with_context(&input, reasoning.as_ref()) {
+            Ok(value) => value,
+            Err(message) => {
+                write_json_error(&mut stream, 400, "invalid_request", &message).await?;
+                return Ok(400);
+            }
+        };
 
     let upstream = config
         .client
@@ -453,7 +653,7 @@ async fn handle_connection(
     }
 
     if wants_stream {
-        proxy_stream(&mut stream, response, config.timeout).await?;
+        proxy_stream(&mut stream, response, config.timeout, &tool_context).await?;
     } else {
         let body = match tokio::time::timeout(config.timeout, response.bytes()).await {
             Ok(Ok(body)) if body.len() <= MAX_BODY_BYTES => body,
@@ -501,7 +701,7 @@ async fn handle_connection(
                 return Ok(502);
             }
         };
-        let converted = chat_to_response(&value);
+        let converted = chat_to_response_with_context(&value, &tool_context);
         write_json(&mut stream, 200, &converted).await?;
     }
     Ok(200)
@@ -604,10 +804,19 @@ fn responses_to_chat(input: &Value) -> Result<Value, String> {
     responses_to_chat_with_reasoning(input, None)
 }
 
+#[cfg(test)]
 fn responses_to_chat_with_reasoning(
     input: &Value,
     reasoning: Option<&CodexChatReasoningConfig>,
 ) -> Result<Value, String> {
+    responses_to_chat_with_context(input, reasoning).map(|(value, _)| value)
+}
+
+fn responses_to_chat_with_context(
+    input: &Value,
+    reasoning: Option<&CodexChatReasoningConfig>,
+) -> Result<(Value, CodexToolContext), String> {
+    let tool_context = build_tool_context(input);
     let model = input
         .get("model")
         .and_then(Value::as_str)
@@ -625,13 +834,13 @@ fn responses_to_chat_with_reasoning(
         Some(Value::String(text)) => messages.push(json!({"role":"user","content":text})),
         Some(Value::Array(items)) => {
             for item in items {
-                if let Some(message) = response_item_to_chat(item) {
+                if let Some(message) = response_item_to_chat(item, &tool_context) {
                     messages.push(message);
                 }
             }
         }
         Some(item @ Value::Object(_)) => {
-            if let Some(message) = response_item_to_chat(item) {
+            if let Some(message) = response_item_to_chat(item, &tool_context) {
                 messages.push(message);
             }
         }
@@ -658,20 +867,23 @@ fn responses_to_chat_with_reasoning(
     if input.get("stream").and_then(Value::as_bool) == Some(true) {
         target.insert("stream_options".into(), json!({"include_usage":true}));
     }
-    if let Some(tools) = input.get("tools").and_then(Value::as_array) {
+    if !tool_context.chat_tools.is_empty() {
         target.insert(
             "tools".into(),
-            Value::Array(tools.iter().filter_map(response_tool_to_chat).collect()),
+            Value::Array(tool_context.chat_tools.clone()),
         );
     }
     if let Some(choice) = input.get("tool_choice") {
-        target.insert("tool_choice".into(), response_tool_choice_to_chat(choice));
+        target.insert(
+            "tool_choice".into(),
+            response_tool_choice_to_chat(choice, &tool_context),
+        );
     }
     if let Some(format) = input.pointer("/text/format") {
         target.insert("response_format".into(), response_format_to_chat(format));
     }
     apply_reasoning_options(input, &mut output, reasoning);
-    Ok(output)
+    Ok((output, tool_context))
 }
 
 fn resolve_reasoning_config(
@@ -876,21 +1088,43 @@ fn map_reasoning_effort(effort: &str, mode: Option<&str>) -> Option<&'static str
     }
 }
 
-fn response_item_to_chat(item: &Value) -> Option<Value> {
+fn response_item_to_chat(item: &Value, context: &CodexToolContext) -> Option<Value> {
     let kind = item
         .get("type")
         .and_then(Value::as_str)
         .unwrap_or("message");
     match kind {
-        "function_call_output" => Some(json!({
+        "function_call_output" | "custom_tool_call_output" | "tool_search_output" => Some(json!({
             "role":"tool",
             "tool_call_id":item.get("call_id").and_then(Value::as_str).unwrap_or_default(),
             "content":item.get("output").cloned().unwrap_or(Value::String(String::new()))
         })),
-        "function_call" => Some(json!({
-            "role":"assistant",
-            "content":Value::Null,
-            "tool_calls":[{"id":item.get("call_id").or_else(|| item.get("id")).cloned().unwrap_or(Value::String(String::new())),"type":"function","function":{"name":item.get("name").cloned().unwrap_or(Value::String(String::new())),"arguments":item.get("arguments").cloned().unwrap_or(Value::String("{}".into()))}}]
+        "function_call" => {
+            let name = item.get("name").and_then(Value::as_str).unwrap_or_default();
+            let chat_name = item
+                .get("namespace")
+                .and_then(Value::as_str)
+                .map(|namespace| flatten_namespace_name(namespace, name))
+                .unwrap_or_else(|| name.to_string());
+            Some(json!({
+                "role":"assistant",
+                "content":Value::Null,
+                "tool_calls":[{"id":item.get("call_id").or_else(|| item.get("id")).cloned().unwrap_or(Value::String(String::new())),"type":"function","function":{"name":chat_name,"arguments":item.get("arguments").cloned().unwrap_or(Value::String("{}".into()))}}]
+            }))
+        }
+        "custom_tool_call" => Some(json!({
+            "role":"assistant","content":Value::Null,
+            "tool_calls":[{"id":item.get("call_id").or_else(|| item.get("id")).cloned().unwrap_or(Value::String(String::new())),"type":"function","function":{
+                "name":item.get("name").cloned().unwrap_or(Value::String(String::new())),
+                "arguments":serde_json::to_string(&json!({CUSTOM_TOOL_INPUT_FIELD:item.get("input").cloned().unwrap_or(Value::String(String::new()))})).unwrap_or_else(|_| "{}".into())
+            }}]
+        })),
+        "tool_search_call" if context.specs.contains_key(TOOL_SEARCH_PROXY_NAME) => Some(json!({
+            "role":"assistant","content":Value::Null,
+            "tool_calls":[{"id":item.get("call_id").or_else(|| item.get("id")).cloned().unwrap_or(Value::String(String::new())),"type":"function","function":{
+                "name":TOOL_SEARCH_PROXY_NAME,
+                "arguments":serde_json::to_string(&item.get("arguments").cloned().unwrap_or_else(|| json!({}))).unwrap_or_else(|_| "{}".into())
+            }}]
         })),
         "message" => {
             let role = item.get("role").and_then(Value::as_str).unwrap_or("user");
@@ -962,28 +1196,35 @@ fn response_format_to_chat(format: &Value) -> Value {
     }
 }
 
-fn response_tool_to_chat(tool: &Value) -> Option<Value> {
-    if tool.get("type").and_then(Value::as_str) != Some("function") {
-        return None;
-    }
-    let mut function = serde_json::Map::new();
-    for key in ["name", "description", "parameters", "strict"] {
-        if let Some(value) = tool.get(key) {
-            function.insert(key.into(), value.clone());
+fn response_tool_choice_to_chat(choice: &Value, context: &CodexToolContext) -> Value {
+    match choice.get("type").and_then(Value::as_str) {
+        Some("function") => {
+            let name = choice
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let namespace = choice.get("namespace").and_then(Value::as_str);
+            let chat_name = namespace
+                .map(|value| flatten_namespace_name(value, name))
+                .unwrap_or_else(|| name.to_string());
+            json!({"type":"function","function":{"name":chat_name}})
         }
-    }
-    Some(json!({"type":"function","function":function}))
-}
-
-fn response_tool_choice_to_chat(choice: &Value) -> Value {
-    if choice.get("type").and_then(Value::as_str) == Some("function") {
-        json!({"type":"function","function":{"name":choice.get("name").cloned().unwrap_or(Value::String(String::new()))}})
-    } else {
-        choice.clone()
+        Some("custom") => json!({"type":"function","function":{
+            "name":choice.get("name").cloned().unwrap_or(Value::String(String::new()))
+        }}),
+        Some("tool_search") if context.specs.contains_key(TOOL_SEARCH_PROXY_NAME) => {
+            json!({"type":"function","function":{"name":TOOL_SEARCH_PROXY_NAME}})
+        }
+        _ => choice.clone(),
     }
 }
 
+#[cfg(test)]
 fn chat_to_response(chat: &Value) -> Value {
+    chat_to_response_with_context(chat, &CodexToolContext::default())
+}
+
+fn chat_to_response_with_context(chat: &Value, context: &CodexToolContext) -> Value {
     let response_id = response_id(chat);
     let message = chat
         .pointer("/choices/0/message")
@@ -999,7 +1240,7 @@ fn chat_to_response(chat: &Value) -> Value {
     }
     if let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array) {
         for call in tool_calls {
-            output.push(chat_tool_call_to_response(call));
+            output.push(chat_tool_call_to_response(call, context));
         }
     }
     json!({
@@ -1015,21 +1256,155 @@ fn chat_to_response(chat: &Value) -> Value {
     })
 }
 
-fn chat_tool_call_to_response(call: &Value) -> Value {
+fn chat_tool_call_to_response(call: &Value, context: &CodexToolContext) -> Value {
     let call_id = call.get("id").and_then(Value::as_str).unwrap_or_default();
-    let item_id = call
-        .get("_response_item_id")
+    let chat_name = call
+        .pointer("/function/name")
         .and_then(Value::as_str)
-        .map(str::to_owned)
-        .unwrap_or_else(|| format!("fc_{call_id}"));
-    json!({
-        "id":item_id,
-        "type":"function_call",
-        "status":"completed",
-        "call_id":call.get("id").cloned().unwrap_or(Value::String(String::new())),
-        "name":call.pointer("/function/name").cloned().unwrap_or(Value::String(String::new())),
-        "arguments":call.pointer("/function/arguments").cloned().unwrap_or(Value::String("{}".into()))
-    })
+        .unwrap_or_default();
+    let item_id = response_tool_item_id(call_id, chat_name, context);
+    let arguments = call
+        .pointer("/function/arguments")
+        .and_then(Value::as_str)
+        .unwrap_or("{}");
+    match context.specs.get(chat_name) {
+        Some(spec) if spec.kind == CodexToolKind::Custom => json!({
+            "id":item_id,"type":"custom_tool_call","status":"completed",
+            "call_id":call_id,"name":spec.name,"input":custom_tool_input(arguments)
+        }),
+        Some(spec) if spec.kind == CodexToolKind::ToolSearch => json!({
+            "type":"tool_search_call","status":"completed","execution":"client",
+            "call_id":call_id,"arguments":parse_arguments_object(arguments)
+        }),
+        Some(spec) => json!({
+            "id":item_id,"type":"function_call","status":"completed","call_id":call_id,
+            "name":spec.name,"namespace":spec.namespace,"arguments":arguments
+        }),
+        None => json!({
+            "id":item_id,"type":"function_call","status":"completed","call_id":call_id,
+            "name":chat_name,"arguments":arguments
+        }),
+    }
+}
+
+fn response_tool_item_id(call_id: &str, chat_name: &str, context: &CodexToolContext) -> String {
+    let prefix = if context
+        .specs
+        .get(chat_name)
+        .is_some_and(|spec| spec.kind == CodexToolKind::Custom)
+    {
+        "ctc"
+    } else {
+        "fc"
+    };
+    format!("{prefix}_{call_id}")
+}
+
+fn custom_tool_input(arguments: &str) -> String {
+    serde_json::from_str::<Value>(arguments)
+        .ok()
+        .and_then(|value| {
+            value
+                .get(CUSTOM_TOOL_INPUT_FIELD)
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| arguments.to_string())
+}
+
+fn parse_arguments_object(arguments: &str) -> Value {
+    serde_json::from_str::<Value>(arguments)
+        .ok()
+        .filter(Value::is_object)
+        .unwrap_or_else(|| json!({"query":arguments}))
+}
+
+fn canonical_json_string(value: &Value) -> String {
+    match value {
+        Value::Null => "null".into(),
+        Value::Bool(value) => value.to_string(),
+        Value::Number(value) => value.to_string(),
+        Value::String(value) => serde_json::to_string(value).unwrap_or_else(|_| "\"\"".into()),
+        Value::Array(values) => format!(
+            "[{}]",
+            values
+                .iter()
+                .map(canonical_json_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        Value::Object(object) => {
+            let mut entries = object.iter().collect::<Vec<_>>();
+            entries.sort_by_key(|(key, _)| *key);
+            format!(
+                "{{{}}}",
+                entries
+                    .into_iter()
+                    .map(|(key, value)| format!(
+                        "{}:{}",
+                        serde_json::to_string(key).unwrap_or_else(|_| "\"\"".into()),
+                        canonical_json_string(value)
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
+        }
+    }
+}
+
+fn canonical_tool_arguments(arguments: &str) -> String {
+    if arguments.trim().is_empty() {
+        return "{}".into();
+    }
+    serde_json::from_str::<Value>(arguments)
+        .map(|value| canonical_json_string(&value))
+        .unwrap_or_else(|_| arguments.to_string())
+}
+
+fn completed_tool_input_events(
+    item: &Value,
+    item_id: &str,
+    raw_arguments: &str,
+    output_index: usize,
+) -> Vec<(&'static str, Value)> {
+    if item.get("type").and_then(Value::as_str) == Some("custom_tool_call") {
+        let input = item
+            .get("input")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let mut events = Vec::with_capacity(2);
+        if !input.is_empty() {
+            events.push((
+                "response.custom_tool_call_input.delta",
+                json!({
+                    "type":"response.custom_tool_call_input.delta",
+                    "item_id":item_id,
+                    "output_index":output_index,
+                    "delta":input
+                }),
+            ));
+        }
+        events.push((
+            "response.custom_tool_call_input.done",
+            json!({
+                "type":"response.custom_tool_call_input.done",
+                "item_id":item_id,
+                "output_index":output_index,
+                "input":input
+            }),
+        ));
+        events
+    } else {
+        vec![(
+            "response.function_call_arguments.done",
+            json!({
+                "type":"response.function_call_arguments.done",
+                "item_id":item_id,
+                "output_index":output_index,
+                "arguments":canonical_tool_arguments(raw_arguments)
+            }),
+        )]
+    }
 }
 
 fn map_usage(usage: Option<&Value>) -> Value {
@@ -1052,6 +1427,7 @@ async fn proxy_stream(
     stream: &mut TcpStream,
     response: reqwest::Response,
     idle_timeout: Duration,
+    tool_context: &CodexToolContext,
 ) -> anyhow::Result<()> {
     stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\nTransfer-Encoding: chunked\r\nX-Content-Type-Options: nosniff\r\n\r\n").await?;
     let response_id = format!("resp_{}", uuid::Uuid::new_v4().simple());
@@ -1119,24 +1495,66 @@ async fn proxy_stream(
                 if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
                     for call in calls {
                         let index = call.get("index").and_then(Value::as_u64).unwrap_or(0);
-                        let first = announced_tool_calls.insert(index);
                         merge_tool_call_deltas(&mut tool_calls, std::slice::from_ref(call));
-                        let Some(merged) = tool_calls.get(&index) else {
+                        let Some(merged) = tool_calls.get_mut(&index) else {
                             continue;
                         };
+                        if merged
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .is_none_or(str::is_empty)
+                            && merged
+                                .pointer("/function/name")
+                                .and_then(Value::as_str)
+                                .is_some_and(|name| !name.is_empty())
+                        {
+                            merged["id"] = json!(format!("call_{index}"));
+                        }
+                        let call_id = merged.get("id").and_then(Value::as_str).unwrap_or_default();
+                        let name = merged
+                            .pointer("/function/name")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
+                        let first = !call_id.is_empty()
+                            && !name.is_empty()
+                            && announced_tool_calls.insert(index);
                         let output_index = index as usize + 1;
                         if first {
-                            let item = chat_tool_call_to_response(merged);
-                            send_sse(stream, "response.output_item.added", &json!({"type":"response.output_item.added","sequence_number":sequence,"output_index":output_index,"item":{"id":item["id"],"type":"function_call","status":"in_progress","call_id":item["call_id"],"name":item["name"],"arguments":""}})).await?;
+                            let mut item = chat_tool_call_to_response(merged, tool_context);
+                            item["status"] = json!("in_progress");
+                            match item.get("type").and_then(Value::as_str) {
+                                Some("custom_tool_call") => item["input"] = json!(""),
+                                Some("function_call") => item["arguments"] = json!(""),
+                                Some("tool_search_call") => item["arguments"] = json!({}),
+                                _ => {}
+                            }
+                            send_sse(stream, "response.output_item.added", &json!({"type":"response.output_item.added","sequence_number":sequence,"output_index":output_index,"item":item})).await?;
                             sequence += 1;
                         }
-                        if let Some(arguments) = call
-                            .pointer("/function/arguments")
-                            .and_then(Value::as_str)
-                            .filter(|value| !value.is_empty())
-                        {
-                            send_sse(stream, "response.function_call_arguments.delta", &json!({"type":"response.function_call_arguments.delta","sequence_number":sequence,"output_index":output_index,"delta":arguments})).await?;
-                            sequence += 1;
+                        if announced_tool_calls.contains(&index) {
+                            let custom = tool_context
+                                .specs
+                                .get(name)
+                                .is_some_and(|spec| spec.kind == CodexToolKind::Custom);
+                            if !custom {
+                                let arguments = if first {
+                                    merged
+                                        .pointer("/function/arguments")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or_default()
+                                } else {
+                                    call.pointer("/function/arguments")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or_default()
+                                };
+                                if arguments.is_empty() {
+                                    continue;
+                                }
+                                let event = "response.function_call_arguments.delta";
+                                let item_id = response_tool_item_id(call_id, name, tool_context);
+                                send_sse(stream, event, &json!({"type":event,"sequence_number":sequence,"item_id":item_id,"output_index":output_index,"delta":arguments})).await?;
+                                sequence += 1;
+                            }
                         }
                     }
                 }
@@ -1153,12 +1571,37 @@ async fn proxy_stream(
     sequence += 1;
 
     let mut output = vec![message];
-    for (_, call) in tool_calls {
-        let item = chat_tool_call_to_response(&call);
-        let index = output.len();
-        send_sse(stream, "response.function_call_arguments.done", &json!({"type":"response.function_call_arguments.done","sequence_number":sequence,"output_index":index,"arguments":item["arguments"]})).await?;
-        sequence += 1;
-        send_sse(stream, "response.output_item.done", &json!({"type":"response.output_item.done","sequence_number":sequence,"output_index":index,"item":item})).await?;
+    for (tool_index, mut call) in tool_calls {
+        if call
+            .get("id")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+        {
+            call["id"] = json!(format!("call_{tool_index}"));
+        }
+        let chat_name = call
+            .pointer("/function/name")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if chat_name.is_empty() {
+            continue;
+        }
+        let call_id = call.get("id").and_then(Value::as_str).unwrap_or_default();
+        let item_id = response_tool_item_id(call_id, chat_name, tool_context);
+        let raw_arguments = call
+            .pointer("/function/arguments")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let item = chat_tool_call_to_response(&call, tool_context);
+        let output_index = tool_index as usize + 1;
+        for (event, mut payload) in
+            completed_tool_input_events(&item, &item_id, raw_arguments, output_index)
+        {
+            payload["sequence_number"] = json!(sequence);
+            send_sse(stream, event, &payload).await?;
+            sequence += 1;
+        }
+        send_sse(stream, "response.output_item.done", &json!({"type":"response.output_item.done","sequence_number":sequence,"output_index":output_index,"item":item})).await?;
         sequence += 1;
         output.push(item);
     }
@@ -1179,7 +1622,6 @@ fn merge_tool_call_deltas(target: &mut BTreeMap<u64, Value>, calls: &[Value]) {
         let entry = target.entry(index).or_insert_with(|| {
             json!({
                 "id":"",
-                "_response_item_id":format!("fc_{}", uuid::Uuid::new_v4().simple()),
                 "type":"function",
                 "function":{"name":"","arguments":""}
             })
@@ -1425,6 +1867,177 @@ mod tests {
     }
 
     #[test]
+    fn preserves_custom_tool_search_and_namespace_tools_for_chat_upstream() {
+        let input = json!({
+            "model":"test-model",
+            "input":[{"role":"user","content":"change Windows theme"}],
+            "tools":[
+                {"type":"custom","name":"exec","description":"Run computer control code"},
+                {"type":"tool_search"},
+                {"type":"namespace","name":"computer_use","tools":[
+                    {"type":"function","name":"click","description":"Click UI","parameters":{"type":"object","properties":{"x":{"type":"integer"}}}}
+                ]}
+            ]
+        });
+        let (output, context) = responses_to_chat_with_context(&input, None).unwrap();
+        let names = output["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|tool| tool.pointer("/function/name").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["exec", "tool_search", "computer_use__click"]);
+
+        let custom = chat_to_response_with_context(
+            &json!({"choices":[{"message":{"tool_calls":[{"id":"call-1","type":"function","function":{"name":"exec","arguments":"{\"input\":\"raw code\"}"}}]}}]}),
+            &context,
+        );
+        assert_eq!(custom["output"][0]["type"], "custom_tool_call");
+        assert_eq!(custom["output"][0]["input"], "raw code");
+
+        let search = chat_to_response_with_context(
+            &json!({"choices":[{"message":{"tool_calls":[{"id":"call-2","type":"function","function":{"name":"tool_search","arguments":"{\"query\":\"computer\"}"}}]}}]}),
+            &context,
+        );
+        assert_eq!(search["output"][0]["type"], "tool_search_call");
+        assert_eq!(search["output"][0]["arguments"]["query"], "computer");
+
+        let namespace = chat_to_response_with_context(
+            &json!({"choices":[{"message":{"tool_calls":[{"id":"call-3","type":"function","function":{"name":"computer_use__click","arguments":"{\"x\":10}"}}]}}]}),
+            &context,
+        );
+        assert_eq!(namespace["output"][0]["type"], "function_call");
+        assert_eq!(namespace["output"][0]["name"], "click");
+        assert_eq!(namespace["output"][0]["namespace"], "computer_use");
+    }
+
+    #[test]
+    fn replays_namespace_tool_history_with_the_upstream_chat_name() {
+        let input = json!({
+            "model":"test-model",
+            "input":[
+                {"type":"function_call","call_id":"call-1","namespace":"computer_use","name":"click","arguments":"{\"x\":10}"},
+                {"type":"function_call_output","call_id":"call-1","output":"ok"}
+            ],
+            "tools":[{"type":"namespace","name":"computer_use","tools":[
+                {"type":"function","name":"click","parameters":{"type":"object"}}
+            ]}]
+        });
+        let (output, _) = responses_to_chat_with_context(&input, None).unwrap();
+        assert_eq!(
+            output["messages"][0]["tool_calls"][0]["function"]["name"],
+            "computer_use__click"
+        );
+        assert_eq!(output["messages"][1]["tool_call_id"], "call-1");
+    }
+
+    #[test]
+    fn decodes_only_complete_custom_tool_input_without_json_wrapper() {
+        assert_eq!(
+            custom_tool_input(r#"{"input":"open Settings"}"#),
+            "open Settings"
+        );
+        assert_eq!(
+            custom_tool_input(r#"{"input":"open \"Settings\"\nthen click"}"#),
+            "open \"Settings\"\nthen click"
+        );
+        assert_eq!(custom_tool_input(r#"{"input":"深色模式"}"#), "深色模式");
+        let incomplete = r#"{"input":"incomplete\"#;
+        assert_eq!(custom_tool_input(incomplete), incomplete);
+    }
+
+    #[test]
+    fn completes_custom_tool_stream_with_raw_input_and_custom_item_id() {
+        let input = json!({
+            "model":"test-model",
+            "input":"change Windows theme",
+            "tools":[{"type":"custom","name":"exec","description":"Run computer control code"}]
+        });
+        let (_, context) = responses_to_chat_with_context(&input, None).unwrap();
+        let call = json!({
+            "id":"call_custom",
+            "type":"function",
+            "function":{"name":"exec","arguments":"{\"input\":\"open Settings\"}"}
+        });
+        let item = chat_tool_call_to_response(&call, &context);
+        let item_id = response_tool_item_id("call_custom", "exec", &context);
+        let events =
+            completed_tool_input_events(&item, &item_id, r#"{"input":"open Settings"}"#, 1);
+
+        assert_eq!(item_id, "ctc_call_custom");
+        assert_eq!(item["id"], item_id);
+        assert_eq!(item["input"], "open Settings");
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].0, "response.custom_tool_call_input.delta");
+        assert_eq!(events[0].1["item_id"], "ctc_call_custom");
+        assert_eq!(events[0].1["delta"], "open Settings");
+        assert_eq!(events[1].0, "response.custom_tool_call_input.done");
+        assert_eq!(events[1].1["input"], "open Settings");
+        assert!(
+            events
+                .iter()
+                .all(|(event, _)| !event.contains("function_call_arguments"))
+        );
+        assert!(
+            events
+                .iter()
+                .all(|(_, payload)| !payload.to_string().contains(r#"{\"input\":"#))
+        );
+    }
+
+    #[test]
+    fn completes_function_and_tool_search_with_stable_nonempty_item_ids() {
+        let function_call = json!({
+            "id":"call_function",
+            "type":"function",
+            "function":{"name":"read","arguments":"{ \"b\": 2, \"a\": 1 }"}
+        });
+        let function_context = CodexToolContext::default();
+        let function_item = chat_tool_call_to_response(&function_call, &function_context);
+        let function_id = response_tool_item_id("call_function", "read", &function_context);
+        let function_events =
+            completed_tool_input_events(&function_item, &function_id, r#"{ "b": 2, "a": 1 }"#, 1);
+        assert_eq!(function_id, "fc_call_function");
+        assert_eq!(function_events.len(), 1);
+        assert_eq!(function_events[0].1["arguments"], r#"{"a":1,"b":2}"#);
+
+        let request = json!({
+            "model":"test-model",
+            "input":"find a tool",
+            "tools":[{"type":"tool_search"}]
+        });
+        let (_, search_context) = responses_to_chat_with_context(&request, None).unwrap();
+        let search_call = json!({
+            "id":"call_search",
+            "type":"function",
+            "function":{"name":"tool_search","arguments":"{\"query\":\"computer\"}"}
+        });
+        let search_item = chat_tool_call_to_response(&search_call, &search_context);
+        let search_id = response_tool_item_id("call_search", "tool_search", &search_context);
+        let search_events =
+            completed_tool_input_events(&search_item, &search_id, r#"{"query":"computer"}"#, 1);
+        assert_eq!(search_item["type"], "tool_search_call");
+        assert_eq!(search_id, "fc_call_search");
+        assert_eq!(search_events.len(), 1);
+        assert_eq!(search_events[0].1["item_id"], "fc_call_search");
+        assert_eq!(search_events[0].1["arguments"], r#"{"query":"computer"}"#);
+    }
+
+    #[test]
+    fn long_namespace_tool_names_are_stable_bounded_and_collision_resistant() {
+        let namespace = "computer_use_namespace_with_a_very_long_provider_identifier";
+        let first = flatten_namespace_name(namespace, "control_windows_settings_primary");
+        let second = flatten_namespace_name(namespace, "control_windows_settings_secondary");
+        assert!(first.len() <= CHAT_TOOL_NAME_MAX_LEN);
+        assert!(second.len() <= CHAT_TOOL_NAME_MAX_LEN);
+        assert_eq!(
+            first,
+            flatten_namespace_name(namespace, "control_windows_settings_primary")
+        );
+        assert_ne!(first, second);
+    }
+
+    #[test]
     fn converts_reasoning_structured_output_and_images() {
         let reasoning = reasoning_config(
             true,
@@ -1535,12 +2148,15 @@ mod tests {
             &[json!({"index":0,"function":{"arguments":"th\":\"a\"}"}})],
         );
         assert_eq!(calls[&0]["function"]["arguments"], "{\"path\":\"a\"}");
-        let item_id = chat_tool_call_to_response(&calls[&0])["id"]
+        let item_id = chat_tool_call_to_response(&calls[&0], &CodexToolContext::default())["id"]
             .as_str()
             .unwrap()
             .to_owned();
         assert!(item_id.starts_with("fc_"));
-        assert_eq!(chat_tool_call_to_response(&calls[&0])["id"], item_id);
+        assert_eq!(
+            chat_tool_call_to_response(&calls[&0], &CodexToolContext::default())["id"],
+            item_id
+        );
     }
 
     #[test]

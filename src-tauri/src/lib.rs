@@ -39,18 +39,16 @@ async fn start_configured_route(app: tauri::AppHandle) {
         return;
     };
     let Some(provider) = providers.into_iter().find(|provider| {
-        provider.enabled && provider.protocol == ProviderProtocol::ChatCompletions
+        provider.active
+            && provider.enabled
+            && provider.protocol == ProviderProtocol::ChatCompletions
     }) else {
         return;
     };
     let Ok(accounts) = store.accounts(Some(&provider.id)) else {
         return;
     };
-    let Some(account) = accounts
-        .into_iter()
-        .find(|account| account.active)
-        .or_else(|| store.accounts(Some(&provider.id)).ok()?.into_iter().next())
-    else {
+    let Some(account) = accounts.into_iter().find(|account| account.active) else {
         return;
     };
     match proxy.prepare(&provider, &account, &settings).await {

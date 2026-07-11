@@ -311,10 +311,7 @@ fn rewrite_rollout(
 fn apply_rollouts(changes: &[RolloutChange]) -> Result<Vec<RolloutChange>, AppError> {
     let mut applied = Vec::new();
     for item in changes.iter().filter(|item| item.changed) {
-        if let Err(error) = fs::write(&item.path, &item.updated) {
-            if is_locked(&error) {
-                continue;
-            }
+        if let Err(error) = atomic_write(&item.path, item.updated.as_bytes()) {
             restore_rollouts(&applied);
             return Err(AppError::Internal(error.to_string()));
         }
@@ -326,7 +323,7 @@ fn apply_rollouts(changes: &[RolloutChange]) -> Result<Vec<RolloutChange>, AppEr
 
 fn restore_rollouts(changes: &[RolloutChange]) {
     for item in changes {
-        let _ = fs::write(&item.path, &item.original);
+        let _ = atomic_write(&item.path, item.original.as_bytes());
         restore_mtime(&item.path, item.mtime);
     }
 }
@@ -579,7 +576,7 @@ fn normalize_global_state(path: &Path) -> anyhow::Result<usize> {
     if changed > 0 {
         let text = serde_json::to_vec_pretty(&Value::Object(state))?;
         atomic_write(path, &text)?;
-        fs::write(path.with_extension("json.bak"), &text)?;
+        atomic_write(&path.with_extension("json.bak"), &text)?;
     }
     Ok(changed)
 }
@@ -792,7 +789,7 @@ fn replace_file(source: &Path, target: &Path) -> anyhow::Result<()> {
 fn restore_file(path: &Path, data: Option<&[u8]>) {
     match data {
         Some(v) => {
-            let _ = fs::write(path, v);
+            let _ = atomic_write(path, v);
         }
         None => {
             let _ = fs::remove_file(path);

@@ -1678,8 +1678,7 @@ function ProviderDialog({
                         自定义推理映射
                       </FieldLabel>
                       <FieldDescription>
-                        默认按 CC-Switch 规则根据
-                        Provider、地址和当前模型实时识别。
+                        默认根据 Provider、地址和当前模型实时识别。
                       </FieldDescription>
                     </div>
                     <Switch

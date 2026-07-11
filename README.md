@@ -81,10 +81,6 @@ src-tauri/src/
 - 推送形如 `v0.1.0` 的 tag 会构建 NSIS 安装包并创建 GitHub Release。
 - 发布前需同步 `package.json`、`src-tauri/Cargo.toml` 与 `src-tauri/tauri.conf.json` 的版本号。
 
-## 致谢
-
-项目在行为设计上参考了 [CodexPlusPlus](https://github.com/BigPizzaV3/CodexPlusPlus) 和 [cc-switch](https://github.com/farion1231/cc-switch)，实现代码独立编写。
-
 ## 许可证
 
 [MIT](LICENSE)

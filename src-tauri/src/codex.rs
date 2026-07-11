@@ -4,12 +4,20 @@ use rusqlite::{Connection, params};
 use std::{
     fs,
     path::{Path, PathBuf},
+    process::Command,
 };
 use toml_edit::{DocumentMut, Item, Table, value};
 use walkdir::WalkDir;
 
 pub const MANAGED_PROVIDER_ID: &str = "custom";
 pub const MODEL_CATALOG_FILENAME: &str = "codex-tools-model-catalog.json";
+const MODEL_CATALOG_TEMPLATE_SLUG: &str = "gpt-5.5";
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CatalogProfile {
+    ProxyChat,
+    NativeResponses,
+}
 
 pub fn home() -> PathBuf {
     dirs::home_dir()
@@ -77,6 +85,8 @@ pub fn scan() -> RepairScan {
                     && catalog_columns
                         .iter()
                         .any(|column| column == "model_provider");
+                let has_legacy_table = has_threads(&db);
+                let has_catalog_table = !catalog_columns.is_empty();
                 let known = legacy || catalog;
                 let count = if known {
                     let table = if legacy {
@@ -91,8 +101,19 @@ pub fn scan() -> RepairScan {
                 } else {
                     0
                 };
+                if !known && (has_legacy_table || has_catalog_table) {
+                    warnings.push(format!("未知会话目录 schema：{}", p.display()));
+                    scans.push(DatabaseScan {
+                        path: p.display().to_string(),
+                        health,
+                        known_schema: false,
+                        thread_count: 0,
+                    });
+                    continue;
+                }
                 if !known {
-                    warnings.push(format!("未知 schema：{}", p.display()))
+                    warnings.push(format!("已跳过不包含会话目录的辅助数据库：{}", p.display()));
+                    continue;
                 }
                 scans.push(DatabaseScan {
                     path: p.display().to_string(),
@@ -321,7 +342,11 @@ pub fn apply_provider_with_proxy(
     };
     let config = build_managed_config(p, account, base_url, &token)?;
     let auth = build_managed_auth(&token);
-    let catalog = (!p.models.is_empty()).then(|| build_model_catalog(p));
+    let catalog = if p.models.is_empty() {
+        None
+    } else {
+        Some(build_model_catalog(p)?)
+    };
     let update = (|| -> Result<(), AppError> {
         fs::create_dir_all(home()).map_err(|error| AppError::Internal(error.to_string()))?;
         let catalog_path = home().join(MODEL_CATALOG_FILENAME);
@@ -363,7 +388,21 @@ fn build_managed_config(
     base_url: &str,
     token: &str,
 ) -> Result<String, AppError> {
-    let mut doc = DocumentMut::new();
+    let existing = fs::read_to_string(home().join("config.toml")).unwrap_or_default();
+    build_managed_config_from(&existing, provider, account, base_url, token)
+}
+
+fn build_managed_config_from(
+    existing: &str,
+    provider: &ProviderProfile,
+    account: &ProviderAccount,
+    base_url: &str,
+    token: &str,
+) -> Result<String, AppError> {
+    // Provider switching must not disable Codex desktop capabilities. Keep the
+    // user's runtime, plugin, MCP, project trust and UI settings, and replace
+    // only fields that select or authenticate a model provider.
+    let mut doc = config_without_provider_selection(existing)?;
     doc["model_provider"] = value(MANAGED_PROVIDER_ID);
     if !provider.models.is_empty() {
         doc["model_catalog_json"] = value(MODEL_CATALOG_FILENAME);
@@ -384,6 +423,46 @@ fn build_managed_config(
     providers[MANAGED_PROVIDER_ID] = Item::Table(managed);
     doc["model_providers"] = Item::Table(providers);
     Ok(doc.to_string())
+}
+
+fn config_without_provider_selection(config: &str) -> Result<DocumentMut, AppError> {
+    let mut doc = if config.trim().is_empty() {
+        DocumentMut::new()
+    } else {
+        config.parse::<DocumentMut>().map_err(|error| {
+            AppError::InvalidConfig(format!("Codex config.toml 语法无效：{error}"))
+        })?
+    };
+    for key in [
+        "model",
+        "model_provider",
+        "model_catalog_json",
+        "model_reasoning_effort",
+        "model_reasoning_summary",
+        "base_url",
+        "wire_api",
+        "experimental_bearer_token",
+        "model_providers",
+    ] {
+        doc.as_table_mut().remove(key);
+    }
+    Ok(doc)
+}
+
+fn build_official_config(current: &str, snapshot: Option<&str>) -> Result<String, AppError> {
+    let mut restored = snapshot
+        .filter(|value| !value.trim().is_empty())
+        .map(config_without_provider_selection)
+        .transpose()?
+        .unwrap_or_default();
+    let current = config_without_provider_selection(current)?;
+    // Current desktop/plugin settings are newer than an account snapshot. They
+    // win when present, while a snapshot still restores settings missing from
+    // legacy provider-only configurations.
+    for (key, item) in current.as_table().iter() {
+        restored.as_table_mut().insert(key, item.clone());
+    }
+    Ok(restored.to_string())
 }
 
 fn merged_header_table(provider: &serde_json::Value, account: &serde_json::Value) -> Table {
@@ -413,70 +492,25 @@ fn build_managed_auth(token: &str) -> serde_json::Value {
     })
 }
 
-#[allow(dead_code)]
-fn legacy_build_model_catalog(provider: &ProviderProfile) -> serde_json::Value {
-    let context_window = provider
-        .context_window
-        .filter(|value| *value > 0)
-        .unwrap_or(128_000);
-    let models = provider.models.iter().map(|model| model.trim().to_string());
-    let (default_reasoning_level, supported_reasoning_levels) = match provider.protocol {
-        ProviderProtocol::ChatCompletions => (
-            "medium",
-            serde_json::json!([
-                {"effort":"low","description":"Fast responses with lighter reasoning"},
-                {"effort":"medium","description":"Balances speed and reasoning depth"},
-                {"effort":"high","description":"Greater reasoning depth for complex problems"},
-                {"effort":"xhigh","description":"Extra high reasoning depth"}
-            ]),
-        ),
-        ProviderProtocol::Responses => (
-            "high",
-            serde_json::json!([
-                {"effort":"none","description":"Disable Thinking"},
-                {"effort":"high","description":"Enable Thinking"}
-            ]),
-        ),
+fn build_model_catalog(provider: &ProviderProfile) -> Result<serde_json::Value, AppError> {
+    let profile = match provider.protocol {
+        ProviderProtocol::ChatCompletions => CatalogProfile::ProxyChat,
+        ProviderProtocol::Responses => CatalogProfile::NativeResponses,
     };
-    let mut seen = std::collections::HashSet::new();
-    let models = models
-        .filter(|model| !model.is_empty() && seen.insert(model.clone()))
-        .enumerate()
-        .map(|(priority, model)| {
-            serde_json::json!({
-                "slug": model,
-                "display_name": model,
-                "description": format!("{} · {}", provider.name.trim(), model),
-                "base_instructions": "You are Codex, a coding agent. You and the user share the same workspace and collaborate to achieve the user's goals.",
-                "default_reasoning_level": default_reasoning_level,
-                "supported_reasoning_levels": supported_reasoning_levels,
-                "shell_type": "shell_command",
-                "visibility": "list",
-                "supported_in_api": true,
-                "priority": priority,
-                "supports_reasoning_summaries": true,
-                "default_reasoning_summary": "none",
-                "support_verbosity": false,
-                "truncation_policy": {
-                    "mode": "bytes",
-                    "limit": 10000
-                },
-                "supports_parallel_tool_calls": false,
-                "supports_image_detail_original": false,
-                "context_window": context_window,
-                "max_context_window": context_window,
-                "effective_context_window_percent": 95,
-                "experimental_supported_tools": [],
-                "input_modalities": ["text"],
-                "supports_search_tool": false
-            })
-        })
-        .collect::<Vec<_>>();
-    serde_json::json!({ "models": models })
+    let template = match profile {
+        CatalogProfile::ProxyChat => load_proxy_chat_template()?,
+        CatalogProfile::NativeResponses => load_native_responses_template()?,
+    };
+    Ok(build_model_catalog_from_template(
+        provider, &template, profile,
+    ))
 }
 
-fn build_model_catalog(provider: &ProviderProfile) -> serde_json::Value {
-    let cached = load_codex_model_cache();
+fn build_model_catalog_from_template(
+    provider: &ProviderProfile,
+    template: &serde_json::Value,
+    profile: CatalogProfile,
+) -> serde_json::Value {
     let mut seen = std::collections::HashSet::new();
     let models = provider.models.iter().filter_map(|raw_model| {
         let model = raw_model.trim();
@@ -484,12 +518,7 @@ fn build_model_catalog(provider: &ProviderProfile) -> serde_json::Value {
             return None;
         }
         let upstream = provider.model_metadata.iter().find(|item| item.id == model);
-        let mut entry = cached
-            .iter()
-            .find(|item| item.get("slug").and_then(serde_json::Value::as_str) == Some(model))
-            .or_else(|| cached.first())
-            .cloned()
-            .unwrap_or_else(minimal_codex_model_template);
+        let mut entry = template.clone();
         let object = entry
             .as_object_mut()
             .expect("model template must be an object");
@@ -497,72 +526,127 @@ fn build_model_catalog(provider: &ProviderProfile) -> serde_json::Value {
         object.insert("display_name".into(), model.into());
         object.insert("description".into(), model.into());
         object.insert("priority".into(), (1000 + seen.len()).into());
-        if let Some(upstream) = upstream {
-            overlay_upstream_model_metadata(object, upstream);
+        object.insert("additional_speed_tiers".into(), serde_json::json!([]));
+        object.insert("service_tiers".into(), serde_json::json!([]));
+        object.insert("availability_nux".into(), serde_json::Value::Null);
+        object.insert("upgrade".into(), serde_json::Value::Null);
+        let context_window = upstream
+            .and_then(model_context_window)
+            .or(provider.context_window)
+            .filter(|value| *value > 0);
+        if let Some(context_window) = context_window {
+            object.insert("context_window".into(), context_window.into());
+            object.insert("max_context_window".into(), context_window.into());
+        }
+        if profile == CatalogProfile::NativeResponses {
+            apply_native_model_metadata(object, upstream);
         }
         Some(entry)
     });
     serde_json::json!({ "models": models.collect::<Vec<_>>() })
 }
 
-fn load_codex_model_cache() -> Vec<serde_json::Value> {
-    fs::read(home().join("models_cache.json"))
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+fn find_model_template(catalog: &serde_json::Value) -> Option<serde_json::Value> {
+    catalog
+        .get("models")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|models| {
+            models.iter().find(|model| {
+                model.get("slug").and_then(serde_json::Value::as_str)
+                    == Some(MODEL_CATALOG_TEMPLATE_SLUG)
+            })
+        })
+        .filter(|model| {
+            model
+                .get("base_instructions")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|value| !value.trim().is_empty())
+                && model.get("model_messages").is_some()
+                && model.get("apply_patch_tool_type").is_some()
+        })
+        .cloned()
+}
+
+fn load_proxy_chat_template() -> Result<serde_json::Value, AppError> {
+    let cache_path = home().join("models_cache.json");
+    if cache_path.exists() {
+        let bytes = fs::read(&cache_path).map_err(|error| AppError::Internal(error.to_string()))?;
+        let catalog: serde_json::Value = serde_json::from_slice(&bytes)
+            .map_err(|error| AppError::InvalidConfig(format!("models_cache.json 无效：{error}")))?;
+        if let Some(template) = find_model_template(&catalog) {
+            return Ok(template);
+        }
+    }
+    if let Ok(output) = Command::new("codex")
+        .args(["debug", "models", "--bundled"])
+        .output()
+        && output.status.success()
+        && let Ok(catalog) = serde_json::from_slice::<serde_json::Value>(&output.stdout)
+        && let Some(template) = find_model_template(&catalog)
+    {
+        return Ok(template);
+    }
+    Err(AppError::InvalidConfig(format!(
+        "找不到本机 Codex 的完整 {MODEL_CATALOG_TEMPLATE_SLUG} agent 模板；请先启动一次 Codex 或确保 codex CLI 可用。已取消切换，以免生成会丢失工具能力的模型目录"
+    )))
+}
+
+fn load_native_responses_template() -> Result<serde_json::Value, AppError> {
+    Ok(serde_json::json!({
+        "slug": "native-responses-template",
+        "display_name": "native-responses-template",
+        "description": "native-responses-template",
+        "base_instructions": "You are Codex, a coding agent. You and the user share the same workspace and collaborate to achieve the user's goals.",
+        "default_reasoning_level": "high",
+        "supported_reasoning_levels": [
+            {"effort": "none", "description": "Disable reasoning"},
+            {"effort": "high", "description": "Enable reasoning"}
+        ],
+        "shell_type": "shell_command",
+        "visibility": "list",
+        "supported_in_api": true,
+        "priority": 0,
+        "supports_reasoning_summaries": true,
+        "default_reasoning_summary": "none",
+        "support_verbosity": false,
+        "truncation_policy": {"mode": "bytes", "limit": 10000},
+        "supports_parallel_tool_calls": false,
+        "supports_image_detail_original": false,
+        "context_window": 262144,
+        "max_context_window": 262144,
+        "effective_context_window_percent": 95,
+        "experimental_supported_tools": [],
+        "input_modalities": ["text"],
+        "supports_search_tool": false
+    }))
+}
+
+fn model_context_window(model: &FetchedModel) -> Option<u64> {
+    ["context_window", "contextWindow", "max_context_window"]
+        .iter()
+        .find_map(|name| model.metadata.get(*name))
         .and_then(|value| {
             value
-                .get("models")
-                .and_then(serde_json::Value::as_array)
-                .cloned()
+                .as_u64()
+                .or_else(|| value.as_str()?.trim().parse().ok())
         })
-        .unwrap_or_default()
+        .filter(|value| *value > 0)
 }
 
-fn minimal_codex_model_template() -> serde_json::Value {
-    serde_json::json!({
-        "slug": "custom", "display_name": "custom", "description": "custom",
-        "base_instructions": "You are Codex, a coding agent.", "shell_type": "shell_command",
-        "visibility": "list", "supported_in_api": true, "priority": 1000
-    })
-}
-
-fn overlay_upstream_model_metadata(
+fn apply_native_model_metadata(
     target: &mut serde_json::Map<String, serde_json::Value>,
-    upstream: &FetchedModel,
+    upstream: Option<&FetchedModel>,
 ) {
+    let Some(upstream) = upstream else { return };
     const FIELDS: &[(&str, &[&str])] = &[
-        ("context_window", &["context_window", "contextWindow"]),
-        (
-            "max_context_window",
-            &["max_context_window", "maxContextWindow"],
-        ),
-        (
-            "default_reasoning_level",
-            &["default_reasoning_level", "defaultReasoningLevel"],
-        ),
-        (
-            "supported_reasoning_levels",
-            &["supported_reasoning_levels", "supportedReasoningLevels"],
-        ),
-        (
-            "supports_reasoning_summaries",
-            &["supports_reasoning_summaries", "supportsReasoningSummaries"],
-        ),
         (
             "supports_parallel_tool_calls",
             &["supports_parallel_tool_calls", "supportsParallelToolCalls"],
         ),
         ("input_modalities", &["input_modalities", "inputModalities"]),
         (
-            "supports_image_detail_original",
-            &[
-                "supports_image_detail_original",
-                "supportsImageDetailOriginal",
-            ],
-        ),
-        (
-            "supports_search_tool",
-            &["supports_search_tool", "supportsSearchTool"],
+            "base_instructions",
+            &["base_instructions", "baseInstructions"],
         ),
     ];
     for (target_name, aliases) in FIELDS {
@@ -570,21 +654,27 @@ fn overlay_upstream_model_metadata(
             target.insert((*target_name).into(), value.clone());
         }
     }
-    if !target.contains_key("max_context_window") {
-        if let Some(value) = target.get("context_window").cloned() {
-            target.insert("max_context_window".into(), value);
-        }
+    for key in [
+        "apply_patch_tool_type",
+        "web_search_tool_type",
+        "tools",
+        "model_messages",
+    ] {
+        target.remove(key);
     }
+    target.insert("shell_type".into(), "shell_command".into());
 }
 
 pub fn restore_official_snapshot(
     auth: &serde_json::Value,
-    _config_snapshot: Option<&str>,
+    config_snapshot: Option<&str>,
 ) -> Result<String, AppError> {
     let backup_path =
         backup("official-account").map_err(|error| AppError::Backup(error.to_string()))?;
     let update = (|| -> Result<(), AppError> {
-        atomic_write(&home().join("config.toml"), b"")?;
+        let current = fs::read_to_string(home().join("config.toml")).unwrap_or_default();
+        let config = build_official_config(&current, config_snapshot)?;
+        atomic_write(&home().join("config.toml"), config.as_bytes())?;
         atomic_write(
             &home().join("auth.json"),
             &serde_json::to_vec_pretty(auth)
@@ -767,7 +857,8 @@ mod tests {
 
     #[test]
     fn provider_switch_rebuilds_minimal_config() {
-        let config = build_managed_config(
+        let config = build_managed_config_from(
+            "",
             &test_provider(),
             &test_account(),
             "https://example.test/v1",
@@ -801,6 +892,95 @@ mod tests {
     }
 
     #[test]
+    fn provider_switch_preserves_desktop_tool_configuration() {
+        let existing = r#"
+model = "old-model"
+model_provider = "old-provider"
+model_reasoning_effort = "high"
+
+[model_providers.old-provider]
+base_url = "https://old.invalid/v1"
+
+[plugins."computer-use@openai-bundled"]
+enabled = true
+
+[mcp_servers.node_repl]
+command = "node_repl.exe"
+
+[desktop]
+conversationDetailMode = "STEPS_COMMANDS"
+
+[windows]
+sandbox = "elevated"
+"#;
+        let config = build_managed_config_from(
+            existing,
+            &test_provider(),
+            &test_account(),
+            "https://example.test/v1",
+            "secret-key",
+        )
+        .unwrap();
+        let parsed = config.parse::<DocumentMut>().unwrap();
+        assert_eq!(
+            parsed.get("model_provider").and_then(Item::as_str),
+            Some(MANAGED_PROVIDER_ID)
+        );
+        assert!(parsed.get("model").is_none());
+        assert!(parsed["model_providers"].get("old-provider").is_none());
+        assert_eq!(
+            parsed["plugins"]["computer-use@openai-bundled"]["enabled"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            parsed["mcp_servers"]["node_repl"]["command"].as_str(),
+            Some("node_repl.exe")
+        );
+        assert_eq!(parsed["windows"]["sandbox"].as_str(), Some("elevated"));
+    }
+
+    #[test]
+    fn official_switch_merges_snapshot_without_losing_current_tools() {
+        let current = r#"
+model_provider = "custom"
+[model_providers.custom]
+base_url = "http://127.0.0.1:1234/v1"
+[plugins."computer-use@openai-bundled"]
+enabled = true
+"#;
+        let snapshot = r#"
+model = "official-model"
+[desktop]
+localeOverride = "zh-CN"
+[plugins."computer-use@openai-bundled"]
+enabled = false
+"#;
+        let config = build_official_config(current, Some(snapshot)).unwrap();
+        let parsed = config.parse::<DocumentMut>().unwrap();
+        assert!(parsed.get("model").is_none());
+        assert!(parsed.get("model_provider").is_none());
+        assert!(parsed.get("model_providers").is_none());
+        assert_eq!(parsed["desktop"]["localeOverride"].as_str(), Some("zh-CN"));
+        assert_eq!(
+            parsed["plugins"]["computer-use@openai-bundled"]["enabled"].as_bool(),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn provider_switch_rejects_invalid_existing_config() {
+        let error = build_managed_config_from(
+            "[broken",
+            &test_provider(),
+            &test_account(),
+            "https://example.test/v1",
+            "secret-key",
+        )
+        .unwrap_err();
+        assert!(matches!(error, AppError::InvalidConfig(_)));
+    }
+
+    #[test]
     fn model_catalog_preserves_selected_model_order_and_deduplicates() {
         let mut provider = test_provider();
         provider.model_metadata = vec![FetchedModel {
@@ -810,25 +990,99 @@ mod tests {
                 "context_window": 96_000,
                 "default_reasoning_level": "high",
                 "supported_reasoning_levels": [{"effort": "high"}],
-                "input_modalities": ["text", "image"]
+                "input_modalities": ["text", "image"],
+                "base_instructions": "upstream instructions must not replace Codex",
+                "apply_patch_tool_type": "disabled"
             }))
             .unwrap(),
         }];
-        let catalog = build_model_catalog(&provider);
+        let template = json!({
+            "slug": "gpt-5.5",
+            "base_instructions": "full Codex instructions",
+            "model_messages": {"instructions_template": "Codex agent template"},
+            "apply_patch_tool_type": "freeform",
+            "tool_mode": "default",
+            "shell_type": "shell_command",
+            "supports_parallel_tool_calls": true
+        });
+        let catalog =
+            build_model_catalog_from_template(&provider, &template, CatalogProfile::ProxyChat);
         let models = catalog["models"].as_array().unwrap();
         assert_eq!(models.len(), 2);
         assert_eq!(models[0]["slug"], "model-b");
         assert_eq!(models[1]["slug"], "model-a");
         assert_eq!(models[0]["context_window"], 96_000);
         assert_eq!(models[0]["max_context_window"], 96_000);
-        assert_eq!(models[0]["default_reasoning_level"], "high");
-        assert_eq!(models[0]["input_modalities"], json!(["text", "image"]));
-        assert!(models[1].get("supported_reasoning_levels").is_none());
-        assert!(
-            models[0]["base_instructions"]
-                .as_str()
-                .is_some_and(|v| !v.is_empty())
+        assert_eq!(models[0]["base_instructions"], "full Codex instructions");
+        assert_eq!(models[0]["tool_mode"], "default");
+        assert_eq!(models[0]["apply_patch_tool_type"], "freeform");
+        assert_eq!(models[0]["supports_parallel_tool_calls"], true);
+        assert!(models[0].get("default_reasoning_level").is_none());
+        assert!(models[0].get("supported_reasoning_levels").is_none());
+        assert!(models[0].get("input_modalities").is_none());
+    }
+
+    #[test]
+    fn native_catalog_uses_clean_template_and_only_safe_upstream_metadata() {
+        let mut provider = test_provider();
+        provider.model_metadata = vec![FetchedModel {
+            id: "model-b".into(),
+            owned_by: None,
+            metadata: serde_json::from_value(json!({
+                "context_window": 120_000,
+                "supports_parallel_tool_calls": true,
+                "input_modalities": ["text", "image"],
+                "base_instructions": "upstream native instructions",
+                "apply_patch_tool_type": "freeform",
+                "model_messages": {"instructions_template": "unsafe"},
+                "default_reasoning_level": "invented"
+            }))
+            .unwrap(),
+        }];
+        let template = json!({
+            "slug": "native-responses-template",
+            "base_instructions": "full Codex instructions",
+            "shell_type": "shell_command",
+            "apply_patch_tool_type": "freeform",
+            "model_messages": {"instructions_template": "unsafe"},
+            "supports_parallel_tool_calls": false
+        });
+        let catalog = build_model_catalog_from_template(
+            &provider,
+            &template,
+            CatalogProfile::NativeResponses,
         );
+        let model = &catalog["models"][0];
+        assert_eq!(model["slug"], "model-b");
+        assert_eq!(model["context_window"], 120_000);
+        assert_eq!(model["base_instructions"], "upstream native instructions");
+        assert_eq!(model["supports_parallel_tool_calls"], true);
+        assert_eq!(model["input_modalities"], json!(["text", "image"]));
+        assert!(model.get("apply_patch_tool_type").is_none());
+        assert!(model.get("model_messages").is_none());
+        assert!(model.get("default_reasoning_level").is_none());
+    }
+
+    #[test]
+    fn chat_template_requires_exact_complete_codex_agent_entry() {
+        let catalog = json!({"models": [
+            {"slug": "gpt-5.5", "base_instructions": "missing tool fields"},
+            {
+                "slug": "another-model",
+                "base_instructions": "complete but wrong model",
+                "model_messages": {},
+                "apply_patch_tool_type": "freeform"
+            }
+        ]});
+        assert!(find_model_template(&catalog).is_none());
+
+        let complete = json!({
+            "slug": "gpt-5.5",
+            "base_instructions": "complete Codex agent instructions",
+            "model_messages": {},
+            "apply_patch_tool_type": "freeform"
+        });
+        assert!(find_model_template(&json!({"models": [complete]})).is_some());
     }
 
     #[test]
