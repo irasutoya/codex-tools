@@ -361,7 +361,48 @@ impl Store {
     }
 
     pub fn save_auth_account(&self, account: &AuthAccount) -> anyhow::Result<()> {
-        self.connect()?.execute(
+        let mut db = self.connect()?;
+        let tx = db.transaction()?;
+        let existing = account
+            .login
+            .as_deref()
+            .filter(|login| !login.trim().is_empty())
+            .map(|login| {
+                tx.query_row(
+                    "SELECT id,active,created_at,config_snapshot FROM auth_accounts
+                     WHERE service='openai' AND login=?1
+                     ORDER BY active DESC,updated_at DESC LIMIT 1",
+                    [login],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, i64>(1)? != 0,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, Option<String>>(3)?,
+                        ))
+                    },
+                )
+                .optional()
+            })
+            .transpose()?
+            .flatten();
+        let id = existing
+            .as_ref()
+            .map(|value| value.0.as_str())
+            .unwrap_or(&account.id);
+        let active = existing
+            .as_ref()
+            .map(|value| value.1)
+            .unwrap_or(account.active);
+        let created_at = existing
+            .as_ref()
+            .map(|value| value.2)
+            .unwrap_or(account.created_at);
+        let config_snapshot = account
+            .config_snapshot
+            .as_ref()
+            .or_else(|| existing.as_ref().and_then(|value| value.3.as_ref()));
+        tx.execute(
             "INSERT INTO auth_accounts(id,service,name,login,email,credential_json,config_snapshot,
              scopes_json,expires_at,active,created_at,updated_at)
              VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,COALESCE(NULLIF(?11,0),strftime('%s','now')),strftime('%s','now'))
@@ -369,19 +410,26 @@ impl Store {
              credential_json=excluded.credential_json,config_snapshot=excluded.config_snapshot,
              scopes_json=excluded.scopes_json,expires_at=excluded.expires_at,updated_at=excluded.updated_at",
             params![
-                account.id,
+                id,
                 "openai",
                 account.name,
                 account.login,
                 account.email,
                 account.credential.as_ref().map(serde_json::to_string).transpose()?,
-                account.config_snapshot,
+                config_snapshot,
                 serde_json::to_string(&account.scopes)?,
                 account.expires_at,
-                account.active,
-                account.created_at,
+                active,
+                created_at,
             ],
         )?;
+        if let Some(login) = account.login.as_deref() {
+            tx.execute(
+                "DELETE FROM auth_accounts WHERE service='openai' AND login=?1 AND id<>?2",
+                params![login, id],
+            )?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -666,6 +714,73 @@ mod tests {
         assert_eq!(indexed.len(), 1);
         assert_eq!(indexed[0].original_provider, "openai");
         assert!(indexed[0].has_user_event);
+    }
+
+    #[test]
+    fn relogin_updates_existing_openai_account_by_stable_login() {
+        let temp = tempdir().unwrap();
+        let store = Store {
+            path: temp.path().join("store.db"),
+        };
+        let db = store.connect().unwrap();
+        db.execute_batch(
+            "CREATE TABLE auth_accounts(
+               id TEXT PRIMARY KEY,service TEXT,name TEXT,login TEXT,email TEXT,
+               credential_json TEXT,config_snapshot TEXT,scopes_json TEXT,expires_at INTEGER,
+               active INTEGER,created_at INTEGER,updated_at INTEGER
+             );",
+        )
+        .unwrap();
+        drop(db);
+        let original = AuthAccount {
+            id: "original-id".into(),
+            service: AuthService::OpenAi,
+            name: "Original".into(),
+            login: Some("acct-stable".into()),
+            email: Some("old@example.test".into()),
+            credential: Some(serde_json::json!({"tokens":{"access_token":"old"}})),
+            config_snapshot: Some("original config".into()),
+            scopes: vec![],
+            expires_at: Some(100),
+            active: true,
+            created_at: 10,
+            updated_at: 20,
+        };
+        store.save_auth_account(&original).unwrap();
+        let relogin = AuthAccount {
+            id: "new-random-id".into(),
+            service: AuthService::OpenAi,
+            name: "Updated".into(),
+            login: Some("acct-stable".into()),
+            email: Some("new@example.test".into()),
+            credential: Some(serde_json::json!({"tokens":{"access_token":"new"}})),
+            config_snapshot: None,
+            scopes: vec!["openid".into()],
+            expires_at: Some(200),
+            active: false,
+            created_at: 30,
+            updated_at: 40,
+        };
+
+        store.save_auth_account(&relogin).unwrap();
+
+        let accounts = store.auth_accounts().unwrap();
+        assert_eq!(accounts.len(), 1);
+        let saved = &accounts[0];
+        assert_eq!(saved.id, "original-id");
+        assert_eq!(saved.name, "Updated");
+        assert_eq!(saved.email.as_deref(), Some("new@example.test"));
+        assert_eq!(saved.config_snapshot.as_deref(), Some("original config"));
+        assert!(saved.active);
+        assert_eq!(saved.created_at, 10);
+        assert_eq!(
+            saved
+                .credential
+                .as_ref()
+                .and_then(|value| value.pointer("/tokens/access_token"))
+                .and_then(serde_json::Value::as_str),
+            Some("new")
+        );
     }
 
     #[test]
