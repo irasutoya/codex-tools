@@ -7,8 +7,6 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 use walkdir::WalkDir;
 
-const BACKUP_LIMIT: usize = 10;
-
 #[derive(Clone)]
 struct RolloutChange {
     path: PathBuf,
@@ -77,12 +75,12 @@ pub fn synchronize(home: &Path, provider: &str) -> Result<RepairResult, AppError
     let result = (|| -> anyhow::Result<(UpdateCounts, usize)> {
         let counts = update_databases(&dbs, provider, None, &user_threads, &cwd_by_thread)?;
         let globals = normalize_global_state(&global_path)?;
-        prune_backups(home)?;
         Ok((counts, globals))
     })();
     drop(lock);
     match result {
         Ok((counts, global_updates)) => {
+            remove_temporary_backup(&backup);
             let mut warnings = Vec::new();
             warnings.append(&mut database_warnings);
             let encrypted = changes
@@ -98,7 +96,7 @@ pub fn synchronize(home: &Path, provider: &str) -> Result<RepairResult, AppError
                 warnings.push(format!("规范化了 {global_updates} 个工作区状态字段"));
             }
             Ok(RepairResult {
-                backup_path: backup.display().to_string(),
+                backup_path: String::new(),
                 databases_repaired: dbs.len(),
                 rows_updated: counts.total(),
                 warnings,
@@ -107,13 +105,14 @@ pub fn synchronize(home: &Path, provider: &str) -> Result<RepairResult, AppError
         Err(error) => {
             restore_rollouts(&applied);
             restore_file(&global_path, original_global.as_deref());
-            match restore_database_backup(home, &backup, &db_paths) {
+            let restored = restore_database_backup(home, &backup, &db_paths);
+            remove_temporary_backup(&backup);
+            match restored {
                 Ok(()) => Err(AppError::Internal(format!(
                     "修复失败，已回滚会话文件、全局状态和数据库：{error}"
                 ))),
                 Err(restore_error) => Err(AppError::Backup(format!(
-                    "修复失败：{error}；数据库回滚也失败：{restore_error}。备份位于 {}",
-                    backup.display()
+                    "修复失败：{error}；数据库回滚也失败：{restore_error}"
                 ))),
             }
         }
@@ -148,21 +147,25 @@ pub fn restore_exact(
     let result = update_database_threads_exact(&dbs, provider, &wanted);
     drop(lock);
     match result {
-        Ok(rows) => Ok(RepairResult {
-            backup_path: backup.display().to_string(),
-            databases_repaired: dbs.len(),
-            rows_updated: rows,
-            warnings,
-        }),
+        Ok(rows) => {
+            remove_temporary_backup(&backup);
+            Ok(RepairResult {
+                backup_path: String::new(),
+                databases_repaired: dbs.len(),
+                rows_updated: rows,
+                warnings,
+            })
+        }
         Err(error) => {
             restore_rollouts(&applied);
-            match restore_database_backup(home, &backup, &db_paths) {
+            let restored = restore_database_backup(home, &backup, &db_paths);
+            remove_temporary_backup(&backup);
+            match restored {
                 Ok(()) => Err(AppError::Internal(format!(
                     "官方历史恢复失败，已按迁移账本回滚：{error}"
                 ))),
                 Err(rollback) => Err(AppError::Backup(format!(
-                    "官方历史恢复失败：{error}；数据库回滚失败：{rollback}。备份位于 {}",
-                    backup.display()
+                    "官方历史恢复失败：{error}；数据库回滚失败：{rollback}"
                 ))),
             }
         }
@@ -428,13 +431,24 @@ fn create_backup(
     changes: &[RolloutChange],
     dbs: &[PathBuf],
 ) -> Result<PathBuf, AppError> {
-    let root = home.join("backups_state/codex-tools-provider-sync");
-    let dir = root.join(format!(
-        "{}-{}",
-        chrono::Local::now().format("%Y%m%d%H%M%S"),
-        uuid::Uuid::new_v4().simple()
-    ));
+    let dir = std::env::temp_dir()
+        .join("codex-tools")
+        .join(format!("provider-sync-{}", uuid::Uuid::new_v4().simple()));
     fs::create_dir_all(&dir).map_err(|e| AppError::Backup(e.to_string()))?;
+    let result = create_backup_contents(home, provider, changes, dbs, &dir);
+    if result.is_err() {
+        remove_temporary_backup(&dir);
+    }
+    result.map(|()| dir)
+}
+
+fn create_backup_contents(
+    home: &Path,
+    provider: &str,
+    changes: &[RolloutChange],
+    dbs: &[PathBuf],
+    dir: &Path,
+) -> Result<(), AppError> {
     for name in [
         "config.toml",
         ".codex-global-state.json",
@@ -466,7 +480,14 @@ fn create_backup(
         .map(|item| json!({"path":item.path,"threadId":item.thread_id}))
         .collect::<Vec<_>>();
     fs::write(dir.join("metadata.json"), serde_json::to_vec_pretty(&json!({"version":1,"managedBy":"Codex Tools provider sync","provider":provider,"dbFiles":db_files,"rollouts":manifest})).map_err(|e|AppError::Backup(e.to_string()))?).map_err(|e|AppError::Backup(e.to_string()))?;
-    Ok(dir)
+    Ok(())
+}
+
+fn remove_temporary_backup(path: &Path) {
+    let _ = fs::remove_dir_all(path);
+    if let Some(parent) = path.parent() {
+        let _ = fs::remove_dir(parent);
+    }
 }
 
 fn restore_database_backup(home: &Path, backup: &Path, dbs: &[PathBuf]) -> anyhow::Result<()> {
@@ -778,23 +799,6 @@ fn restore_file(path: &Path, data: Option<&[u8]>) {
         }
     }
 }
-fn prune_backups(home: &Path) -> anyhow::Result<()> {
-    let root = home.join("backups_state/codex-tools-provider-sync");
-    if !root.exists() {
-        return Ok(());
-    }
-    let mut dirs = fs::read_dir(root)?
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.is_dir())
-        .collect::<Vec<_>>();
-    dirs.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
-    for p in dirs.into_iter().skip(BACKUP_LIMIT) {
-        let _ = fs::remove_dir_all(p);
-    }
-    Ok(())
-}
-
 struct SyncLock(PathBuf);
 impl SyncLock {
     fn acquire(path: &Path) -> Result<Self, AppError> {
@@ -865,11 +869,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(row, ("custom".into(), 1, "C:/workspace".into()));
-        assert!(
-            Path::new(&result.backup_path)
-                .join("db/state_5.sqlite")
-                .exists()
-        );
+        assert!(result.backup_path.is_empty());
     }
 
     #[test]

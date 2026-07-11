@@ -1,5 +1,6 @@
 use crate::models::{
-    AppError, ProviderAccount, ProviderProfile, RouteConsoleSnapshot, RouteLogEntry,
+    AppError, CodexChatReasoningConfig, ProviderAccount, ProviderProfile, RouteConsoleSnapshot,
+    RouteLogEntry,
 };
 use futures_util::StreamExt;
 use reqwest::{
@@ -60,6 +61,7 @@ struct ProxyConfig {
     timeout: Duration,
     concurrency: Arc<Semaphore>,
     telemetry: Arc<ProxyTelemetry>,
+    provider: ProviderProfile,
 }
 
 struct ProxyTelemetry {
@@ -137,6 +139,7 @@ impl ProxyManager {
             timeout,
             concurrency: Arc::new(Semaphore::new(MAX_CONCURRENT_REQUESTS)),
             telemetry: telemetry.clone(),
+            provider: provider.clone(),
         });
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
 
@@ -276,7 +279,7 @@ impl ProxyManager {
     }
 }
 
-fn build_upstream_headers(
+pub(crate) fn build_upstream_headers(
     api_key: &str,
     provider: &Value,
     account: &Value,
@@ -374,7 +377,8 @@ async fn handle_connection(
         .get("stream")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let upstream_body = match responses_to_chat(&input) {
+    let reasoning = resolve_reasoning_config(&config.provider, &input);
+    let upstream_body = match responses_to_chat_with_reasoning(&input, reasoning.as_ref()) {
         Ok(value) => value,
         Err(message) => {
             write_json_error(&mut stream, 400, "invalid_request", &message).await?;
@@ -565,7 +569,15 @@ async fn read_request(stream: &mut TcpStream) -> Result<HttpRequest, (u16, &'sta
     })
 }
 
+#[cfg(test)]
 fn responses_to_chat(input: &Value) -> Result<Value, String> {
+    responses_to_chat_with_reasoning(input, None)
+}
+
+fn responses_to_chat_with_reasoning(
+    input: &Value,
+    reasoning: Option<&CodexChatReasoningConfig>,
+) -> Result<Value, String> {
     let model = input
         .get("model")
         .and_then(Value::as_str)
@@ -628,10 +640,210 @@ fn responses_to_chat(input: &Value) -> Result<Value, String> {
     if let Some(format) = input.pointer("/text/format") {
         target.insert("response_format".into(), response_format_to_chat(format));
     }
-    if let Some(effort) = input.pointer("/reasoning/effort") {
-        target.insert("reasoning_effort".into(), effort.clone());
-    }
+    apply_reasoning_options(input, &mut output, reasoning);
     Ok(output)
+}
+
+fn resolve_reasoning_config(
+    provider: &ProviderProfile,
+    body: &Value,
+) -> Option<CodexChatReasoningConfig> {
+    if let Some(mut config) = provider.codex_chat_reasoning.clone() {
+        if config.supports_effort == Some(true) && config.supports_thinking.is_none() {
+            config.supports_thinking = Some(true);
+        }
+        return Some(config);
+    }
+    let model = body
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or(&provider.default_model)
+        .to_ascii_lowercase();
+    let name = provider.name.to_ascii_lowercase();
+    let base = provider.base_url.to_ascii_lowercase();
+    let platform = format!("{name} {base}");
+    if platform.contains("openrouter") {
+        return Some(reasoning_config(
+            false,
+            true,
+            "none",
+            "reasoning.effort",
+            Some("openrouter"),
+            "auto",
+        ));
+    }
+    if platform.contains("siliconflow") {
+        return Some(reasoning_config(
+            true,
+            false,
+            "enable_thinking",
+            "none",
+            None,
+            "reasoning_content",
+        ));
+    }
+    let haystack = format!("{platform} {model}");
+    if haystack.contains("deepseek") {
+        Some(reasoning_config(
+            true,
+            true,
+            "thinking",
+            "reasoning_effort",
+            Some("deepseek"),
+            "reasoning_content",
+        ))
+    } else if haystack.contains("stepfun") || haystack.contains("step-3.5-flash-2603") {
+        Some(reasoning_config(
+            true,
+            model.contains("2603"),
+            "none",
+            "reasoning_effort",
+            Some("low_high"),
+            "reasoning",
+        ))
+    } else if haystack.contains("qwen")
+        || haystack.contains("dashscope")
+        || haystack.contains("bailian")
+    {
+        Some(reasoning_config(
+            true,
+            false,
+            "enable_thinking",
+            "none",
+            None,
+            "reasoning_content",
+        ))
+    } else if haystack.contains("minimax") {
+        Some(reasoning_config(
+            true,
+            false,
+            "reasoning_split",
+            "none",
+            None,
+            "reasoning_details",
+        ))
+    } else if ["kimi", "moonshot", "glm", "zhipu", "z.ai", "mimo"]
+        .iter()
+        .any(|value| haystack.contains(value))
+    {
+        Some(reasoning_config(
+            true,
+            false,
+            "thinking",
+            "none",
+            None,
+            "reasoning_content",
+        ))
+    } else {
+        None
+    }
+}
+
+fn reasoning_config(
+    thinking: bool,
+    effort: bool,
+    thinking_param: &str,
+    effort_param: &str,
+    mode: Option<&str>,
+    output: &str,
+) -> CodexChatReasoningConfig {
+    CodexChatReasoningConfig {
+        supports_thinking: Some(thinking),
+        supports_effort: Some(effort),
+        thinking_param: Some(thinking_param.into()),
+        effort_param: Some(effort_param.into()),
+        effort_value_mode: mode.map(str::to_owned),
+        output_format: Some(output.into()),
+    }
+}
+
+fn apply_reasoning_options(
+    body: &Value,
+    result: &mut Value,
+    config: Option<&CodexChatReasoningConfig>,
+) {
+    let Some(config) = config else { return };
+    let Some(enabled) = reasoning_requested(body) else {
+        return;
+    };
+    let supports_effort = config.supports_effort.unwrap_or(false);
+    if config.supports_thinking.unwrap_or(false) || supports_effort {
+        match config.thinking_param.as_deref().unwrap_or("thinking") {
+            "thinking" => {
+                result["thinking"] = json!({"type": if enabled { "enabled" } else { "disabled" }})
+            }
+            "enable_thinking" => result["enable_thinking"] = json!(enabled),
+            "reasoning_split" => result["reasoning_split"] = json!(enabled),
+            _ => {}
+        }
+    }
+    let effort_param = config.effort_param.as_deref().unwrap_or("reasoning_effort");
+    if !enabled {
+        if effort_param == "reasoning.effort" {
+            result["reasoning"] = json!({"effort":"none"});
+        }
+        return;
+    }
+    if !supports_effort {
+        return;
+    }
+    let Some(effort) = body.pointer("/reasoning/effort").and_then(Value::as_str) else {
+        return;
+    };
+    let Some(mapped) = map_reasoning_effort(effort, config.effort_value_mode.as_deref()) else {
+        return;
+    };
+    match effort_param {
+        "reasoning_effort" => result["reasoning_effort"] = json!(mapped),
+        "reasoning.effort" => result["reasoning"] = json!({"effort":mapped}),
+        _ => {}
+    }
+}
+
+fn reasoning_requested(body: &Value) -> Option<bool> {
+    if let Some(effort) = body.pointer("/reasoning/effort").and_then(Value::as_str) {
+        return Some(!matches!(
+            effort.trim().to_ascii_lowercase().as_str(),
+            "none" | "off" | "disabled"
+        ));
+    }
+    body.get("reasoning").map(|value| !value.is_null())
+}
+
+fn map_reasoning_effort(effort: &str, mode: Option<&str>) -> Option<&'static str> {
+    let effort = effort.trim().to_ascii_lowercase();
+    if matches!(effort.as_str(), "none" | "off" | "disabled") {
+        return None;
+    }
+    match mode.unwrap_or("passthrough") {
+        "deepseek" => Some(if matches!(effort.as_str(), "max" | "xhigh") {
+            "max"
+        } else {
+            "high"
+        }),
+        "low_high" => Some(if matches!(effort.as_str(), "minimal" | "low") {
+            "low"
+        } else {
+            "high"
+        }),
+        "openrouter" => match effort.as_str() {
+            "max" | "xhigh" => Some("xhigh"),
+            "high" => Some("high"),
+            "medium" => Some("medium"),
+            "low" => Some("low"),
+            "minimal" => Some("minimal"),
+            _ => None,
+        },
+        _ => match effort.as_str() {
+            "minimal" => Some("minimal"),
+            "low" => Some("low"),
+            "medium" => Some("medium"),
+            "high" => Some("high"),
+            "xhigh" => Some("xhigh"),
+            "max" => Some("max"),
+            _ => None,
+        },
+    }
 }
 
 fn response_item_to_chat(item: &Value) -> Option<Value> {
@@ -1083,6 +1295,7 @@ mod tests {
             base_url: "http://127.0.0.1:9/v1".into(),
             default_model: "test-model".into(),
             models: vec![],
+            codex_chat_reasoning: None,
             headers: json!({}),
             timeout_secs: 1,
             context_window: None,
@@ -1167,7 +1380,15 @@ mod tests {
 
     #[test]
     fn converts_reasoning_structured_output_and_images() {
-        let output = responses_to_chat(&json!({
+        let reasoning = reasoning_config(
+            true,
+            true,
+            "thinking",
+            "reasoning_effort",
+            Some("standard"),
+            "reasoning_content",
+        );
+        let output = responses_to_chat_with_reasoning(&json!({
             "model":"test-model",
             "input":[{"role":"user","content":[
                 {"type":"input_text","text":"describe"},
@@ -1175,12 +1396,60 @@ mod tests {
             ]}],
             "reasoning":{"effort":"high"},
             "text":{"format":{"type":"json_schema","name":"answer","schema":{"type":"object"},"strict":true}}
-        })).unwrap();
+        }), Some(&reasoning)).unwrap();
         assert_eq!(output["reasoning_effort"], "high");
         assert_eq!(output["response_format"]["type"], "json_schema");
         assert_eq!(output["response_format"]["json_schema"]["name"], "answer");
         assert_eq!(output["messages"][0]["content"][0]["type"], "text");
         assert_eq!(output["messages"][0]["content"][1]["type"], "image_url");
+    }
+
+    #[test]
+    fn maps_openrouter_effort_from_current_request_model() {
+        let mut provider = provider();
+        provider.name = "OpenRouter".into();
+        let input =
+            json!({"model":"vendor/live-model","input":"hello","reasoning":{"effort":"max"}});
+        let config = resolve_reasoning_config(&provider, &input).unwrap();
+        let output = responses_to_chat_with_reasoning(&input, Some(&config)).unwrap();
+        assert_eq!(output["reasoning"]["effort"], "xhigh");
+        assert!(output.get("thinking").is_none());
+    }
+
+    #[test]
+    fn maps_deepseek_thinking_and_effort() {
+        let mut provider = provider();
+        provider.default_model = "deepseek-reasoner".into();
+        let input = json!({
+            "model":"deepseek-reasoner",
+            "input":"hello",
+            "reasoning":{"effort":"xhigh"}
+        });
+        let config = resolve_reasoning_config(&provider, &input).unwrap();
+        let output = responses_to_chat_with_reasoning(&input, Some(&config)).unwrap();
+        assert_eq!(output["thinking"]["type"], "enabled");
+        assert_eq!(output["reasoning_effort"], "max");
+    }
+
+    #[test]
+    fn maps_qwen_and_kimi_thinking_switches() {
+        let mut qwen = provider();
+        qwen.default_model = "qwen3-coder".into();
+        let input = json!({"model":"qwen3-coder","input":"hello","reasoning":{"effort":"high"}});
+        let config = resolve_reasoning_config(&qwen, &input).unwrap();
+        let output = responses_to_chat_with_reasoning(&input, Some(&config)).unwrap();
+        assert_eq!(output["enable_thinking"], true);
+
+        let mut kimi = provider();
+        kimi.default_model = "kimi-k2-thinking".into();
+        let input = json!({
+            "model":"kimi-k2-thinking",
+            "input":"hello",
+            "reasoning":{"effort":"high"}
+        });
+        let config = resolve_reasoning_config(&kimi, &input).unwrap();
+        let output = responses_to_chat_with_reasoning(&input, Some(&config)).unwrap();
+        assert_eq!(output["thinking"]["type"], "enabled");
     }
 
     #[test]

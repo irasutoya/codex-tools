@@ -11,6 +11,8 @@ pub struct ProviderProfile {
     #[serde(default)]
     pub models: Vec<String>,
     #[serde(default)]
+    pub codex_chat_reasoning: Option<CodexChatReasoningConfig>,
+    #[serde(default)]
     pub headers: serde_json::Value,
     #[serde(default = "default_timeout")]
     pub timeout_secs: u64,
@@ -26,6 +28,30 @@ pub struct ProviderProfile {
     pub active_account_id: Option<String>,
     #[serde(default)]
     pub account_count: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexChatReasoningConfig {
+    #[serde(default)]
+    pub supports_thinking: Option<bool>,
+    #[serde(default)]
+    pub supports_effort: Option<bool>,
+    #[serde(default)]
+    pub thinking_param: Option<String>,
+    #[serde(default)]
+    pub effort_param: Option<String>,
+    #[serde(default)]
+    pub effort_value_mode: Option<String>,
+    #[serde(default)]
+    pub output_format: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct FetchedModel {
+    pub id: String,
+    pub owned_by: Option<String>,
 }
 
 fn default_timeout() -> u64 {

@@ -1,6 +1,5 @@
 use crate::models::{
     AccountAuthKind, AuthAccount, AuthService, ProviderAccount, ProviderProfile, ProviderProtocol,
-    SessionSummary,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use std::path::{Path, PathBuf};
@@ -29,12 +28,12 @@ impl Store {
                timeout_secs INTEGER NOT NULL DEFAULT 30,active INTEGER NOT NULL DEFAULT 0,
                updated_at INTEGER NOT NULL);
              CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);
-             CREATE TABLE IF NOT EXISTS operations(id TEXT PRIMARY KEY,kind TEXT NOT NULL,payload TEXT NOT NULL,created_at INTEGER NOT NULL,consumed INTEGER NOT NULL DEFAULT 0);
-             CREATE TABLE IF NOT EXISTS backups(id TEXT PRIMARY KEY,kind TEXT NOT NULL,path TEXT NOT NULL,created_at INTEGER NOT NULL,pinned INTEGER NOT NULL DEFAULT 0);",
+             CREATE TABLE IF NOT EXISTS operations(id TEXT PRIMARY KEY,kind TEXT NOT NULL,payload TEXT NOT NULL,created_at INTEGER NOT NULL,consumed INTEGER NOT NULL DEFAULT 0);",
         )?;
         add_column(&db, "providers", "context_window", "INTEGER")?;
         add_column(&db, "providers", "auto_compact_threshold", "INTEGER")?;
         add_column(&db, "providers", "enabled", "INTEGER NOT NULL DEFAULT 1")?;
+        add_column(&db, "providers", "codex_chat_reasoning_json", "TEXT")?;
         db.execute_batch(
             "CREATE TABLE IF NOT EXISTS provider_accounts(
                id TEXT PRIMARY KEY,
@@ -64,22 +63,9 @@ impl Store {
              CREATE INDEX IF NOT EXISTS idx_auth_accounts_service ON auth_accounts(service);
              CREATE UNIQUE INDEX IF NOT EXISTS idx_auth_accounts_active_openai
                ON auth_accounts(service) WHERE active=1 AND service='openai';
-             CREATE TABLE IF NOT EXISTS unified_sessions(
-               identity TEXT PRIMARY KEY, thread_id TEXT NOT NULL, host_id TEXT,
-               title TEXT NOT NULL DEFAULT '', cwd TEXT NOT NULL DEFAULT '',
-               original_provider TEXT NOT NULL DEFAULT '', effective_provider TEXT NOT NULL DEFAULT '',
-               archived INTEGER NOT NULL DEFAULT 0, has_user_event INTEGER NOT NULL DEFAULT 0,
-               source_rollout TEXT, source_db TEXT NOT NULL DEFAULT '',
-               created_at INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL DEFAULT 0,
-               last_indexed_at INTEGER NOT NULL
-             );
-             CREATE INDEX IF NOT EXISTS idx_unified_sessions_thread ON unified_sessions(thread_id);
-             CREATE INDEX IF NOT EXISTS idx_unified_sessions_updated ON unified_sessions(updated_at DESC);
-             CREATE TABLE IF NOT EXISTS session_provider_origins(
-               codex_home TEXT NOT NULL, thread_id TEXT NOT NULL,
-               original_provider TEXT NOT NULL, captured_at INTEGER NOT NULL,
-               PRIMARY KEY(codex_home,thread_id)
-             );",
+             DROP TABLE IF EXISTS unified_sessions;
+             DROP TABLE IF EXISTS session_provider_origins;
+             DROP TABLE IF EXISTS backups;",
         )?;
         migrate_official_accounts(&db)?;
         migrate_legacy_keys(&db)?;
@@ -101,7 +87,7 @@ impl Store {
         let mut statement = db.prepare(
             "SELECT p.id,p.name,p.protocol,p.base_url,p.default_model,p.models_json,
                     p.headers_json,p.timeout_secs,p.context_window,p.auto_compact_threshold,
-                    p.enabled,p.active,
+                    p.enabled,p.active,p.codex_chat_reasoning_json,
                     (SELECT id FROM provider_accounts a WHERE a.provider_id=p.id AND a.active=1 LIMIT 1),
                     (SELECT count(*) FROM provider_accounts a WHERE a.provider_id=p.id)
              FROM providers p ORDER BY p.active DESC,p.name",
@@ -114,21 +100,26 @@ impl Store {
                 base_url: row.get(3)?,
                 default_model: row.get(4)?,
                 models: json_or_default(row.get(5)?),
+                codex_chat_reasoning: row
+                    .get::<_, Option<String>>(12)?
+                    .and_then(|value| serde_json::from_str(&value).ok()),
                 headers: json_or_default(row.get(6)?),
                 timeout_secs: row.get::<_, i64>(7)? as u64,
                 context_window: row.get::<_, Option<i64>>(8)?.map(|value| value as u64),
                 auto_compact_threshold: row.get::<_, Option<i64>>(9)?.map(|value| value as u64),
                 enabled: row.get::<_, i64>(10)? != 0,
                 active: row.get::<_, i64>(11)? != 0,
-                active_account_id: row.get(12)?,
-                account_count: row.get::<_, i64>(13)? as u64,
+                active_account_id: row.get(13)?,
+                account_count: row.get::<_, i64>(14)? as u64,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     pub fn save_provider(&self, provider: &ProviderProfile) -> anyhow::Result<()> {
-        self.connect()?.execute(
+        let mut db = self.connect()?;
+        let tx = db.transaction()?;
+        tx.execute(
             "INSERT INTO providers(id,name,protocol,base_url,api_key,default_model,models_json,headers_json,timeout_secs,active,updated_at,context_window,auto_compact_threshold,enabled)
              VALUES(?1,?2,?3,?4,'',?5,?6,?7,?8,?9,strftime('%s','now'),?10,?11,?12)
              ON CONFLICT(id) DO UPDATE SET name=excluded.name,protocol=excluded.protocol,
@@ -151,6 +142,18 @@ impl Store {
                 provider.enabled,
             ],
         )?;
+        tx.execute(
+            "UPDATE providers SET codex_chat_reasoning_json=?1 WHERE id=?2",
+            params![
+                provider
+                    .codex_chat_reasoning
+                    .as_ref()
+                    .map(serde_json::to_string)
+                    .transpose()?,
+                provider.id
+            ],
+        )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -462,114 +465,6 @@ impl Store {
         }
         Ok(())
     }
-
-    pub fn replace_unified_sessions(&self, sessions: &[SessionSummary]) -> anyhow::Result<()> {
-        let mut db = self.connect()?;
-        let tx = db.transaction()?;
-        tx.execute("DELETE FROM unified_sessions", [])?;
-        let now = chrono::Utc::now().timestamp();
-        for session in sessions {
-            tx.execute(
-                "INSERT INTO unified_sessions(identity,thread_id,title,cwd,original_provider,
-                 effective_provider,archived,has_user_event,source_rollout,source_db,updated_at,last_indexed_at)
-                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
-                params![
-                    session.identity,
-                    session.id,
-                    session.title,
-                    session.cwd,
-                    session.original_provider,
-                    session.provider,
-                    session.archived,
-                    session.has_user_event,
-                    session.source_rollout,
-                    session.source_db,
-                    session.updated_at,
-                    now,
-                ],
-            )?;
-        }
-        tx.commit()?;
-        Ok(())
-    }
-
-    pub fn remember_session_origins(
-        &self,
-        codex_home: &Path,
-        thread_ids: &[String],
-        provider: &str,
-    ) -> anyhow::Result<usize> {
-        let mut db = self.connect()?;
-        let tx = db.transaction()?;
-        let mut inserted = 0;
-        for id in thread_ids {
-            inserted += tx.execute(
-                "INSERT OR IGNORE INTO session_provider_origins(
-                   codex_home,thread_id,original_provider,captured_at
-                 ) VALUES(?1,?2,?3,strftime('%s','now'))",
-                params![codex_home.display().to_string(), id, provider],
-            )?;
-        }
-        tx.commit()?;
-        Ok(inserted)
-    }
-
-    #[allow(dead_code)]
-    pub fn session_origins(
-        &self,
-        codex_home: &Path,
-        provider: &str,
-    ) -> anyhow::Result<Vec<String>> {
-        let db = self.connect()?;
-        let mut statement = db.prepare(
-            "SELECT thread_id FROM session_provider_origins
-             WHERE codex_home=?1 AND original_provider=?2 ORDER BY captured_at,thread_id",
-        )?;
-        let rows = statement
-            .query_map(params![codex_home.display().to_string(), provider], |row| {
-                row.get(0)
-            })?;
-        Ok(rows.collect::<rusqlite::Result<_>>()?)
-    }
-
-    pub fn forget_session_origins(
-        &self,
-        codex_home: &Path,
-        provider: &str,
-    ) -> anyhow::Result<usize> {
-        Ok(self.connect()?.execute(
-            "DELETE FROM session_provider_origins WHERE codex_home=?1 AND original_provider=?2",
-            params![codex_home.display().to_string(), provider],
-        )?)
-    }
-
-    pub fn unified_sessions(&self, query: Option<&str>) -> anyhow::Result<Vec<SessionSummary>> {
-        let needle = format!("%{}%", query.unwrap_or_default().to_lowercase());
-        let db = self.connect()?;
-        let mut statement = db.prepare(
-            "SELECT identity,thread_id,title,effective_provider,cwd,archived,updated_at,source_db,
-                    source_rollout,original_provider,has_user_event
-             FROM unified_sessions
-             WHERE ?1='%%' OR lower(thread_id || ' ' || title || ' ' || effective_provider || ' ' || cwd) LIKE ?1
-             ORDER BY updated_at DESC LIMIT 1000",
-        )?;
-        let rows = statement.query_map([needle], |row| {
-            Ok(SessionSummary {
-                identity: row.get(0)?,
-                id: row.get(1)?,
-                title: row.get(2)?,
-                provider: row.get(3)?,
-                cwd: row.get(4)?,
-                archived: row.get::<_, i64>(5)? != 0,
-                updated_at: row.get(6)?,
-                source_db: row.get(7)?,
-                source_rollout: row.get(8)?,
-                original_provider: row.get(9)?,
-                has_user_event: row.get::<_, i64>(10)? != 0,
-            })
-        })?;
-        Ok(rows.collect::<rusqlite::Result<_>>()?)
-    }
 }
 
 fn add_column(db: &Connection, table: &str, column: &str, definition: &str) -> anyhow::Result<()> {
@@ -659,7 +554,7 @@ mod tests {
     }
 
     #[test]
-    fn stores_auth_accounts_and_rebuildable_session_index() {
+    fn stores_auth_accounts_without_copying_session_history() {
         let temp = tempdir().unwrap();
         let store = Store {
             path: temp.path().join("store.db"),
@@ -670,11 +565,6 @@ mod tests {
                id TEXT PRIMARY KEY,service TEXT,name TEXT,login TEXT,email TEXT,
                credential_json TEXT,config_snapshot TEXT,scopes_json TEXT,expires_at INTEGER,
                active INTEGER,created_at INTEGER,updated_at INTEGER
-             );
-             CREATE TABLE unified_sessions(
-               identity TEXT PRIMARY KEY,thread_id TEXT,host_id TEXT,title TEXT,cwd TEXT,
-               original_provider TEXT,effective_provider TEXT,archived INTEGER,has_user_event INTEGER,
-               source_rollout TEXT,source_db TEXT,created_at INTEGER,updated_at INTEGER,last_indexed_at INTEGER
              );",
         )
         .unwrap();
@@ -696,24 +586,15 @@ mod tests {
         store.save_auth_account(&account).unwrap();
         assert_eq!(store.auth_accounts().unwrap()[0].email, account.email);
 
-        let session = SessionSummary {
-            identity: "rollout:file".into(),
-            id: "thread-1".into(),
-            title: "Conversation".into(),
-            provider: "custom".into(),
-            cwd: "C:/work".into(),
-            archived: false,
-            updated_at: 2,
-            source_db: "state.db".into(),
-            source_rollout: Some("rollout.jsonl".into()),
-            original_provider: "openai".into(),
-            has_user_event: true,
-        };
-        store.replace_unified_sessions(&[session]).unwrap();
-        let indexed = store.unified_sessions(Some("conversation")).unwrap();
-        assert_eq!(indexed.len(), 1);
-        assert_eq!(indexed[0].original_provider, "openai");
-        assert!(indexed[0].has_user_event);
+        let db = store.connect().unwrap();
+        let copied_sessions: i64 = db
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='unified_sessions'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(copied_sessions, 0);
     }
 
     #[test]

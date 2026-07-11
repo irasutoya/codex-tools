@@ -3,6 +3,20 @@ export type Page =
 
 export type Protocol = "responses" | "chat_completions"
 
+export type CodexChatReasoningConfig = {
+  supportsThinking?: boolean
+  supportsEffort?: boolean
+  thinkingParam?: string
+  effortParam?: string
+  effortValueMode?: string
+  outputFormat?: string
+}
+
+export type FetchedModel = {
+  id: string
+  ownedBy?: string
+}
+
 export type Provider = {
   id: string
   name: string
@@ -10,6 +24,7 @@ export type Provider = {
   baseUrl: string
   defaultModel: string
   models: string[]
+  codexChatReasoning?: CodexChatReasoningConfig
   headers: Record<string, string>
   timeoutSecs: number
   contextWindow?: number

@@ -1,10 +1,10 @@
-use crate::{codex, models::SessionSummary, storage::Store};
+use crate::{codex, models::SessionSummary};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub fn rebuild(store: &Store) -> anyhow::Result<Vec<SessionSummary>> {
+pub fn rebuild() -> anyhow::Result<Vec<SessionSummary>> {
     let mut by_thread = HashMap::<String, SessionSummary>::new();
     let indexed_titles = read_indexed_titles(&codex::home().join("session_index.jsonl"));
     for session in codex::list_sessions(None)? {
@@ -84,7 +84,6 @@ pub fn rebuild(store: &Store) -> anyhow::Result<Vec<SessionSummary>> {
     }
     let mut sessions = by_thread.into_values().collect::<Vec<_>>();
     sessions.sort_by_key(|session| std::cmp::Reverse(session.updated_at));
-    store.replace_unified_sessions(&sessions)?;
     Ok(sessions)
 }
 

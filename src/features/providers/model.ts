@@ -7,6 +7,7 @@ export const blankProvider: Provider = {
   baseUrl: "https://api.openai.com/v1",
   defaultModel: "gpt-5",
   models: [],
+  codexChatReasoning: undefined,
   headers: {},
   timeoutSecs: 30,
   enabled: true,

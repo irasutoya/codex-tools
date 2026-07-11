@@ -1,5 +1,6 @@
 mod auth_center;
 mod codex;
+mod model_fetch;
 mod models;
 mod protocol_proxy;
 mod provider_sync;
@@ -22,6 +23,40 @@ fn show_main_window(app: &tauri::AppHandle) {
         let _ = window.unminimize();
         let _ = window.show();
         let _ = window.set_focus();
+    }
+}
+
+async fn restore_active_proxy(app: tauri::AppHandle) {
+    let store = app.state::<Store>();
+    let proxy = app.state::<ProxyManager>();
+    let Ok((Some(provider_id), Some(account_id), _)) = store.active_state() else {
+        return;
+    };
+    let Ok(provider) = store.provider(&provider_id) else {
+        return;
+    };
+    if provider.protocol != ProviderProtocol::ChatCompletions {
+        return;
+    }
+    let Ok(account) = store.account(&account_id) else {
+        return;
+    };
+    let endpoint = match proxy.prepare(&provider, &account).await {
+        Ok(endpoint) => endpoint,
+        Err(_) => return,
+    };
+    let backup = match codex::apply_provider_with_proxy(&provider, &account, Some(&endpoint)) {
+        Ok(backup) => backup,
+        Err(_) => {
+            proxy.abort().await;
+            return;
+        }
+    };
+    if proxy.commit().await.is_ok() {
+        codex::discard_provider_backup(&backup);
+    } else {
+        let _ = codex::restore_provider_backup(&backup);
+        proxy.abort().await;
     }
 }
 
@@ -54,6 +89,20 @@ fn save_provider(
 fn delete_provider(store: State<Store>, id: String) -> Result<(), AppError> {
     store.delete_provider(&id)?;
     Ok(())
+}
+
+#[tauri::command]
+async fn fetch_provider_models(
+    store: State<'_, Store>,
+    provider: ProviderProfile,
+) -> Result<Vec<FetchedModel>, AppError> {
+    let accounts = store.accounts(Some(&provider.id))?;
+    let account = accounts
+        .iter()
+        .find(|account| account.active)
+        .or_else(|| accounts.first())
+        .ok_or_else(|| AppError::InvalidConfig("请先为 Provider 添加 API 账号".into()))?;
+    model_fetch::fetch_models(&provider, account).await
 }
 
 #[tauri::command]
@@ -174,18 +223,6 @@ async fn activate_provider(
     }
     let _ = force;
     let previous = store.active_state()?;
-    let official_threads = if codex::is_official_mode() {
-        session_index::rebuild(&store)?
-            .into_iter()
-            .filter(|session| session.provider == "openai" || session.original_provider == "openai")
-            .map(|session| session.id)
-            .collect::<Vec<_>>()
-    } else {
-        Vec::new()
-    };
-    if !official_threads.is_empty() {
-        store.remember_session_origins(&codex::home(), &official_threads, "openai")?;
-    }
     let endpoint = if provider.protocol == ProviderProtocol::ChatCompletions {
         Some(proxy.prepare(&provider, &account).await?)
     } else {
@@ -231,6 +268,7 @@ async fn activate_provider(
     } else {
         proxy.stop().await;
     }
+    codex::discard_provider_backup(&backup);
     Ok(result)
 }
 
@@ -257,12 +295,22 @@ fn repair_codex_data(operation_id: String) -> Result<RepairResult, AppError> {
 }
 
 #[tauri::command]
-fn list_sessions(
-    store: State<Store>,
-    query: Option<String>,
-) -> Result<Vec<SessionSummary>, AppError> {
-    session_index::rebuild(&store)?;
-    store.unified_sessions(query.as_deref()).map_err(Into::into)
+fn list_sessions(query: Option<String>) -> Result<Vec<SessionSummary>, AppError> {
+    let query = query.unwrap_or_default().to_lowercase();
+    let sessions = session_index::rebuild()?
+        .into_iter()
+        .filter(|session| {
+            query.is_empty()
+                || format!(
+                    "{} {} {} {}",
+                    session.id, session.title, session.provider, session.cwd
+                )
+                .to_lowercase()
+                .contains(&query)
+        })
+        .take(1000)
+        .collect();
+    Ok(sessions)
 }
 
 #[tauri::command]
@@ -309,14 +357,11 @@ async fn activate_openai_account(
             ))),
         };
     }
-    store.forget_session_origins(&codex::home(), "openai")?;
     proxy.stop().await;
     result
         .warnings
         .push("已恢复官方认证，并将全部会话历史统一修复为 OpenAI Provider。".into());
-    if result.backup_path.is_empty() {
-        result.backup_path = backup;
-    }
+    codex::discard_provider_backup(&backup);
     Ok(result)
 }
 
@@ -377,7 +422,7 @@ fn export_sessions(ids: Vec<String>, target: String) -> Result<String, AppError>
 fn get_dashboard(store: State<Store>) -> Result<Dashboard, AppError> {
     let providers = store.providers()?;
     let scan = codex::scan();
-    let sessions = session_index::rebuild(&store).unwrap_or_default();
+    let sessions = session_index::rebuild().unwrap_or_default();
     Ok(Dashboard {
         provider_count: providers.len() as u64,
         active_provider: providers.into_iter().find(|p| p.active).map(|p| p.name),
@@ -446,6 +491,7 @@ pub fn run() {
                 tray = tray.icon(icon);
             }
             tray.build(app)?;
+            tauri::async_runtime::spawn(restore_active_proxy(app.handle().clone()));
             Ok(())
         })
         .on_window_event(|window, event| match event {
@@ -463,6 +509,7 @@ pub fn run() {
             list_providers,
             save_provider,
             delete_provider,
+            fetch_provider_models,
             list_provider_accounts,
             save_provider_account,
             delete_provider_account,

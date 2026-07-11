@@ -94,6 +94,7 @@ import {
   TableRow,
 } from "@/components/ui/table"
 import { Textarea } from "@/components/ui/textarea"
+import { Switch } from "@/components/ui/switch"
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group"
 import { TooltipProvider } from "@/components/ui/tooltip"
 import { Toaster } from "@/components/ui/sonner"
@@ -110,6 +111,7 @@ import type {
   Account,
   AuthAccount,
   Dashboard,
+  FetchedModel,
   Page,
   Protocol,
   Provider,
@@ -357,7 +359,8 @@ export default function App() {
               <KeyRound />
               <AlertTitle>明文凭据</AlertTitle>
               <AlertDescription>
-                API Key 和官方登录快照保存在本机数据库中，请勿分享完整备份。
+                API Key
+                和官方登录快照以明文保存在本机数据库中，请勿分享数据库文件。
               </AlertDescription>
             </Alert>
           </SidebarFooter>
@@ -446,9 +449,9 @@ export default function App() {
                 切换到“{activating?.account.name}”？
               </AlertDialogTitle>
               <AlertDialogDescription>
-                将先备份 Codex
-                配置和会话数据，再切换账号并把已识别的历史记录统一到 custom
-                会话桶。任何一步失败都会回滚。
+                切换期间会创建临时回滚副本，再把已识别的历史记录统一到目标
+                Provider。成功或回滚后副本会立即删除，Codex Tools
+                不长期保存聊天记录。
               </AlertDialogDescription>
             </AlertDialogHeader>
             <AlertDialogFooter>
@@ -1236,7 +1239,7 @@ function RepairPage({
       <CardFooter>
         <Button disabled={busy || !scan?.canRepair} onClick={onRepair}>
           <Database data-icon="inline-start" />
-          备份并统一历史
+          安全统一历史
         </Button>
       </CardFooter>
     </Card>
@@ -1263,9 +1266,10 @@ function SettingsPage({ dashboard }: { dashboard?: Dashboard }) {
           </Field>
           <Field orientation="horizontal">
             <div>
-              <FieldLabel>修复前完整备份</FieldLabel>
+              <FieldLabel>操作期临时回滚</FieldLabel>
               <FieldDescription>
-                包含配置、rollout、SQLite 主库及 WAL/SHM。
+                修改期间临时复制 rollout、SQLite 主库及
+                WAL/SHM；完成后立即删除。
               </FieldDescription>
             </div>
             <Badge variant="secondary">已启用</Badge>
@@ -1294,6 +1298,25 @@ function ProviderDialog({
   onChange: (provider?: Provider) => void
   onSave: () => void
 }) {
+  const [fetchingModels, setFetchingModels] = useState(false)
+  const fetchModels = async () => {
+    if (!value?.id) {
+      toast.error("请先保存 Provider 并添加 API 账号，再获取模型。")
+      return
+    }
+    setFetchingModels(true)
+    try {
+      const models = await call<FetchedModel[]>("fetch_provider_models", {
+        provider: value,
+      })
+      onChange({ ...value, models: models.map((model) => model.id) })
+      toast.success(`已获取 ${models.length} 个模型，默认全部选中。`)
+    } catch (error) {
+      toast.error(String(error))
+    } finally {
+      setFetchingModels(false)
+    }
+  }
   return (
     <Dialog open={!!value} onOpenChange={(open) => !open && onChange()}>
       <DialogContent className="max-h-[90vh] overflow-y-auto">
@@ -1352,14 +1375,144 @@ function ProviderDialog({
             </Field>
             <Field>
               <FieldLabel>可选模型</FieldLabel>
-              <Input
-                value={value.models.join(", ")}
-                onChange={(event) =>
-                  onChange({ ...value, models: commaList(event.target.value) })
-                }
-              />
-              <FieldDescription>用英文逗号分隔。</FieldDescription>
+              <InputGroup>
+                <InputGroupInput
+                  value={value.models.join(", ")}
+                  onChange={(event) =>
+                    onChange({
+                      ...value,
+                      models: commaList(event.target.value),
+                    })
+                  }
+                  placeholder="留空则不启用自定义模型目录"
+                />
+                <InputGroupAddon align="inline-end">
+                  <InputGroupButton
+                    aria-label="从 Provider 获取全部模型"
+                    title="获取全部模型"
+                    disabled={fetchingModels || !value.id}
+                    onClick={() => void fetchModels()}
+                  >
+                    <RefreshCw data-icon="inline-start" />
+                    {fetchingModels ? "获取中" : "获取模型"}
+                  </InputGroupButton>
+                </InputGroupAddon>
+              </InputGroup>
+              <FieldDescription>
+                实时请求 Provider 的
+                /models，成功后默认填入全部模型；留空时不生成 Codex
+                自定义模型目录。
+              </FieldDescription>
             </Field>
+            {value.protocol === "chat_completions" && (
+              <Field>
+                <div className="flex items-center justify-between gap-3">
+                  <div className="flex flex-col gap-1">
+                    <FieldLabel htmlFor="reasoning-override">
+                      自定义推理映射
+                    </FieldLabel>
+                    <FieldDescription>
+                      默认按 CC-Switch 规则根据
+                      Provider、地址和当前模型实时识别。
+                    </FieldDescription>
+                  </div>
+                  <Switch
+                    id="reasoning-override"
+                    checked={!!value.codexChatReasoning}
+                    onCheckedChange={(checked) =>
+                      onChange({
+                        ...value,
+                        codexChatReasoning: checked
+                          ? {
+                              supportsThinking: true,
+                              supportsEffort: true,
+                              thinkingParam: "thinking",
+                              effortParam: "reasoning_effort",
+                              effortValueMode: "standard",
+                              outputFormat: "reasoning_content",
+                            }
+                          : undefined,
+                      })
+                    }
+                  />
+                </div>
+              </Field>
+            )}
+            {value.protocol === "chat_completions" &&
+              value.codexChatReasoning && (
+                <FieldGroup>
+                  <Field orientation="horizontal">
+                    <FieldLabel htmlFor="supports-thinking">
+                      发送思考开关
+                    </FieldLabel>
+                    <Switch
+                      id="supports-thinking"
+                      checked={
+                        value.codexChatReasoning.supportsThinking ?? false
+                      }
+                      onCheckedChange={(checked) =>
+                        onChange({
+                          ...value,
+                          codexChatReasoning: {
+                            ...value.codexChatReasoning,
+                            supportsThinking: checked,
+                          },
+                        })
+                      }
+                    />
+                  </Field>
+                  <Field orientation="horizontal">
+                    <FieldLabel htmlFor="supports-effort">
+                      发送推理强度
+                    </FieldLabel>
+                    <Switch
+                      id="supports-effort"
+                      checked={value.codexChatReasoning.supportsEffort ?? false}
+                      onCheckedChange={(checked) =>
+                        onChange({
+                          ...value,
+                          codexChatReasoning: {
+                            ...value.codexChatReasoning,
+                            supportsEffort: checked,
+                          },
+                        })
+                      }
+                    />
+                  </Field>
+                  <Field>
+                    <FieldLabel>思考参数</FieldLabel>
+                    <Input
+                      value={value.codexChatReasoning.thinkingParam ?? ""}
+                      placeholder="thinking / enable_thinking / reasoning_split"
+                      onChange={(event) =>
+                        onChange({
+                          ...value,
+                          codexChatReasoning: {
+                            ...value.codexChatReasoning,
+                            thinkingParam: event.target.value || undefined,
+                          },
+                        })
+                      }
+                    />
+                  </Field>
+                  <Field>
+                    <FieldLabel>推理强度参数</FieldLabel>
+                    <Input
+                      value={value.codexChatReasoning.effortParam ?? ""}
+                      placeholder="reasoning_effort / reasoning.effort"
+                      onChange={(event) =>
+                        onChange({
+                          ...value,
+                          codexChatReasoning: {
+                            ...value.codexChatReasoning,
+                            effortParam: event.target.value || undefined,
+                          },
+                        })
+                      }
+                    />
+                  </Field>
+                </FieldGroup>
+              )}
             <Field>
               <FieldLabel>上下文窗口</FieldLabel>
               <Input

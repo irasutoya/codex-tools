@@ -1,6 +1,5 @@
 use crate::models::*;
 use crate::protocol_proxy::ProxyEndpoint;
-use chrono::Utc;
 use rusqlite::{Connection, params};
 use std::{
     fs,
@@ -261,14 +260,9 @@ fn replace_file(source: &Path, target: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 fn backup(label: &str) -> anyhow::Result<PathBuf> {
-    let root = home()
-        .join("backups_state")
+    let root = std::env::temp_dir()
         .join("codex-tools")
-        .join(format!(
-            "{}-{label}-{}",
-            Utc::now().format("%Y%m%d%H%M%S"),
-            uuid::Uuid::new_v4().simple()
-        ));
+        .join(format!("{label}-{}", uuid::Uuid::new_v4().simple()));
     fs::create_dir_all(&root)?;
     for name in [
         "config.toml",
@@ -280,11 +274,6 @@ fn backup(label: &str) -> anyhow::Result<PathBuf> {
         if src.exists() {
             fs::copy(src, root.join(name))?;
         }
-    }
-    for db in databases() {
-        let dest = root.join("db").join(db.file_name().unwrap());
-        fs::create_dir_all(dest.parent().unwrap())?;
-        fs::copy(db, dest)?;
     }
     Ok(root)
 }
@@ -333,15 +322,21 @@ pub fn apply_provider_with_proxy(
     };
     let config = build_managed_config(p, account, base_url, &token)?;
     let auth = build_managed_auth(&token);
-    let catalog = build_model_catalog(p);
+    let catalog = (!p.models.is_empty()).then(|| build_model_catalog(p));
     let update = (|| -> Result<(), AppError> {
         fs::create_dir_all(home()).map_err(|error| AppError::Internal(error.to_string()))?;
-        atomic_write(
-            &home().join(MODEL_CATALOG_FILENAME),
-            &serde_json::to_vec_pretty(&catalog)
-                .map_err(|error| AppError::Internal(error.to_string()))?,
-        )
-        .map_err(|error| AppError::Internal(error.to_string()))?;
+        let catalog_path = home().join(MODEL_CATALOG_FILENAME);
+        if let Some(catalog) = catalog {
+            atomic_write(
+                &catalog_path,
+                &serde_json::to_vec_pretty(&catalog)
+                    .map_err(|error| AppError::Internal(error.to_string()))?,
+            )
+            .map_err(|error| AppError::Internal(error.to_string()))?;
+        } else if catalog_path.exists() {
+            fs::remove_file(&catalog_path)
+                .map_err(|error| AppError::Internal(error.to_string()))?;
+        }
         atomic_write(
             &home().join("auth.json"),
             &serde_json::to_vec_pretty(&auth)
@@ -372,7 +367,9 @@ fn build_managed_config(
     let mut doc = DocumentMut::new();
     doc["model_provider"] = value(MANAGED_PROVIDER_ID);
     doc["model"] = value(provider.default_model.trim());
-    doc["model_catalog_json"] = value(MODEL_CATALOG_FILENAME);
+    if !provider.models.is_empty() {
+        doc["model_catalog_json"] = value(MODEL_CATALOG_FILENAME);
+    }
     if let Some(context_window) = provider.context_window.filter(|value| *value > 0) {
         doc["model_context_window"] = value(
             i64::try_from(context_window)
@@ -436,11 +433,27 @@ fn build_model_catalog(provider: &ProviderProfile) -> serde_json::Value {
         .context_window
         .filter(|value| *value > 0)
         .unwrap_or(128_000);
-    let mut models = vec![provider.default_model.trim().to_string()];
-    models.extend(provider.models.iter().map(|model| model.trim().to_string()));
+    let models = provider.models.iter().map(|model| model.trim().to_string());
+    let (default_reasoning_level, supported_reasoning_levels) = match provider.protocol {
+        ProviderProtocol::ChatCompletions => (
+            "medium",
+            serde_json::json!([
+                {"effort":"low","description":"Fast responses with lighter reasoning"},
+                {"effort":"medium","description":"Balances speed and reasoning depth"},
+                {"effort":"high","description":"Greater reasoning depth for complex problems"},
+                {"effort":"xhigh","description":"Extra high reasoning depth"}
+            ]),
+        ),
+        ProviderProtocol::Responses => (
+            "high",
+            serde_json::json!([
+                {"effort":"none","description":"Disable Thinking"},
+                {"effort":"high","description":"Enable Thinking"}
+            ]),
+        ),
+    };
     let mut seen = std::collections::HashSet::new();
     let models = models
-        .into_iter()
         .filter(|model| !model.is_empty() && seen.insert(model.clone()))
         .enumerate()
         .map(|(priority, model)| {
@@ -449,18 +462,13 @@ fn build_model_catalog(provider: &ProviderProfile) -> serde_json::Value {
                 "display_name": model,
                 "description": format!("{} · {}", provider.name.trim(), model),
                 "base_instructions": "You are Codex, a coding agent. You and the user share the same workspace and collaborate to achieve the user's goals.",
-                "default_reasoning_level": "none",
-                "supported_reasoning_levels": [
-                    {
-                        "effort": "none",
-                        "description": "Disable Thinking"
-                    }
-                ],
+                "default_reasoning_level": default_reasoning_level,
+                "supported_reasoning_levels": supported_reasoning_levels,
                 "shell_type": "shell_command",
                 "visibility": "list",
                 "supported_in_api": true,
                 "priority": priority,
-                "supports_reasoning_summaries": false,
+                "supports_reasoning_summaries": true,
                 "default_reasoning_summary": "none",
                 "support_verbosity": false,
                 "truncation_policy": {
@@ -479,22 +487,6 @@ fn build_model_catalog(provider: &ProviderProfile) -> serde_json::Value {
         })
         .collect::<Vec<_>>();
     serde_json::json!({ "models": models })
-}
-
-pub fn capture_official_config() -> String {
-    fs::read_to_string(home().join("config.toml")).unwrap_or_default()
-}
-
-pub fn is_official_mode() -> bool {
-    let config = capture_official_config();
-    let Ok(doc) = config.parse::<DocumentMut>() else {
-        return false;
-    };
-    doc.get("model_provider")
-        .and_then(Item::as_str)
-        .is_none_or(|provider| {
-            provider != MANAGED_PROVIDER_ID && !provider.starts_with("codex_tools_")
-        })
 }
 
 pub fn restore_official_snapshot(
@@ -540,7 +532,16 @@ pub fn restore_provider_backup(backup_path: &str) -> Result<(), AppError> {
             }
         }
     }
+    discard_provider_backup(backup_path.to_string_lossy().as_ref());
     Ok(())
+}
+
+pub fn discard_provider_backup(backup_path: &str) {
+    let path = Path::new(backup_path);
+    let _ = fs::remove_dir_all(path);
+    if let Some(parent) = path.parent() {
+        let _ = fs::remove_dir(parent);
+    }
 }
 
 pub fn repair(provider: &str) -> Result<RepairResult, AppError> {
@@ -554,6 +555,13 @@ pub fn restore_sessions_exact(
     crate::provider_sync::restore_exact(&home(), provider, thread_ids)
 }
 pub fn delete_sessions(ids: &[String]) -> anyhow::Result<usize> {
+    let sessions = crate::session_index::rebuild()?;
+    let rollout_paths = sessions
+        .iter()
+        .filter(|session| ids.contains(&session.id))
+        .filter_map(|session| session.source_rollout.as_deref())
+        .map(PathBuf::from)
+        .collect::<std::collections::HashSet<_>>();
     let mut n = 0;
     for p in databases() {
         let mut db = Connection::open(p)?;
@@ -572,6 +580,12 @@ pub fn delete_sessions(ids: &[String]) -> anyhow::Result<usize> {
             )?
         }
         tx.commit()?
+    }
+    for path in rollout_paths {
+        if path.exists() {
+            fs::remove_file(path)?;
+            n += 1;
+        }
     }
     Ok(n)
 }
@@ -635,6 +649,7 @@ mod tests {
             base_url: "https://example.test/v1".into(),
             default_model: "model-a".into(),
             models: vec!["model-b".into(), "model-a".into(), " ".into()],
+            codex_chat_reasoning: None,
             headers: json!({"X-Provider": "provider", "X-Override": "provider"}),
             timeout_secs: 30,
             context_window: Some(64_000),
@@ -697,12 +712,12 @@ mod tests {
     }
 
     #[test]
-    fn model_catalog_contains_default_and_deduplicated_models() {
+    fn model_catalog_preserves_selected_model_order_and_deduplicates() {
         let catalog = build_model_catalog(&test_provider());
         let models = catalog["models"].as_array().unwrap();
         assert_eq!(models.len(), 2);
-        assert_eq!(models[0]["slug"], "model-a");
-        assert_eq!(models[1]["slug"], "model-b");
+        assert_eq!(models[0]["slug"], "model-b");
+        assert_eq!(models[1]["slug"], "model-a");
         assert_eq!(models[0]["context_window"], 64_000);
         assert!(
             models[0]["base_instructions"]
