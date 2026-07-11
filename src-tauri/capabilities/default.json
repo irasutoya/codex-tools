@@ -6,6 +6,9 @@
   "permissions": [
     "core:default",
     "dialog:default",
-    "opener:allow-open-url"
+    {
+      "identifier": "opener:allow-open-url",
+      "allow": [{ "url": "https://auth.openai.com/codex/device" }]
+    }
   ]
 }
