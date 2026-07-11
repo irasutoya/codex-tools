@@ -1,10 +1,13 @@
 import { useCallback, useEffect, useMemo, useState } from "react"
 import { save } from "@tauri-apps/plugin-dialog"
+import { openUrl } from "@tauri-apps/plugin-opener"
 import {
   Activity,
+  Copy,
   Database,
   Eye,
   EyeOff,
+  ExternalLink,
   FileArchive,
   Gauge,
   KeyRound,
@@ -638,6 +641,25 @@ function ProvidersPage({
     }
   }
 
+  const copyDeviceCode = async () => {
+    if (!device) return
+    try {
+      await navigator.clipboard.writeText(device.userCode)
+      toast.success("授权码已复制")
+    } catch (error) {
+      toast.error(`复制授权码失败：${String(error)}`)
+    }
+  }
+
+  const openDeviceAuthorization = async () => {
+    if (!device) return
+    try {
+      await openUrl(device.verificationUri)
+    } catch (error) {
+      toast.error(`打开默认浏览器失败：${String(error)}`)
+    }
+  }
+
   useEffect(() => {
     if (!device) return
     let stopped = false
@@ -756,18 +778,38 @@ function ProvidersPage({
           {device && (
             <Alert>
               <KeyRound />
-              <AlertTitle>授权码：{device.userCode}</AlertTitle>
-              <AlertDescription>
-                打开{" "}
-                <a
-                  className="underline"
-                  href={device.verificationUri}
-                  target="_blank"
-                  rel="noreferrer"
+              <AlertTitle>在浏览器中完成授权</AlertTitle>
+              <AlertDescription className="flex flex-col gap-3">
+                <span>
+                  复制下面的授权码，然后使用电脑默认浏览器打开 OpenAI
+                  设备授权页面。Codex Tools 会自动等待登录完成。
+                </span>
+                <InputGroup>
+                  <InputGroupInput
+                    aria-label="OpenAI 设备授权码"
+                    readOnly
+                    value={device.userCode}
+                    onFocus={(event) => event.currentTarget.select()}
+                  />
+                  <InputGroupAddon align="inline-end">
+                    <InputGroupButton
+                      aria-label="复制授权码"
+                      title="复制授权码"
+                      onClick={() => void copyDeviceCode()}
+                    >
+                      <Copy />
+                    </InputGroupButton>
+                  </InputGroupAddon>
+                </InputGroup>
+                <Button
+                  type="button"
+                  size="sm"
+                  className="self-start"
+                  onClick={() => void openDeviceAuthorization()}
                 >
-                  OpenAI 设备授权页面
-                </a>
-                ，输入授权码。Codex Tools 会自动等待登录完成。
+                  <ExternalLink data-icon="inline-start" />
+                  用默认浏览器打开授权页面
+                </Button>
               </AlertDescription>
             </Alert>
           )}
