@@ -15,6 +15,7 @@ export type CodexChatReasoningConfig = {
 export type FetchedModel = {
   id: string
   ownedBy?: string
+  [key: string]: unknown
 }
 
 export type Provider = {
@@ -22,8 +23,8 @@ export type Provider = {
   name: string
   protocol: Protocol
   baseUrl: string
-  defaultModel: string
   models: string[]
+  modelMetadata: FetchedModel[]
   codexChatReasoning?: CodexChatReasoningConfig
   headers: Record<string, string>
   timeoutSecs: number
@@ -72,6 +73,13 @@ export type Session = {
   hasUserEvent: boolean
 }
 
+export type PageResult<T> = {
+  items: T[]
+  total: number
+  page: number
+  pageSize: number
+}
+
 export type AuthAccount = {
   id: string
   service: "open_ai"
@@ -94,6 +102,7 @@ export type OpenAiDeviceAuthorization = {
 }
 
 export type RouteConsole = {
+  settings: RouteSettings
   running: boolean
   baseUrl?: string
   upstreamUrl?: string
@@ -115,6 +124,15 @@ export type RouteConsole = {
     latencyMs: number
     message?: string
   }[]
+  logTotal: number
+  logPage: number
+  logPageSize: number
+}
+
+export type RouteSettings = {
+  enabled: boolean
+  listenAddress: string
+  port: number
 }
 
 export type RepairScan = {

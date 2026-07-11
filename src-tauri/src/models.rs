@@ -7,9 +7,10 @@ pub struct ProviderProfile {
     pub name: String,
     pub protocol: ProviderProtocol,
     pub base_url: String,
-    pub default_model: String,
     #[serde(default)]
     pub models: Vec<String>,
+    #[serde(default)]
+    pub model_metadata: Vec<FetchedModel>,
     #[serde(default)]
     pub codex_chat_reasoning: Option<CodexChatReasoningConfig>,
     #[serde(default)]
@@ -51,7 +52,10 @@ pub struct CodexChatReasoningConfig {
 #[serde(rename_all = "camelCase")]
 pub struct FetchedModel {
     pub id: String,
+    #[serde(default)]
     pub owned_by: Option<String>,
+    #[serde(flatten)]
+    pub metadata: serde_json::Map<String, serde_json::Value>,
 }
 
 fn default_timeout() -> u64 {
@@ -143,6 +147,15 @@ pub struct SessionSummary {
     pub has_user_event: bool,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PageResult<T> {
+    pub items: Vec<T>,
+    pub total: usize,
+    pub page: usize,
+    pub page_size: usize,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub enum AuthService {
@@ -202,9 +215,28 @@ pub struct RouteLogEntry {
     pub message: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RouteSettings {
+    pub enabled: bool,
+    pub listen_address: String,
+    pub port: u16,
+}
+
+impl Default for RouteSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            listen_address: "127.0.0.1".into(),
+            port: 0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct RouteConsoleSnapshot {
+    pub settings: RouteSettings,
     pub running: bool,
     pub base_url: Option<String>,
     pub upstream_url: Option<String>,
@@ -218,6 +250,9 @@ pub struct RouteConsoleSnapshot {
     pub active_requests: u64,
     pub last_latency_ms: Option<u64>,
     pub logs: Vec<RouteLogEntry>,
+    pub log_total: usize,
+    pub log_page: usize,
+    pub log_page_size: usize,
 }
 
 #[derive(Debug, Serialize)]

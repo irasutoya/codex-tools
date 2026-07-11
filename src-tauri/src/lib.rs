@@ -26,36 +26,38 @@ fn show_main_window(app: &tauri::AppHandle) {
     }
 }
 
-async fn restore_active_proxy(app: tauri::AppHandle) {
+async fn start_configured_route(app: tauri::AppHandle) {
     let store = app.state::<Store>();
     let proxy = app.state::<ProxyManager>();
-    let Ok((Some(provider_id), Some(account_id), _)) = store.active_state() else {
+    let Ok(settings) = store.route_settings() else {
         return;
     };
-    let Ok(provider) = store.provider(&provider_id) else {
-        return;
-    };
-    if provider.protocol != ProviderProtocol::ChatCompletions {
+    if !settings.enabled {
         return;
     }
-    let Ok(account) = store.account(&account_id) else {
+    let Ok(providers) = store.providers() else {
         return;
     };
-    let endpoint = match proxy.prepare(&provider, &account).await {
-        Ok(endpoint) => endpoint,
+    let Some(provider) = providers.into_iter().find(|provider| {
+        provider.enabled && provider.protocol == ProviderProtocol::ChatCompletions
+    }) else {
+        return;
+    };
+    let Ok(accounts) = store.accounts(Some(&provider.id)) else {
+        return;
+    };
+    let Some(account) = accounts
+        .into_iter()
+        .find(|account| account.active)
+        .or_else(|| store.accounts(Some(&provider.id)).ok()?.into_iter().next())
+    else {
+        return;
+    };
+    match proxy.prepare(&provider, &account, &settings).await {
+        Ok(_) => {}
         Err(_) => return,
     };
-    let backup = match codex::apply_provider_with_proxy(&provider, &account, Some(&endpoint)) {
-        Ok(backup) => backup,
-        Err(_) => {
-            proxy.abort().await;
-            return;
-        }
-    };
-    if proxy.commit().await.is_ok() {
-        codex::discard_provider_backup(&backup);
-    } else {
-        let _ = codex::restore_provider_backup(&backup);
+    if proxy.commit().await.is_err() {
         proxy.abort().await;
     }
 }
@@ -73,14 +75,15 @@ fn save_provider(
     if provider.id.is_empty() {
         provider.id = uuid::Uuid::new_v4().to_string();
     }
-    if provider.name.trim().is_empty()
-        || provider.base_url.trim().is_empty()
-        || provider.default_model.trim().is_empty()
-    {
-        return Err(AppError::InvalidConfig(
-            "名称、Base URL 和默认模型不能为空".into(),
-        ));
+    if provider.name.trim().is_empty() || provider.base_url.trim().is_empty() {
+        return Err(AppError::InvalidConfig("名称和 Base URL 不能为空".into()));
     }
+    provider.model_metadata.retain(|metadata| {
+        provider
+            .models
+            .iter()
+            .any(|model| model.trim() == metadata.id.trim())
+    });
     store.save_provider(&provider)?;
     Ok(provider)
 }
@@ -162,10 +165,14 @@ async fn test_provider(
         "chat/completions"
     };
     let endpoint = format!("{base}/{suffix}");
+    let model = provider
+        .models
+        .first()
+        .ok_or_else(|| AppError::InvalidConfig("请先获取或填写模型列表，再执行连接测试".into()))?;
     let payload = if provider.protocol == ProviderProtocol::Responses {
-        serde_json::json!({"model":provider.default_model,"input":"hi","max_output_tokens":8})
+        serde_json::json!({"model":model,"input":"hi","max_output_tokens":8})
     } else {
-        serde_json::json!({"model":provider.default_model,"messages":[{"role":"user","content":"hi"}],"max_tokens":8})
+        serde_json::json!({"model":model,"messages":[{"role":"user","content":"hi"}],"max_tokens":8})
     };
     let mut request = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(provider.timeout_secs.max(1)))
@@ -224,7 +231,13 @@ async fn activate_provider(
     let _ = force;
     let previous = store.active_state()?;
     let endpoint = if provider.protocol == ProviderProtocol::ChatCompletions {
-        Some(proxy.prepare(&provider, &account).await?)
+        let settings = store.route_settings()?;
+        if !settings.enabled {
+            return Err(AppError::InvalidConfig(
+                "Chat Completions 需要先启用本地路由".into(),
+            ));
+        }
+        Some(proxy.prepare(&provider, &account, &settings).await?)
     } else {
         None
     };
@@ -265,8 +278,6 @@ async fn activate_provider(
     };
     if endpoint.is_some() {
         proxy.commit().await?;
-    } else {
-        proxy.stop().await;
     }
     codex::discard_provider_backup(&backup);
     Ok(result)
@@ -295,9 +306,15 @@ fn repair_codex_data(operation_id: String) -> Result<RepairResult, AppError> {
 }
 
 #[tauri::command]
-fn list_sessions(query: Option<String>) -> Result<Vec<SessionSummary>, AppError> {
+fn list_sessions(
+    query: Option<String>,
+    page: Option<usize>,
+    page_size: Option<usize>,
+) -> Result<PageResult<SessionSummary>, AppError> {
+    let page = page.unwrap_or(1).max(1);
+    let page_size = page_size.unwrap_or(25).clamp(1, 100);
     let query = query.unwrap_or_default().to_lowercase();
-    let sessions = session_index::rebuild()?
+    let sessions: Vec<_> = session_index::rebuild()?
         .into_iter()
         .filter(|session| {
             query.is_empty()
@@ -308,9 +325,16 @@ fn list_sessions(query: Option<String>) -> Result<Vec<SessionSummary>, AppError>
                 .to_lowercase()
                 .contains(&query)
         })
-        .take(1000)
         .collect();
-    Ok(sessions)
+    let total = sessions.len();
+    let start = (page - 1).saturating_mul(page_size).min(total);
+    let items = sessions.into_iter().skip(start).take(page_size).collect();
+    Ok(PageResult {
+        items,
+        total,
+        page,
+        page_size,
+    })
 }
 
 #[tauri::command]
@@ -357,7 +381,6 @@ async fn activate_openai_account(
             ))),
         };
     }
-    proxy.stop().await;
     result
         .warnings
         .push("已恢复官方认证，并将全部会话历史统一修复为 OpenAI Provider。".into());
@@ -393,15 +416,49 @@ async fn poll_openai_device_auth(
 
 #[tauri::command]
 async fn get_route_console(
+    store: State<'_, Store>,
     proxy: State<'_, ProxyManager>,
+    page: Option<usize>,
+    page_size: Option<usize>,
 ) -> Result<RouteConsoleSnapshot, AppError> {
-    Ok(proxy.console().await)
+    Ok(proxy
+        .console(
+            store.route_settings()?,
+            page.unwrap_or(1),
+            page_size.unwrap_or(25),
+        )
+        .await)
 }
 
 #[tauri::command]
-async fn stop_local_route(proxy: State<'_, ProxyManager>) -> Result<(), AppError> {
+async fn save_route_settings(
+    app: tauri::AppHandle,
+    store: State<'_, Store>,
+    proxy: State<'_, ProxyManager>,
+    settings: RouteSettings,
+) -> Result<RouteConsoleSnapshot, AppError> {
+    let address = settings
+        .listen_address
+        .trim()
+        .parse::<std::net::IpAddr>()
+        .map_err(|_| AppError::InvalidConfig("监听地址必须是有效的 IP 地址".into()))?;
+    if !address.is_loopback() {
+        return Err(AppError::InvalidConfig(
+            "为避免明文密钥暴露，本地路由仅允许监听回环地址".into(),
+        ));
+    }
+    let settings = RouteSettings {
+        listen_address: address.to_string(),
+        ..settings
+    };
+    store.save_route_settings(&settings)?;
     proxy.stop().await;
-    Ok(())
+    if settings.enabled {
+        start_configured_route(app.clone()).await;
+    }
+    let store = app.state::<Store>();
+    let proxy = app.state::<ProxyManager>();
+    Ok(proxy.console(store.route_settings()?, 1, 25).await)
 }
 
 #[tauri::command]
@@ -422,13 +479,17 @@ fn export_sessions(ids: Vec<String>, target: String) -> Result<String, AppError>
 fn get_dashboard(store: State<Store>) -> Result<Dashboard, AppError> {
     let providers = store.providers()?;
     let scan = codex::scan();
-    let sessions = session_index::rebuild().unwrap_or_default();
+    let session_count = scan
+        .databases
+        .iter()
+        .map(|database| database.thread_count as usize)
+        .sum();
     Ok(Dashboard {
         provider_count: providers.len() as u64,
         active_provider: providers.into_iter().find(|p| p.active).map(|p| p.name),
         codex_home: codex::home().display().to_string(),
         database_count: scan.databases.len(),
-        session_count: sessions.len(),
+        session_count,
         database_health: if scan.databases.iter().all(|db| db.health == "ok") {
             "健康".into()
         } else {
@@ -491,7 +552,7 @@ pub fn run() {
                 tray = tray.icon(icon);
             }
             tray.build(app)?;
-            tauri::async_runtime::spawn(restore_active_proxy(app.handle().clone()));
+            tauri::async_runtime::spawn(start_configured_route(app.handle().clone()));
             Ok(())
         })
         .on_window_event(|window, event| match event {
@@ -528,7 +589,7 @@ pub fn run() {
             start_openai_device_auth,
             poll_openai_device_auth,
             get_route_console,
-            stop_local_route,
+            save_route_settings,
             clear_route_logs
         ])
         .run(tauri::generate_context!())

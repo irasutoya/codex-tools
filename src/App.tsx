@@ -101,7 +101,6 @@ import { Toaster } from "@/components/ui/sonner"
 import {
   blankAccount,
   blankProvider,
-  commaList,
   maskKey,
   optionalNumber,
   parseHeaders,
@@ -113,6 +112,7 @@ import type {
   Dashboard,
   FetchedModel,
   Page,
+  PageResult,
   Protocol,
   Provider,
   RepairScan,
@@ -134,6 +134,9 @@ export default function App() {
   const [providers, setProviders] = useState<Provider[]>([])
   const [accounts, setAccounts] = useState<Account[]>([])
   const [sessions, setSessions] = useState<Session[]>([])
+  const [sessionPage, setSessionPage] = useState(1)
+  const [sessionTotal, setSessionTotal] = useState(0)
+  const [routePage, setRoutePage] = useState(1)
   const [authAccounts, setAuthAccounts] = useState<AuthAccount[]>([])
   const [route, setRoute] = useState<RouteConsole>()
   const [scan, setScan] = useState<RepairScan>()
@@ -155,26 +158,20 @@ export default function App() {
         nextDashboard,
         nextProviders,
         nextAccounts,
-        nextSessions,
         nextScan,
         nextAuthAccounts,
-        nextRoute,
       ] = await Promise.all([
         call<Dashboard>("get_dashboard"),
         call<Provider[]>("list_providers"),
         call<Account[]>("list_provider_accounts"),
-        call<Session[]>("list_sessions"),
         call<RepairScan>("scan_codex_data"),
         call<AuthAccount[]>("list_auth_accounts"),
-        call<RouteConsole>("get_route_console"),
       ])
       setDashboard(nextDashboard)
       setProviders(nextProviders)
       setAccounts(nextAccounts)
-      setSessions(nextSessions)
       setScan(nextScan)
       setAuthAccounts(nextAuthAccounts)
-      setRoute(nextRoute)
     } catch (error) {
       toast.error(String(error))
     }
@@ -183,6 +180,30 @@ export default function App() {
     const task = window.setTimeout(() => void reload(), 0)
     return () => window.clearTimeout(task)
   }, [reload])
+  const loadSessions = useCallback(async (nextPage: number) => {
+    const result = await call<PageResult<Session>>("list_sessions", {
+      page: nextPage,
+      pageSize: 25,
+    })
+    setSessions(result.items)
+    setSessionTotal(result.total)
+    setSessionPage(result.page)
+  }, [])
+  const loadRoute = useCallback(async (nextPage: number) => {
+    const result = await call<RouteConsole>("get_route_console", {
+      page: nextPage,
+      pageSize: 25,
+    })
+    setRoute(result)
+    setRoutePage(result.logPage || 1)
+  }, [])
+  useEffect(() => {
+    const task = window.setTimeout(() => {
+      if (page === "sessions") void loadSessions(sessionPage)
+      if (page === "routes") void loadRoute(routePage)
+    }, 0)
+    return () => window.clearTimeout(task)
+  }, [loadRoute, loadSessions, page, routePage, sessionPage])
 
   const officialAccounts = useMemo(() => authAccounts, [authAccounts])
   const saveProvider = async () => {
@@ -289,7 +310,10 @@ export default function App() {
       await call("delete_sessions_permanently", { ids: [deletingSession.id] })
       toast.success("会话已永久删除")
       setDeletingSession(undefined)
+      const nextPage =
+        sessions.length === 1 && sessionPage > 1 ? sessionPage - 1 : sessionPage
       await reload()
+      await loadSessions(nextPage)
     } catch (error) {
       toast.error(String(error))
     }
@@ -381,7 +405,7 @@ export default function App() {
               刷新
             </Button>
           </header>
-          <main className="flex flex-1 flex-col gap-5 p-6">
+          <main className="flex min-w-0 flex-1 flex-col gap-5 overflow-x-hidden p-6">
             {page === "dashboard" && (
               <DashboardPage
                 dashboard={dashboard}
@@ -414,6 +438,10 @@ export default function App() {
             {page === "sessions" && (
               <SessionsPage
                 sessions={sessions}
+                page={sessionPage}
+                total={sessionTotal}
+                pageSize={25}
+                onPageChange={setSessionPage}
                 onExport={exportOne}
                 onDelete={setDeletingSession}
               />
@@ -422,7 +450,12 @@ export default function App() {
               <RepairPage scan={scan} busy={busy} onRepair={repair} />
             )}
             {page === "routes" && (
-              <RouteConsolePage route={route} onReload={reload} />
+              <RouteConsolePage
+                route={route}
+                page={routePage}
+                onPageChange={setRoutePage}
+                onReload={() => loadRoute(routePage)}
+              />
             )}
             {page === "settings" && <SettingsPage dashboard={dashboard} />}
           </main>
@@ -843,9 +876,7 @@ function ProvidersPage({
                 <div className="flex items-start justify-between gap-4">
                   <div>
                     <CardTitle>{provider.name}</CardTitle>
-                    <CardDescription>
-                      {provider.baseUrl} · {provider.defaultModel}
-                    </CardDescription>
+                    <CardDescription>{provider.baseUrl}</CardDescription>
                   </div>
                   <div className="flex gap-2">
                     <Badge variant="outline">
@@ -976,17 +1007,70 @@ function ProvidersPage({
   )
 }
 
+function PaginationControls({
+  page,
+  pageSize,
+  total,
+  onPageChange,
+}: {
+  page: number
+  pageSize: number
+  total: number
+  onPageChange: (page: number) => void
+}) {
+  const pages = Math.max(1, Math.ceil(total / pageSize))
+  const safePage = Math.min(page, pages)
+  const start = total ? (safePage - 1) * pageSize + 1 : 0
+  const end = Math.min(safePage * pageSize, total)
+  return (
+    <div className="flex min-w-0 flex-wrap items-center justify-between gap-3 text-sm text-muted-foreground">
+      <span>
+        {start}-{end} / {total}
+      </span>
+      <div className="flex items-center gap-2">
+        <Button
+          variant="outline"
+          size="sm"
+          disabled={safePage <= 1}
+          onClick={() => onPageChange(safePage - 1)}
+        >
+          上一页
+        </Button>
+        <span className="whitespace-nowrap">
+          {safePage} / {pages}
+        </span>
+        <Button
+          variant="outline"
+          size="sm"
+          disabled={safePage >= pages}
+          onClick={() => onPageChange(safePage + 1)}
+        >
+          下一页
+        </Button>
+      </div>
+    </div>
+  )
+}
+
 function SessionsPage({
   sessions,
+  page,
+  total,
+  pageSize,
+  onPageChange,
   onExport,
   onDelete,
 }: {
   sessions: Session[]
+  page: number
+  total: number
+  pageSize: number
+  onPageChange: (page: number) => void
   onExport: (session: Session) => void
   onDelete: (session: Session) => void
 }) {
   return (
-    <Card>
+    <Card className="min-w-0 overflow-hidden">
       <CardHeader>
         <CardTitle>统一会话历史</CardTitle>
         <CardDescription>
@@ -1006,30 +1090,49 @@ function SessionsPage({
           </AlertDescription>
         </Alert>
         {sessions.length ? (
-          <Table>
+          <Table className="table-fixed">
             <TableHeader>
               <TableRow>
-                <TableHead>标题</TableHead>
-                <TableHead>Provider</TableHead>
-                <TableHead>原始归属</TableHead>
-                <TableHead>项目</TableHead>
-                <TableHead className="text-right">操作</TableHead>
+                <TableHead className="w-[32%]">标题</TableHead>
+                <TableHead className="w-[15%]">Provider</TableHead>
+                <TableHead className="w-[15%]">原始归属</TableHead>
+                <TableHead className="w-[24%]">项目</TableHead>
+                <TableHead className="w-36 text-right">操作</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
               {sessions.map((session) => (
                 <TableRow key={`${session.sourceDb}-${session.id}`}>
-                  <TableCell>{session.title || session.id}</TableCell>
                   <TableCell>
-                    <Badge variant="outline">{session.provider || "-"}</Badge>
+                    <div
+                      className="truncate"
+                      title={session.title || session.id}
+                    >
+                      {session.title || session.id}
+                    </div>
+                  </TableCell>
+                  <TableCell className="overflow-hidden">
+                    <Badge
+                      className="max-w-full truncate"
+                      variant="outline"
+                      title={session.provider || "-"}
+                    >
+                      {session.provider || "-"}
+                    </Badge>
                   </TableCell>
                   <TableCell>
-                    <Badge variant="secondary">
+                    <Badge
+                      className="max-w-full truncate"
+                      variant="secondary"
+                      title={session.originalProvider || "-"}
+                    >
                       {session.originalProvider || "-"}
                     </Badge>
                   </TableCell>
-                  <TableCell className="max-w-64 truncate">
-                    {session.cwd || "-"}
+                  <TableCell>
+                    <div className="truncate" title={session.cwd || "-"}>
+                      {session.cwd || "-"}
+                    </div>
                   </TableCell>
                   <TableCell>
                     <div className="flex justify-end gap-2">
@@ -1068,21 +1171,36 @@ function SessionsPage({
           </Empty>
         )}
       </CardContent>
+      <CardFooter>
+        <PaginationControls
+          page={page}
+          pageSize={pageSize}
+          total={total}
+          onPageChange={onPageChange}
+        />
+      </CardFooter>
     </Card>
   )
 }
 
 function RouteConsolePage({
   route,
+  page,
+  onPageChange,
   onReload,
 }: {
   route?: RouteConsole
+  page: number
+  onPageChange: (page: number) => void
   onReload: () => Promise<void>
 }) {
-  const stop = async () => {
+  const [settings, setSettings] = useState(
+    route?.settings ?? { enabled: true, listenAddress: "127.0.0.1", port: 0 }
+  )
+  const save = async () => {
     try {
-      await call("stop_local_route")
-      toast.success("本地路由已停止")
+      await call("save_route_settings", { settings })
+      toast.success(settings.enabled ? "本地路由设置已应用" : "本地路由已关闭")
       await onReload()
     } catch (error) {
       toast.error(String(error))
@@ -1092,95 +1210,170 @@ function RouteConsolePage({
     await call("clear_route_logs")
     await onReload()
   }
-  if (!route?.running) {
-    return (
-      <Empty>
-        <EmptyHeader>
-          <EmptyMedia variant="icon">
-            <Network />
-          </EmptyMedia>
-          <EmptyTitle>本地路由未运行</EmptyTitle>
-          <EmptyDescription>
-            激活 Chat Completions Provider 后，会自动启动仅监听 127.0.0.1
-            的协议路由。
-          </EmptyDescription>
-        </EmptyHeader>
-      </Empty>
-    )
-  }
   return (
     <>
-      <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
-        {[
-          ["请求", route.requestCount],
-          ["成功", route.successCount],
-          ["错误", route.errorCount],
-          ["最近延迟", `${route.lastLatencyMs ?? 0} ms`],
-        ].map(([label, value]) => (
-          <Card key={label}>
-            <CardHeader>
-              <CardDescription>{label}</CardDescription>
-              <CardTitle>{value}</CardTitle>
-            </CardHeader>
-          </Card>
-        ))}
-      </div>
       <Card>
         <CardHeader>
-          <CardTitle>
-            {route.providerName} / {route.model}
-          </CardTitle>
+          <CardTitle>路由设置</CardTitle>
           <CardDescription>
-            {route.baseUrl} → {route.upstreamUrl}
+            路由随 Codex Tools 启动和退出，不再跟随 Provider 开关。
           </CardDescription>
         </CardHeader>
         <CardContent>
-          {route.logs.length ? (
-            <Table>
-              <TableHeader>
-                <TableRow>
-                  <TableHead>时间</TableHead>
-                  <TableHead>请求</TableHead>
-                  <TableHead>状态</TableHead>
-                  <TableHead>耗时</TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {route.logs.map((entry) => (
-                  <TableRow key={entry.id}>
-                    <TableCell>
-                      {new Date(entry.timestamp * 1000).toLocaleTimeString()}
-                    </TableCell>
-                    <TableCell className="font-mono text-xs">
-                      {entry.method} {entry.path}
-                    </TableCell>
-                    <TableCell>
-                      <Badge
-                        variant={
-                          entry.status < 400 ? "secondary" : "destructive"
-                        }
-                      >
-                        {entry.status}
-                      </Badge>
-                    </TableCell>
-                    <TableCell>{entry.latencyMs} ms</TableCell>
-                  </TableRow>
-                ))}
-              </TableBody>
-            </Table>
-          ) : (
-            <div className="text-sm text-muted-foreground">暂无请求记录。</div>
-          )}
+          <FieldGroup>
+            <Field orientation="horizontal">
+              <div className="flex flex-col gap-1">
+                <FieldLabel htmlFor="route-enabled">启用本地路由</FieldLabel>
+                <FieldDescription>
+                  托盘驻留期间路由会继续运行。
+                </FieldDescription>
+              </div>
+              <Switch
+                id="route-enabled"
+                checked={settings.enabled}
+                onCheckedChange={(enabled) =>
+                  setSettings({ ...settings, enabled })
+                }
+              />
+            </Field>
+            <Field>
+              <FieldLabel htmlFor="route-address">监听地址</FieldLabel>
+              <Input
+                id="route-address"
+                value={settings.listenAddress}
+                onChange={(event) =>
+                  setSettings({
+                    ...settings,
+                    listenAddress: event.target.value,
+                  })
+                }
+              />
+              <FieldDescription>
+                出于密钥安全考虑，仅允许回环地址。
+              </FieldDescription>
+            </Field>
+            <Field>
+              <FieldLabel htmlFor="route-port">监听端口</FieldLabel>
+              <Input
+                id="route-port"
+                type="number"
+                min={0}
+                max={65535}
+                value={settings.port}
+                onChange={(event) =>
+                  setSettings({ ...settings, port: Number(event.target.value) })
+                }
+              />
+              <FieldDescription>
+                填写 0 时由系统自动分配可用端口。
+              </FieldDescription>
+            </Field>
+          </FieldGroup>
         </CardContent>
-        <CardFooter className="flex gap-2">
-          <Button variant="outline" onClick={() => void clear()}>
-            清空日志
-          </Button>
-          <Button variant="destructive" onClick={() => void stop()}>
-            停止路由
-          </Button>
+        <CardFooter>
+          <Button onClick={() => void save()}>保存并应用</Button>
         </CardFooter>
       </Card>
+      {!route?.running && (
+        <Alert>
+          <Network />
+          <AlertTitle>
+            {settings.enabled ? "等待路由目标" : "本地路由已关闭"}
+          </AlertTitle>
+          <AlertDescription>
+            {settings.enabled
+              ? "添加可用的 Chat Completions Provider 和账号后即可建立转发。"
+              : "启用并保存设置后，本地路由会立即启动。"}
+          </AlertDescription>
+        </Alert>
+      )}
+      {route?.running && (
+        <>
+          <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
+            {[
+              ["请求", route.requestCount],
+              ["成功", route.successCount],
+              ["错误", route.errorCount],
+              ["最近延迟", `${route.lastLatencyMs ?? 0} ms`],
+            ].map(([label, value]) => (
+              <Card key={label}>
+                <CardHeader>
+                  <CardDescription>{label}</CardDescription>
+                  <CardTitle>{value}</CardTitle>
+                </CardHeader>
+              </Card>
+            ))}
+          </div>
+          <Card className="min-w-0 overflow-hidden">
+            <CardHeader>
+              <CardTitle>
+                {route.providerName} / {route.model}
+              </CardTitle>
+              <CardDescription>
+                {route.baseUrl} → {route.upstreamUrl}
+              </CardDescription>
+            </CardHeader>
+            <CardContent>
+              {route.logs.length ? (
+                <Table className="table-fixed">
+                  <TableHeader>
+                    <TableRow>
+                      <TableHead className="w-28">时间</TableHead>
+                      <TableHead>请求</TableHead>
+                      <TableHead className="w-24">状态</TableHead>
+                      <TableHead className="w-24">耗时</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {route.logs.map((entry) => (
+                      <TableRow key={entry.id}>
+                        <TableCell>
+                          {new Date(
+                            entry.timestamp * 1000
+                          ).toLocaleTimeString()}
+                        </TableCell>
+                        <TableCell className="overflow-hidden font-mono text-xs">
+                          <div
+                            className="truncate"
+                            title={`${entry.method} ${entry.path}`}
+                          >
+                            {entry.method} {entry.path}
+                          </div>
+                        </TableCell>
+                        <TableCell>
+                          <Badge
+                            variant={
+                              entry.status < 400 ? "secondary" : "destructive"
+                            }
+                          >
+                            {entry.status}
+                          </Badge>
+                        </TableCell>
+                        <TableCell>{entry.latencyMs} ms</TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+              ) : (
+                <div className="text-sm text-muted-foreground">
+                  暂无请求记录。
+                </div>
+              )}
+            </CardContent>
+            <CardFooter className="flex flex-wrap items-center justify-between gap-2">
+              <Button variant="outline" onClick={() => void clear()}>
+                清空日志
+              </Button>
+              <PaginationControls
+                page={page}
+                pageSize={route.logPageSize || 25}
+                total={route.logTotal}
+                onPageChange={onPageChange}
+              />
+            </CardFooter>
+          </Card>
+        </>
+      )}
     </>
   )
 }
@@ -1298,7 +1491,20 @@ function ProviderDialog({
   onChange: (provider?: Provider) => void
   onSave: () => void
 }) {
+  const allowLegacyModelOverrides = false
   const [fetchingModels, setFetchingModels] = useState(false)
+  const [newModel, setNewModel] = useState("")
+  const addModel = () => {
+    if (!value) return
+    const model = newModel.trim()
+    if (!model) return
+    if (value.models.includes(model)) {
+      toast.error("模型已存在")
+      return
+    }
+    onChange({ ...value, models: [...value.models, model] })
+    setNewModel("")
+  }
   const fetchModels = async () => {
     if (!value?.id) {
       toast.error("请先保存 Provider 并添加 API 账号，再获取模型。")
@@ -1309,7 +1515,11 @@ function ProviderDialog({
       const models = await call<FetchedModel[]>("fetch_provider_models", {
         provider: value,
       })
-      onChange({ ...value, models: models.map((model) => model.id) })
+      onChange({
+        ...value,
+        models: models.map((model) => model.id),
+        modelMetadata: models,
+      })
       toast.success(`已获取 ${models.length} 个模型，默认全部选中。`)
     } catch (error) {
       toast.error(String(error))
@@ -1365,28 +1575,29 @@ function ProviderDialog({
               />
             </Field>
             <Field>
-              <FieldLabel>默认模型</FieldLabel>
-              <Input
-                value={value.defaultModel}
-                onChange={(event) =>
-                  onChange({ ...value, defaultModel: event.target.value })
-                }
-              />
-            </Field>
-            <Field>
               <FieldLabel>可选模型</FieldLabel>
               <InputGroup>
                 <InputGroupInput
-                  value={value.models.join(", ")}
-                  onChange={(event) =>
-                    onChange({
-                      ...value,
-                      models: commaList(event.target.value),
-                    })
-                  }
-                  placeholder="留空则不启用自定义模型目录"
+                  value={newModel}
+                  onChange={(event) => setNewModel(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") {
+                      event.preventDefault()
+                      addModel()
+                    }
+                  }}
+                  placeholder="输入模型 ID"
                 />
                 <InputGroupAddon align="inline-end">
+                  <InputGroupButton
+                    aria-label="添加模型"
+                    title="添加模型"
+                    disabled={!newModel.trim()}
+                    onClick={addModel}
+                  >
+                    <Plus data-icon="inline-start" />
+                    添加
+                  </InputGroupButton>
                   <InputGroupButton
                     aria-label="从 Provider 获取全部模型"
                     title="获取全部模型"
@@ -1398,46 +1609,101 @@ function ProviderDialog({
                   </InputGroupButton>
                 </InputGroupAddon>
               </InputGroup>
+              {value.models.length ? (
+                <div className="max-h-64 overflow-y-auto rounded-lg border">
+                  <Table>
+                    <TableHeader>
+                      <TableRow>
+                        <TableHead>模型 ID</TableHead>
+                        <TableHead className="w-20 text-right">操作</TableHead>
+                      </TableRow>
+                    </TableHeader>
+                    <TableBody>
+                      {value.models.map((model) => (
+                        <TableRow key={model}>
+                          <TableCell className="font-mono text-xs">
+                            {model}
+                          </TableCell>
+                          <TableCell className="text-right">
+                            <Button
+                              size="icon-sm"
+                              variant="ghost"
+                              aria-label={`删除模型 ${model}`}
+                              title="删除模型"
+                              onClick={() =>
+                                onChange({
+                                  ...value,
+                                  models: value.models.filter(
+                                    (item) => item !== model
+                                  ),
+                                  modelMetadata: value.modelMetadata.filter(
+                                    (item) => item.id !== model
+                                  ),
+                                })
+                              }
+                            >
+                              <Trash2 />
+                            </Button>
+                          </TableCell>
+                        </TableRow>
+                      ))}
+                    </TableBody>
+                  </Table>
+                </div>
+              ) : (
+                <Empty className="min-h-32 border">
+                  <EmptyHeader>
+                    <EmptyMedia variant="icon">
+                      <Server />
+                    </EmptyMedia>
+                    <EmptyTitle>尚未添加模型</EmptyTitle>
+                    <EmptyDescription>
+                      手动添加模型，或保存 Provider 和账号后获取全部模型。
+                    </EmptyDescription>
+                  </EmptyHeader>
+                </Empty>
+              )}
               <FieldDescription>
                 实时请求 Provider 的
                 /models，成功后默认填入全部模型；留空时不生成 Codex
                 自定义模型目录。
               </FieldDescription>
             </Field>
-            {value.protocol === "chat_completions" && (
-              <Field>
-                <div className="flex items-center justify-between gap-3">
-                  <div className="flex flex-col gap-1">
-                    <FieldLabel htmlFor="reasoning-override">
-                      自定义推理映射
-                    </FieldLabel>
-                    <FieldDescription>
-                      默认按 CC-Switch 规则根据
-                      Provider、地址和当前模型实时识别。
-                    </FieldDescription>
+            {allowLegacyModelOverrides &&
+              value.protocol === "chat_completions" && (
+                <Field>
+                  <div className="flex items-center justify-between gap-3">
+                    <div className="flex flex-col gap-1">
+                      <FieldLabel htmlFor="reasoning-override">
+                        自定义推理映射
+                      </FieldLabel>
+                      <FieldDescription>
+                        默认按 CC-Switch 规则根据
+                        Provider、地址和当前模型实时识别。
+                      </FieldDescription>
+                    </div>
+                    <Switch
+                      id="reasoning-override"
+                      checked={!!value.codexChatReasoning}
+                      onCheckedChange={(checked) =>
+                        onChange({
+                          ...value,
+                          codexChatReasoning: checked
+                            ? {
+                                supportsThinking: true,
+                                supportsEffort: true,
+                                thinkingParam: "thinking",
+                                effortParam: "reasoning_effort",
+                                effortValueMode: "standard",
+                                outputFormat: "reasoning_content",
+                              }
+                            : undefined,
+                        })
+                      }
+                    />
                   </div>
-                  <Switch
-                    id="reasoning-override"
-                    checked={!!value.codexChatReasoning}
-                    onCheckedChange={(checked) =>
-                      onChange({
-                        ...value,
-                        codexChatReasoning: checked
-                          ? {
-                              supportsThinking: true,
-                              supportsEffort: true,
-                              thinkingParam: "thinking",
-                              effortParam: "reasoning_effort",
-                              effortValueMode: "standard",
-                              outputFormat: "reasoning_content",
-                            }
-                          : undefined,
-                      })
-                    }
-                  />
-                </div>
-              </Field>
-            )}
+                </Field>
+              )}
             {value.protocol === "chat_completions" &&
               value.codexChatReasoning && (
                 <FieldGroup>
@@ -1513,34 +1779,38 @@ function ProviderDialog({
                   </Field>
                 </FieldGroup>
               )}
-            <Field>
-              <FieldLabel>上下文窗口</FieldLabel>
-              <Input
-                type="number"
-                min={1}
-                value={value.contextWindow ?? ""}
-                onChange={(event) =>
-                  onChange({
-                    ...value,
-                    contextWindow: optionalNumber(event.target.value),
-                  })
-                }
-              />
-            </Field>
-            <Field>
-              <FieldLabel>自动压缩阈值</FieldLabel>
-              <Input
-                type="number"
-                min={1}
-                value={value.autoCompactThreshold ?? ""}
-                onChange={(event) =>
-                  onChange({
-                    ...value,
-                    autoCompactThreshold: optionalNumber(event.target.value),
-                  })
-                }
-              />
-            </Field>
+            {allowLegacyModelOverrides && (
+              <Field>
+                <FieldLabel>上下文窗口</FieldLabel>
+                <Input
+                  type="number"
+                  min={1}
+                  value={value.contextWindow ?? ""}
+                  onChange={(event) =>
+                    onChange({
+                      ...value,
+                      contextWindow: optionalNumber(event.target.value),
+                    })
+                  }
+                />
+              </Field>
+            )}
+            {allowLegacyModelOverrides && (
+              <Field>
+                <FieldLabel>自动压缩阈值</FieldLabel>
+                <Input
+                  type="number"
+                  min={1}
+                  value={value.autoCompactThreshold ?? ""}
+                  onChange={(event) =>
+                    onChange({
+                      ...value,
+                      autoCompactThreshold: optionalNumber(event.target.value),
+                    })
+                  }
+                />
+              </Field>
+            )}
             <Field>
               <FieldLabel>超时（秒）</FieldLabel>
               <Input

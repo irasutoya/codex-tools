@@ -299,7 +299,6 @@ pub fn apply_provider_with_proxy(
             .unwrap_or_default()
             .trim()
             .is_empty()
-        || p.default_model.trim().is_empty()
     {
         return Err(AppError::InvalidConfig(
             "provider fields are required".into(),
@@ -366,23 +365,9 @@ fn build_managed_config(
 ) -> Result<String, AppError> {
     let mut doc = DocumentMut::new();
     doc["model_provider"] = value(MANAGED_PROVIDER_ID);
-    doc["model"] = value(provider.default_model.trim());
     if !provider.models.is_empty() {
         doc["model_catalog_json"] = value(MODEL_CATALOG_FILENAME);
     }
-    if let Some(context_window) = provider.context_window.filter(|value| *value > 0) {
-        doc["model_context_window"] = value(
-            i64::try_from(context_window)
-                .map_err(|_| AppError::InvalidConfig("上下文窗口数值过大".into()))?,
-        );
-    }
-    if let Some(threshold) = provider.auto_compact_threshold.filter(|value| *value > 0) {
-        doc["model_auto_compact_token_limit"] = value(
-            i64::try_from(threshold)
-                .map_err(|_| AppError::InvalidConfig("自动压缩阈值数值过大".into()))?,
-        );
-    }
-
     let mut providers = Table::new();
     let mut managed = Table::new();
     managed["name"] = value(provider.name.trim());
@@ -428,7 +413,8 @@ fn build_managed_auth(token: &str) -> serde_json::Value {
     })
 }
 
-fn build_model_catalog(provider: &ProviderProfile) -> serde_json::Value {
+#[allow(dead_code)]
+fn legacy_build_model_catalog(provider: &ProviderProfile) -> serde_json::Value {
     let context_window = provider
         .context_window
         .filter(|value| *value > 0)
@@ -487,6 +473,108 @@ fn build_model_catalog(provider: &ProviderProfile) -> serde_json::Value {
         })
         .collect::<Vec<_>>();
     serde_json::json!({ "models": models })
+}
+
+fn build_model_catalog(provider: &ProviderProfile) -> serde_json::Value {
+    let cached = load_codex_model_cache();
+    let mut seen = std::collections::HashSet::new();
+    let models = provider.models.iter().filter_map(|raw_model| {
+        let model = raw_model.trim();
+        if model.is_empty() || !seen.insert(model.to_string()) {
+            return None;
+        }
+        let upstream = provider.model_metadata.iter().find(|item| item.id == model);
+        let mut entry = cached
+            .iter()
+            .find(|item| item.get("slug").and_then(serde_json::Value::as_str) == Some(model))
+            .or_else(|| cached.first())
+            .cloned()
+            .unwrap_or_else(minimal_codex_model_template);
+        let object = entry
+            .as_object_mut()
+            .expect("model template must be an object");
+        object.insert("slug".into(), model.into());
+        object.insert("display_name".into(), model.into());
+        object.insert("description".into(), model.into());
+        object.insert("priority".into(), (1000 + seen.len()).into());
+        if let Some(upstream) = upstream {
+            overlay_upstream_model_metadata(object, upstream);
+        }
+        Some(entry)
+    });
+    serde_json::json!({ "models": models.collect::<Vec<_>>() })
+}
+
+fn load_codex_model_cache() -> Vec<serde_json::Value> {
+    fs::read(home().join("models_cache.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .and_then(|value| {
+            value
+                .get("models")
+                .and_then(serde_json::Value::as_array)
+                .cloned()
+        })
+        .unwrap_or_default()
+}
+
+fn minimal_codex_model_template() -> serde_json::Value {
+    serde_json::json!({
+        "slug": "custom", "display_name": "custom", "description": "custom",
+        "base_instructions": "You are Codex, a coding agent.", "shell_type": "shell_command",
+        "visibility": "list", "supported_in_api": true, "priority": 1000
+    })
+}
+
+fn overlay_upstream_model_metadata(
+    target: &mut serde_json::Map<String, serde_json::Value>,
+    upstream: &FetchedModel,
+) {
+    const FIELDS: &[(&str, &[&str])] = &[
+        ("context_window", &["context_window", "contextWindow"]),
+        (
+            "max_context_window",
+            &["max_context_window", "maxContextWindow"],
+        ),
+        (
+            "default_reasoning_level",
+            &["default_reasoning_level", "defaultReasoningLevel"],
+        ),
+        (
+            "supported_reasoning_levels",
+            &["supported_reasoning_levels", "supportedReasoningLevels"],
+        ),
+        (
+            "supports_reasoning_summaries",
+            &["supports_reasoning_summaries", "supportsReasoningSummaries"],
+        ),
+        (
+            "supports_parallel_tool_calls",
+            &["supports_parallel_tool_calls", "supportsParallelToolCalls"],
+        ),
+        ("input_modalities", &["input_modalities", "inputModalities"]),
+        (
+            "supports_image_detail_original",
+            &[
+                "supports_image_detail_original",
+                "supportsImageDetailOriginal",
+            ],
+        ),
+        (
+            "supports_search_tool",
+            &["supports_search_tool", "supportsSearchTool"],
+        ),
+    ];
+    for (target_name, aliases) in FIELDS {
+        if let Some(value) = aliases.iter().find_map(|name| upstream.metadata.get(*name)) {
+            target.insert((*target_name).into(), value.clone());
+        }
+    }
+    if !target.contains_key("max_context_window") {
+        if let Some(value) = target.get("context_window").cloned() {
+            target.insert("max_context_window".into(), value);
+        }
+    }
 }
 
 pub fn restore_official_snapshot(
@@ -647,8 +735,8 @@ mod tests {
             name: "Example Gateway".into(),
             protocol: ProviderProtocol::Responses,
             base_url: "https://example.test/v1".into(),
-            default_model: "model-a".into(),
             models: vec!["model-b".into(), "model-a".into(), " ".into()],
+            model_metadata: vec![],
             codex_chat_reasoning: None,
             headers: json!({"X-Provider": "provider", "X-Override": "provider"}),
             timeout_secs: 30,
@@ -691,6 +779,7 @@ mod tests {
             parsed.get("model_provider").and_then(Item::as_str),
             Some(MANAGED_PROVIDER_ID)
         );
+        assert!(parsed.get("model").is_none());
         assert_eq!(
             parsed.get("model_catalog_json").and_then(Item::as_str),
             Some(MODEL_CATALOG_FILENAME)
@@ -713,12 +802,28 @@ mod tests {
 
     #[test]
     fn model_catalog_preserves_selected_model_order_and_deduplicates() {
-        let catalog = build_model_catalog(&test_provider());
+        let mut provider = test_provider();
+        provider.model_metadata = vec![FetchedModel {
+            id: "model-b".into(),
+            owned_by: Some("upstream".into()),
+            metadata: serde_json::from_value(json!({
+                "context_window": 96_000,
+                "default_reasoning_level": "high",
+                "supported_reasoning_levels": [{"effort": "high"}],
+                "input_modalities": ["text", "image"]
+            }))
+            .unwrap(),
+        }];
+        let catalog = build_model_catalog(&provider);
         let models = catalog["models"].as_array().unwrap();
         assert_eq!(models.len(), 2);
         assert_eq!(models[0]["slug"], "model-b");
         assert_eq!(models[1]["slug"], "model-a");
-        assert_eq!(models[0]["context_window"], 64_000);
+        assert_eq!(models[0]["context_window"], 96_000);
+        assert_eq!(models[0]["max_context_window"], 96_000);
+        assert_eq!(models[0]["default_reasoning_level"], "high");
+        assert_eq!(models[0]["input_modalities"], json!(["text", "image"]));
+        assert!(models[1].get("supported_reasoning_levels").is_none());
         assert!(
             models[0]["base_instructions"]
                 .as_str()

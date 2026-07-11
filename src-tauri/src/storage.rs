@@ -1,5 +1,6 @@
 use crate::models::{
     AccountAuthKind, AuthAccount, AuthService, ProviderAccount, ProviderProfile, ProviderProtocol,
+    RouteSettings,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use std::path::{Path, PathBuf};
@@ -34,6 +35,12 @@ impl Store {
         add_column(&db, "providers", "auto_compact_threshold", "INTEGER")?;
         add_column(&db, "providers", "enabled", "INTEGER NOT NULL DEFAULT 1")?;
         add_column(&db, "providers", "codex_chat_reasoning_json", "TEXT")?;
+        add_column(
+            &db,
+            "providers",
+            "model_metadata_json",
+            "TEXT NOT NULL DEFAULT '[]'",
+        )?;
         db.execute_batch(
             "CREATE TABLE IF NOT EXISTS provider_accounts(
                id TEXT PRIMARY KEY,
@@ -85,9 +92,9 @@ impl Store {
     pub fn providers(&self) -> anyhow::Result<Vec<ProviderProfile>> {
         let db = self.connect()?;
         let mut statement = db.prepare(
-            "SELECT p.id,p.name,p.protocol,p.base_url,p.default_model,p.models_json,
+            "SELECT p.id,p.name,p.protocol,p.base_url,p.models_json,
                     p.headers_json,p.timeout_secs,p.context_window,p.auto_compact_threshold,
-                    p.enabled,p.active,p.codex_chat_reasoning_json,
+                    p.enabled,p.active,p.codex_chat_reasoning_json,p.model_metadata_json,
                     (SELECT id FROM provider_accounts a WHERE a.provider_id=p.id AND a.active=1 LIMIT 1),
                     (SELECT count(*) FROM provider_accounts a WHERE a.provider_id=p.id)
              FROM providers p ORDER BY p.active DESC,p.name",
@@ -98,17 +105,17 @@ impl Store {
                 name: row.get(1)?,
                 protocol: protocol_from_db(&row.get::<_, String>(2)?),
                 base_url: row.get(3)?,
-                default_model: row.get(4)?,
-                models: json_or_default(row.get(5)?),
+                models: json_or_default(row.get(4)?),
+                model_metadata: json_or_default(row.get(12)?),
                 codex_chat_reasoning: row
-                    .get::<_, Option<String>>(12)?
+                    .get::<_, Option<String>>(11)?
                     .and_then(|value| serde_json::from_str(&value).ok()),
-                headers: json_or_default(row.get(6)?),
-                timeout_secs: row.get::<_, i64>(7)? as u64,
-                context_window: row.get::<_, Option<i64>>(8)?.map(|value| value as u64),
-                auto_compact_threshold: row.get::<_, Option<i64>>(9)?.map(|value| value as u64),
-                enabled: row.get::<_, i64>(10)? != 0,
-                active: row.get::<_, i64>(11)? != 0,
+                headers: json_or_default(row.get(5)?),
+                timeout_secs: row.get::<_, i64>(6)? as u64,
+                context_window: row.get::<_, Option<i64>>(7)?.map(|value| value as u64),
+                auto_compact_threshold: row.get::<_, Option<i64>>(8)?.map(|value| value as u64),
+                enabled: row.get::<_, i64>(9)? != 0,
+                active: row.get::<_, i64>(10)? != 0,
                 active_account_id: row.get(13)?,
                 account_count: row.get::<_, i64>(14)? as u64,
             })
@@ -121,9 +128,9 @@ impl Store {
         let tx = db.transaction()?;
         tx.execute(
             "INSERT INTO providers(id,name,protocol,base_url,api_key,default_model,models_json,headers_json,timeout_secs,active,updated_at,context_window,auto_compact_threshold,enabled)
-             VALUES(?1,?2,?3,?4,'',?5,?6,?7,?8,?9,strftime('%s','now'),?10,?11,?12)
+             VALUES(?1,?2,?3,?4,'','',?5,?6,?7,?8,strftime('%s','now'),?9,?10,?11)
              ON CONFLICT(id) DO UPDATE SET name=excluded.name,protocol=excluded.protocol,
-             base_url=excluded.base_url,default_model=excluded.default_model,models_json=excluded.models_json,
+             base_url=excluded.base_url,default_model='',models_json=excluded.models_json,
              headers_json=excluded.headers_json,timeout_secs=excluded.timeout_secs,
              context_window=excluded.context_window,auto_compact_threshold=excluded.auto_compact_threshold,
              enabled=excluded.enabled,updated_at=excluded.updated_at",
@@ -132,7 +139,6 @@ impl Store {
                 provider.name,
                 protocol_to_db(provider.protocol),
                 provider.base_url,
-                provider.default_model,
                 serde_json::to_string(&provider.models)?,
                 serde_json::to_string(&provider.headers)?,
                 provider.timeout_secs,
@@ -150,6 +156,13 @@ impl Store {
                     .as_ref()
                     .map(serde_json::to_string)
                     .transpose()?,
+                provider.id
+            ],
+        )?;
+        tx.execute(
+            "UPDATE providers SET model_metadata_json=?1 WHERE id=?2",
+            params![
+                serde_json::to_string(&provider.model_metadata)?,
                 provider.id
             ],
         )?;
@@ -301,6 +314,29 @@ impl Store {
             )
             .optional()?;
         Ok((provider, account, official))
+    }
+
+    pub fn route_settings(&self) -> anyhow::Result<RouteSettings> {
+        let value = self
+            .connect()?
+            .query_row(
+                "SELECT value FROM settings WHERE key='local_route'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        Ok(value
+            .as_deref()
+            .and_then(|value| serde_json::from_str(value).ok())
+            .unwrap_or_default())
+    }
+
+    pub fn save_route_settings(&self, settings: &RouteSettings) -> anyhow::Result<()> {
+        self.connect()?.execute(
+            "INSERT INTO settings(key,value) VALUES('local_route',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            [serde_json::to_string(settings)?],
+        )?;
+        Ok(())
     }
 
     pub fn restore_active(

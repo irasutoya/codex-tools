@@ -1,6 +1,6 @@
 use crate::models::{
     AppError, CodexChatReasoningConfig, ProviderAccount, ProviderProfile, RouteConsoleSnapshot,
-    RouteLogEntry,
+    RouteLogEntry, RouteSettings,
 };
 use futures_util::StreamExt;
 use reqwest::{
@@ -88,16 +88,22 @@ impl ProxyManager {
         &self,
         provider: &ProviderProfile,
         account: &ProviderAccount,
+        settings: &RouteSettings,
     ) -> Result<ProxyEndpoint, AppError> {
-        let listener = TcpListener::bind(("127.0.0.1", 0))
+        if settings.port != 0 {
+            self.stop().await;
+        }
+        let address = settings.listen_address.trim();
+        let bind = format!("{address}:{}", settings.port);
+        let listener = TcpListener::bind(&bind)
             .await
-            .map_err(|error| AppError::Proxy(error.to_string()))?;
+            .map_err(|error| AppError::Proxy(format!("无法监听 {bind}：{error}")))?;
         let address = listener
             .local_addr()
             .map_err(|error| AppError::Proxy(error.to_string()))?;
         let token = format!("ct_{}", uuid::Uuid::new_v4().simple());
         let endpoint = ProxyEndpoint {
-            base_url: format!("http://127.0.0.1:{}/v1", address.port()),
+            base_url: format!("http://{}:{}/v1", settings.listen_address, address.port()),
             token: token.clone(),
         };
         let upstream_url = format!(
@@ -108,7 +114,7 @@ impl ProxyManager {
             upstream_url: upstream_url.clone(),
             provider_name: provider.name.clone(),
             account_name: account.name.clone(),
-            model: provider.default_model.clone(),
+            model: provider.models.first().cloned().unwrap_or_default(),
             started_at: chrono::Utc::now().timestamp(),
             request_count: AtomicU64::new(0),
             success_count: AtomicU64::new(0),
@@ -239,13 +245,34 @@ impl ProxyManager {
             .map(|proxy| proxy.endpoint.clone())
     }
 
-    pub async fn console(&self) -> RouteConsoleSnapshot {
+    pub async fn console(
+        &self,
+        settings: RouteSettings,
+        page: usize,
+        page_size: usize,
+    ) -> RouteConsoleSnapshot {
+        let page = page.max(1);
+        let page_size = page_size.clamp(1, 100);
         let state = self.inner.lock().await;
         let Some(proxy) = state.current.as_ref() else {
-            return RouteConsoleSnapshot::default();
+            return RouteConsoleSnapshot {
+                settings,
+                ..Default::default()
+            };
         };
         let telemetry = &proxy.telemetry;
+        let logs = telemetry.logs.lock().await;
+        let log_total = logs.len();
+        let start = (page - 1).saturating_mul(page_size).min(log_total);
+        let page_logs = logs
+            .iter()
+            .rev()
+            .skip(start)
+            .take(page_size)
+            .cloned()
+            .collect();
         RouteConsoleSnapshot {
+            settings,
             running: true,
             base_url: Some(proxy.endpoint.base_url.clone()),
             upstream_url: Some(telemetry.upstream_url.clone()),
@@ -261,7 +288,10 @@ impl ProxyManager {
                 0 => None,
                 value => Some(value),
             },
-            logs: telemetry.logs.lock().await.iter().cloned().collect(),
+            logs: page_logs,
+            log_total,
+            log_page: page,
+            log_page_size: page_size,
         }
     }
 
@@ -657,7 +687,7 @@ fn resolve_reasoning_config(
     let model = body
         .get("model")
         .and_then(Value::as_str)
-        .unwrap_or(&provider.default_model)
+        .unwrap_or_default()
         .to_ascii_lowercase();
     let name = provider.name.to_ascii_lowercase();
     let base = provider.base_url.to_ascii_lowercase();
@@ -1293,8 +1323,8 @@ mod tests {
             name: "Test".into(),
             protocol: crate::models::ProviderProtocol::ChatCompletions,
             base_url: "http://127.0.0.1:9/v1".into(),
-            default_model: "test-model".into(),
             models: vec![],
+            model_metadata: vec![],
             codex_chat_reasoning: None,
             headers: json!({}),
             timeout_secs: 1,
@@ -1323,12 +1353,22 @@ mod tests {
         }
     }
 
+    fn route_settings() -> RouteSettings {
+        RouteSettings::default()
+    }
+
     #[tokio::test]
     async fn aborted_prepare_keeps_current_proxy_running() {
         let manager = ProxyManager::default();
-        let first = manager.prepare(&provider(), &account()).await.unwrap();
+        let first = manager
+            .prepare(&provider(), &account(), &route_settings())
+            .await
+            .unwrap();
         manager.commit().await.unwrap();
-        let second = manager.prepare(&provider(), &account()).await.unwrap();
+        let second = manager
+            .prepare(&provider(), &account(), &route_settings())
+            .await
+            .unwrap();
         assert_ne!(first.base_url, second.base_url);
         manager.abort().await;
         assert_eq!(manager.endpoint().await.unwrap().base_url, first.base_url);
@@ -1346,9 +1386,15 @@ mod tests {
     #[tokio::test]
     async fn committing_prepare_replaces_current_proxy() {
         let manager = ProxyManager::default();
-        let first = manager.prepare(&provider(), &account()).await.unwrap();
+        let first = manager
+            .prepare(&provider(), &account(), &route_settings())
+            .await
+            .unwrap();
         manager.commit().await.unwrap();
-        let second = manager.prepare(&provider(), &account()).await.unwrap();
+        let second = manager
+            .prepare(&provider(), &account(), &route_settings())
+            .await
+            .unwrap();
         manager.commit().await.unwrap();
         assert_eq!(manager.endpoint().await.unwrap().base_url, second.base_url);
         assert_ne!(first.base_url, second.base_url);
@@ -1418,8 +1464,7 @@ mod tests {
 
     #[test]
     fn maps_deepseek_thinking_and_effort() {
-        let mut provider = provider();
-        provider.default_model = "deepseek-reasoner".into();
+        let provider = provider();
         let input = json!({
             "model":"deepseek-reasoner",
             "input":"hello",
@@ -1433,15 +1478,13 @@ mod tests {
 
     #[test]
     fn maps_qwen_and_kimi_thinking_switches() {
-        let mut qwen = provider();
-        qwen.default_model = "qwen3-coder".into();
+        let qwen = provider();
         let input = json!({"model":"qwen3-coder","input":"hello","reasoning":{"effort":"high"}});
         let config = resolve_reasoning_config(&qwen, &input).unwrap();
         let output = responses_to_chat_with_reasoning(&input, Some(&config)).unwrap();
         assert_eq!(output["enable_thinking"], true);
 
-        let mut kimi = provider();
-        kimi.default_model = "kimi-k2-thinking".into();
+        let kimi = provider();
         let input = json!({
             "model":"kimi-k2-thinking",
             "input":"hello",

@@ -5,8 +5,8 @@ export const blankProvider: Provider = {
   name: "",
   protocol: "responses",
   baseUrl: "https://api.openai.com/v1",
-  defaultModel: "gpt-5",
   models: [],
+  modelMetadata: [],
   codexChatReasoning: undefined,
   headers: {},
   timeoutSecs: 30,
@@ -27,13 +27,6 @@ export function blankAccount(providerId: string): Account {
     createdAt: 0,
     updatedAt: 0,
   }
-}
-
-export function commaList(value: string) {
-  return value
-    .split(",")
-    .map((item) => item.trim())
-    .filter(Boolean)
 }
 
 export function optionalNumber(value: string) {
