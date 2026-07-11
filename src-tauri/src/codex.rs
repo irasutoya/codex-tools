@@ -4,20 +4,12 @@ use rusqlite::{Connection, params};
 use std::{
     fs,
     path::{Path, PathBuf},
-    process::Command,
 };
 use toml_edit::{DocumentMut, Item, Table, value};
 use walkdir::WalkDir;
 
 pub const MANAGED_PROVIDER_ID: &str = "custom";
 pub const MODEL_CATALOG_FILENAME: &str = "codex-tools-model-catalog.json";
-const MODEL_CATALOG_TEMPLATE_SLUG: &str = "gpt-5.5";
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum CatalogProfile {
-    ProxyChat,
-    NativeResponses,
-}
 
 pub fn home() -> PathBuf {
     dirs::home_dir()
@@ -280,38 +272,46 @@ fn replace_file(source: &Path, target: &Path) -> anyhow::Result<()> {
     fs::rename(source, target)?;
     Ok(())
 }
-fn backup(label: &str) -> anyhow::Result<PathBuf> {
-    let root = std::env::temp_dir()
-        .join("codex-tools")
-        .join(format!("{label}-{}", uuid::Uuid::new_v4().simple()));
-    fs::create_dir_all(&root)?;
-    for name in [
-        "config.toml",
-        "auth.json",
-        MODEL_CATALOG_FILENAME,
-        ".codex-global-state.json",
-    ] {
-        let src = home().join(name);
-        if src.exists() {
-            fs::copy(src, root.join(name))?;
+
+#[derive(Clone)]
+pub(crate) struct ConfigState {
+    files: Vec<(&'static str, Option<Vec<u8>>)>,
+}
+
+pub(crate) fn capture_config_state() -> Result<ConfigState, AppError> {
+    let files = ["config.toml", "auth.json", MODEL_CATALOG_FILENAME]
+        .into_iter()
+        .map(|name| {
+            let path = home().join(name);
+            let data = if path.exists() {
+                Some(fs::read(path).map_err(|error| AppError::Internal(error.to_string()))?)
+            } else {
+                None
+            };
+            Ok((name, data))
+        })
+        .collect::<Result<Vec<_>, AppError>>()?;
+    Ok(ConfigState { files })
+}
+
+pub(crate) fn restore_config_state(state: &ConfigState) -> Result<(), AppError> {
+    for (name, data) in &state.files {
+        let path = home().join(name);
+        match data {
+            Some(data) => atomic_write(&path, data)?,
+            None if path.exists() => {
+                fs::remove_file(path).map_err(|error| AppError::Internal(error.to_string()))?;
+            }
+            None => {}
         }
     }
-    Ok(root)
-}
-#[allow(dead_code)]
-pub fn apply_provider(p: &ProviderProfile, account: &ProviderAccount) -> Result<String, AppError> {
-    if p.protocol == ProviderProtocol::ChatCompletions {
-        return Err(AppError::InvalidConfig(
-            "Chat Completions 需要先启动本地协议代理".into(),
-        ));
-    }
-    apply_provider_with_proxy(p, account, None)
+    Ok(())
 }
 pub fn apply_provider_with_proxy(
     p: &ProviderProfile,
     account: &ProviderAccount,
     proxy: Option<&ProxyEndpoint>,
-) -> Result<String, AppError> {
+) -> Result<(), AppError> {
     if p.name.trim().is_empty()
         || p.base_url.trim().is_empty()
         || account
@@ -325,7 +325,6 @@ pub fn apply_provider_with_proxy(
             "provider fields are required".into(),
         ));
     }
-    let backup_path = backup("provider").map_err(|e| AppError::Backup(e.to_string()))?;
     let token = match p.protocol {
         ProviderProtocol::Responses => account.api_key.clone().unwrap_or_default(),
         ProviderProtocol::ChatCompletions => {
@@ -347,33 +346,33 @@ pub fn apply_provider_with_proxy(
     } else {
         Some(build_model_catalog(p)?)
     };
+    let catalog_bytes = catalog
+        .as_ref()
+        .map(serde_json::to_vec_pretty)
+        .transpose()
+        .map_err(|error| AppError::Internal(error.to_string()))?;
+    let auth_bytes =
+        serde_json::to_vec_pretty(&auth).map_err(|error| AppError::Internal(error.to_string()))?;
+    let original = capture_config_state()?;
     let update = (|| -> Result<(), AppError> {
         fs::create_dir_all(home()).map_err(|error| AppError::Internal(error.to_string()))?;
         let catalog_path = home().join(MODEL_CATALOG_FILENAME);
-        if let Some(catalog) = catalog {
-            atomic_write(
-                &catalog_path,
-                &serde_json::to_vec_pretty(&catalog)
-                    .map_err(|error| AppError::Internal(error.to_string()))?,
-            )
-            .map_err(|error| AppError::Internal(error.to_string()))?;
+        if let Some(catalog_bytes) = catalog_bytes {
+            atomic_write(&catalog_path, &catalog_bytes)
+                .map_err(|error| AppError::Internal(error.to_string()))?;
         } else if catalog_path.exists() {
             fs::remove_file(&catalog_path)
                 .map_err(|error| AppError::Internal(error.to_string()))?;
         }
-        atomic_write(
-            &home().join("auth.json"),
-            &serde_json::to_vec_pretty(&auth)
-                .map_err(|error| AppError::Internal(error.to_string()))?,
-        )
-        .map_err(|error| AppError::Internal(error.to_string()))?;
+        atomic_write(&home().join("auth.json"), &auth_bytes)
+            .map_err(|error| AppError::Internal(error.to_string()))?;
         atomic_write(&home().join("config.toml"), config.as_bytes())
             .map_err(|error| AppError::Internal(error.to_string()))?;
         Ok(())
     })();
     match update {
-        Ok(()) => Ok(backup_path.display().to_string()),
-        Err(error) => match restore_provider_backup(&backup_path.display().to_string()) {
+        Ok(()) => Ok(()),
+        Err(error) => match restore_config_state(&original) {
             Ok(()) => Err(error),
             Err(restore_error) => Err(AppError::Backup(format!(
                 "configuration update failed: {error}; rollback failed: {restore_error}"
@@ -388,21 +387,16 @@ fn build_managed_config(
     base_url: &str,
     token: &str,
 ) -> Result<String, AppError> {
-    let existing = fs::read_to_string(home().join("config.toml")).unwrap_or_default();
-    build_managed_config_from(&existing, provider, account, base_url, token)
+    build_managed_config_from(provider, account, base_url, token)
 }
 
 fn build_managed_config_from(
-    existing: &str,
     provider: &ProviderProfile,
     account: &ProviderAccount,
     base_url: &str,
     token: &str,
 ) -> Result<String, AppError> {
-    // Provider switching must not disable Codex desktop capabilities. Keep the
-    // user's runtime, plugin, MCP, project trust and UI settings, and replace
-    // only fields that select or authenticate a model provider.
-    let mut doc = config_without_provider_selection(existing)?;
+    let mut doc = DocumentMut::new();
     doc["model_provider"] = value(MANAGED_PROVIDER_ID);
     if !provider.models.is_empty() {
         doc["model_catalog_json"] = value(MODEL_CATALOG_FILENAME);
@@ -423,46 +417,6 @@ fn build_managed_config_from(
     providers[MANAGED_PROVIDER_ID] = Item::Table(managed);
     doc["model_providers"] = Item::Table(providers);
     Ok(doc.to_string())
-}
-
-fn config_without_provider_selection(config: &str) -> Result<DocumentMut, AppError> {
-    let mut doc = if config.trim().is_empty() {
-        DocumentMut::new()
-    } else {
-        config.parse::<DocumentMut>().map_err(|error| {
-            AppError::InvalidConfig(format!("Codex config.toml 语法无效：{error}"))
-        })?
-    };
-    for key in [
-        "model",
-        "model_provider",
-        "model_catalog_json",
-        "model_reasoning_effort",
-        "model_reasoning_summary",
-        "base_url",
-        "wire_api",
-        "experimental_bearer_token",
-        "model_providers",
-    ] {
-        doc.as_table_mut().remove(key);
-    }
-    Ok(doc)
-}
-
-fn build_official_config(current: &str, snapshot: Option<&str>) -> Result<String, AppError> {
-    let mut restored = snapshot
-        .filter(|value| !value.trim().is_empty())
-        .map(config_without_provider_selection)
-        .transpose()?
-        .unwrap_or_default();
-    let current = config_without_provider_selection(current)?;
-    // Current desktop/plugin settings are newer than an account snapshot. They
-    // win when present, while a snapshot still restores settings missing from
-    // legacy provider-only configurations.
-    for (key, item) in current.as_table().iter() {
-        restored.as_table_mut().insert(key, item.clone());
-    }
-    Ok(restored.to_string())
 }
 
 fn merged_header_table(provider: &serde_json::Value, account: &serde_json::Value) -> Table {
@@ -493,188 +447,13 @@ fn build_managed_auth(token: &str) -> serde_json::Value {
 }
 
 fn build_model_catalog(provider: &ProviderProfile) -> Result<serde_json::Value, AppError> {
-    let profile = match provider.protocol {
-        ProviderProtocol::ChatCompletions => CatalogProfile::ProxyChat,
-        ProviderProtocol::Responses => CatalogProfile::NativeResponses,
-    };
-    let template = match profile {
-        CatalogProfile::ProxyChat => load_proxy_chat_template()?,
-        CatalogProfile::NativeResponses => load_native_responses_template()?,
-    };
-    Ok(build_model_catalog_from_template(
-        provider, &template, profile,
-    ))
+    crate::model_catalog::build(provider, &home())
 }
 
-fn build_model_catalog_from_template(
-    provider: &ProviderProfile,
-    template: &serde_json::Value,
-    profile: CatalogProfile,
-) -> serde_json::Value {
-    let mut seen = std::collections::HashSet::new();
-    let models = provider.models.iter().filter_map(|raw_model| {
-        let model = raw_model.trim();
-        if model.is_empty() || !seen.insert(model.to_string()) {
-            return None;
-        }
-        let upstream = provider.model_metadata.iter().find(|item| item.id == model);
-        let mut entry = template.clone();
-        let object = entry
-            .as_object_mut()
-            .expect("model template must be an object");
-        object.insert("slug".into(), model.into());
-        object.insert("display_name".into(), model.into());
-        object.insert("description".into(), model.into());
-        object.insert("priority".into(), (1000 + seen.len()).into());
-        object.insert("additional_speed_tiers".into(), serde_json::json!([]));
-        object.insert("service_tiers".into(), serde_json::json!([]));
-        object.insert("availability_nux".into(), serde_json::Value::Null);
-        object.insert("upgrade".into(), serde_json::Value::Null);
-        let context_window = upstream
-            .and_then(model_context_window)
-            .or(provider.context_window)
-            .filter(|value| *value > 0);
-        if let Some(context_window) = context_window {
-            object.insert("context_window".into(), context_window.into());
-            object.insert("max_context_window".into(), context_window.into());
-        }
-        if profile == CatalogProfile::NativeResponses {
-            apply_native_model_metadata(object, upstream);
-        }
-        Some(entry)
-    });
-    serde_json::json!({ "models": models.collect::<Vec<_>>() })
-}
-
-fn find_model_template(catalog: &serde_json::Value) -> Option<serde_json::Value> {
-    catalog
-        .get("models")
-        .and_then(serde_json::Value::as_array)
-        .and_then(|models| {
-            models.iter().find(|model| {
-                model.get("slug").and_then(serde_json::Value::as_str)
-                    == Some(MODEL_CATALOG_TEMPLATE_SLUG)
-            })
-        })
-        .filter(|model| {
-            model
-                .get("base_instructions")
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|value| !value.trim().is_empty())
-                && model.get("model_messages").is_some()
-                && model.get("apply_patch_tool_type").is_some()
-        })
-        .cloned()
-}
-
-fn load_proxy_chat_template() -> Result<serde_json::Value, AppError> {
-    let cache_path = home().join("models_cache.json");
-    if cache_path.exists() {
-        let bytes = fs::read(&cache_path).map_err(|error| AppError::Internal(error.to_string()))?;
-        let catalog: serde_json::Value = serde_json::from_slice(&bytes)
-            .map_err(|error| AppError::InvalidConfig(format!("models_cache.json 无效：{error}")))?;
-        if let Some(template) = find_model_template(&catalog) {
-            return Ok(template);
-        }
-    }
-    if let Ok(output) = Command::new("codex")
-        .args(["debug", "models", "--bundled"])
-        .output()
-        && output.status.success()
-        && let Ok(catalog) = serde_json::from_slice::<serde_json::Value>(&output.stdout)
-        && let Some(template) = find_model_template(&catalog)
-    {
-        return Ok(template);
-    }
-    Err(AppError::InvalidConfig(format!(
-        "找不到本机 Codex 的完整 {MODEL_CATALOG_TEMPLATE_SLUG} agent 模板；请先启动一次 Codex 或确保 codex CLI 可用。已取消切换，以免生成会丢失工具能力的模型目录"
-    )))
-}
-
-fn load_native_responses_template() -> Result<serde_json::Value, AppError> {
-    Ok(serde_json::json!({
-        "slug": "native-responses-template",
-        "display_name": "native-responses-template",
-        "description": "native-responses-template",
-        "base_instructions": "You are Codex, a coding agent. You and the user share the same workspace and collaborate to achieve the user's goals.",
-        "default_reasoning_level": "high",
-        "supported_reasoning_levels": [
-            {"effort": "none", "description": "Disable reasoning"},
-            {"effort": "high", "description": "Enable reasoning"}
-        ],
-        "shell_type": "shell_command",
-        "visibility": "list",
-        "supported_in_api": true,
-        "priority": 0,
-        "supports_reasoning_summaries": true,
-        "default_reasoning_summary": "none",
-        "support_verbosity": false,
-        "truncation_policy": {"mode": "bytes", "limit": 10000},
-        "supports_parallel_tool_calls": false,
-        "supports_image_detail_original": false,
-        "context_window": 262144,
-        "max_context_window": 262144,
-        "effective_context_window_percent": 95,
-        "experimental_supported_tools": [],
-        "input_modalities": ["text"],
-        "supports_search_tool": false
-    }))
-}
-
-fn model_context_window(model: &FetchedModel) -> Option<u64> {
-    ["context_window", "contextWindow", "max_context_window"]
-        .iter()
-        .find_map(|name| model.metadata.get(*name))
-        .and_then(|value| {
-            value
-                .as_u64()
-                .or_else(|| value.as_str()?.trim().parse().ok())
-        })
-        .filter(|value| *value > 0)
-}
-
-fn apply_native_model_metadata(
-    target: &mut serde_json::Map<String, serde_json::Value>,
-    upstream: Option<&FetchedModel>,
-) {
-    let Some(upstream) = upstream else { return };
-    const FIELDS: &[(&str, &[&str])] = &[
-        (
-            "supports_parallel_tool_calls",
-            &["supports_parallel_tool_calls", "supportsParallelToolCalls"],
-        ),
-        ("input_modalities", &["input_modalities", "inputModalities"]),
-        (
-            "base_instructions",
-            &["base_instructions", "baseInstructions"],
-        ),
-    ];
-    for (target_name, aliases) in FIELDS {
-        if let Some(value) = aliases.iter().find_map(|name| upstream.metadata.get(*name)) {
-            target.insert((*target_name).into(), value.clone());
-        }
-    }
-    for key in [
-        "apply_patch_tool_type",
-        "web_search_tool_type",
-        "tools",
-        "model_messages",
-    ] {
-        target.remove(key);
-    }
-    target.insert("shell_type".into(), "shell_command".into());
-}
-
-pub fn restore_official_snapshot(
-    auth: &serde_json::Value,
-    config_snapshot: Option<&str>,
-) -> Result<String, AppError> {
-    let backup_path =
-        backup("official-account").map_err(|error| AppError::Backup(error.to_string()))?;
+pub fn apply_official_account(auth: &serde_json::Value) -> Result<(), AppError> {
+    let original = capture_config_state()?;
     let update = (|| -> Result<(), AppError> {
-        let current = fs::read_to_string(home().join("config.toml")).unwrap_or_default();
-        let config = build_official_config(&current, config_snapshot)?;
-        atomic_write(&home().join("config.toml"), config.as_bytes())?;
+        atomic_write(&home().join("config.toml"), b"")?;
         atomic_write(
             &home().join("auth.json"),
             &serde_json::to_vec_pretty(auth)
@@ -687,50 +466,18 @@ pub fn restore_official_snapshot(
         Ok(())
     })();
     match update {
-        Ok(()) => Ok(backup_path.display().to_string()),
-        Err(error) => {
-            restore_provider_backup(&backup_path.display().to_string())?;
-            Err(error)
-        }
-    }
-}
-
-pub fn restore_provider_backup(backup_path: &str) -> Result<(), AppError> {
-    let backup_path = Path::new(backup_path);
-    for name in ["config.toml", "auth.json", MODEL_CATALOG_FILENAME] {
-        let source = backup_path.join(name);
-        if source.exists() {
-            let bytes = fs::read(&source).map_err(|error| AppError::Backup(error.to_string()))?;
-            atomic_write(&home().join(name), &bytes)
-                .map_err(|error| AppError::Backup(error.to_string()))?;
-        } else {
-            let target = home().join(name);
-            if target.exists() {
-                fs::remove_file(target).map_err(|error| AppError::Backup(error.to_string()))?;
-            }
-        }
-    }
-    discard_provider_backup(backup_path.to_string_lossy().as_ref());
-    Ok(())
-}
-
-pub fn discard_provider_backup(backup_path: &str) {
-    let path = Path::new(backup_path);
-    let _ = fs::remove_dir_all(path);
-    if let Some(parent) = path.parent() {
-        let _ = fs::remove_dir(parent);
+        Ok(()) => Ok(()),
+        Err(error) => match restore_config_state(&original) {
+            Ok(()) => Err(error),
+            Err(rollback) => Err(AppError::Backup(format!(
+                "官方账号配置失败：{error}；内存回滚失败：{rollback}"
+            ))),
+        },
     }
 }
 
 pub fn repair(provider: &str) -> Result<RepairResult, AppError> {
     crate::provider_sync::synchronize(&home(), provider)
-}
-#[allow(dead_code)]
-pub fn restore_sessions_exact(
-    provider: &str,
-    thread_ids: &[String],
-) -> Result<RepairResult, AppError> {
-    crate::provider_sync::restore_exact(&home(), provider, thread_ids)
 }
 pub fn delete_sessions(ids: &[String]) -> anyhow::Result<usize> {
     let sessions = crate::session_index::rebuild()?;
@@ -858,7 +605,6 @@ mod tests {
     #[test]
     fn provider_switch_rebuilds_minimal_config() {
         let config = build_managed_config_from(
-            "",
             &test_provider(),
             &test_account(),
             "https://example.test/v1",
@@ -892,29 +638,8 @@ mod tests {
     }
 
     #[test]
-    fn provider_switch_preserves_desktop_tool_configuration() {
-        let existing = r#"
-model = "old-model"
-model_provider = "old-provider"
-model_reasoning_effort = "high"
-
-[model_providers.old-provider]
-base_url = "https://old.invalid/v1"
-
-[plugins."computer-use@openai-bundled"]
-enabled = true
-
-[mcp_servers.node_repl]
-command = "node_repl.exe"
-
-[desktop]
-conversationDetailMode = "STEPS_COMMANDS"
-
-[windows]
-sandbox = "elevated"
-"#;
+    fn provider_switch_config_contains_only_managed_fields() {
         let config = build_managed_config_from(
-            existing,
             &test_provider(),
             &test_account(),
             "https://example.test/v1",
@@ -927,162 +652,15 @@ sandbox = "elevated"
             Some(MANAGED_PROVIDER_ID)
         );
         assert!(parsed.get("model").is_none());
-        assert!(parsed["model_providers"].get("old-provider").is_none());
+        let keys = parsed
+            .as_table()
+            .iter()
+            .map(|(key, _)| key)
+            .collect::<Vec<_>>();
         assert_eq!(
-            parsed["plugins"]["computer-use@openai-bundled"]["enabled"].as_bool(),
-            Some(true)
+            keys,
+            vec!["model_provider", "model_catalog_json", "model_providers"]
         );
-        assert_eq!(
-            parsed["mcp_servers"]["node_repl"]["command"].as_str(),
-            Some("node_repl.exe")
-        );
-        assert_eq!(parsed["windows"]["sandbox"].as_str(), Some("elevated"));
-    }
-
-    #[test]
-    fn official_switch_merges_snapshot_without_losing_current_tools() {
-        let current = r#"
-model_provider = "custom"
-[model_providers.custom]
-base_url = "http://127.0.0.1:1234/v1"
-[plugins."computer-use@openai-bundled"]
-enabled = true
-"#;
-        let snapshot = r#"
-model = "official-model"
-[desktop]
-localeOverride = "zh-CN"
-[plugins."computer-use@openai-bundled"]
-enabled = false
-"#;
-        let config = build_official_config(current, Some(snapshot)).unwrap();
-        let parsed = config.parse::<DocumentMut>().unwrap();
-        assert!(parsed.get("model").is_none());
-        assert!(parsed.get("model_provider").is_none());
-        assert!(parsed.get("model_providers").is_none());
-        assert_eq!(parsed["desktop"]["localeOverride"].as_str(), Some("zh-CN"));
-        assert_eq!(
-            parsed["plugins"]["computer-use@openai-bundled"]["enabled"].as_bool(),
-            Some(true)
-        );
-    }
-
-    #[test]
-    fn provider_switch_rejects_invalid_existing_config() {
-        let error = build_managed_config_from(
-            "[broken",
-            &test_provider(),
-            &test_account(),
-            "https://example.test/v1",
-            "secret-key",
-        )
-        .unwrap_err();
-        assert!(matches!(error, AppError::InvalidConfig(_)));
-    }
-
-    #[test]
-    fn model_catalog_preserves_selected_model_order_and_deduplicates() {
-        let mut provider = test_provider();
-        provider.model_metadata = vec![FetchedModel {
-            id: "model-b".into(),
-            owned_by: Some("upstream".into()),
-            metadata: serde_json::from_value(json!({
-                "context_window": 96_000,
-                "default_reasoning_level": "high",
-                "supported_reasoning_levels": [{"effort": "high"}],
-                "input_modalities": ["text", "image"],
-                "base_instructions": "upstream instructions must not replace Codex",
-                "apply_patch_tool_type": "disabled"
-            }))
-            .unwrap(),
-        }];
-        let template = json!({
-            "slug": "gpt-5.5",
-            "base_instructions": "full Codex instructions",
-            "model_messages": {"instructions_template": "Codex agent template"},
-            "apply_patch_tool_type": "freeform",
-            "tool_mode": "default",
-            "shell_type": "shell_command",
-            "supports_parallel_tool_calls": true
-        });
-        let catalog =
-            build_model_catalog_from_template(&provider, &template, CatalogProfile::ProxyChat);
-        let models = catalog["models"].as_array().unwrap();
-        assert_eq!(models.len(), 2);
-        assert_eq!(models[0]["slug"], "model-b");
-        assert_eq!(models[1]["slug"], "model-a");
-        assert_eq!(models[0]["context_window"], 96_000);
-        assert_eq!(models[0]["max_context_window"], 96_000);
-        assert_eq!(models[0]["base_instructions"], "full Codex instructions");
-        assert_eq!(models[0]["tool_mode"], "default");
-        assert_eq!(models[0]["apply_patch_tool_type"], "freeform");
-        assert_eq!(models[0]["supports_parallel_tool_calls"], true);
-        assert!(models[0].get("default_reasoning_level").is_none());
-        assert!(models[0].get("supported_reasoning_levels").is_none());
-        assert!(models[0].get("input_modalities").is_none());
-    }
-
-    #[test]
-    fn native_catalog_uses_clean_template_and_only_safe_upstream_metadata() {
-        let mut provider = test_provider();
-        provider.model_metadata = vec![FetchedModel {
-            id: "model-b".into(),
-            owned_by: None,
-            metadata: serde_json::from_value(json!({
-                "context_window": 120_000,
-                "supports_parallel_tool_calls": true,
-                "input_modalities": ["text", "image"],
-                "base_instructions": "upstream native instructions",
-                "apply_patch_tool_type": "freeform",
-                "model_messages": {"instructions_template": "unsafe"},
-                "default_reasoning_level": "invented"
-            }))
-            .unwrap(),
-        }];
-        let template = json!({
-            "slug": "native-responses-template",
-            "base_instructions": "full Codex instructions",
-            "shell_type": "shell_command",
-            "apply_patch_tool_type": "freeform",
-            "model_messages": {"instructions_template": "unsafe"},
-            "supports_parallel_tool_calls": false
-        });
-        let catalog = build_model_catalog_from_template(
-            &provider,
-            &template,
-            CatalogProfile::NativeResponses,
-        );
-        let model = &catalog["models"][0];
-        assert_eq!(model["slug"], "model-b");
-        assert_eq!(model["context_window"], 120_000);
-        assert_eq!(model["base_instructions"], "upstream native instructions");
-        assert_eq!(model["supports_parallel_tool_calls"], true);
-        assert_eq!(model["input_modalities"], json!(["text", "image"]));
-        assert!(model.get("apply_patch_tool_type").is_none());
-        assert!(model.get("model_messages").is_none());
-        assert!(model.get("default_reasoning_level").is_none());
-    }
-
-    #[test]
-    fn chat_template_requires_exact_complete_codex_agent_entry() {
-        let catalog = json!({"models": [
-            {"slug": "gpt-5.5", "base_instructions": "missing tool fields"},
-            {
-                "slug": "another-model",
-                "base_instructions": "complete but wrong model",
-                "model_messages": {},
-                "apply_patch_tool_type": "freeform"
-            }
-        ]});
-        assert!(find_model_template(&catalog).is_none());
-
-        let complete = json!({
-            "slug": "gpt-5.5",
-            "base_instructions": "complete Codex agent instructions",
-            "model_messages": {},
-            "apply_patch_tool_type": "freeform"
-        });
-        assert!(find_model_template(&json!({"models": [complete]})).is_some());
     }
 
     #[test]

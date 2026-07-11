@@ -2,27 +2,27 @@
 
 Codex Tools 是面向 Windows 10/11 x64 的单体 Codex Provider、账号和会话管理工具。它不会使用 CDP、不会向 Codex 注入脚本，也不会修改 Codex 安装目录。
 
-> 当前版本为 `0.1.0` 早期预览版。Provider 切换和数据库修复会在写入前创建备份，但仍建议先自行备份 `%USERPROFILE%\.codex`。
+> 当前版本为 `0.1.0` 早期预览版。Provider 切换和数据库修复会直接更新 Codex 数据，建议用户按需自行备份 `%USERPROFILE%\.codex`。
 
 ## 功能
 
 - 保存多个 Responses 或 Chat Completions 兼容 Provider。
 - 每个 Provider 管理多个 API 账号并一键切换。
-- 保存和切换 Codex 官方 OAuth 登录快照。
+- 保存和切换 Codex 官方 OAuth 登录账号。
 - 在应用进程内运行仅监听 loopback 的 Responses → Chat Completions 适配代理。
 - 切换账号时同步已识别的 Codex 会话 Provider，统一历史可见性。
 - 扫描默认 SQLite、`sqlite_home`、`CODEX_SQLITE_HOME` 和 rollout JSONL。
-- 修复前备份 SQLite、WAL/SHM、rollout 和全局状态，并支持失败回滚。
+- 修复操作仅在系统临时目录创建事务回滚副本，结束后立即删除，不保留历史备份。
 - 搜索、Markdown 导出和永久删除已识别会话。
 
 ## 安全说明
 
-按项目设计，API Key 和官方登录快照以明文保存在本机 `codex-tools.db`。完整应用备份也可能包含明文凭据：
+按项目设计，Provider、账号、API Key 和应用设置以明文保存在本机 `codex-tools.sqlite`：
 
-- 不要将数据库、备份或诊断附件上传到公开位置。
+- 不要将数据库或诊断附件上传到公开位置。
 - Provider 测试不会在界面或日志中返回完整上游响应。
 - 未识别的 Codex SQLite schema 只读扫描，不猜测字段并写入。
-- 只迁移 Codex Tools 明确认识的历史 Provider ID，不改写用户自定义 Provider。
+- 仅改写当前账号切换所需的 Provider 和已识别会话字段。
 
 ## 开发环境
 
@@ -70,8 +70,8 @@ src/
 src-tauri/src/
   codex.rs                Codex 配置、扫描与会话操作
   protocol_proxy.rs       loopback 协议适配代理
-  provider_sync.rs        会话统一、备份与回滚
-  storage.rs              codex-tools.db 与迁移
+  provider_sync.rs        会话统一与临时事务回滚
+  storage.rs              codex-tools.sqlite 当前数据结构
   models.rs               Rust IPC 数据类型和稳定错误
 ```
 

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react"
+import { useCallback, useEffect, useState } from "react"
 import { save } from "@tauri-apps/plugin-dialog"
 import { openUrl } from "@tauri-apps/plugin-opener"
 import {
@@ -102,7 +102,6 @@ import {
   blankAccount,
   blankProvider,
   maskKey,
-  optionalNumber,
   parseHeaders,
 } from "@/features/providers/model"
 import { call } from "@/lib/tauri"
@@ -205,7 +204,6 @@ export default function App() {
     return () => window.clearTimeout(task)
   }, [loadRoute, loadSessions, page, routePage, sessionPage])
 
-  const officialAccounts = useMemo(() => authAccounts, [authAccounts])
   const saveProvider = async () => {
     if (!editingProvider) return
     setBusy(true)
@@ -265,7 +263,6 @@ export default function App() {
         : await call<{ rowsUpdated: number }>("activate_provider", {
             id: activating.provider?.id,
             accountId: activating.account.id,
-            force: false,
           })
       toast.success(`切换完成，统一了 ${result.rowsUpdated} 条会话数据`)
       setActivating(undefined)
@@ -409,14 +406,14 @@ export default function App() {
             {page === "dashboard" && (
               <DashboardPage
                 dashboard={dashboard}
-                officialCount={officialAccounts.length}
+                officialCount={authAccounts.length}
               />
             )}
             {page === "providers" && (
               <ProvidersPage
                 providers={providers}
                 accounts={accounts}
-                officialAccounts={officialAccounts}
+                officialAccounts={authAccounts}
                 busy={busy}
                 onNew={() => setEditingProvider({ ...blankProvider })}
                 onEdit={setEditingProvider}
@@ -451,6 +448,11 @@ export default function App() {
             )}
             {page === "routes" && (
               <RouteConsolePage
+                key={
+                  route
+                    ? `${route.settings.listenAddress}:${route.settings.port}:${route.settings.enabled}`
+                    : "loading"
+                }
                 route={route}
                 page={routePage}
                 onPageChange={setRoutePage}
@@ -1491,7 +1493,6 @@ function ProviderDialog({
   onChange: (provider?: Provider) => void
   onSave: () => void
 }) {
-  const allowLegacyModelOverrides = false
   const [fetchingModels, setFetchingModels] = useState(false)
   const [newModel, setNewModel] = useState("")
   const addModel = () => {
@@ -1669,147 +1670,6 @@ function ProviderDialog({
                 自定义模型目录。
               </FieldDescription>
             </Field>
-            {allowLegacyModelOverrides &&
-              value.protocol === "chat_completions" && (
-                <Field>
-                  <div className="flex items-center justify-between gap-3">
-                    <div className="flex flex-col gap-1">
-                      <FieldLabel htmlFor="reasoning-override">
-                        自定义推理映射
-                      </FieldLabel>
-                      <FieldDescription>
-                        默认根据 Provider、地址和当前模型实时识别。
-                      </FieldDescription>
-                    </div>
-                    <Switch
-                      id="reasoning-override"
-                      checked={!!value.codexChatReasoning}
-                      onCheckedChange={(checked) =>
-                        onChange({
-                          ...value,
-                          codexChatReasoning: checked
-                            ? {
-                                supportsThinking: true,
-                                supportsEffort: true,
-                                thinkingParam: "thinking",
-                                effortParam: "reasoning_effort",
-                                effortValueMode: "standard",
-                                outputFormat: "reasoning_content",
-                              }
-                            : undefined,
-                        })
-                      }
-                    />
-                  </div>
-                </Field>
-              )}
-            {value.protocol === "chat_completions" &&
-              value.codexChatReasoning && (
-                <FieldGroup>
-                  <Field orientation="horizontal">
-                    <FieldLabel htmlFor="supports-thinking">
-                      发送思考开关
-                    </FieldLabel>
-                    <Switch
-                      id="supports-thinking"
-                      checked={
-                        value.codexChatReasoning.supportsThinking ?? false
-                      }
-                      onCheckedChange={(checked) =>
-                        onChange({
-                          ...value,
-                          codexChatReasoning: {
-                            ...value.codexChatReasoning,
-                            supportsThinking: checked,
-                          },
-                        })
-                      }
-                    />
-                  </Field>
-                  <Field orientation="horizontal">
-                    <FieldLabel htmlFor="supports-effort">
-                      发送推理强度
-                    </FieldLabel>
-                    <Switch
-                      id="supports-effort"
-                      checked={value.codexChatReasoning.supportsEffort ?? false}
-                      onCheckedChange={(checked) =>
-                        onChange({
-                          ...value,
-                          codexChatReasoning: {
-                            ...value.codexChatReasoning,
-                            supportsEffort: checked,
-                          },
-                        })
-                      }
-                    />
-                  </Field>
-                  <Field>
-                    <FieldLabel>思考参数</FieldLabel>
-                    <Input
-                      value={value.codexChatReasoning.thinkingParam ?? ""}
-                      placeholder="thinking / enable_thinking / reasoning_split"
-                      onChange={(event) =>
-                        onChange({
-                          ...value,
-                          codexChatReasoning: {
-                            ...value.codexChatReasoning,
-                            thinkingParam: event.target.value || undefined,
-                          },
-                        })
-                      }
-                    />
-                  </Field>
-                  <Field>
-                    <FieldLabel>推理强度参数</FieldLabel>
-                    <Input
-                      value={value.codexChatReasoning.effortParam ?? ""}
-                      placeholder="reasoning_effort / reasoning.effort"
-                      onChange={(event) =>
-                        onChange({
-                          ...value,
-                          codexChatReasoning: {
-                            ...value.codexChatReasoning,
-                            effortParam: event.target.value || undefined,
-                          },
-                        })
-                      }
-                    />
-                  </Field>
-                </FieldGroup>
-              )}
-            {allowLegacyModelOverrides && (
-              <Field>
-                <FieldLabel>上下文窗口</FieldLabel>
-                <Input
-                  type="number"
-                  min={1}
-                  value={value.contextWindow ?? ""}
-                  onChange={(event) =>
-                    onChange({
-                      ...value,
-                      contextWindow: optionalNumber(event.target.value),
-                    })
-                  }
-                />
-              </Field>
-            )}
-            {allowLegacyModelOverrides && (
-              <Field>
-                <FieldLabel>自动压缩阈值</FieldLabel>
-                <Input
-                  type="number"
-                  min={1}
-                  value={value.autoCompactThreshold ?? ""}
-                  onChange={(event) =>
-                    onChange({
-                      ...value,
-                      autoCompactThreshold: optionalNumber(event.target.value),
-                    })
-                  }
-                />
-              </Field>
-            )}
             <Field>
               <FieldLabel>超时（秒）</FieldLabel>
               <Input
@@ -1863,7 +1723,7 @@ function AccountDialog({
         <DialogHeader>
           <DialogTitle>{value?.id ? "编辑" : "新增"} API 账号</DialogTitle>
           <DialogDescription>
-            凭据以明文保存在 codex-tools.db；账号专属 Header 会覆盖 Provider
+            凭据以明文保存在 codex-tools.sqlite；账号专属 Header 会覆盖 Provider
             Header。
           </DialogDescription>
         </DialogHeader>

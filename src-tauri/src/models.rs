@@ -66,6 +66,70 @@ fn default_true() -> bool {
     true
 }
 
+impl ProviderProfile {
+    pub fn normalize_and_validate(&mut self) -> Result<(), AppError> {
+        self.name = self.name.trim().to_owned();
+        self.base_url = self.base_url.trim().trim_end_matches('/').to_owned();
+        if self.name.is_empty() || self.base_url.is_empty() {
+            return Err(AppError::InvalidConfig("名称和 Base URL 不能为空".into()));
+        }
+        let url = reqwest::Url::parse(&self.base_url)
+            .map_err(|_| AppError::InvalidConfig("Base URL 必须是有效的 HTTP(S) URL".into()))?;
+        if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+            return Err(AppError::InvalidConfig(
+                "Base URL 只支持有效的 HTTP(S) 地址".into(),
+            ));
+        }
+        validate_headers(&self.headers)?;
+        self.timeout_secs = self.timeout_secs.clamp(1, 600);
+        let mut seen = std::collections::HashSet::new();
+        self.models = self
+            .models
+            .iter()
+            .map(|model| model.trim())
+            .filter(|model| !model.is_empty() && seen.insert((*model).to_owned()))
+            .map(str::to_owned)
+            .collect();
+        self.model_metadata
+            .retain(|metadata| self.models.iter().any(|model| model == metadata.id.trim()));
+        Ok(())
+    }
+}
+
+impl ProviderAccount {
+    pub fn normalize_and_validate(&mut self) -> Result<(), AppError> {
+        self.name = self.name.trim().to_owned();
+        if self.name.is_empty() {
+            return Err(AppError::InvalidConfig("账号名称不能为空".into()));
+        }
+        validate_headers(&self.headers)?;
+        if self.auth_kind == AccountAuthKind::ApiKey {
+            let key = self.api_key.as_deref().unwrap_or_default().trim();
+            if key.is_empty() {
+                return Err(AppError::InvalidConfig("API Key 不能为空".into()));
+            }
+            self.api_key = Some(key.to_owned());
+        }
+        Ok(())
+    }
+}
+
+fn validate_headers(headers: &serde_json::Value) -> Result<(), AppError> {
+    let object = headers
+        .as_object()
+        .ok_or_else(|| AppError::InvalidConfig("Headers 必须是字符串键值对象".into()))?;
+    for (name, value) in object {
+        reqwest::header::HeaderName::from_bytes(name.as_bytes())
+            .map_err(|_| AppError::InvalidConfig(format!("无效的 Header 名称：{name}")))?;
+        let value = value
+            .as_str()
+            .ok_or_else(|| AppError::InvalidConfig(format!("Header {name} 的值必须是字符串")))?;
+        reqwest::header::HeaderValue::from_str(value)
+            .map_err(|_| AppError::InvalidConfig(format!("Header {name} 包含无效字符")))?;
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderProtocol {
@@ -111,13 +175,6 @@ pub struct ProviderTestResult {
     pub endpoint: String,
     pub message: String,
     pub suggest_v1: bool,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ProxyStatus {
-    pub running: bool,
-    pub base_url: Option<String>,
 }
 
 #[derive(Debug, Serialize, Default)]
@@ -172,8 +229,6 @@ pub struct AuthAccount {
     pub email: Option<String>,
     #[serde(default)]
     pub credential: Option<serde_json::Value>,
-    #[serde(default)]
-    pub config_snapshot: Option<String>,
     #[serde(default)]
     pub scopes: Vec<String>,
     pub expires_at: Option<i64>,
@@ -283,24 +338,10 @@ pub struct RepairResult {
     pub warnings: Vec<String>,
 }
 
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DiagnosticReport {
-    pub app_db: String,
-    pub codex_home: String,
-    pub config_exists: bool,
-    pub auth_exists: bool,
-    pub databases: Vec<String>,
-    pub warnings: Vec<String>,
-}
-
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
     #[error("配置无效：{0}")]
     InvalidConfig(String),
-    #[error("Codex 正在运行，请先退出后再修复数据库")]
-    #[allow(dead_code)]
-    CodexRunning,
     #[error("未知数据库结构：{0}")]
     UnknownSchema(String),
     #[error("备份失败：{0}")]
@@ -324,5 +365,70 @@ impl serde::Serialize for AppError {
 impl From<anyhow::Error> for AppError {
     fn from(error: anyhow::Error) -> Self {
         Self::Internal(error.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn provider() -> ProviderProfile {
+        ProviderProfile {
+            id: "provider".into(),
+            name: "  Example  ".into(),
+            protocol: ProviderProtocol::Responses,
+            base_url: " https://example.test/v1/ ".into(),
+            models: vec![" model-a ".into(), "model-a".into(), "".into()],
+            model_metadata: vec![
+                FetchedModel {
+                    id: "model-a".into(),
+                    owned_by: None,
+                    metadata: Default::default(),
+                },
+                FetchedModel {
+                    id: "removed".into(),
+                    owned_by: None,
+                    metadata: Default::default(),
+                },
+            ],
+            codex_chat_reasoning: None,
+            headers: json!({"x-provider":"value"}),
+            timeout_secs: 0,
+            context_window: None,
+            auto_compact_threshold: None,
+            enabled: true,
+            active: false,
+            active_account_id: None,
+            account_count: 0,
+        }
+    }
+
+    #[test]
+    fn provider_validation_normalizes_network_configuration() {
+        let mut provider = provider();
+        provider.normalize_and_validate().unwrap();
+        assert_eq!(provider.name, "Example");
+        assert_eq!(provider.base_url, "https://example.test/v1");
+        assert_eq!(provider.models, vec!["model-a"]);
+        assert_eq!(provider.model_metadata.len(), 1);
+        assert_eq!(provider.timeout_secs, 1);
+    }
+
+    #[test]
+    fn provider_validation_rejects_non_http_urls_and_invalid_headers() {
+        let mut invalid_url = provider();
+        invalid_url.base_url = "file:///secret".into();
+        assert!(matches!(
+            invalid_url.normalize_and_validate(),
+            Err(AppError::InvalidConfig(_))
+        ));
+
+        let mut invalid_headers = provider();
+        invalid_headers.headers = json!({"authorization":["not", "a string"]});
+        assert!(matches!(
+            invalid_headers.normalize_and_validate(),
+            Err(AppError::InvalidConfig(_))
+        ));
     }
 }

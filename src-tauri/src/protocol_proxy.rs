@@ -10,7 +10,7 @@ use reqwest::{
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     net::SocketAddr,
     sync::{
         Arc,
@@ -41,11 +41,33 @@ enum CodexToolKind {
     ToolSearch,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PatchProxyAction {
+    AddFile,
+    DeleteFile,
+    UpdateFile,
+    ReplaceFile,
+    Batch,
+}
+
+impl PatchProxyAction {
+    fn suffix(self) -> &'static str {
+        match self {
+            Self::AddFile => "add_file",
+            Self::DeleteFile => "delete_file",
+            Self::UpdateFile => "update_file",
+            Self::ReplaceFile => "replace_file",
+            Self::Batch => "batch",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct CodexToolSpec {
     kind: CodexToolKind,
     name: String,
     namespace: Option<String>,
+    patch_action: Option<PatchProxyAction>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -94,6 +116,7 @@ impl CodexToolContext {
                 },
                 name: name.to_string(),
                 namespace: namespace.map(str::to_owned),
+                patch_action: None,
             },
             chat_tool,
         );
@@ -103,6 +126,10 @@ impl CodexToolContext {
         let Some(name) = tool.get("name").and_then(Value::as_str) else {
             return;
         };
+        if is_apply_patch_tool(tool, name) {
+            self.add_patch_tools(name, tool.get("description").and_then(Value::as_str));
+            return;
+        }
         let description = format!(
             "Original tool definition:\n```json\n{}\n```",
             canonical_json_string(tool)
@@ -113,6 +140,7 @@ impl CodexToolContext {
                 kind: CodexToolKind::Custom,
                 name: name.to_string(),
                 namespace: None,
+                patch_action: None,
             },
             json!({"type":"function","function":{
                 "name":name,
@@ -124,6 +152,32 @@ impl CodexToolContext {
         );
     }
 
+    fn add_patch_tools(&mut self, original_name: &str, description: Option<&str>) {
+        for action in [
+            PatchProxyAction::AddFile,
+            PatchProxyAction::DeleteFile,
+            PatchProxyAction::UpdateFile,
+            PatchProxyAction::ReplaceFile,
+            PatchProxyAction::Batch,
+        ] {
+            let chat_name = patch_proxy_name(original_name, action);
+            self.add(
+                chat_name.clone(),
+                CodexToolSpec {
+                    kind: CodexToolKind::Custom,
+                    name: original_name.to_owned(),
+                    namespace: None,
+                    patch_action: Some(action),
+                },
+                json!({"type":"function","function":{
+                    "name":chat_name,
+                    "description":patch_proxy_description(description, action),
+                    "parameters":patch_proxy_schema(action)
+                }}),
+            );
+        }
+    }
+
     fn add_tool_search(&mut self) {
         self.add(
             TOOL_SEARCH_PROXY_NAME.into(),
@@ -131,6 +185,7 @@ impl CodexToolContext {
                 kind: CodexToolKind::ToolSearch,
                 name: TOOL_SEARCH_PROXY_NAME.into(),
                 namespace: None,
+                patch_action: None,
             },
             json!({"type":"function","function":{
                 "name":TOOL_SEARCH_PROXY_NAME,
@@ -163,6 +218,126 @@ impl CodexToolContext {
             }
             _ => {}
         }
+    }
+
+    fn custom_history_call(&self, name: &str, input: &str) -> (String, String) {
+        let batch_name = patch_proxy_name(name, PatchProxyAction::Batch);
+        if self
+            .specs
+            .get(&batch_name)
+            .is_some_and(|spec| spec.patch_action == Some(PatchProxyAction::Batch))
+        {
+            return encode_patch_history(name, input);
+        }
+        (
+            name.to_owned(),
+            canonical_json_string(&json!({CUSTOM_TOOL_INPUT_FIELD:input})),
+        )
+    }
+
+    fn custom_choice_name(&self, original_name: &str) -> String {
+        let batch = patch_proxy_name(original_name, PatchProxyAction::Batch);
+        if self.specs.contains_key(&batch) {
+            batch
+        } else {
+            original_name.to_owned()
+        }
+    }
+}
+
+fn is_apply_patch_tool(tool: &Value, name: &str) -> bool {
+    name == "apply_patch"
+        || tool
+            .pointer("/format/definition")
+            .and_then(Value::as_str)
+            .is_some_and(|definition| {
+                definition.contains("*** Begin Patch")
+                    || (definition.contains("begin_patch")
+                        && definition.contains("end_patch")
+                        && definition.contains("update_hunk"))
+            })
+}
+
+fn patch_proxy_name(original_name: &str, action: PatchProxyAction) -> String {
+    flatten_namespace_name(original_name, action.suffix())
+}
+
+fn patch_proxy_description(description: Option<&str>, action: PatchProxyAction) -> String {
+    let purpose = match action {
+        PatchProxyAction::AddFile => "Create one new file from its path and complete content.",
+        PatchProxyAction::DeleteFile => "Delete one file by path.",
+        PatchProxyAction::UpdateFile => {
+            "Update or move one existing file using ordered line hunks."
+        }
+        PatchProxyAction::ReplaceFile => "Replace one existing file with complete new content.",
+        PatchProxyAction::Batch => {
+            "Apply an ordered batch of file additions, deletions, updates, or replacements."
+        }
+    };
+    match description.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(description) => format!("{purpose}\n\n{description}"),
+        None => purpose.into(),
+    }
+}
+
+fn patch_hunks_schema() -> Value {
+    json!({
+        "type":"array",
+        "items":{
+            "type":"object","additionalProperties":false,
+            "properties":{
+                "context":{"type":"string"},
+                "lines":{"type":"array","items":{
+                    "type":"object","additionalProperties":false,
+                    "properties":{
+                        "op":{"type":"string","enum":["context","add","remove"]},
+                        "text":{"type":"string"}
+                    },
+                    "required":["op","text"]
+                }}
+            },
+            "required":["lines"]
+        }
+    })
+}
+
+fn patch_proxy_schema(action: PatchProxyAction) -> Value {
+    let operation = json!({
+        "type":"object","additionalProperties":false,
+        "properties":{
+            "type":{"type":"string","enum":["add_file","delete_file","update_file","replace_file"]},
+            "path":{"type":"string"},
+            "move_to":{"type":"string"},
+            "content":{"type":"string"},
+            "hunks":patch_hunks_schema()
+        },
+        "required":["type","path"]
+    });
+    match action {
+        PatchProxyAction::AddFile | PatchProxyAction::ReplaceFile => json!({
+            "type":"object","additionalProperties":false,
+            "properties":{"path":{"type":"string"},"content":{"type":"string"}},
+            "required":["path","content"]
+        }),
+        PatchProxyAction::DeleteFile => json!({
+            "type":"object","additionalProperties":false,
+            "properties":{"path":{"type":"string"}},"required":["path"]
+        }),
+        PatchProxyAction::UpdateFile => json!({
+            "type":"object","additionalProperties":false,
+            "properties":{
+                "path":{"type":"string"},"move_to":{"type":"string"},"hunks":patch_hunks_schema()
+            },
+            "required":["path","hunks"]
+        }),
+        PatchProxyAction::Batch => json!({
+            "type":"object","additionalProperties":false,
+            "properties":{
+                "operations":{"type":"array","items":operation},
+                "raw_patch":{"type":"string","description":"Fallback complete patch text when structured operations cannot represent the edit."}
+            },
+            "required":["operations"]
+        }),
     }
 }
 
@@ -435,7 +610,8 @@ impl ProxyManager {
         }
     }
 
-    pub async fn endpoint(&self) -> Option<ProxyEndpoint> {
+    #[cfg(test)]
+    async fn endpoint(&self) -> Option<ProxyEndpoint> {
         self.inner
             .lock()
             .await
@@ -833,16 +1009,10 @@ fn responses_to_chat_with_context(
     match input.get("input") {
         Some(Value::String(text)) => messages.push(json!({"role":"user","content":text})),
         Some(Value::Array(items)) => {
-            for item in items {
-                if let Some(message) = response_item_to_chat(item, &tool_context) {
-                    messages.push(message);
-                }
-            }
+            append_response_history(&mut messages, items, &tool_context);
         }
         Some(item @ Value::Object(_)) => {
-            if let Some(message) = response_item_to_chat(item, &tool_context) {
-                messages.push(message);
-            }
+            append_response_history(&mut messages, std::slice::from_ref(item), &tool_context);
         }
         _ => return Err("input is required".into()),
     }
@@ -855,7 +1025,6 @@ fn responses_to_chat_with_context(
         ("max_output_tokens", "max_tokens"),
         ("temperature", "temperature"),
         ("top_p", "top_p"),
-        ("parallel_tool_calls", "parallel_tool_calls"),
         ("seed", "seed"),
         ("user", "user"),
         ("stream", "stream"),
@@ -872,12 +1041,15 @@ fn responses_to_chat_with_context(
             "tools".into(),
             Value::Array(tool_context.chat_tools.clone()),
         );
-    }
-    if let Some(choice) = input.get("tool_choice") {
-        target.insert(
-            "tool_choice".into(),
-            response_tool_choice_to_chat(choice, &tool_context),
-        );
+        if let Some(choice) = input.get("tool_choice") {
+            target.insert(
+                "tool_choice".into(),
+                response_tool_choice_to_chat(choice, &tool_context),
+            );
+        }
+        if let Some(parallel) = input.get("parallel_tool_calls") {
+            target.insert("parallel_tool_calls".into(), parallel.clone());
+        }
     }
     if let Some(format) = input.pointer("/text/format") {
         target.insert("response_format".into(), response_format_to_chat(format));
@@ -888,7 +1060,7 @@ fn responses_to_chat_with_context(
 
 fn resolve_reasoning_config(
     provider: &ProviderProfile,
-    body: &Value,
+    _body: &Value,
 ) -> Option<CodexChatReasoningConfig> {
     if let Some(mut config) = provider.codex_chat_reasoning.clone() {
         if config.supports_effort == Some(true) && config.supports_thinking.is_none() {
@@ -896,91 +1068,10 @@ fn resolve_reasoning_config(
         }
         return Some(config);
     }
-    let model = body
-        .get("model")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    let name = provider.name.to_ascii_lowercase();
-    let base = provider.base_url.to_ascii_lowercase();
-    let platform = format!("{name} {base}");
-    if platform.contains("openrouter") {
-        return Some(reasoning_config(
-            false,
-            true,
-            "none",
-            "reasoning.effort",
-            Some("openrouter"),
-            "auto",
-        ));
-    }
-    if platform.contains("siliconflow") {
-        return Some(reasoning_config(
-            true,
-            false,
-            "enable_thinking",
-            "none",
-            None,
-            "reasoning_content",
-        ));
-    }
-    let haystack = format!("{platform} {model}");
-    if haystack.contains("deepseek") {
-        Some(reasoning_config(
-            true,
-            true,
-            "thinking",
-            "reasoning_effort",
-            Some("deepseek"),
-            "reasoning_content",
-        ))
-    } else if haystack.contains("stepfun") || haystack.contains("step-3.5-flash-2603") {
-        Some(reasoning_config(
-            true,
-            model.contains("2603"),
-            "none",
-            "reasoning_effort",
-            Some("low_high"),
-            "reasoning",
-        ))
-    } else if haystack.contains("qwen")
-        || haystack.contains("dashscope")
-        || haystack.contains("bailian")
-    {
-        Some(reasoning_config(
-            true,
-            false,
-            "enable_thinking",
-            "none",
-            None,
-            "reasoning_content",
-        ))
-    } else if haystack.contains("minimax") {
-        Some(reasoning_config(
-            true,
-            false,
-            "reasoning_split",
-            "none",
-            None,
-            "reasoning_details",
-        ))
-    } else if ["kimi", "moonshot", "glm", "zhipu", "z.ai", "mimo"]
-        .iter()
-        .any(|value| haystack.contains(value))
-    {
-        Some(reasoning_config(
-            true,
-            false,
-            "thinking",
-            "none",
-            None,
-            "reasoning_content",
-        ))
-    } else {
-        None
-    }
+    None
 }
 
+#[cfg(test)]
 fn reasoning_config(
     thinking: bool,
     effort: bool,
@@ -1088,17 +1179,48 @@ fn map_reasoning_effort(effort: &str, mode: Option<&str>) -> Option<&'static str
     }
 }
 
-fn response_item_to_chat(item: &Value, context: &CodexToolContext) -> Option<Value> {
+fn append_response_history(messages: &mut Vec<Value>, items: &[Value], context: &CodexToolContext) {
+    let mut known_calls = HashSet::new();
+    for item in items {
+        append_response_item(messages, item, context, &mut known_calls);
+    }
+}
+
+fn append_response_item(
+    messages: &mut Vec<Value>,
+    item: &Value,
+    context: &CodexToolContext,
+    known_calls: &mut HashSet<String>,
+) {
     let kind = item
         .get("type")
         .and_then(Value::as_str)
         .unwrap_or("message");
     match kind {
-        "function_call_output" | "custom_tool_call_output" | "tool_search_output" => Some(json!({
-            "role":"tool",
-            "tool_call_id":item.get("call_id").and_then(Value::as_str).unwrap_or_default(),
-            "content":item.get("output").cloned().unwrap_or(Value::String(String::new()))
-        })),
+        "function_call_output" | "custom_tool_call_output" | "tool_search_output" => {
+            let call_id = item
+                .get("call_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let output = content_to_text(item.get("output"));
+            if !call_id.is_empty() && known_calls.contains(call_id) {
+                messages.push(json!({
+                    "role":"tool",
+                    "tool_call_id":call_id,
+                    "content":output
+                }));
+            } else {
+                // Chat Completions rejects tool messages without a preceding
+                // assistant tool call. Preserve the information as user text
+                // instead of emitting an invalid orphan tool message.
+                messages.push(json!({
+                    "role":"user",
+                    "content":format!("Tool result{}:\n{}",
+                        if call_id.is_empty() { String::new() } else { format!(" ({call_id})") },
+                        plain_content(&output))
+                }));
+            }
+        }
         "function_call" => {
             let name = item.get("name").and_then(Value::as_str).unwrap_or_default();
             let chat_name = item
@@ -1106,38 +1228,225 @@ fn response_item_to_chat(item: &Value, context: &CodexToolContext) -> Option<Val
                 .and_then(Value::as_str)
                 .map(|namespace| flatten_namespace_name(namespace, name))
                 .unwrap_or_else(|| name.to_string());
-            Some(json!({
-                "role":"assistant",
-                "content":Value::Null,
-                "tool_calls":[{"id":item.get("call_id").or_else(|| item.get("id")).cloned().unwrap_or(Value::String(String::new())),"type":"function","function":{"name":chat_name,"arguments":item.get("arguments").cloned().unwrap_or(Value::String("{}".into()))}}]
-            }))
+            let call_id = history_call_id(item, &chat_name);
+            known_calls.insert(call_id.clone());
+            append_assistant_tool_call(
+                messages,
+                json!({
+                    "id":call_id,
+                    "type":"function",
+                    "function":{
+                        "name":chat_name,
+                        "arguments":normalize_history_arguments(item.get("arguments"))
+                    }
+                }),
+            );
         }
-        "custom_tool_call" => Some(json!({
-            "role":"assistant","content":Value::Null,
-            "tool_calls":[{"id":item.get("call_id").or_else(|| item.get("id")).cloned().unwrap_or(Value::String(String::new())),"type":"function","function":{
-                "name":item.get("name").cloned().unwrap_or(Value::String(String::new())),
-                "arguments":serde_json::to_string(&json!({CUSTOM_TOOL_INPUT_FIELD:item.get("input").cloned().unwrap_or(Value::String(String::new()))})).unwrap_or_else(|_| "{}".into())
-            }}]
-        })),
-        "tool_search_call" if context.specs.contains_key(TOOL_SEARCH_PROXY_NAME) => Some(json!({
-            "role":"assistant","content":Value::Null,
-            "tool_calls":[{"id":item.get("call_id").or_else(|| item.get("id")).cloned().unwrap_or(Value::String(String::new())),"type":"function","function":{
-                "name":TOOL_SEARCH_PROXY_NAME,
-                "arguments":serde_json::to_string(&item.get("arguments").cloned().unwrap_or_else(|| json!({}))).unwrap_or_else(|_| "{}".into())
-            }}]
-        })),
+        "custom_tool_call" => {
+            let name = item.get("name").and_then(Value::as_str).unwrap_or_default();
+            let call_id = history_call_id(item, name);
+            known_calls.insert(call_id.clone());
+            let input = item
+                .get("input")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let (chat_name, arguments) = context.custom_history_call(name, input);
+            append_assistant_tool_call(
+                messages,
+                json!({
+                    "id":call_id,
+                    "type":"function",
+                    "function":{
+                        "name":chat_name,
+                        "arguments":arguments
+                    }
+                }),
+            );
+        }
+        "tool_search_call" if context.specs.contains_key(TOOL_SEARCH_PROXY_NAME) => {
+            let call_id = history_call_id(item, TOOL_SEARCH_PROXY_NAME);
+            known_calls.insert(call_id.clone());
+            append_assistant_tool_call(
+                messages,
+                json!({
+                    "id":call_id,
+                    "type":"function",
+                    "function":{
+                        "name":TOOL_SEARCH_PROXY_NAME,
+                        "arguments":normalize_history_arguments(item.get("arguments"))
+                    }
+                }),
+            );
+        }
+        "reasoning" => {
+            if let Some(text) = reasoning_history_text(item) {
+                append_assistant_text(messages, &text, "reasoning_content");
+            }
+        }
         "message" => {
             let role = item.get("role").and_then(Value::as_str).unwrap_or("user");
             let role = if role == "developer" { "system" } else { role };
-            Some(json!({"role":role,"content":content_to_text(item.get("content"))}))
+            let content = content_to_text(item.get("content"));
+            if role == "assistant" {
+                append_assistant_content(messages, content);
+            } else {
+                messages.push(json!({"role":role,"content":content}));
+            }
         }
         _ if item.get("role").is_some() => {
             let role = item.get("role").and_then(Value::as_str).unwrap_or("user");
             let role = if role == "developer" { "system" } else { role };
-            Some(json!({"role":role,"content":content_to_text(item.get("content"))}))
+            let content = content_to_text(item.get("content"));
+            if role == "assistant" {
+                append_assistant_content(messages, content);
+            } else {
+                messages.push(json!({"role":role,"content":content}));
+            }
         }
-        _ => None,
+        _ => {}
     }
+}
+
+fn append_assistant_content(messages: &mut Vec<Value>, content: Value) {
+    if let Some(last) = messages.last_mut()
+        && last.get("role").and_then(Value::as_str) == Some("assistant")
+    {
+        let existing = last.get("content").cloned().unwrap_or(Value::Null);
+        last["content"] = merge_chat_content(existing, content);
+    } else {
+        messages.push(json!({"role":"assistant","content":content}));
+    }
+}
+
+fn append_assistant_text(messages: &mut Vec<Value>, text: &str, field: &str) {
+    if messages
+        .last()
+        .and_then(|message| message.get("role"))
+        .and_then(Value::as_str)
+        != Some("assistant")
+    {
+        messages.push(json!({"role":"assistant","content":Value::Null}));
+    }
+    let last = messages.last_mut().expect("assistant message was inserted");
+    let current = last.get(field).and_then(Value::as_str).unwrap_or_default();
+    last[field] = if current.is_empty() {
+        json!(text)
+    } else {
+        json!(format!("{current}\n{text}"))
+    };
+}
+
+fn append_assistant_tool_call(messages: &mut Vec<Value>, tool_call: Value) {
+    if messages
+        .last()
+        .and_then(|message| message.get("role"))
+        .and_then(Value::as_str)
+        != Some("assistant")
+    {
+        messages.push(json!({"role":"assistant","content":Value::Null,"tool_calls":[]}));
+    }
+    let last = messages.last_mut().expect("assistant message was inserted");
+    if last.get("tool_calls").and_then(Value::as_array).is_none() {
+        last["tool_calls"] = json!([]);
+    }
+    last["tool_calls"]
+        .as_array_mut()
+        .expect("tool_calls was initialized as an array")
+        .push(tool_call);
+}
+
+fn merge_chat_content(left: Value, right: Value) -> Value {
+    match (left, right) {
+        (Value::Null, right) => right,
+        (left, Value::Null) => left,
+        (Value::String(left), Value::String(right)) => {
+            if left.is_empty() {
+                json!(right)
+            } else if right.is_empty() {
+                json!(left)
+            } else {
+                json!(format!("{left}\n{right}"))
+            }
+        }
+        (Value::Array(mut left), Value::Array(right)) => {
+            left.extend(right);
+            Value::Array(left)
+        }
+        (Value::Array(mut left), right) => {
+            left.push(json!({"type":"text","text":plain_content(&right)}));
+            Value::Array(left)
+        }
+        (left, Value::Array(mut right)) => {
+            right.insert(0, json!({"type":"text","text":plain_content(&left)}));
+            Value::Array(right)
+        }
+        (left, right) => json!(format!(
+            "{}\n{}",
+            plain_content(&left),
+            plain_content(&right)
+        )),
+    }
+}
+
+fn plain_content(value: &Value) -> String {
+    match value {
+        Value::String(value) => value.clone(),
+        Value::Null => String::new(),
+        value => serde_json::to_string(value).unwrap_or_default(),
+    }
+}
+
+fn history_call_id(item: &Value, name: &str) -> String {
+    if let Some(id) = item
+        .get("call_id")
+        .or_else(|| item.get("id"))
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+    {
+        return id.to_owned();
+    }
+    let digest = Sha256::digest(canonical_json_string(item).as_bytes());
+    format!(
+        "call_{}_{}",
+        name.chars()
+            .filter(|ch| ch.is_ascii_alphanumeric())
+            .take(16)
+            .collect::<String>(),
+        digest
+            .iter()
+            .take(6)
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    )
+}
+
+fn normalize_history_arguments(arguments: Option<&Value>) -> String {
+    match arguments {
+        Some(Value::Object(value)) => canonical_json_string(&Value::Object(value.clone())),
+        Some(Value::String(value)) if value.trim().is_empty() => "{}".into(),
+        Some(Value::String(value)) if !value.trim().is_empty() => {
+            match serde_json::from_str::<Value>(value) {
+                Ok(Value::Object(value)) => canonical_json_string(&Value::Object(value)),
+                Ok(value) => canonical_json_string(&json!({"input":value})),
+                Err(_) => canonical_json_string(&json!({"input":value})),
+            }
+        }
+        Some(value) if !value.is_null() => canonical_json_string(&json!({"input":value})),
+        _ => "{}".into(),
+    }
+}
+
+fn reasoning_history_text(item: &Value) -> Option<String> {
+    let parts = item
+        .get("summary")
+        .or_else(|| item.get("content"))
+        .and_then(Value::as_array)?;
+    let text = parts
+        .iter()
+        .filter_map(|part| part.get("text").and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join("\n");
+    (!text.is_empty()).then_some(text)
 }
 
 fn content_to_text(content: Option<&Value>) -> Value {
@@ -1209,9 +1518,15 @@ fn response_tool_choice_to_chat(choice: &Value, context: &CodexToolContext) -> V
                 .unwrap_or_else(|| name.to_string());
             json!({"type":"function","function":{"name":chat_name}})
         }
-        Some("custom") => json!({"type":"function","function":{
-            "name":choice.get("name").cloned().unwrap_or(Value::String(String::new()))
-        }}),
+        Some("custom") => {
+            let original_name = choice
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            json!({"type":"function","function":{
+                "name":context.custom_choice_name(original_name)
+            }})
+        }
         Some("tool_search") if context.specs.contains_key(TOOL_SEARCH_PROXY_NAME) => {
             json!({"type":"function","function":{"name":TOOL_SEARCH_PROXY_NAME}})
         }
@@ -1270,7 +1585,7 @@ fn chat_tool_call_to_response(call: &Value, context: &CodexToolContext) -> Value
     match context.specs.get(chat_name) {
         Some(spec) if spec.kind == CodexToolKind::Custom => json!({
             "id":item_id,"type":"custom_tool_call","status":"completed",
-            "call_id":call_id,"name":spec.name,"input":custom_tool_input(arguments)
+            "call_id":call_id,"name":spec.name,"input":custom_tool_input(spec, arguments)
         }),
         Some(spec) if spec.kind == CodexToolKind::ToolSearch => json!({
             "type":"tool_search_call","status":"completed","execution":"client",
@@ -1300,7 +1615,14 @@ fn response_tool_item_id(call_id: &str, chat_name: &str, context: &CodexToolCont
     format!("{prefix}_{call_id}")
 }
 
-fn custom_tool_input(arguments: &str) -> String {
+fn custom_tool_input(spec: &CodexToolSpec, arguments: &str) -> String {
+    if let Some(action) = spec.patch_action {
+        return reconstruct_patch_input(action, arguments);
+    }
+    raw_custom_tool_input(arguments)
+}
+
+fn raw_custom_tool_input(arguments: &str) -> String {
     serde_json::from_str::<Value>(arguments)
         .ok()
         .and_then(|value| {
@@ -1310,6 +1632,274 @@ fn custom_tool_input(arguments: &str) -> String {
                 .map(str::to_owned)
         })
         .unwrap_or_else(|| arguments.to_string())
+}
+
+fn encode_patch_history(original_name: &str, input: &str) -> (String, String) {
+    let operations = parse_patch_operations(input);
+    if operations.len() == 1
+        && let Some(action) = operations[0]
+            .get("type")
+            .and_then(Value::as_str)
+            .and_then(patch_action_from_type)
+    {
+        return (
+            patch_proxy_name(original_name, action),
+            patch_operation_arguments(&operations[0], action),
+        );
+    }
+    (
+        patch_proxy_name(original_name, PatchProxyAction::Batch),
+        canonical_json_string(&json!({"operations":operations,"raw_patch":input})),
+    )
+}
+
+fn reconstruct_patch_input(action: PatchProxyAction, arguments: &str) -> String {
+    let Ok(value) = serde_json::from_str::<Value>(arguments) else {
+        return arguments.to_owned();
+    };
+    if let Some(raw_patch) = value
+        .get("raw_patch")
+        .or_else(|| value.get("patch"))
+        .or_else(|| value.get(CUSTOM_TOOL_INPUT_FIELD))
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+    {
+        return raw_patch.to_owned();
+    }
+    let operations = match action {
+        PatchProxyAction::AddFile => vec![json!({
+            "type":"add_file","path":string_field(&value,"path"),
+            "content":string_field(&value,"content")
+        })],
+        PatchProxyAction::DeleteFile => vec![json!({
+            "type":"delete_file","path":string_field(&value,"path")
+        })],
+        PatchProxyAction::UpdateFile => vec![json!({
+            "type":"update_file","path":string_field(&value,"path"),
+            "move_to":string_field(&value,"move_to"),
+            "hunks":value.get("hunks").cloned().unwrap_or_else(|| json!([]))
+        })],
+        PatchProxyAction::ReplaceFile => vec![json!({
+            "type":"replace_file","path":string_field(&value,"path"),
+            "content":string_field(&value,"content")
+        })],
+        PatchProxyAction::Batch => value
+            .get("operations")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default(),
+    };
+    build_patch_text(&operations)
+}
+
+fn string_field<'a>(value: &'a Value, name: &str) -> &'a str {
+    value.get(name).and_then(Value::as_str).unwrap_or_default()
+}
+
+fn patch_action_from_type(value: &str) -> Option<PatchProxyAction> {
+    match value {
+        "add_file" => Some(PatchProxyAction::AddFile),
+        "delete_file" => Some(PatchProxyAction::DeleteFile),
+        "update_file" => Some(PatchProxyAction::UpdateFile),
+        "replace_file" => Some(PatchProxyAction::ReplaceFile),
+        _ => None,
+    }
+}
+
+fn patch_operation_arguments(operation: &Value, action: PatchProxyAction) -> String {
+    let value = match action {
+        PatchProxyAction::AddFile | PatchProxyAction::ReplaceFile => json!({
+            "path":string_field(operation,"path"),"content":string_field(operation,"content")
+        }),
+        PatchProxyAction::DeleteFile => json!({"path":string_field(operation,"path")}),
+        PatchProxyAction::UpdateFile => {
+            let mut value = json!({
+                "path":string_field(operation,"path"),
+                "hunks":operation.get("hunks").cloned().unwrap_or_else(|| json!([]))
+            });
+            if let Some(move_to) = operation
+                .get("move_to")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+            {
+                value["move_to"] = json!(move_to);
+            }
+            value
+        }
+        PatchProxyAction::Batch => json!({"operations":[operation]}),
+    };
+    canonical_json_string(&value)
+}
+
+fn parse_patch_operations(input: &str) -> Vec<Value> {
+    let mut operations = Vec::new();
+    let mut current: Option<serde_json::Map<String, Value>> = None;
+    let mut content = Vec::new();
+    let mut hunks = Vec::new();
+    let mut current_hunk: Option<serde_json::Map<String, Value>> = None;
+    let mut hunk_lines = Vec::new();
+
+    fn flush_hunk(
+        current_hunk: &mut Option<serde_json::Map<String, Value>>,
+        hunk_lines: &mut Vec<Value>,
+        hunks: &mut Vec<Value>,
+    ) {
+        if let Some(mut hunk) = current_hunk.take() {
+            hunk.insert("lines".into(), Value::Array(std::mem::take(hunk_lines)));
+            hunks.push(Value::Object(hunk));
+        }
+    }
+    fn flush_operation(
+        current: &mut Option<serde_json::Map<String, Value>>,
+        content: &mut Vec<String>,
+        hunks: &mut Vec<Value>,
+        operations: &mut Vec<Value>,
+    ) {
+        if let Some(mut operation) = current.take() {
+            match operation.get("type").and_then(Value::as_str) {
+                Some("add_file" | "replace_file") => {
+                    operation.insert("content".into(), content.join("\n").into());
+                }
+                Some("update_file") => {
+                    operation.insert("hunks".into(), Value::Array(std::mem::take(hunks)));
+                }
+                _ => {}
+            }
+            content.clear();
+            operations.push(Value::Object(operation));
+        }
+    }
+
+    for line in input.lines() {
+        if matches!(line, "*** Begin Patch" | "*** End Patch") {
+            continue;
+        }
+        let header = [
+            ("*** Add File: ", "add_file"),
+            ("*** Delete File: ", "delete_file"),
+            ("*** Update File: ", "update_file"),
+        ]
+        .into_iter()
+        .find_map(|(prefix, kind)| line.strip_prefix(prefix).map(|path| (kind, path)));
+        if let Some((kind, path)) = header {
+            flush_hunk(&mut current_hunk, &mut hunk_lines, &mut hunks);
+            flush_operation(&mut current, &mut content, &mut hunks, &mut operations);
+            current = Some(serde_json::Map::from_iter([
+                ("type".into(), kind.into()),
+                ("path".into(), path.into()),
+            ]));
+            continue;
+        }
+        if let Some(path) = line.strip_prefix("*** Move to: ") {
+            if let Some(operation) = current.as_mut() {
+                operation.insert("move_to".into(), path.into());
+            }
+            continue;
+        }
+        if let Some(context) = line.strip_prefix("@@") {
+            flush_hunk(&mut current_hunk, &mut hunk_lines, &mut hunks);
+            current_hunk = Some(serde_json::Map::from_iter([(
+                "context".into(),
+                context.trim().into(),
+            )]));
+            continue;
+        }
+        match current
+            .as_ref()
+            .and_then(|operation| operation.get("type"))
+            .and_then(Value::as_str)
+        {
+            Some("add_file" | "replace_file") => {
+                if let Some(value) = line.strip_prefix('+') {
+                    content.push(value.to_owned());
+                }
+            }
+            Some("update_file") => {
+                let (op, text) = match line.as_bytes().first() {
+                    Some(b'+') => ("add", &line[1..]),
+                    Some(b'-') => ("remove", &line[1..]),
+                    Some(b' ') => ("context", &line[1..]),
+                    _ => ("context", line),
+                };
+                hunk_lines.push(json!({"op":op,"text":text}));
+            }
+            _ => {}
+        }
+    }
+    flush_hunk(&mut current_hunk, &mut hunk_lines, &mut hunks);
+    flush_operation(&mut current, &mut content, &mut hunks, &mut operations);
+    operations
+}
+
+fn build_patch_text(operations: &[Value]) -> String {
+    let mut output = String::from("*** Begin Patch");
+    for operation in operations {
+        let path = string_field(operation, "path");
+        match operation
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+        {
+            "add_file" => {
+                output.push_str(&format!("\n*** Add File: {path}"));
+                append_added_content(&mut output, string_field(operation, "content"));
+            }
+            "delete_file" => output.push_str(&format!("\n*** Delete File: {path}")),
+            "update_file" => {
+                output.push_str(&format!("\n*** Update File: {path}"));
+                if let Some(move_to) = operation
+                    .get("move_to")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                {
+                    output.push_str(&format!("\n*** Move to: {move_to}"));
+                }
+                for hunk in operation
+                    .get("hunks")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
+                    let context = string_field(hunk, "context");
+                    if context.is_empty() {
+                        output.push_str("\n@@");
+                    } else {
+                        output.push_str(&format!("\n@@ {context}"));
+                    }
+                    for line in hunk
+                        .get("lines")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                    {
+                        let prefix = match line.get("op").and_then(Value::as_str) {
+                            Some("add") => '+',
+                            Some("remove" | "delete") => '-',
+                            _ => ' ',
+                        };
+                        output.push('\n');
+                        output.push(prefix);
+                        output.push_str(string_field(line, "text"));
+                    }
+                }
+            }
+            "replace_file" => {
+                output.push_str(&format!("\n*** Delete File: {path}"));
+                output.push_str(&format!("\n*** Add File: {path}"));
+                append_added_content(&mut output, string_field(operation, "content"));
+            }
+            _ => {}
+        }
+    }
+    output.push_str("\n*** End Patch");
+    output
+}
+
+fn append_added_content(output: &mut String, content: &str) {
+    for line in content.split('\n') {
+        output.push_str("\n+");
+        output.push_str(line.strip_suffix('\r').unwrap_or(line));
+    }
 }
 
 fn parse_arguments_object(arguments: &str) -> Value {
@@ -1420,7 +2010,23 @@ fn map_usage(usage: Option<&Value>) -> Value {
         .and_then(|v| v.get("total_tokens"))
         .and_then(Value::as_u64)
         .unwrap_or(input + output);
-    json!({"input_tokens":input,"input_tokens_details":{"cached_tokens":0},"output_tokens":output,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":total})
+    let cached = usage
+        .and_then(|value| {
+            value
+                .pointer("/prompt_tokens_details/cached_tokens")
+                .or_else(|| value.get("cached_tokens"))
+        })
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let reasoning = usage
+        .and_then(|value| {
+            value
+                .pointer("/completion_tokens_details/reasoning_tokens")
+                .or_else(|| value.get("reasoning_tokens"))
+        })
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    json!({"input_tokens":input,"input_tokens_details":{"cached_tokens":cached},"output_tokens":output,"output_tokens_details":{"reasoning_tokens":reasoning},"total_tokens":total})
 }
 
 async fn proxy_stream(
@@ -1437,12 +2043,10 @@ async fn proxy_stream(
     let mut usage = map_usage(None);
     let mut model = String::new();
     let mut tool_calls: BTreeMap<u64, Value> = BTreeMap::new();
-    let mut announced_tool_calls = BTreeSet::new();
+    let mut tool_output_indices = HashMap::new();
+    let mut text_output_index = None;
+    let mut next_output_index = 0_usize;
     send_sse(stream, "response.created", &json!({"type":"response.created","sequence_number":sequence,"response":stream_response(&response_id,"in_progress",&model,vec![],usage.clone())})).await?;
-    sequence += 1;
-    send_sse(stream, "response.output_item.added", &json!({"type":"response.output_item.added","sequence_number":sequence,"output_index":0,"item":{"id":message_id,"type":"message","status":"in_progress","role":"assistant","content":[]}})).await?;
-    sequence += 1;
-    send_sse(stream, "response.content_part.added", &json!({"type":"response.content_part.added","sequence_number":sequence,"output_index":0,"content_index":0,"part":{"type":"output_text","text":"","annotations":[]}})).await?;
     sequence += 1;
 
     let mut pending = Vec::new();
@@ -1488,8 +2092,21 @@ async fn proxy_stream(
                     continue;
                 };
                 if let Some(text) = delta.get("content").and_then(Value::as_str) {
+                    let output_index = match text_output_index {
+                        Some(index) => index,
+                        None => {
+                            let index = next_output_index;
+                            next_output_index += 1;
+                            text_output_index = Some(index);
+                            send_sse(stream, "response.output_item.added", &json!({"type":"response.output_item.added","sequence_number":sequence,"output_index":index,"item":{"id":message_id,"type":"message","status":"in_progress","role":"assistant","content":[]}})).await?;
+                            sequence += 1;
+                            send_sse(stream, "response.content_part.added", &json!({"type":"response.content_part.added","sequence_number":sequence,"output_index":index,"content_index":0,"part":{"type":"output_text","text":"","annotations":[]}})).await?;
+                            sequence += 1;
+                            index
+                        }
+                    };
                     full_text.push_str(text);
-                    send_sse(stream, "response.output_text.delta", &json!({"type":"response.output_text.delta","sequence_number":sequence,"output_index":0,"content_index":0,"delta":text})).await?;
+                    send_sse(stream, "response.output_text.delta", &json!({"type":"response.output_text.delta","sequence_number":sequence,"output_index":output_index,"content_index":0,"delta":text})).await?;
                     sequence += 1;
                 }
                 if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
@@ -1517,9 +2134,11 @@ async fn proxy_stream(
                             .unwrap_or_default();
                         let first = !call_id.is_empty()
                             && !name.is_empty()
-                            && announced_tool_calls.insert(index);
-                        let output_index = index as usize + 1;
+                            && !tool_output_indices.contains_key(&index);
                         if first {
+                            let output_index = next_output_index;
+                            next_output_index += 1;
+                            tool_output_indices.insert(index, output_index);
                             let mut item = chat_tool_call_to_response(merged, tool_context);
                             item["status"] = json!("in_progress");
                             match item.get("type").and_then(Value::as_str) {
@@ -1531,7 +2150,7 @@ async fn proxy_stream(
                             send_sse(stream, "response.output_item.added", &json!({"type":"response.output_item.added","sequence_number":sequence,"output_index":output_index,"item":item})).await?;
                             sequence += 1;
                         }
-                        if announced_tool_calls.contains(&index) {
+                        if let Some(&output_index) = tool_output_indices.get(&index) {
                             let custom = tool_context
                                 .specs
                                 .get(name)
@@ -1562,15 +2181,18 @@ async fn proxy_stream(
         }
     }
 
-    send_sse(stream, "response.output_text.done", &json!({"type":"response.output_text.done","sequence_number":sequence,"output_index":0,"content_index":0,"text":full_text})).await?;
-    sequence += 1;
-    send_sse(stream, "response.content_part.done", &json!({"type":"response.content_part.done","sequence_number":sequence,"output_index":0,"content_index":0,"part":{"type":"output_text","text":full_text,"annotations":[]}})).await?;
-    sequence += 1;
-    let message = json!({"id":message_id,"type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":full_text,"annotations":[]}]});
-    send_sse(stream, "response.output_item.done", &json!({"type":"response.output_item.done","sequence_number":sequence,"output_index":0,"item":message})).await?;
-    sequence += 1;
+    let mut indexed_output = Vec::new();
+    if let Some(output_index) = text_output_index {
+        send_sse(stream, "response.output_text.done", &json!({"type":"response.output_text.done","sequence_number":sequence,"output_index":output_index,"content_index":0,"text":full_text})).await?;
+        sequence += 1;
+        send_sse(stream, "response.content_part.done", &json!({"type":"response.content_part.done","sequence_number":sequence,"output_index":output_index,"content_index":0,"part":{"type":"output_text","text":full_text,"annotations":[]}})).await?;
+        sequence += 1;
+        let message = json!({"id":message_id,"type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":full_text,"annotations":[]}]});
+        send_sse(stream, "response.output_item.done", &json!({"type":"response.output_item.done","sequence_number":sequence,"output_index":output_index,"item":message})).await?;
+        sequence += 1;
+        indexed_output.push((output_index, message));
+    }
 
-    let mut output = vec![message];
     for (tool_index, mut call) in tool_calls {
         if call
             .get("id")
@@ -1593,7 +2215,24 @@ async fn proxy_stream(
             .and_then(Value::as_str)
             .unwrap_or_default();
         let item = chat_tool_call_to_response(&call, tool_context);
-        let output_index = tool_index as usize + 1;
+        let output_index = match tool_output_indices.get(&tool_index).copied() {
+            Some(index) => index,
+            None => {
+                let index = next_output_index;
+                next_output_index += 1;
+                let mut pending_item = item.clone();
+                pending_item["status"] = json!("in_progress");
+                match pending_item.get("type").and_then(Value::as_str) {
+                    Some("custom_tool_call") => pending_item["input"] = json!(""),
+                    Some("function_call") => pending_item["arguments"] = json!(""),
+                    Some("tool_search_call") => pending_item["arguments"] = json!({}),
+                    _ => {}
+                }
+                send_sse(stream, "response.output_item.added", &json!({"type":"response.output_item.added","sequence_number":sequence,"output_index":index,"item":pending_item})).await?;
+                sequence += 1;
+                index
+            }
+        };
         for (event, mut payload) in
             completed_tool_input_events(&item, &item_id, raw_arguments, output_index)
         {
@@ -1603,8 +2242,10 @@ async fn proxy_stream(
         }
         send_sse(stream, "response.output_item.done", &json!({"type":"response.output_item.done","sequence_number":sequence,"output_index":output_index,"item":item})).await?;
         sequence += 1;
-        output.push(item);
+        indexed_output.push((output_index, item));
     }
+    indexed_output.sort_by_key(|(index, _)| *index);
+    let output = indexed_output.into_iter().map(|(_, item)| item).collect();
     let completed = stream_response(&response_id, "completed", &model, output, usage);
     send_sse(
         stream,
@@ -1912,6 +2553,150 @@ mod tests {
     }
 
     #[test]
+    fn exposes_apply_patch_as_structured_chat_functions() {
+        let input = json!({
+            "model":"test-model",
+            "input":"edit files",
+            "tools":[{"type":"custom","name":"apply_patch","description":"Patch workspace files"}],
+            "tool_choice":{"type":"custom","name":"apply_patch"}
+        });
+        let (output, context) = responses_to_chat_with_context(&input, None).unwrap();
+        let names = output["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool.pointer("/function/name").unwrap().as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            vec![
+                "apply_patch__add_file",
+                "apply_patch__delete_file",
+                "apply_patch__update_file",
+                "apply_patch__replace_file",
+                "apply_patch__batch"
+            ]
+        );
+        assert_eq!(
+            output["tool_choice"]["function"]["name"],
+            "apply_patch__batch"
+        );
+        assert_eq!(
+            output["tools"][2]["function"]["parameters"]["properties"]["hunks"]["items"]["properties"]
+                ["lines"]["items"]["required"],
+            json!(["op", "text"])
+        );
+        assert!(
+            context
+                .specs
+                .values()
+                .all(|spec| spec.name == "apply_patch" && spec.patch_action.is_some())
+        );
+    }
+
+    #[test]
+    fn replays_and_reconstructs_apply_patch_calls_without_json_wrapper() {
+        let patch = "*** Begin Patch\n*** Add File: src/new.rs\n+fn main() {}\n*** End Patch";
+        let input = json!({
+            "model":"test-model",
+            "input":[{"type":"custom_tool_call","call_id":"patch-1","name":"apply_patch","input":patch}],
+            "tools":[{"type":"custom","name":"apply_patch"}]
+        });
+        let (output, context) = responses_to_chat_with_context(&input, None).unwrap();
+        let call = &output["messages"][0]["tool_calls"][0];
+        assert_eq!(call["function"]["name"], "apply_patch__add_file");
+        let arguments = call["function"]["arguments"].as_str().unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(arguments).unwrap(),
+            json!({"path":"src/new.rs","content":"fn main() {}"})
+        );
+
+        let response = chat_to_response_with_context(
+            &json!({"choices":[{"message":{"tool_calls":[{
+                "id":"patch-2","type":"function","function":{
+                    "name":"apply_patch__add_file","arguments":arguments
+                }
+            }]}}]}),
+            &context,
+        );
+        assert_eq!(response["output"][0]["type"], "custom_tool_call");
+        assert_eq!(response["output"][0]["name"], "apply_patch");
+        assert_eq!(response["output"][0]["input"], patch);
+    }
+
+    #[test]
+    fn reconstructs_update_batch_and_invalid_patch_arguments() {
+        let request = json!({
+            "model":"test-model","input":"edit",
+            "tools":[{"type":"custom","name":"apply_patch"}]
+        });
+        let (_, context) = responses_to_chat_with_context(&request, None).unwrap();
+        let update = chat_tool_call_to_response(
+            &json!({"id":"u","function":{
+                "name":"apply_patch__update_file",
+                "arguments":canonical_json_string(&json!({
+                    "path":"src/lib.rs","move_to":"src/core.rs",
+                    "hunks":[{"context":"fn old()","lines":[
+                        {"op":"remove","text":"fn old() {}"},
+                        {"op":"add","text":"fn new() {}"}
+                    ]}]
+                }))
+            }}),
+            &context,
+        );
+        assert_eq!(
+            update["input"],
+            "*** Begin Patch\n*** Update File: src/lib.rs\n*** Move to: src/core.rs\n@@ fn old()\n-fn old() {}\n+fn new() {}\n*** End Patch"
+        );
+
+        let batch = chat_tool_call_to_response(
+            &json!({"id":"b","function":{
+                "name":"apply_patch__batch",
+                "arguments":canonical_json_string(&json!({"operations":[
+                    {"type":"delete_file","path":"old.txt"},
+                    {"type":"replace_file","path":"new.txt","content":"one\ntwo"}
+                ]}))
+            }}),
+            &context,
+        );
+        assert_eq!(
+            batch["input"],
+            "*** Begin Patch\n*** Delete File: old.txt\n*** Delete File: new.txt\n*** Add File: new.txt\n+one\n+two\n*** End Patch"
+        );
+
+        let invalid = chat_tool_call_to_response(
+            &json!({"id":"x","function":{
+                "name":"apply_patch__batch","arguments":"not-json"
+            }}),
+            &context,
+        );
+        assert_eq!(invalid["input"], "not-json");
+    }
+
+    #[test]
+    fn completes_structured_patch_stream_as_raw_custom_input() {
+        let request = json!({
+            "model":"test-model","input":"edit",
+            "tools":[{"type":"custom","name":"apply_patch"}]
+        });
+        let (_, context) = responses_to_chat_with_context(&request, None).unwrap();
+        let arguments = r#"{"content":"hello","path":"new.txt"}"#;
+        let call = json!({"id":"patch-stream","function":{
+            "name":"apply_patch__add_file","arguments":arguments
+        }});
+        let item = chat_tool_call_to_response(&call, &context);
+        let id = response_tool_item_id("patch-stream", "apply_patch__add_file", &context);
+        let events = completed_tool_input_events(&item, &id, arguments, 0);
+        assert_eq!(item["type"], "custom_tool_call");
+        assert_eq!(item["name"], "apply_patch");
+        assert_eq!(id, "ctc_patch-stream");
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].1["delta"], item["input"]);
+        assert_eq!(events[1].1["input"], item["input"]);
+        assert!(!events[0].1["delta"].as_str().unwrap().starts_with('{'));
+    }
+
+    #[test]
     fn replays_namespace_tool_history_with_the_upstream_chat_name() {
         let input = json!({
             "model":"test-model",
@@ -1932,18 +2717,94 @@ mod tests {
     }
 
     #[test]
+    fn merges_contiguous_assistant_history_and_parallel_tool_calls() {
+        let input = json!({
+            "model":"test-model",
+            "input":[
+                {"role":"user","content":"change the theme"},
+                {"type":"reasoning","summary":[{"type":"summary_text","text":"I should use tools"}]},
+                {"role":"assistant","content":[{"type":"output_text","text":"I will do that."}]},
+                {"type":"function_call","call_id":"call-1","name":"read","arguments":"{\"path\":\"a\"}"},
+                {"type":"custom_tool_call","call_id":"call-2","name":"computer","input":"open Settings"},
+                {"type":"function_call_output","call_id":"call-1","output":"ok"},
+                {"type":"custom_tool_call_output","call_id":"call-2","output":"done"}
+            ],
+            "tools":[
+                {"type":"function","name":"read","parameters":{"type":"object"}},
+                {"type":"custom","name":"computer","description":"Control the computer"}
+            ]
+        });
+        let output = responses_to_chat(&input).unwrap();
+        let assistant = &output["messages"][1];
+        assert_eq!(assistant["role"], "assistant");
+        assert_eq!(assistant["content"], "I will do that.");
+        assert_eq!(assistant["reasoning_content"], "I should use tools");
+        assert_eq!(assistant["tool_calls"].as_array().unwrap().len(), 2);
+        assert_eq!(output["messages"][2]["tool_call_id"], "call-1");
+        assert_eq!(output["messages"][3]["tool_call_id"], "call-2");
+    }
+
+    #[test]
+    fn orphan_tool_results_become_user_context_instead_of_invalid_tool_messages() {
+        let output = responses_to_chat(&json!({
+            "model":"test-model",
+            "input":[{"type":"function_call_output","call_id":"missing","output":"result"}]
+        }))
+        .unwrap();
+        assert_eq!(output["messages"][0]["role"], "user");
+        assert!(
+            output["messages"][0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("result")
+        );
+    }
+
+    #[test]
+    fn normalizes_empty_and_invalid_history_arguments() {
+        let input = json!({
+            "model":"test-model",
+            "input":[
+                {"type":"function_call","call_id":"empty","name":"read","arguments":""},
+                {"type":"function_call","call_id":"invalid","name":"write","arguments":"raw text"}
+            ],
+            "tools":[
+                {"type":"function","name":"read","parameters":{"type":"object"}},
+                {"type":"function","name":"write","parameters":{"type":"object"}}
+            ]
+        });
+        let output = responses_to_chat(&input).unwrap();
+        let calls = output["messages"][0]["tool_calls"].as_array().unwrap();
+        assert_eq!(calls[0]["function"]["arguments"], "{}");
+        assert_eq!(calls[1]["function"]["arguments"], r#"{"input":"raw text"}"#);
+    }
+
+    #[test]
+    fn omits_tool_controls_when_no_chat_tools_exist() {
+        let output = responses_to_chat(&json!({
+            "model":"test-model",
+            "input":"hello",
+            "tool_choice":"required",
+            "parallel_tool_calls":true
+        }))
+        .unwrap();
+        assert!(output.get("tool_choice").is_none());
+        assert!(output.get("parallel_tool_calls").is_none());
+    }
+
+    #[test]
     fn decodes_only_complete_custom_tool_input_without_json_wrapper() {
         assert_eq!(
-            custom_tool_input(r#"{"input":"open Settings"}"#),
+            raw_custom_tool_input(r#"{"input":"open Settings"}"#),
             "open Settings"
         );
         assert_eq!(
-            custom_tool_input(r#"{"input":"open \"Settings\"\nthen click"}"#),
+            raw_custom_tool_input(r#"{"input":"open \"Settings\"\nthen click"}"#),
             "open \"Settings\"\nthen click"
         );
-        assert_eq!(custom_tool_input(r#"{"input":"深色模式"}"#), "深色模式");
+        assert_eq!(raw_custom_tool_input(r#"{"input":"深色模式"}"#), "深色模式");
         let incomplete = r#"{"input":"incomplete\"#;
-        assert_eq!(custom_tool_input(incomplete), incomplete);
+        assert_eq!(raw_custom_tool_input(incomplete), incomplete);
     }
 
     #[test]
@@ -2064,11 +2925,22 @@ mod tests {
     }
 
     #[test]
-    fn maps_openrouter_effort_from_current_request_model() {
+    fn only_maps_reasoning_when_provider_has_explicit_configuration() {
         let mut provider = provider();
-        provider.name = "OpenRouter".into();
+        provider.name = "Provider name must not trigger guessing".into();
+        provider.base_url = "https://example.test/openrouter/deepseek/qwen".into();
         let input =
-            json!({"model":"vendor/live-model","input":"hello","reasoning":{"effort":"max"}});
+            json!({"model":"deepseek-reasoner","input":"hello","reasoning":{"effort":"max"}});
+        assert!(resolve_reasoning_config(&provider, &input).is_none());
+
+        provider.codex_chat_reasoning = Some(reasoning_config(
+            false,
+            true,
+            "none",
+            "reasoning.effort",
+            Some("openrouter"),
+            "auto",
+        ));
         let config = resolve_reasoning_config(&provider, &input).unwrap();
         let output = responses_to_chat_with_reasoning(&input, Some(&config)).unwrap();
         assert_eq!(output["reasoning"]["effort"], "xhigh");
@@ -2076,8 +2948,16 @@ mod tests {
     }
 
     #[test]
-    fn maps_deepseek_thinking_and_effort() {
-        let provider = provider();
+    fn maps_explicit_thinking_and_effort() {
+        let mut provider = provider();
+        provider.codex_chat_reasoning = Some(reasoning_config(
+            true,
+            true,
+            "thinking",
+            "reasoning_effort",
+            Some("deepseek"),
+            "reasoning_content",
+        ));
         let input = json!({
             "model":"deepseek-reasoner",
             "input":"hello",
@@ -2090,14 +2970,30 @@ mod tests {
     }
 
     #[test]
-    fn maps_qwen_and_kimi_thinking_switches() {
-        let qwen = provider();
+    fn maps_explicit_boolean_thinking_switches() {
+        let mut qwen = provider();
+        qwen.codex_chat_reasoning = Some(reasoning_config(
+            true,
+            false,
+            "enable_thinking",
+            "none",
+            None,
+            "reasoning_content",
+        ));
         let input = json!({"model":"qwen3-coder","input":"hello","reasoning":{"effort":"high"}});
         let config = resolve_reasoning_config(&qwen, &input).unwrap();
         let output = responses_to_chat_with_reasoning(&input, Some(&config)).unwrap();
         assert_eq!(output["enable_thinking"], true);
 
-        let kimi = provider();
+        let mut kimi = provider();
+        kimi.codex_chat_reasoning = Some(reasoning_config(
+            true,
+            false,
+            "thinking",
+            "none",
+            None,
+            "reasoning_content",
+        ));
         let input = json!({
             "model":"kimi-k2-thinking",
             "input":"hello",
@@ -2134,6 +3030,19 @@ mod tests {
         assert_eq!(response["output"][0]["content"][0]["text"], "done");
         assert_eq!(response["output"][1]["type"], "function_call");
         assert_eq!(response["usage"]["total_tokens"], 5);
+    }
+
+    #[test]
+    fn preserves_cached_and_reasoning_usage_details() {
+        let usage = map_usage(Some(&json!({
+            "prompt_tokens":20,
+            "completion_tokens":8,
+            "total_tokens":28,
+            "prompt_tokens_details":{"cached_tokens":7},
+            "completion_tokens_details":{"reasoning_tokens":5}
+        })));
+        assert_eq!(usage["input_tokens_details"]["cached_tokens"], 7);
+        assert_eq!(usage["output_tokens_details"]["reasoning_tokens"], 5);
     }
 
     #[test]

@@ -270,7 +270,6 @@ fn account_from_tokens(
         login: Some(account_id),
         email,
         credential: Some(credential),
-        config_snapshot: previous_account.and_then(|account| account.config_snapshot.clone()),
         scopes: vec!["openid".into(), "profile".into(), "email".into()],
         expires_at: Some(now.timestamp() + tokens.expires_in.unwrap_or(3600)),
         active: previous_account.is_some_and(|account| account.active),

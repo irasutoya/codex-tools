@@ -1,5 +1,6 @@
 mod auth_center;
 mod codex;
+mod model_catalog;
 mod model_fetch;
 mod models;
 mod protocol_proxy;
@@ -26,38 +27,31 @@ fn show_main_window(app: &tauri::AppHandle) {
     }
 }
 
-async fn start_configured_route(app: tauri::AppHandle) {
+async fn start_configured_route(app: tauri::AppHandle) -> Result<(), AppError> {
     let store = app.state::<Store>();
     let proxy = app.state::<ProxyManager>();
-    let Ok(settings) = store.route_settings() else {
-        return;
-    };
+    let settings = store.route_settings()?;
     if !settings.enabled {
-        return;
+        return Ok(());
     }
-    let Ok(providers) = store.providers() else {
-        return;
-    };
+    let providers = store.providers()?;
     let Some(provider) = providers.into_iter().find(|provider| {
         provider.active
             && provider.enabled
             && provider.protocol == ProviderProtocol::ChatCompletions
     }) else {
-        return;
+        return Ok(());
     };
-    let Ok(accounts) = store.accounts(Some(&provider.id)) else {
-        return;
-    };
+    let accounts = store.accounts(Some(&provider.id))?;
     let Some(account) = accounts.into_iter().find(|account| account.active) else {
-        return;
+        return Ok(());
     };
-    match proxy.prepare(&provider, &account, &settings).await {
-        Ok(_) => {}
-        Err(_) => return,
-    };
-    if proxy.commit().await.is_err() {
+    proxy.prepare(&provider, &account, &settings).await?;
+    if let Err(error) = proxy.commit().await {
         proxy.abort().await;
+        return Err(error);
     }
+    Ok(())
 }
 
 #[tauri::command]
@@ -73,15 +67,7 @@ fn save_provider(
     if provider.id.is_empty() {
         provider.id = uuid::Uuid::new_v4().to_string();
     }
-    if provider.name.trim().is_empty() || provider.base_url.trim().is_empty() {
-        return Err(AppError::InvalidConfig("名称和 Base URL 不能为空".into()));
-    }
-    provider.model_metadata.retain(|metadata| {
-        provider
-            .models
-            .iter()
-            .any(|model| model.trim() == metadata.id.trim())
-    });
+    provider.normalize_and_validate()?;
     store.save_provider(&provider)?;
     Ok(provider)
 }
@@ -95,15 +81,18 @@ fn delete_provider(store: State<Store>, id: String) -> Result<(), AppError> {
 #[tauri::command]
 async fn fetch_provider_models(
     store: State<'_, Store>,
-    provider: ProviderProfile,
+    mut provider: ProviderProfile,
 ) -> Result<Vec<FetchedModel>, AppError> {
+    provider.normalize_and_validate()?;
     let accounts = store.accounts(Some(&provider.id))?;
-    let account = accounts
+    let mut account = accounts
         .iter()
         .find(|account| account.active)
         .or_else(|| accounts.first())
+        .cloned()
         .ok_or_else(|| AppError::InvalidConfig("请先为 Provider 添加 API 账号".into()))?;
-    model_fetch::fetch_models(&provider, account).await
+    account.normalize_and_validate()?;
+    model_fetch::fetch_models(&provider, &account).await
 }
 
 #[tauri::command]
@@ -122,19 +111,7 @@ fn save_provider_account(
     if account.id.is_empty() {
         account.id = uuid::Uuid::new_v4().to_string();
     }
-    if account.name.trim().is_empty() {
-        return Err(AppError::InvalidConfig("账号名称不能为空".into()));
-    }
-    if account.auth_kind == AccountAuthKind::ApiKey
-        && account
-            .api_key
-            .as_deref()
-            .unwrap_or_default()
-            .trim()
-            .is_empty()
-    {
-        return Err(AppError::InvalidConfig("API Key 不能为空".into()));
-    }
+    account.normalize_and_validate()?;
     store.save_account(&account)?;
     Ok(account)
 }
@@ -151,8 +128,10 @@ async fn test_provider(
     id: String,
     account_id: String,
 ) -> Result<ProviderTestResult, AppError> {
-    let provider = store.provider(&id)?;
-    let account = store.account(&account_id)?;
+    let mut provider = store.provider(&id)?;
+    let mut account = store.account(&account_id)?;
+    provider.normalize_and_validate()?;
+    account.normalize_and_validate()?;
     if account.provider_id.as_deref() != Some(&id) {
         return Err(AppError::InvalidConfig("账号不属于所选 Provider".into()));
     }
@@ -193,8 +172,6 @@ async fn test_provider(
         .await
         .map_err(|error| AppError::Internal(error.to_string()))?;
     let status = response.status().as_u16();
-    // Consume the response body without retaining or exposing potentially sensitive data.
-    let _ = response.text().await;
     let message = if status < 400 {
         "连接成功".into()
     } else {
@@ -215,19 +192,20 @@ async fn activate_provider(
     proxy: State<'_, ProxyManager>,
     id: String,
     account_id: String,
-    force: bool,
 ) -> Result<RepairResult, AppError> {
     let _guard = proxy.activation_guard().await;
-    let provider = store.provider(&id)?;
-    let account = store.account(&account_id)?;
+    let mut provider = store.provider(&id)?;
+    let mut account = store.account(&account_id)?;
+    provider.normalize_and_validate()?;
+    account.normalize_and_validate()?;
     if !provider.enabled {
         return Err(AppError::InvalidConfig("Provider 已禁用".into()));
     }
     if account.provider_id.as_deref() != Some(&id) {
         return Err(AppError::InvalidConfig("账号不属于所选 Provider".into()));
     }
-    let _ = force;
     let previous = store.active_state()?;
+    let config_state = codex::capture_config_state()?;
     let endpoint = if provider.protocol == ProviderProtocol::ChatCompletions {
         let settings = store.route_settings()?;
         if !settings.enabled {
@@ -239,15 +217,12 @@ async fn activate_provider(
     } else {
         None
     };
-    let backup = match codex::apply_provider_with_proxy(&provider, &account, endpoint.as_ref()) {
-        Ok(path) => path,
-        Err(error) => {
-            proxy.abort().await;
-            return Err(error);
-        }
-    };
+    if let Err(error) = codex::apply_provider_with_proxy(&provider, &account, endpoint.as_ref()) {
+        proxy.abort().await;
+        return Err(error);
+    }
     if let Err(error) = store.activate(&id, &account_id) {
-        let restored = codex::restore_provider_backup(&backup);
+        let restored = codex::restore_config_state(&config_state);
         proxy.abort().await;
         return match restored {
             Ok(()) => Err(error.into()),
@@ -259,7 +234,7 @@ async fn activate_provider(
     let result = match codex::repair(codex::MANAGED_PROVIDER_ID) {
         Ok(result) => result,
         Err(error) => {
-            let config = codex::restore_provider_backup(&backup);
+            let config = codex::restore_config_state(&config_state);
             let active = store.restore_active((
                 previous.0.as_deref(),
                 previous.1.as_deref(),
@@ -277,17 +252,7 @@ async fn activate_provider(
     if endpoint.is_some() {
         proxy.commit().await?;
     }
-    codex::discard_provider_backup(&backup);
     Ok(result)
-}
-
-#[tauri::command]
-async fn get_proxy_status(proxy: State<'_, ProxyManager>) -> Result<ProxyStatus, AppError> {
-    let endpoint = proxy.endpoint().await;
-    Ok(ProxyStatus {
-        running: endpoint.is_some(),
-        base_url: endpoint.map(|value| value.base_url),
-    })
 }
 
 #[tauri::command]
@@ -357,11 +322,12 @@ async fn activate_openai_account(
         .credential
         .as_ref()
         .ok_or(AppError::OfficialAuthMissing)?;
-    let backup = codex::restore_official_snapshot(auth, account.config_snapshot.as_deref())?;
+    let config_state = codex::capture_config_state()?;
+    codex::apply_official_account(auth)?;
     let mut result = match codex::repair("openai") {
         Ok(result) => result,
         Err(error) => {
-            let rollback = codex::restore_provider_backup(&backup);
+            let rollback = codex::restore_config_state(&config_state);
             return match rollback {
                 Ok(()) => Err(error),
                 Err(rollback) => Err(AppError::Backup(format!(
@@ -371,7 +337,7 @@ async fn activate_openai_account(
         }
     };
     if let Err(error) = store.activate_auth_account(&id) {
-        let rollback = codex::restore_provider_backup(&backup);
+        let rollback = codex::restore_config_state(&config_state);
         return match rollback {
             Ok(()) => Err(error.into()),
             Err(rollback) => Err(AppError::Backup(format!(
@@ -382,7 +348,6 @@ async fn activate_openai_account(
     result
         .warnings
         .push("已恢复官方认证，并将全部会话历史统一修复为 OpenAI Provider。".into());
-    codex::discard_provider_backup(&backup);
     Ok(result)
 }
 
@@ -452,7 +417,7 @@ async fn save_route_settings(
     store.save_route_settings(&settings)?;
     proxy.stop().await;
     if settings.enabled {
-        start_configured_route(app.clone()).await;
+        start_configured_route(app.clone()).await?;
     }
     let store = app.state::<Store>();
     let proxy = app.state::<ProxyManager>();
@@ -496,21 +461,6 @@ fn get_dashboard(store: State<Store>) -> Result<Dashboard, AppError> {
     })
 }
 
-#[tauri::command]
-fn get_diagnostics(store: State<Store>) -> DiagnosticReport {
-    DiagnosticReport {
-        app_db: store.path().display().to_string(),
-        codex_home: codex::home().display().to_string(),
-        config_exists: codex::home().join("config.toml").exists(),
-        auth_exists: codex::home().join("auth.json").exists(),
-        databases: codex::databases()
-            .iter()
-            .map(|path| path.display().to_string())
-            .collect(),
-        warnings: codex::scan().warnings,
-    }
-}
-
 pub fn run() {
     let store = Store::open().expect("无法初始化应用数据库");
     tauri::Builder::default()
@@ -550,7 +500,10 @@ pub fn run() {
                 tray = tray.icon(icon);
             }
             tray.build(app)?;
-            tauri::async_runtime::spawn(start_configured_route(app.handle().clone()));
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                let _ = start_configured_route(handle).await;
+            });
             Ok(())
         })
         .on_window_event(|window, event| match event {
@@ -574,13 +527,11 @@ pub fn run() {
             delete_provider_account,
             test_provider,
             activate_provider,
-            get_proxy_status,
             scan_codex_data,
             repair_codex_data,
             list_sessions,
             export_sessions,
             delete_sessions_permanently,
-            get_diagnostics,
             list_auth_accounts,
             activate_openai_account,
             delete_auth_account,
