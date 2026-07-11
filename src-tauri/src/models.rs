@@ -118,10 +118,9 @@ pub struct SessionSummary {
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "camelCase")]
 pub enum AuthService {
     OpenAi,
-    GitHub,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -149,12 +148,20 @@ pub struct AuthAccount {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct GitHubDeviceAuthorization {
+pub struct OpenAiDeviceAuthorization {
     pub operation_id: String,
     pub user_code: String,
     pub verification_uri: String,
     pub expires_at: i64,
     pub interval_secs: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum OpenAiDevicePoll {
+    Pending,
+    Expired,
+    Complete { account: Box<AuthAccount> },
 }
 
 #[derive(Debug, Clone, Serialize)]

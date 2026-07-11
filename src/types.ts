@@ -1,11 +1,5 @@
 export type Page =
-  | "dashboard"
-  | "providers"
-  | "auth"
-  | "sessions"
-  | "repair"
-  | "routes"
-  | "settings"
+  "dashboard" | "providers" | "sessions" | "repair" | "routes" | "settings"
 
 export type Protocol = "responses" | "chat_completions"
 
@@ -65,7 +59,7 @@ export type Session = {
 
 export type AuthAccount = {
   id: string
-  service: "open_ai" | "github"
+  service: "open_ai"
   name: string
   login?: string
   email?: string
@@ -76,7 +70,7 @@ export type AuthAccount = {
   updatedAt: number
 }
 
-export type GitHubDeviceAuthorization = {
+export type OpenAiDeviceAuthorization = {
   operationId: string
   userCode: string
   verificationUri: string

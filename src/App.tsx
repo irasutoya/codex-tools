@@ -16,7 +16,6 @@ import {
   ShieldCheck,
   Trash2,
   UserRound,
-  CodeXml,
 } from "lucide-react"
 import { toast } from "sonner"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
@@ -118,7 +117,6 @@ import type {
 const nav: [Page, string, React.ComponentType][] = [
   ["dashboard", "概览", Gauge],
   ["providers", "Provider 与账号", Server],
-  ["auth", "OAuth 认证中心", KeyRound],
   ["sessions", "会话历史", FileArchive],
   ["repair", "数据库修复", Database],
   ["routes", "本地路由", Network],
@@ -138,7 +136,8 @@ export default function App() {
   const [editingAccount, setEditingAccount] = useState<Account>()
   const [activating, setActivating] = useState<{
     provider?: Provider
-    account: Account
+    account: Account | AuthAccount
+    official?: boolean
   }>()
   const [deletingProvider, setDeletingProvider] = useState<Provider>()
   const [deletingAccount, setDeletingAccount] = useState<Account>()
@@ -180,10 +179,7 @@ export default function App() {
     return () => window.clearTimeout(task)
   }, [reload])
 
-  const officialAccounts = useMemo(
-    () => accounts.filter((account) => account.authKind === "official_oauth"),
-    [accounts]
-  )
+  const officialAccounts = useMemo(() => authAccounts, [authAccounts])
   const saveProvider = async () => {
     if (!editingProvider) return
     setBusy(true)
@@ -205,20 +201,6 @@ export default function App() {
       await call("save_provider_account", { account: editingAccount })
       toast.success("账号已保存")
       setEditingAccount(undefined)
-      await reload()
-    } catch (error) {
-      toast.error(String(error))
-    } finally {
-      setBusy(false)
-    }
-  }
-  const captureOfficial = async () => {
-    setBusy(true)
-    try {
-      await call("capture_official_account", {
-        name: `官方账号 ${officialAccounts.length + 1}`,
-      })
-      toast.success("已保存当前 Codex 官方登录")
       await reload()
     } catch (error) {
       toast.error(String(error))
@@ -250,16 +232,15 @@ export default function App() {
     if (!activating) return
     setBusy(true)
     try {
-      const result =
-        activating.account.authKind === "official_oauth"
-          ? await call<{ rowsUpdated: number }>("activate_official_account", {
-              accountId: activating.account.id,
-            })
-          : await call<{ rowsUpdated: number }>("activate_provider", {
-              id: activating.provider?.id,
-              accountId: activating.account.id,
-              force: false,
-            })
+      const result = activating.official
+        ? await call<{ rowsUpdated: number }>("activate_openai_account", {
+            id: activating.account.id,
+          })
+        : await call<{ rowsUpdated: number }>("activate_provider", {
+            id: activating.provider?.id,
+            accountId: activating.account.id,
+            force: false,
+          })
       toast.success(`切换完成，统一了 ${result.rowsUpdated} 条会话数据`)
       setActivating(undefined)
       await reload()
@@ -417,8 +398,11 @@ export default function App() {
                 onActivate={(provider, account) =>
                   setActivating({ provider, account })
                 }
-                onActivateOfficial={(account) => setActivating({ account })}
-                onCaptureOfficial={captureOfficial}
+                onActivateOfficial={(account) =>
+                  setActivating({ account, official: true })
+                }
+                onBusy={setBusy}
+                onReload={reload}
               />
             )}
             {page === "sessions" && (
@@ -426,14 +410,6 @@ export default function App() {
                 sessions={sessions}
                 onExport={exportOne}
                 onDelete={setDeletingSession}
-              />
-            )}
-            {page === "auth" && (
-              <AuthCenterPage
-                accounts={authAccounts}
-                busy={busy}
-                onBusy={setBusy}
-                onReload={reload}
               />
             )}
             {page === "repair" && (
@@ -620,11 +596,12 @@ function ProvidersPage({
   onTest,
   onActivate,
   onActivateOfficial,
-  onCaptureOfficial,
+  onBusy,
+  onReload,
 }: {
   providers: Provider[]
   accounts: Account[]
-  officialAccounts: Account[]
+  officialAccounts: AuthAccount[]
   busy: boolean
   onNew: () => void
   onEdit: (provider: Provider) => void
@@ -634,17 +611,83 @@ function ProvidersPage({
   onDeleteAccount: (account: Account) => void
   onTest: (provider: Provider, account: Account) => void
   onActivate: (provider: Provider, account: Account) => void
-  onActivateOfficial: (account: Account) => void
-  onCaptureOfficial: () => void
+  onActivateOfficial: (account: AuthAccount) => void
+  onBusy: (value: boolean) => void
+  onReload: () => Promise<void>
 }) {
+  const [device, setDevice] = useState<{
+    operationId: string
+    userCode: string
+    verificationUri: string
+    expiresAt: number
+    intervalSecs: number
+  }>()
+
+  const startOfficialLogin = async () => {
+    onBusy(true)
+    try {
+      const authorization = await call<typeof device & object>(
+        "start_openai_device_auth"
+      )
+      setDevice(authorization)
+      toast.success("设备登录已创建，请在 OpenAI 页面输入授权码")
+    } catch (error) {
+      toast.error(String(error))
+    } finally {
+      onBusy(false)
+    }
+  }
+
+  useEffect(() => {
+    if (!device) return
+    let stopped = false
+    const timer = window.setInterval(
+      async () => {
+        try {
+          const result = await call<{
+            status: "pending" | "expired" | "complete"
+          }>("poll_openai_device_auth", { operationId: device.operationId })
+          if (stopped || result.status === "pending") return
+          window.clearInterval(timer)
+          setDevice(undefined)
+          if (result.status === "complete") {
+            toast.success("OpenAI 官方账号已添加")
+            await onReload()
+          } else {
+            toast.error("OpenAI 设备授权已过期，请重新登录")
+          }
+        } catch (error) {
+          window.clearInterval(timer)
+          setDevice(undefined)
+          toast.error(String(error))
+        }
+      },
+      Math.max(device.intervalSecs, 3) * 1000
+    )
+    return () => {
+      stopped = true
+      window.clearInterval(timer)
+    }
+  }, [device, onReload])
+
+  const deleteOfficial = async (account: AuthAccount) => {
+    try {
+      await call("delete_auth_account", { id: account.id })
+      toast.success("官方账号已删除")
+      await onReload()
+    } catch (error) {
+      toast.error(String(error))
+    }
+  }
+
   return (
     <>
       <Card>
         <CardHeader>
-          <CardTitle>官方 Codex 账号</CardTitle>
+          <CardTitle>OpenAI 官方账号</CardTitle>
           <CardDescription>
-            保存当前 auth.json 的完整登录快照，之后可以一键切换回来。切换第三方
-            API 时不会覆盖这些 OAuth 数据。
+            使用 OpenAI Device Code OAuth 添加账号，无需调用 Codex
+            客户端登录。切换第三方 API 时只更新路由配置，保留这里的官方登录。
           </CardDescription>
         </CardHeader>
         <CardContent>
@@ -662,7 +705,9 @@ function ProvidersPage({
                 {officialAccounts.map((account) => (
                   <TableRow key={account.id}>
                     <TableCell>{account.name}</TableCell>
-                    <TableCell>{account.email || "已保存登录快照"}</TableCell>
+                    <TableCell>
+                      {account.email || account.login || "OpenAI 账号"}
+                    </TableCell>
                     <TableCell>
                       {account.active ? (
                         <Badge>当前</Badge>
@@ -675,15 +720,8 @@ function ProvidersPage({
                         <Button
                           variant="outline"
                           size="sm"
-                          onClick={() => onEditAccount(account)}
-                        >
-                          重命名
-                        </Button>
-                        <Button
-                          variant="outline"
-                          size="sm"
                           disabled={account.active}
-                          onClick={() => onDeleteAccount(account)}
+                          onClick={() => void deleteOfficial(account)}
                         >
                           删除
                         </Button>
@@ -706,18 +744,40 @@ function ProvidersPage({
                 <EmptyMedia variant="icon">
                   <UserRound />
                 </EmptyMedia>
-                <EmptyTitle>还没有官方账号快照</EmptyTitle>
+                <EmptyTitle>还没有官方账号</EmptyTitle>
                 <EmptyDescription>
-                  先在 Codex 中完成 ChatGPT 登录，然后捕获当前账号。
+                  点击下方按钮，通过 OpenAI 设备授权页面登录 ChatGPT 账号。
                 </EmptyDescription>
               </EmptyHeader>
             </Empty>
           )}
         </CardContent>
-        <CardFooter>
-          <Button variant="outline" disabled={busy} onClick={onCaptureOfficial}>
+        <CardFooter className="flex flex-col items-start gap-3">
+          {device && (
+            <Alert>
+              <KeyRound />
+              <AlertTitle>授权码：{device.userCode}</AlertTitle>
+              <AlertDescription>
+                打开{" "}
+                <a
+                  className="underline"
+                  href={device.verificationUri}
+                  target="_blank"
+                  rel="noreferrer"
+                >
+                  OpenAI 设备授权页面
+                </a>
+                ，输入授权码。Codex Tools 会自动等待登录完成。
+              </AlertDescription>
+            </Alert>
+          )}
+          <Button
+            variant="outline"
+            disabled={busy || !!device}
+            onClick={() => void startOfficialLogin()}
+          >
             <Plus data-icon="inline-start" />
-            捕获当前官方登录
+            添加官方账号
           </Button>
         </CardFooter>
       </Card>
@@ -964,196 +1024,6 @@ function SessionsPage({
         )}
       </CardContent>
     </Card>
-  )
-}
-
-function AuthCenterPage({
-  accounts,
-  busy,
-  onBusy,
-  onReload,
-}: {
-  accounts: AuthAccount[]
-  busy: boolean
-  onBusy: (value: boolean) => void
-  onReload: () => Promise<void>
-}) {
-  const [clientId, setClientId] = useState("")
-  const [device, setDevice] = useState<{
-    operationId: string
-    userCode: string
-    verificationUri: string
-  }>()
-  const captureOpenAi = async () => {
-    onBusy(true)
-    try {
-      await call("capture_openai_account", { name: "OpenAI 官方账号" })
-      toast.success("已保存当前 Codex 官方登录与配置快照")
-      await onReload()
-    } catch (error) {
-      toast.error(String(error))
-    } finally {
-      onBusy(false)
-    }
-  }
-  const startGitHub = async () => {
-    onBusy(true)
-    try {
-      const next = await call<{
-        operationId: string
-        userCode: string
-        verificationUri: string
-      }>("start_github_device_auth", {
-        clientId,
-        scopes: ["read:user", "user:email"],
-      })
-      setDevice(next)
-      toast.success("设备授权已创建，请在 GitHub 完成确认")
-    } catch (error) {
-      toast.error(String(error))
-    } finally {
-      onBusy(false)
-    }
-  }
-  const completeGitHub = async () => {
-    if (!device) return
-    onBusy(true)
-    try {
-      await call("complete_github_device_auth", {
-        operationId: device.operationId,
-      })
-      setDevice(undefined)
-      toast.success("GitHub 账号已添加")
-      await onReload()
-    } catch (error) {
-      toast.error(String(error))
-    } finally {
-      onBusy(false)
-    }
-  }
-  const activateOpenAi = async (id: string) => {
-    onBusy(true)
-    try {
-      await call("activate_openai_account", { id })
-      toast.success("已恢复 OpenAI 官方登录")
-      await onReload()
-    } catch (error) {
-      toast.error(String(error))
-    } finally {
-      onBusy(false)
-    }
-  }
-  return (
-    <>
-      <Alert>
-        <ShieldCheck />
-        <AlertTitle>认证与模型路由分离</AlertTitle>
-        <AlertDescription>
-          OpenAI 快照可直接恢复到 Codex。GitHub 登录只保存身份与授权，不会伪装成
-          OpenAI 凭据；使用 GitHub Models 时仍需单独配置兼容 Provider。
-        </AlertDescription>
-      </Alert>
-      <div className="grid gap-4 xl:grid-cols-2">
-        <Card>
-          <CardHeader>
-            <CardTitle>OpenAI / Codex</CardTitle>
-            <CardDescription>
-              捕获当前 auth.json 和官方配置；切换第三方前也会自动保存一次。
-            </CardDescription>
-          </CardHeader>
-          <CardContent className="flex flex-col gap-3">
-            {accounts
-              .filter((account) => account.service === "open_ai")
-              .map((account) => (
-                <div
-                  key={account.id}
-                  className="flex items-center justify-between rounded-lg border p-3"
-                >
-                  <div>
-                    <div className="font-medium">{account.name}</div>
-                    <div className="text-sm text-muted-foreground">
-                      {account.email || "官方登录快照"}
-                    </div>
-                  </div>
-                  <div className="flex gap-2">
-                    {account.active && <Badge>当前</Badge>}
-                    <Button
-                      size="sm"
-                      disabled={busy || account.active}
-                      onClick={() => void activateOpenAi(account.id)}
-                    >
-                      恢复到 Codex
-                    </Button>
-                  </div>
-                </div>
-              ))}
-          </CardContent>
-          <CardFooter>
-            <Button disabled={busy} onClick={() => void captureOpenAi()}>
-              <KeyRound data-icon="inline-start" />
-              保存当前官方登录
-            </Button>
-          </CardFooter>
-        </Card>
-        <Card>
-          <CardHeader>
-            <CardTitle>GitHub Device Flow</CardTitle>
-            <CardDescription>
-              使用你自己的 GitHub OAuth App Client
-              ID；令牌按当前项目约定明文保存在本机数据库。
-            </CardDescription>
-          </CardHeader>
-          <CardContent>
-            <FieldGroup>
-              <Field>
-                <FieldLabel>OAuth App Client ID</FieldLabel>
-                <Input
-                  value={clientId}
-                  onChange={(event) => setClientId(event.target.value)}
-                />
-              </Field>
-              {device && (
-                <Alert>
-                  <CodeXml />
-                  <AlertTitle>授权码：{device.userCode}</AlertTitle>
-                  <AlertDescription>{device.verificationUri}</AlertDescription>
-                </Alert>
-              )}
-              {accounts
-                .filter((account) => account.service === "github")
-                .map((account) => (
-                  <div
-                    key={account.id}
-                    className="flex items-center gap-3 rounded-lg border p-3"
-                  >
-                    <CodeXml />
-                    <div>
-                      <div className="font-medium">{account.name}</div>
-                      <div className="text-sm text-muted-foreground">
-                        @{account.login}
-                      </div>
-                    </div>
-                  </div>
-                ))}
-            </FieldGroup>
-          </CardContent>
-          <CardFooter className="flex gap-2">
-            <Button
-              variant="outline"
-              disabled={busy || !clientId}
-              onClick={() => void startGitHub()}
-            >
-              开始授权
-            </Button>
-            {device && (
-              <Button disabled={busy} onClick={() => void completeGitHub()}>
-                我已授权，完成添加
-              </Button>
-            )}
-          </CardFooter>
-        </Card>
-      </div>
-    </>
   )
 }
 

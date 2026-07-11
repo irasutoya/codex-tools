@@ -81,6 +81,7 @@ impl Store {
                PRIMARY KEY(codex_home,thread_id)
              );",
         )?;
+        migrate_official_accounts(&db)?;
         migrate_legacy_keys(&db)?;
         Ok(store)
     }
@@ -173,9 +174,9 @@ impl Store {
     pub fn accounts(&self, provider_id: Option<&str>) -> anyhow::Result<Vec<ProviderAccount>> {
         let db = self.connect()?;
         let sql = if provider_id.is_some() {
-            "SELECT id,provider_id,name,auth_kind,api_key,auth_json,headers_json,active,email,created_at,updated_at FROM provider_accounts WHERE provider_id=?1 ORDER BY active DESC,name"
+            "SELECT id,provider_id,name,auth_kind,api_key,auth_json,headers_json,active,email,created_at,updated_at FROM provider_accounts WHERE provider_id=?1 AND auth_kind='api_key' ORDER BY active DESC,name"
         } else {
-            "SELECT id,provider_id,name,auth_kind,api_key,auth_json,headers_json,active,email,created_at,updated_at FROM provider_accounts ORDER BY active DESC,name"
+            "SELECT id,provider_id,name,auth_kind,api_key,auth_json,headers_json,active,email,created_at,updated_at FROM provider_accounts WHERE auth_kind='api_key' ORDER BY active DESC,name"
         };
         let mut statement = db.prepare(sql)?;
         let map = |row: &rusqlite::Row<'_>| {
@@ -257,6 +258,10 @@ impl Store {
         let tx = db.transaction()?;
         tx.execute("UPDATE providers SET active=0", [])?;
         tx.execute("UPDATE provider_accounts SET active=0", [])?;
+        tx.execute(
+            "UPDATE auth_accounts SET active=0 WHERE service='openai'",
+            [],
+        )?;
         tx.execute("UPDATE providers SET active=1 WHERE id=?1", [provider_id])?;
         let changed = tx.execute(
             "UPDATE provider_accounts SET active=1 WHERE id=?1 AND provider_id=?2",
@@ -269,20 +274,7 @@ impl Store {
         Ok(())
     }
 
-    pub fn activate_official(&self, account_id: &str) -> anyhow::Result<()> {
-        let mut db = self.connect()?;
-        let tx = db.transaction()?;
-        tx.execute("UPDATE providers SET active=0", [])?;
-        tx.execute("UPDATE provider_accounts SET active=0", [])?;
-        tx.execute(
-            "UPDATE provider_accounts SET active=1 WHERE id=?1 AND auth_kind='official_oauth'",
-            [account_id],
-        )?;
-        tx.commit()?;
-        Ok(())
-    }
-
-    pub fn active_state(&self) -> anyhow::Result<(Option<String>, Option<String>)> {
+    pub fn active_state(&self) -> anyhow::Result<(Option<String>, Option<String>, Option<String>)> {
         let db = self.connect()?;
         let provider = db
             .query_row(
@@ -298,19 +290,36 @@ impl Store {
                 |row| row.get(0),
             )
             .optional()?;
-        Ok((provider, account))
+        let official = db
+            .query_row(
+                "SELECT id FROM auth_accounts WHERE active=1 AND service='openai' LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok((provider, account, official))
     }
 
-    pub fn restore_active(&self, state: (Option<&str>, Option<&str>)) -> anyhow::Result<()> {
+    pub fn restore_active(
+        &self,
+        state: (Option<&str>, Option<&str>, Option<&str>),
+    ) -> anyhow::Result<()> {
         let mut db = self.connect()?;
         let tx = db.transaction()?;
         tx.execute("UPDATE providers SET active=0", [])?;
         tx.execute("UPDATE provider_accounts SET active=0", [])?;
+        tx.execute("UPDATE auth_accounts SET active=0", [])?;
         if let Some(id) = state.0 {
             tx.execute("UPDATE providers SET active=1 WHERE id=?1", [id])?;
         }
         if let Some(id) = state.1 {
             tx.execute("UPDATE provider_accounts SET active=1 WHERE id=?1", [id])?;
+        }
+        if let Some(id) = state.2 {
+            tx.execute(
+                "UPDATE auth_accounts SET active=1 WHERE id=?1 AND service='openai'",
+                [id],
+            )?;
         }
         tx.commit()?;
         Ok(())
@@ -326,11 +335,7 @@ impl Store {
         let rows = statement.query_map([], |row| {
             Ok(AuthAccount {
                 id: row.get(0)?,
-                service: if row.get::<_, String>(1)? == "github" {
-                    AuthService::GitHub
-                } else {
-                    AuthService::OpenAi
-                },
+                service: AuthService::OpenAi,
                 name: row.get(2)?,
                 login: row.get(3)?,
                 email: row.get(4)?,
@@ -365,7 +370,7 @@ impl Store {
              scopes_json=excluded.scopes_json,expires_at=excluded.expires_at,updated_at=excluded.updated_at",
             params![
                 account.id,
-                if account.service == AuthService::GitHub { "github" } else { "openai" },
+                "openai",
                 account.name,
                 account.login,
                 account.email,
@@ -383,6 +388,8 @@ impl Store {
     pub fn activate_auth_account(&self, id: &str) -> anyhow::Result<()> {
         let mut db = self.connect()?;
         let tx = db.transaction()?;
+        tx.execute("UPDATE providers SET active=0", [])?;
+        tx.execute("UPDATE provider_accounts SET active=0", [])?;
         tx.execute(
             "UPDATE auth_accounts SET active=0 WHERE service='openai'",
             [],
@@ -540,6 +547,21 @@ fn migrate_legacy_keys(db: &Connection) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn migrate_official_accounts(db: &Connection) -> anyhow::Result<()> {
+    db.execute_batch(
+        "INSERT OR IGNORE INTO auth_accounts(
+           id,service,name,login,email,credential_json,config_snapshot,scopes_json,
+           expires_at,active,created_at,updated_at
+         )
+         SELECT id,'openai',name,NULL,email,auth_json,NULL,'[]',NULL,active,created_at,updated_at
+         FROM provider_accounts
+         WHERE auth_kind='official_oauth' AND auth_json IS NOT NULL;
+         DELETE FROM auth_accounts WHERE service='github';
+         DELETE FROM provider_accounts WHERE auth_kind='official_oauth';",
+    )?;
+    Ok(())
+}
+
 fn json_or_default<T: serde::de::DeserializeOwned + Default>(value: String) -> T {
     serde_json::from_str(&value).unwrap_or_default()
 }
@@ -643,5 +665,56 @@ mod tests {
         assert_eq!(indexed.len(), 1);
         assert_eq!(indexed[0].original_provider, "openai");
         assert!(indexed[0].has_user_event);
+    }
+
+    #[test]
+    fn migrates_legacy_official_accounts_and_removes_github_rows() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE provider_accounts(
+               id TEXT PRIMARY KEY,provider_id TEXT,name TEXT,auth_kind TEXT,api_key TEXT,
+               auth_json TEXT,headers_json TEXT,active INTEGER,email TEXT,
+               created_at INTEGER,updated_at INTEGER
+             );
+             CREATE TABLE auth_accounts(
+               id TEXT PRIMARY KEY,service TEXT,name TEXT,login TEXT,email TEXT,
+               credential_json TEXT,config_snapshot TEXT,scopes_json TEXT,expires_at INTEGER,
+               active INTEGER,created_at INTEGER,updated_at INTEGER
+             );
+             INSERT INTO provider_accounts VALUES(
+               'legacy-openai',NULL,'Official','official_oauth',NULL,
+               '{\"tokens\":{\"refresh_token\":\"secret\"}}','{}',1,'user@example.test',1,2
+             );
+             INSERT INTO auth_accounts VALUES(
+               'github-1','github','GitHub',NULL,NULL,'{}',NULL,'[]',NULL,0,1,1
+             );",
+        )
+        .unwrap();
+
+        migrate_official_accounts(&db).unwrap();
+
+        let migrated: (String, String, i64) = db
+            .query_row(
+                "SELECT service,email,active FROM auth_accounts WHERE id='legacy-openai'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(migrated, ("openai".into(), "user@example.test".into(), 1));
+        let github_count: i64 = db
+            .query_row(
+                "SELECT count(*) FROM auth_accounts WHERE service='github'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let legacy_count: i64 = db
+            .query_row(
+                "SELECT count(*) FROM provider_accounts WHERE auth_kind='official_oauth'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!((github_count, legacy_count), (0, 0));
     }
 }

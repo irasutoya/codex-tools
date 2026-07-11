@@ -83,39 +83,6 @@ fn delete_provider_account(store: State<Store>, id: String) -> Result<(), AppErr
 }
 
 #[tauri::command]
-fn capture_official_account(
-    store: State<Store>,
-    name: String,
-) -> Result<ProviderAccount, AppError> {
-    let auth = codex::capture_official_auth()?;
-    let email = auth
-        .pointer("/tokens/id_token/email")
-        .or_else(|| auth.pointer("/email"))
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_owned);
-    let now = chrono::Utc::now().timestamp();
-    let account = ProviderAccount {
-        id: uuid::Uuid::new_v4().to_string(),
-        provider_id: None,
-        name: if name.trim().is_empty() {
-            "官方账号".into()
-        } else {
-            name
-        },
-        auth_kind: AccountAuthKind::OfficialOauth,
-        api_key: None,
-        auth_json: Some(auth),
-        headers: serde_json::json!({}),
-        active: false,
-        email,
-        created_at: now,
-        updated_at: now,
-    };
-    store.save_account(&account)?;
-    Ok(account)
-}
-
-#[tauri::command]
 async fn test_provider(
     store: State<'_, Store>,
     id: String,
@@ -186,7 +153,6 @@ async fn activate_provider(
     let _guard = proxy.activation_guard().await;
     let provider = store.provider(&id)?;
     let account = store.account(&account_id)?;
-    preserve_current_official_login(&store)?;
     if !provider.enabled {
         return Err(AppError::InvalidConfig("Provider 已禁用".into()));
     }
@@ -250,7 +216,11 @@ async fn activate_provider(
         Ok(result) => result,
         Err(error) => {
             let config = codex::restore_provider_backup(&backup);
-            let active = store.restore_active((previous.0.as_deref(), previous.1.as_deref()));
+            let active = store.restore_active((
+                previous.0.as_deref(),
+                previous.1.as_deref(),
+                previous.2.as_deref(),
+            ));
             proxy.abort().await;
             return match (config, active) {
                 (Ok(()), Ok(())) => Err(error),
@@ -264,49 +234,6 @@ async fn activate_provider(
         proxy.commit().await?;
     } else {
         proxy.stop().await;
-    }
-    Ok(result)
-}
-
-#[tauri::command]
-async fn activate_official_account(
-    store: State<'_, Store>,
-    proxy: State<'_, ProxyManager>,
-    account_id: String,
-) -> Result<RepairResult, AppError> {
-    let _guard = proxy.activation_guard().await;
-    let account = store.account(&account_id)?;
-    if account.auth_kind != AccountAuthKind::OfficialOauth {
-        return Err(AppError::InvalidConfig(
-            "所选账号不是官方 OAuth 账号".into(),
-        ));
-    }
-    let backup = codex::restore_official_account(&account)?;
-    let origins = store.session_origins(&codex::home(), "openai")?;
-    let mut result = match codex::restore_sessions_exact("openai", &origins) {
-        Ok(result) => result,
-        Err(error) => {
-            let rollback = codex::restore_provider_backup(&backup);
-            return match rollback {
-                Ok(()) => Err(error),
-                Err(rollback) => Err(AppError::Backup(format!(
-                    "恢复官方历史失败：{error}；配置回滚失败：{rollback}"
-                ))),
-            };
-        }
-    };
-    if let Err(error) = store.activate_official(&account_id) {
-        let _ = codex::restore_provider_backup(&backup);
-        return Err(error.into());
-    }
-    store.forget_session_origins(&codex::home(), "openai")?;
-    proxy.stop().await;
-    result.warnings.push(format!(
-        "已切换官方账号，并按迁移账本恢复了 {} 个会话的官方归属。",
-        origins.len()
-    ));
-    if result.backup_path.is_empty() {
-        result.backup_path = backup;
     }
     Ok(result)
 }
@@ -342,82 +269,21 @@ fn list_sessions(
     store.unified_sessions(query.as_deref()).map_err(Into::into)
 }
 
-fn preserve_current_official_login(store: &Store) -> Result<(), AppError> {
-    if !codex::is_official_mode() {
-        return Ok(());
-    }
-    let Ok(auth) = codex::capture_official_auth() else {
-        return Ok(());
-    };
-    if store.auth_accounts()?.iter().any(|account| {
-        account.service == AuthService::OpenAi && account.credential.as_ref() == Some(&auth)
-    }) {
-        return Ok(());
-    }
-    let now = chrono::Utc::now().timestamp();
-    store.save_auth_account(&AuthAccount {
-        id: uuid::Uuid::new_v4().to_string(),
-        service: AuthService::OpenAi,
-        name: "自动保存的 OpenAI 登录".into(),
-        login: None,
-        email: auth
-            .pointer("/tokens/id_token/email")
-            .or_else(|| auth.pointer("/email"))
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned),
-        credential: Some(auth),
-        config_snapshot: Some(codex::capture_official_config()),
-        scopes: Vec::new(),
-        expires_at: None,
-        active: false,
-        created_at: now,
-        updated_at: now,
-    })?;
-    Ok(())
-}
-
 #[tauri::command]
 fn list_auth_accounts(store: State<Store>) -> Result<Vec<AuthAccount>, AppError> {
     store.auth_accounts().map_err(Into::into)
 }
 
 #[tauri::command]
-fn capture_openai_account(store: State<Store>, name: String) -> Result<AuthAccount, AppError> {
-    let auth = codex::capture_official_auth()?;
-    let now = chrono::Utc::now().timestamp();
-    let account = AuthAccount {
-        id: uuid::Uuid::new_v4().to_string(),
-        service: AuthService::OpenAi,
-        name: if name.trim().is_empty() {
-            "OpenAI 官方账号".into()
-        } else {
-            name
-        },
-        login: None,
-        email: auth
-            .pointer("/tokens/id_token/email")
-            .or_else(|| auth.pointer("/email"))
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned),
-        credential: Some(auth),
-        config_snapshot: Some(codex::capture_official_config()),
-        scopes: Vec::new(),
-        expires_at: None,
-        active: false,
-        created_at: now,
-        updated_at: now,
-    };
-    store.save_auth_account(&account)?;
-    Ok(account)
-}
-
-#[tauri::command]
 async fn activate_openai_account(
     store: State<'_, Store>,
     proxy: State<'_, ProxyManager>,
+    center: State<'_, AuthCenter>,
     id: String,
 ) -> Result<RepairResult, AppError> {
-    let account = store.auth_account(&id)?;
+    let _guard = proxy.activation_guard().await;
+    let account = center.refresh_account(&store.auth_account(&id)?).await?;
+    store.save_auth_account(&account)?;
     if account.service != AuthService::OpenAi {
         return Err(AppError::InvalidConfig("所选账号不是 OpenAI 账号".into()));
     }
@@ -439,7 +305,15 @@ async fn activate_openai_account(
             };
         }
     };
-    store.activate_auth_account(&id)?;
+    if let Err(error) = store.activate_auth_account(&id) {
+        let rollback = codex::restore_provider_backup(&backup);
+        return match rollback {
+            Ok(()) => Err(error.into()),
+            Err(rollback) => Err(AppError::Backup(format!(
+                "官方账号状态更新失败：{error}；配置回滚失败：{rollback}"
+            ))),
+        };
+    }
     store.forget_session_origins(&codex::home(), "openai")?;
     proxy.stop().await;
     result.warnings.push(format!(
@@ -459,23 +333,23 @@ fn delete_auth_account(store: State<Store>, id: String) -> Result<(), AppError> 
 }
 
 #[tauri::command]
-async fn start_github_device_auth(
+async fn start_openai_device_auth(
     center: State<'_, AuthCenter>,
-    client_id: String,
-    scopes: Vec<String>,
-) -> Result<GitHubDeviceAuthorization, AppError> {
-    center.start_github(&client_id, &scopes).await
+) -> Result<OpenAiDeviceAuthorization, AppError> {
+    center.start_openai().await
 }
 
 #[tauri::command]
-async fn complete_github_device_auth(
+async fn poll_openai_device_auth(
     center: State<'_, AuthCenter>,
     store: State<'_, Store>,
     operation_id: String,
-) -> Result<AuthAccount, AppError> {
-    let account = center.complete_github(&operation_id).await?;
-    store.save_auth_account(&account)?;
-    Ok(account)
+) -> Result<OpenAiDevicePoll, AppError> {
+    let result = center.poll_openai(&operation_id).await?;
+    if let OpenAiDevicePoll::Complete { account } = &result {
+        store.save_auth_account(account)?;
+    }
+    Ok(result)
 }
 
 #[tauri::command]
@@ -560,10 +434,8 @@ pub fn run() {
             list_provider_accounts,
             save_provider_account,
             delete_provider_account,
-            capture_official_account,
             test_provider,
             activate_provider,
-            activate_official_account,
             get_proxy_status,
             scan_codex_data,
             repair_codex_data,
@@ -572,11 +444,10 @@ pub fn run() {
             delete_sessions_permanently,
             get_diagnostics,
             list_auth_accounts,
-            capture_openai_account,
             activate_openai_account,
             delete_auth_account,
-            start_github_device_auth,
-            complete_github_device_auth,
+            start_openai_device_auth,
+            poll_openai_device_auth,
             get_route_console,
             stop_local_route,
             clear_route_logs

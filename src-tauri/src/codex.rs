@@ -394,12 +394,6 @@ pub fn apply_provider_with_proxy(
     }
 }
 
-pub fn capture_official_auth() -> Result<serde_json::Value, AppError> {
-    let path = home().join("auth.json");
-    let text = fs::read_to_string(path).map_err(|_| AppError::OfficialAuthMissing)?;
-    serde_json::from_str(&text).map_err(|error| AppError::InvalidConfig(error.to_string()))
-}
-
 pub fn capture_official_config() -> String {
     fs::read_to_string(home().join("config.toml")).unwrap_or_default()
 }
@@ -442,49 +436,6 @@ pub fn restore_official_snapshot(
                 .map_err(|error| AppError::InvalidConfig(error.to_string()))?;
             atomic_write(&config_path, config.as_bytes())?;
         }
-        atomic_write(
-            &home().join("auth.json"),
-            &serde_json::to_vec_pretty(auth)
-                .map_err(|error| AppError::Internal(error.to_string()))?,
-        )?;
-        Ok(())
-    })();
-    match update {
-        Ok(()) => Ok(backup_path.display().to_string()),
-        Err(error) => {
-            restore_provider_backup(&backup_path.display().to_string())?;
-            Err(error)
-        }
-    }
-}
-
-pub fn restore_official_account(account: &ProviderAccount) -> Result<String, AppError> {
-    let auth = account
-        .auth_json
-        .as_ref()
-        .ok_or(AppError::OfficialAuthMissing)?;
-    let backup_path =
-        backup("official-account").map_err(|error| AppError::Backup(error.to_string()))?;
-    let config_path = home().join("config.toml");
-    let original = fs::read_to_string(&config_path).unwrap_or_default();
-    let mut doc = original
-        .parse::<DocumentMut>()
-        .map_err(|error| AppError::InvalidConfig(error.to_string()))?;
-    doc["model_provider"] = value(MANAGED_PROVIDER_ID);
-    if !doc.as_table().contains_key("model_providers") {
-        doc["model_providers"] = Item::Table(Table::new());
-    }
-    let providers = doc["model_providers"]
-        .as_table_mut()
-        .ok_or_else(|| AppError::InvalidConfig("model_providers 必须是 table".into()))?;
-    let mut official = Table::new();
-    official["name"] = value("OpenAI");
-    official["requires_openai_auth"] = value(true);
-    official["supports_websockets"] = value(true);
-    official["wire_api"] = value("responses");
-    providers[MANAGED_PROVIDER_ID] = Item::Table(official);
-    let update = (|| -> Result<(), AppError> {
-        atomic_write(&config_path, doc.to_string().as_bytes())?;
         atomic_write(
             &home().join("auth.json"),
             &serde_json::to_vec_pretty(auth)
