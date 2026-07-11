@@ -55,8 +55,7 @@ pub fn synchronize(home: &Path, provider: &str) -> Result<RepairResult, AppError
         )));
     }
     let lock = SyncLock::acquire(&home.join("tmp/codex-tools-provider-sync.lock"))?;
-    let source_providers = known_source_providers(home, provider);
-    let changes = collect_rollouts(home, provider, &source_providers)?;
+    let changes = collect_rollouts(home, provider, None)?;
     let projectless = projectless_threads(&home.join(".codex-global-state.json"))?;
     let user_threads = changes
         .iter()
@@ -76,13 +75,7 @@ pub fn synchronize(home: &Path, provider: &str) -> Result<RepairResult, AppError
     let original_global = fs::read(&global_path).ok();
     let applied = apply_rollouts(&changes)?;
     let result = (|| -> anyhow::Result<(UpdateCounts, usize)> {
-        let counts = update_databases(
-            &dbs,
-            provider,
-            &source_providers,
-            &user_threads,
-            &cwd_by_thread,
-        )?;
+        let counts = update_databases(&dbs, provider, None, &user_threads, &cwd_by_thread)?;
         let globals = normalize_global_state(&global_path)?;
         prune_backups(home)?;
         Ok((counts, globals))
@@ -127,6 +120,7 @@ pub fn synchronize(home: &Path, provider: &str) -> Result<RepairResult, AppError
     }
 }
 
+#[allow(dead_code)]
 pub fn restore_exact(
     home: &Path,
     provider: &str,
@@ -144,7 +138,7 @@ pub fn restore_exact(
     let wanted = thread_ids.iter().cloned().collect::<HashSet<_>>();
     let lock = SyncLock::acquire(&home.join("tmp/codex-tools-provider-sync.lock"))?;
     let sources = HashSet::from(["custom".to_string()]);
-    let mut changes = collect_rollouts(home, provider, &sources)?;
+    let mut changes = collect_rollouts(home, provider, Some(&sources))?;
     changes.retain(|change| wanted.contains(&change.thread_id));
     let discovered = database_paths(home);
     let (dbs, warnings) = classify_databases(&discovered)?;
@@ -175,6 +169,7 @@ pub fn restore_exact(
     }
 }
 
+#[allow(dead_code)]
 fn update_database_threads_exact(
     targets: &[DatabaseTarget],
     provider: &str,
@@ -224,7 +219,7 @@ fn validate_provider(provider: &str) -> Result<(), AppError> {
 fn collect_rollouts(
     home: &Path,
     provider: &str,
-    source_providers: &HashSet<String>,
+    source_providers: Option<&HashSet<String>>,
 ) -> Result<Vec<RolloutChange>, AppError> {
     let mut result = Vec::new();
     for root in [home.join("sessions"), home.join("archived_sessions")] {
@@ -258,7 +253,7 @@ fn rewrite_rollout(
     path: &Path,
     original: String,
     provider: &str,
-    source_providers: &HashSet<String>,
+    source_providers: Option<&HashSet<String>>,
 ) -> Result<Option<RolloutChange>, AppError> {
     let mut updated = String::new();
     let mut thread_id = None;
@@ -281,7 +276,8 @@ fn rewrite_rollout(
             });
             let current = payload.get("model_provider").and_then(Value::as_str);
             if current != Some(provider)
-                && current.is_some_and(|value| source_providers.contains(value))
+                && source_providers
+                    .is_none_or(|sources| current.is_none_or(|value| sources.contains(value)))
             {
                 payload.insert("model_provider".into(), json!(provider));
                 next = serde_json::to_string(&record)
@@ -380,7 +376,7 @@ fn classify_databases(paths: &[PathBuf]) -> Result<(Vec<DatabaseTarget>, Vec<Str
 fn update_databases(
     targets: &[DatabaseTarget],
     provider: &str,
-    source_providers: &HashSet<String>,
+    source_providers: Option<&HashSet<String>>,
     users: &HashSet<String>,
     cwd: &HashMap<String, String>,
 ) -> anyhow::Result<UpdateCounts> {
@@ -394,9 +390,16 @@ fn update_databases(
         };
         let columns = table_columns_anyhow(&db, table)?;
         let tx = db.transaction()?;
-        for source in source_providers {
-            let sql = format!("UPDATE {table} SET model_provider=?1 WHERE model_provider=?2");
-            total.provider += tx.execute(&sql, (provider, source))?;
+        if let Some(sources) = source_providers {
+            for source in sources {
+                let sql = format!("UPDATE {table} SET model_provider=?1 WHERE model_provider=?2");
+                total.provider += tx.execute(&sql, (provider, source))?;
+            }
+        } else {
+            let sql = format!(
+                "UPDATE {table} SET model_provider=?1 WHERE COALESCE(model_provider,'')<>?1"
+            );
+            total.provider += tx.execute(&sql, [provider])?;
         }
         if columns.contains("has_user_event") {
             for id in users {
@@ -417,60 +420,6 @@ fn update_databases(
         tx.commit()?;
     }
     Ok(total)
-}
-
-fn known_source_providers(home: &Path, target: &str) -> HashSet<String> {
-    let mut providers = HashSet::from(["openai".to_string()]);
-    let config = fs::read_to_string(home.join("config.toml")).unwrap_or_default();
-    if let Ok(doc) = config.parse::<toml_edit::DocumentMut>() {
-        if let Some(active) = doc.get("model_provider").and_then(toml_edit::Item::as_str)
-            && (active == target || active == "custom" || active.starts_with("codex_tools_"))
-        {
-            providers.insert(active.to_string());
-        }
-        if let Some(tables) = doc
-            .get("model_providers")
-            .and_then(toml_edit::Item::as_table)
-        {
-            providers.extend(
-                tables
-                    .iter()
-                    .map(|(name, _)| name.to_string())
-                    .filter(|name| {
-                        name == target || name == "custom" || name.starts_with("codex_tools_")
-                    }),
-            );
-        }
-    }
-    for rollout in [home.join("sessions"), home.join("archived_sessions")] {
-        if !rollout.exists() {
-            continue;
-        }
-        for entry in WalkDir::new(rollout).into_iter().filter_map(Result::ok) {
-            let path = entry.path();
-            if path
-                .extension()
-                .is_none_or(|extension| extension != "jsonl")
-            {
-                continue;
-            }
-            if let Ok(text) = fs::read_to_string(path) {
-                for line in text.lines().filter(|line| line.contains("model_provider")) {
-                    if let Ok(value) = serde_json::from_str::<Value>(line)
-                        && value.get("type").and_then(Value::as_str) == Some("session_meta")
-                        && let Some(id) = value
-                            .pointer("/payload/model_provider")
-                            .and_then(Value::as_str)
-                        && (id == target || id == "custom" || id.starts_with("codex_tools_"))
-                    {
-                        providers.insert(id.to_string());
-                    }
-                }
-            }
-        }
-    }
-    providers.remove(target);
-    providers
 }
 
 fn create_backup(
@@ -1066,8 +1015,7 @@ mod tests {
     fn database_backup_restores_database_and_removes_new_sidecars() {
         let (_tmp, home) = fixture(false);
         let db = home.join("state_5.sqlite");
-        let sources = known_source_providers(&home, "custom");
-        let changes = collect_rollouts(&home, "custom", &sources).unwrap();
+        let changes = collect_rollouts(&home, "custom", None).unwrap();
         let backup = create_backup(&home, "custom", &changes, std::slice::from_ref(&db)).unwrap();
 
         {
@@ -1090,7 +1038,7 @@ mod tests {
     }
 
     #[test]
-    fn leaves_unknown_provider_history_untouched() {
+    fn unifies_all_provider_history_to_current_target() {
         let (_tmp, home) = fixture(false);
         let rollout_path = home.join("sessions/2026/rollout-test.jsonl");
         let original = fs::read_to_string(&rollout_path)
@@ -1108,25 +1056,12 @@ mod tests {
         synchronize(&home, "custom").unwrap();
 
         let rollout = fs::read_to_string(rollout_path).unwrap();
-        assert!(rollout.contains("\"model_provider\":\"user_owned_provider\""));
+        assert!(rollout.contains("\"model_provider\":\"custom\""));
         let db = Connection::open(home.join("state_5.sqlite")).unwrap();
         let provider: String = db
             .query_row("SELECT model_provider FROM threads", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(provider, "user_owned_provider");
-    }
-
-    #[test]
-    fn active_unknown_provider_is_not_a_trusted_migration_source() {
-        let (_tmp, home) = fixture(false);
-        fs::write(
-            home.join("config.toml"),
-            "model_provider = \"user_owned_provider\"\n[model_providers.user_owned_provider]\nname = \"Private\"\n",
-        )
-        .unwrap();
-        let sources = known_source_providers(&home, "custom");
-        assert!(!sources.contains("user_owned_provider"));
-        assert!(sources.contains("openai"));
+        assert_eq!(provider, "custom");
     }
 
     #[test]

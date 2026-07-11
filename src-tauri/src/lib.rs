@@ -195,23 +195,6 @@ async fn activate_provider(
             ))),
         };
     }
-    let account_only_switch = previous.0.as_deref() == Some(id.as_str());
-    if account_only_switch {
-        if endpoint.is_some() {
-            proxy.commit().await?;
-        } else {
-            proxy.stop().await;
-        }
-        return Ok(RepairResult {
-            backup_path: backup,
-            databases_repaired: 0,
-            rows_updated: 0,
-            warnings: vec![
-                "仅切换账号：已更新 Codex 认证与配置，会话 Provider 未变化，因此未执行数据库修复。"
-                    .into(),
-            ],
-        });
-    }
     let result = match codex::repair(codex::MANAGED_PROVIDER_ID) {
         Ok(result) => result,
         Err(error) => {
@@ -292,8 +275,7 @@ async fn activate_openai_account(
         .as_ref()
         .ok_or(AppError::OfficialAuthMissing)?;
     let backup = codex::restore_official_snapshot(auth, account.config_snapshot.as_deref())?;
-    let origins = store.session_origins(&codex::home(), "openai")?;
-    let mut result = match codex::restore_sessions_exact("openai", &origins) {
+    let mut result = match codex::repair("openai") {
         Ok(result) => result,
         Err(error) => {
             let rollback = codex::restore_provider_backup(&backup);
@@ -316,10 +298,9 @@ async fn activate_openai_account(
     }
     store.forget_session_origins(&codex::home(), "openai")?;
     proxy.stop().await;
-    result.warnings.push(format!(
-        "已恢复官方认证和配置；仅按迁移账本恢复了 {} 个会话的官方归属。",
-        origins.len()
-    ));
+    result
+        .warnings
+        .push("已恢复官方认证，并将全部会话历史统一修复为 OpenAI Provider。".into());
     if result.backup_path.is_empty() {
         result.backup_path = backup;
     }

@@ -546,6 +546,7 @@ pub fn restore_provider_backup(backup_path: &str) -> Result<(), AppError> {
 pub fn repair(provider: &str) -> Result<RepairResult, AppError> {
     crate::provider_sync::synchronize(&home(), provider)
 }
+#[allow(dead_code)]
 pub fn restore_sessions_exact(
     provider: &str,
     thread_ids: &[String],

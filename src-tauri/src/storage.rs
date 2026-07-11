@@ -466,6 +466,7 @@ impl Store {
         Ok(inserted)
     }
 
+    #[allow(dead_code)]
     pub fn session_origins(
         &self,
         codex_home: &Path,
