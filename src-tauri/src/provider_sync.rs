@@ -1,5 +1,5 @@
 use crate::models::{AppError, RepairResult};
-use rusqlite::Connection;
+use rusqlite::{Connection, OpenFlags};
 use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -26,6 +26,18 @@ struct UpdateCounts {
     provider: usize,
     user_event: usize,
     cwd: usize,
+}
+
+#[derive(Clone, Copy)]
+enum DatabaseKind {
+    LegacyThreads,
+    LocalThreadCatalog,
+}
+
+#[derive(Clone)]
+struct DatabaseTarget {
+    path: PathBuf,
+    kind: DatabaseKind,
 }
 
 impl UpdateCounts {
@@ -56,9 +68,10 @@ pub fn synchronize(home: &Path, provider: &str) -> Result<RepairResult, AppError
         .filter(|item| !projectless.contains(&item.thread_id))
         .filter_map(|item| Some((item.thread_id.clone(), item.cwd.clone()?)))
         .collect::<HashMap<_, _>>();
-    let dbs = database_paths(home);
-    validate_databases(&dbs)?;
-    let backup = create_backup(home, provider, &changes, &dbs)?;
+    let discovered_dbs = database_paths(home);
+    let (dbs, mut database_warnings) = classify_databases(&discovered_dbs)?;
+    let db_paths = dbs.iter().map(|db| db.path.clone()).collect::<Vec<_>>();
+    let backup = create_backup(home, provider, &changes, &db_paths)?;
     let global_path = home.join(".codex-global-state.json");
     let original_global = fs::read(&global_path).ok();
     let applied = apply_rollouts(&changes)?;
@@ -78,6 +91,7 @@ pub fn synchronize(home: &Path, provider: &str) -> Result<RepairResult, AppError
     match result {
         Ok((counts, global_updates)) => {
             let mut warnings = Vec::new();
+            warnings.append(&mut database_warnings);
             let encrypted = changes
                 .iter()
                 .filter(|item| item.original.contains("encrypted_content"))
@@ -100,7 +114,7 @@ pub fn synchronize(home: &Path, provider: &str) -> Result<RepairResult, AppError
         Err(error) => {
             restore_rollouts(&applied);
             restore_file(&global_path, original_global.as_deref());
-            match restore_database_backup(home, &backup, &dbs) {
+            match restore_database_backup(home, &backup, &db_paths) {
                 Ok(()) => Err(AppError::Internal(format!(
                     "修复失败，已回滚会话文件、全局状态和数据库：{error}"
                 ))),
@@ -237,13 +251,11 @@ fn restore_rollouts(changes: &[RolloutChange]) {
     }
 }
 
-fn validate_databases(paths: &[PathBuf]) -> Result<(), AppError> {
+fn classify_databases(paths: &[PathBuf]) -> Result<(Vec<DatabaseTarget>, Vec<String>), AppError> {
+    let mut targets = Vec::new();
+    let mut warnings = Vec::new();
     for path in paths {
-        let db = Connection::open(path).map_err(|e| AppError::Internal(e.to_string()))?;
-        let columns = table_columns(&db)?;
-        if !columns.contains("id") || !columns.contains("model_provider") {
-            return Err(AppError::UnknownSchema(path.display().to_string()));
-        }
+        let db = open_read_only(path)?;
         let quick: String = db
             .query_row("PRAGMA quick_check", [], |row| row.get(0))
             .map_err(|e| AppError::Internal(e.to_string()))?;
@@ -256,40 +268,69 @@ fn validate_databases(paths: &[PathBuf]) -> Result<(), AppError> {
                 path.display()
             )));
         }
+        if table_exists(&db, "threads")? {
+            let columns = table_columns(&db, "threads")?;
+            if !columns.contains("id") || !columns.contains("model_provider") {
+                return Err(AppError::UnknownSchema(path.display().to_string()));
+            }
+            targets.push(DatabaseTarget {
+                path: path.clone(),
+                kind: DatabaseKind::LegacyThreads,
+            });
+        } else if table_exists(&db, "local_thread_catalog")? {
+            let columns = table_columns(&db, "local_thread_catalog")?;
+            if !columns.contains("thread_id") || !columns.contains("model_provider") {
+                return Err(AppError::UnknownSchema(path.display().to_string()));
+            }
+            targets.push(DatabaseTarget {
+                path: path.clone(),
+                kind: DatabaseKind::LocalThreadCatalog,
+            });
+        } else {
+            warnings.push(format!(
+                "已跳过不包含会话目录的辅助数据库：{}",
+                path.display()
+            ));
+        }
     }
-    Ok(())
+    Ok((targets, warnings))
 }
 
 fn update_databases(
-    paths: &[PathBuf],
+    targets: &[DatabaseTarget],
     provider: &str,
     source_providers: &HashSet<String>,
     users: &HashSet<String>,
     cwd: &HashMap<String, String>,
 ) -> anyhow::Result<UpdateCounts> {
     let mut total = UpdateCounts::default();
-    for path in paths {
-        let mut db = Connection::open(path)?;
+    for target in targets {
+        let mut db = Connection::open(&target.path)?;
         db.execute_batch("PRAGMA wal_checkpoint(PASSIVE);")?;
-        let columns = table_columns_anyhow(&db)?;
+        let (table, id_column) = match target.kind {
+            DatabaseKind::LegacyThreads => ("threads", "id"),
+            DatabaseKind::LocalThreadCatalog => ("local_thread_catalog", "thread_id"),
+        };
+        let columns = table_columns_anyhow(&db, table)?;
         let tx = db.transaction()?;
         for source in source_providers {
-            total.provider += tx.execute(
-                "UPDATE threads SET model_provider=?1 WHERE model_provider=?2",
-                (provider, source),
-            )?;
+            let sql = format!("UPDATE {table} SET model_provider=?1 WHERE model_provider=?2");
+            total.provider += tx.execute(&sql, (provider, source))?;
         }
         if columns.contains("has_user_event") {
             for id in users {
-                total.user_event += tx.execute("UPDATE threads SET has_user_event=1 WHERE id=?1 AND COALESCE(has_user_event,0)<>1", [id])?;
+                let sql = format!(
+                    "UPDATE {table} SET has_user_event=1 WHERE {id_column}=?1 AND COALESCE(has_user_event,0)<>1"
+                );
+                total.user_event += tx.execute(&sql, [id])?;
             }
         }
         if columns.contains("cwd") {
             for (id, path) in cwd {
-                total.cwd += tx.execute(
-                    "UPDATE threads SET cwd=?1 WHERE id=?2 AND COALESCE(cwd,'')<>?1",
-                    (path, id),
-                )?;
+                let sql = format!(
+                    "UPDATE {table} SET cwd=?1 WHERE {id_column}=?2 AND COALESCE(cwd,'')<>?1"
+                );
+                total.cwd += tx.execute(&sql, (path, id))?;
             }
         }
         tx.commit()?;
@@ -598,11 +639,30 @@ fn sqlite_files(path: &Path) -> Vec<PathBuf> {
         PathBuf::from(format!("{s}-shm")),
     ]
 }
-fn table_columns(db: &Connection) -> Result<HashSet<String>, AppError> {
-    table_columns_anyhow(db).map_err(|e| AppError::Internal(e.to_string()))
+fn open_read_only(path: &Path) -> Result<Connection, AppError> {
+    Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_URI
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|error| AppError::Internal(error.to_string()))
 }
-fn table_columns_anyhow(db: &Connection) -> anyhow::Result<HashSet<String>> {
-    let mut s = db.prepare("PRAGMA table_info(threads)")?;
+
+fn table_exists(db: &Connection, table: &str) -> Result<bool, AppError> {
+    db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name=?1)",
+        [table],
+        |row| row.get(0),
+    )
+    .map_err(|error| AppError::Internal(error.to_string()))
+}
+
+fn table_columns(db: &Connection, table: &str) -> Result<HashSet<String>, AppError> {
+    table_columns_anyhow(db, table).map_err(|e| AppError::Internal(e.to_string()))
+}
+fn table_columns_anyhow(db: &Connection, table: &str) -> anyhow::Result<HashSet<String>> {
+    let mut s = db.prepare(&format!("PRAGMA table_info({table})"))?;
     Ok(s.query_map([], |r| r.get::<_, String>(1))?
         .collect::<rusqlite::Result<_>>()?)
 }
@@ -791,6 +851,93 @@ mod tests {
             .query_row("SELECT cwd FROM threads", [], |r| r.get(0))
             .unwrap();
         assert_eq!(cwd, "C:/old");
+    }
+
+    #[test]
+    fn syncs_current_local_thread_catalog_schema() {
+        let (_tmp, home) = fixture(false);
+        fs::create_dir_all(home.join("sqlite")).unwrap();
+        let catalog_path = home.join("sqlite/codex-dev.db");
+        let catalog = Connection::open(&catalog_path).unwrap();
+        catalog
+            .execute_batch(
+                "CREATE TABLE local_thread_catalog(
+                    host_id TEXT NOT NULL,
+                    thread_id TEXT NOT NULL,
+                    display_title TEXT NOT NULL,
+                    source_created_at REAL NOT NULL,
+                    source_updated_at REAL NOT NULL,
+                    cwd TEXT NOT NULL,
+                    source_kind TEXT NOT NULL,
+                    source_detail TEXT,
+                    model_provider TEXT NOT NULL,
+                    git_branch TEXT,
+                    observation_sequence INTEGER NOT NULL,
+                    missing_candidate INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY(host_id, thread_id)
+                );
+                INSERT INTO local_thread_catalog VALUES(
+                    'local','thread-1','Test',0,0,'C:/old','cli',NULL,
+                    'openai',NULL,0,0
+                );",
+            )
+            .unwrap();
+        drop(catalog);
+
+        let result = synchronize(&home, "custom").unwrap();
+
+        assert_eq!(result.databases_repaired, 2);
+        let catalog = Connection::open(catalog_path).unwrap();
+        let row: (String, String) = catalog
+            .query_row(
+                "SELECT model_provider,cwd FROM local_thread_catalog WHERE thread_id='thread-1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(row, ("custom".into(), "C:/workspace".into()));
+    }
+
+    #[test]
+    fn skips_auxiliary_database_without_session_tables() {
+        let (_tmp, home) = fixture(false);
+        fs::create_dir_all(home.join("sqlite")).unwrap();
+        let auxiliary_path = home.join("sqlite/auxiliary.db");
+        let auxiliary = Connection::open(&auxiliary_path).unwrap();
+        auxiliary
+            .execute_batch("CREATE TABLE automations(id TEXT PRIMARY KEY);")
+            .unwrap();
+        drop(auxiliary);
+
+        let result = synchronize(&home, "custom").unwrap();
+
+        assert_eq!(result.databases_repaired, 1);
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("辅助数据库"))
+        );
+        let auxiliary = Connection::open(auxiliary_path).unwrap();
+        let table_count: i64 = auxiliary
+            .query_row("SELECT count(*) FROM automations", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(table_count, 0);
+    }
+
+    #[test]
+    fn rejects_unknown_session_catalog_schema() {
+        let (_tmp, home) = fixture(false);
+        fs::create_dir_all(home.join("sqlite")).unwrap();
+        let path = home.join("sqlite/unknown.db");
+        let database = Connection::open(&path).unwrap();
+        database
+            .execute_batch("CREATE TABLE local_thread_catalog(thread_id TEXT PRIMARY KEY);")
+            .unwrap();
+        drop(database);
+
+        let error = synchronize(&home, "custom").unwrap_err();
+        assert!(matches!(error, AppError::UnknownSchema(_)));
     }
 
     #[test]

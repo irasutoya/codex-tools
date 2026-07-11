@@ -44,7 +44,13 @@ fn has_threads(db: &Connection) -> bool {
         > 0
 }
 fn columns(db: &Connection) -> Vec<String> {
-    let Ok(mut s) = db.prepare("PRAGMA table_info(threads)") else {
+    table_columns(db, "threads")
+}
+fn table_columns(db: &Connection, table: &str) -> Vec<String> {
+    if !matches!(table, "threads" | "local_thread_catalog") {
+        return vec![];
+    }
+    let Ok(mut s) = db.prepare(&format!("PRAGMA table_info({table})")) else {
         return vec![];
     };
     s.query_map([], |r| r.get(1))
@@ -60,11 +66,28 @@ pub fn scan() -> RepairScan {
                 let health = db
                     .query_row("PRAGMA quick_check", [], |r| r.get::<_, String>(0))
                     .unwrap_or_else(|_| "unreadable".into());
-                let cols = columns(&db);
-                let known = has_threads(&db) && cols.iter().any(|x| x == "id");
+                let legacy_columns = columns(&db);
+                let catalog_columns = table_columns(&db, "local_thread_catalog");
+                let legacy = has_threads(&db)
+                    && legacy_columns.iter().any(|column| column == "id")
+                    && legacy_columns
+                        .iter()
+                        .any(|column| column == "model_provider");
+                let catalog = catalog_columns.iter().any(|column| column == "thread_id")
+                    && catalog_columns
+                        .iter()
+                        .any(|column| column == "model_provider");
+                let known = legacy || catalog;
                 let count = if known {
-                    db.query_row("SELECT count(*) FROM threads", [], |r| r.get::<_, u64>(0))
-                        .unwrap_or(0)
+                    let table = if legacy {
+                        "threads"
+                    } else {
+                        "local_thread_catalog"
+                    };
+                    db.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| {
+                        r.get::<_, u64>(0)
+                    })
+                    .unwrap_or(0)
                 } else {
                     0
                 };
@@ -108,10 +131,15 @@ pub fn list_sessions(query: Option<String>) -> anyhow::Result<Vec<SessionSummary
     let mut out = vec![];
     for path in databases() {
         let db = Connection::open(&path)?;
-        let cols = columns(&db);
-        if !cols.contains(&"id".into()) {
+        let legacy_columns = columns(&db);
+        let catalog_columns = table_columns(&db, "local_thread_catalog");
+        let (table, id, cols) = if legacy_columns.contains(&"id".into()) {
+            ("threads", "id", legacy_columns)
+        } else if catalog_columns.contains(&"thread_id".into()) {
+            ("local_thread_catalog", "thread_id", catalog_columns)
+        } else {
             continue;
-        }
+        };
         let title = if cols.contains(&"title".into()) {
             "title"
         } else {
@@ -138,7 +166,7 @@ pub fn list_sessions(query: Option<String>) -> anyhow::Result<Vec<SessionSummary
             "0"
         };
         let sql = format!(
-            "SELECT id,{title},{provider},{cwd},{archived},{updated} FROM threads ORDER BY {updated} DESC LIMIT 1000"
+            "SELECT {id},{title},{provider},{cwd},{archived},{updated} FROM {table} ORDER BY {updated} DESC LIMIT 1000"
         );
         let mut st = db.prepare(&sql)?;
         let rows = st.query_map([], |r| {
@@ -428,12 +456,19 @@ pub fn delete_sessions(ids: &[String]) -> anyhow::Result<usize> {
     let mut n = 0;
     for p in databases() {
         let mut db = Connection::open(p)?;
-        if !has_threads(&db) {
+        let (table, id_column) = if has_threads(&db) {
+            ("threads", "id")
+        } else if table_columns(&db, "local_thread_catalog").contains(&"thread_id".into()) {
+            ("local_thread_catalog", "thread_id")
+        } else {
             continue;
-        }
+        };
         let tx = db.transaction()?;
         for id in ids {
-            n += tx.execute("DELETE FROM threads WHERE id=?1", params![id])?
+            n += tx.execute(
+                &format!("DELETE FROM {table} WHERE {id_column}=?1"),
+                params![id],
+            )?
         }
         tx.commit()?
     }

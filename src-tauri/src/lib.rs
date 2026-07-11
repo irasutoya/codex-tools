@@ -213,6 +213,23 @@ async fn activate_provider(
             ))),
         };
     }
+    let account_only_switch = previous.0.as_deref() == Some(id.as_str());
+    if account_only_switch {
+        if endpoint.is_some() {
+            proxy.commit().await?;
+        } else {
+            proxy.stop().await;
+        }
+        return Ok(RepairResult {
+            backup_path: backup,
+            databases_repaired: 0,
+            rows_updated: 0,
+            warnings: vec![
+                "仅切换账号：已更新 Codex 认证与配置，会话 Provider 未变化，因此未执行数据库修复。"
+                    .into(),
+            ],
+        });
+    }
     let result = match codex::repair(codex::MANAGED_PROVIDER_ID) {
         Ok(result) => result,
         Err(error) => {
@@ -248,22 +265,20 @@ async fn activate_official_account(
             "所选账号不是官方 OAuth 账号".into(),
         ));
     }
-    let previous = store.active_state()?;
     let backup = codex::restore_official_account(&account)?;
     if let Err(error) = store.activate_official(&account_id) {
         let _ = codex::restore_provider_backup(&backup);
         return Err(error.into());
     }
-    let result = match codex::repair(codex::MANAGED_PROVIDER_ID) {
-        Ok(result) => result,
-        Err(error) => {
-            let _ = codex::restore_provider_backup(&backup);
-            let _ = store.restore_active((previous.0.as_deref(), previous.1.as_deref()));
-            return Err(error);
-        }
-    };
     proxy.stop().await;
-    Ok(result)
+    Ok(RepairResult {
+        backup_path: backup,
+        databases_repaired: 0,
+        rows_updated: 0,
+        warnings: vec![
+            "已切换官方账号；本次只更新 auth.json 与 config.toml，未修改会话数据库。".into(),
+        ],
+    })
 }
 
 #[tauri::command]
