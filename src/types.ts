@@ -1,16 +1,6 @@
 export type Page =
-  "dashboard" | "providers" | "sessions" | "repair" | "routes" | "settings"
-
-export type Protocol = "responses" | "chat_completions"
-
-export type CodexChatReasoningConfig = {
-  supportsThinking?: boolean
-  supportsEffort?: boolean
-  thinkingParam?: string
-  effortParam?: string
-  effortValueMode?: string
-  outputFormat?: string
-}
+  "dashboard" | "providers" | "routes" | "sessions" | "settings"
+export type Protocol = "responses" | "chat_completions" | "anthropic_messages"
 
 export type FetchedModel = {
   id: string
@@ -25,7 +15,7 @@ export type Provider = {
   baseUrl: string
   models: string[]
   modelMetadata: FetchedModel[]
-  codexChatReasoning?: CodexChatReasoningConfig
+  modelAliases: Record<string, string>
   headers: Record<string, string>
   timeoutSecs: number
   contextWindow?: number
@@ -42,7 +32,6 @@ export type Account = {
   name: string
   authKind: "api_key" | "official_oauth"
   apiKey?: string
-  authJson?: unknown
   headers: Record<string, string>
   active: boolean
   email?: string
@@ -80,25 +69,14 @@ export type PageResult<T> = {
   pageSize: number
 }
 
-export type AuthAccount = {
-  id: string
-  service: "open_ai"
-  name: string
-  login?: string
-  email?: string
-  scopes: string[]
-  expiresAt?: number
-  active: boolean
-  createdAt: number
-  updatedAt: number
-}
-
-export type OpenAiDeviceAuthorization = {
-  operationId: string
-  userCode: string
-  verificationUri: string
-  expiresAt: number
-  intervalSecs: number
+export type RouteSettings = {
+  enabled: boolean
+  listenAddress: string
+  port: number
+  requestTimeoutMs: number
+  requestMaxRetries: number
+  streamMaxRetries: number
+  maxConcurrentRequests: number
 }
 
 export type RouteConsole = {
@@ -115,7 +93,7 @@ export type RouteConsole = {
   errorCount: number
   activeRequests: number
   lastLatencyMs?: number
-  logs: {
+  logs: Array<{
     id: number
     timestamp: number
     method: string
@@ -123,27 +101,112 @@ export type RouteConsole = {
     status: number
     latencyMs: number
     message?: string
-  }[]
+  }>
   logTotal: number
   logPage: number
   logPageSize: number
 }
 
-export type RouteSettings = {
-  enabled: boolean
-  listenAddress: string
-  port: number
-}
-
 export type RepairScan = {
-  operationId: string
-  databases: {
-    path: string
-    health: string
-    knownSchema: boolean
-    threadCount: number
-  }[]
+  currentProvider: string
+  targets: Array<{ id: string; sources: string[]; current: boolean }>
   rolloutFiles: number
-  canRepair: boolean
+  sessionMetaCount: number
+  databases: Array<{ path: string; schema: string; threadCount: number }>
   warnings: string[]
 }
+
+export type RepairResult = {
+  targetProvider: string
+  filesScanned: number
+  filesModified: number
+  filesSkipped: number
+  filesFailed: number
+  sessionMetaUpdated: number
+  rowsUpdated: number
+  warnings: string[]
+}
+
+export type OfficialAccountView = {
+  id: string
+  name: string
+  accountId: string
+  email: string
+  expiresAt?: number
+  active: boolean
+  createdAt: number
+  updatedAt: number
+}
+
+export type ProviderOverview = {
+  providers: Provider[]
+  accounts: Account[]
+  officialAccounts: OfficialAccountView[]
+}
+
+export type DeviceAuthorization = {
+  operationId: string
+  userCode: string
+  verificationUri: string
+  expiresAt: number
+  intervalSecs: number
+}
+
+export type DeviceAuthPollResult =
+  | { status: "pending" }
+  | { status: "expired" }
+  | {
+      status: "complete"
+      account: OfficialAccountView
+      repair: RepairResult
+    }
+
+export type ConfigPatchPreview = {
+  operationId: string
+  targetPath: string
+  baseHash: string
+  rendered: string
+  changes: string[]
+  compatibilityTokenMasked: string
+}
+
+export type ConfigInspection = {
+  path: string
+  valid: boolean
+  activeProvider?: string
+  managedProviderPresent: boolean
+  modelCatalogPath: string
+  warnings: string[]
+}
+
+export type SettingsOverview = {
+  inspection: ConfigInspection
+  diagnostics: Record<string, unknown>
+}
+
+export const emptyProvider = (): Provider => ({
+  id: "",
+  name: "",
+  protocol: "responses",
+  baseUrl: "https://api.openai.com/v1",
+  models: [],
+  modelMetadata: [],
+  modelAliases: {},
+  headers: {},
+  timeoutSecs: 30,
+  enabled: true,
+  active: false,
+  accountCount: 0,
+})
+
+export const emptyAccount = (providerId: string): Account => ({
+  id: "",
+  providerId,
+  name: "默认账号",
+  authKind: "api_key",
+  apiKey: "",
+  headers: {},
+  active: false,
+  createdAt: 0,
+  updatedAt: 0,
+})

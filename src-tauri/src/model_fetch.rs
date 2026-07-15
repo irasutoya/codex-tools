@@ -1,4 +1,5 @@
 use crate::models::{AppError, FetchedModel, ProviderAccount, ProviderProfile};
+use futures_util::StreamExt;
 use reqwest::{Client, StatusCode};
 use serde::Deserialize;
 use std::time::Duration;
@@ -14,6 +15,7 @@ const KNOWN_COMPAT_SUFFIXES: &[&str] = &[
     "/coding",
     "/claude",
 ];
+const MAX_MODELS_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 
 #[derive(Deserialize)]
 struct ModelsResponse {
@@ -21,6 +23,7 @@ struct ModelsResponse {
 }
 
 pub async fn fetch_models(
+    client: &Client,
     provider: &ProviderProfile,
     account: &ProviderAccount,
 ) -> Result<Vec<FetchedModel>, AppError> {
@@ -33,25 +36,19 @@ pub async fn fetch_models(
         &provider.headers,
         &account.headers,
     )?;
-    let client = Client::builder()
-        .connect_timeout(Duration::from_secs(15))
-        .timeout(Duration::from_secs(15))
-        .build()
-        .map_err(|error| AppError::Internal(error.to_string()))?;
     let mut last_status = None;
     for url in build_models_url_candidates(&provider.base_url)? {
-        let response = client
-            .get(&url)
-            .headers(headers.clone())
-            .send()
-            .await
-            .map_err(|error| AppError::InvalidConfig(format!("获取模型失败：{error}")))?;
+        let response = tokio::time::timeout(
+            Duration::from_secs(15),
+            client.get(&url).headers(headers.clone()).send(),
+        )
+        .await
+        .map_err(|_| AppError::InvalidConfig("获取模型超时".into()))?
+        .map_err(|error| AppError::InvalidConfig(format!("获取模型失败：{error}")))?;
         let status = response.status();
         if status.is_success() {
-            let mut models = response
-                .json::<ModelsResponse>()
-                .await
-                .map_err(|error| AppError::InvalidConfig(format!("模型响应格式无效：{error}")))?
+            let mut models = read_models_response(response)
+                .await?
                 .data
                 .unwrap_or_default();
             models.retain(|model| !model.id.trim().is_empty());
@@ -75,6 +72,31 @@ pub async fn fetch_models(
         "所有模型端点均不可用（最后 HTTP {}）",
         last_status.unwrap_or(0)
     )))
+}
+
+async fn read_models_response(response: reqwest::Response) -> Result<ModelsResponse, AppError> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_MODELS_RESPONSE_BYTES as u64)
+    {
+        return Err(AppError::InvalidConfig("模型响应超过 2 MiB".into()));
+    }
+    let mut bytes = Vec::new();
+    let mut chunks = response.bytes_stream();
+    loop {
+        let next = tokio::time::timeout(Duration::from_secs(15), chunks.next())
+            .await
+            .map_err(|_| AppError::InvalidConfig("读取模型响应超时".into()))?;
+        let Some(chunk) = next else { break };
+        let chunk =
+            chunk.map_err(|error| AppError::InvalidConfig(format!("读取模型响应失败：{error}")))?;
+        if bytes.len().saturating_add(chunk.len()) > MAX_MODELS_RESPONSE_BYTES {
+            return Err(AppError::InvalidConfig("模型响应超过 2 MiB".into()));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&bytes)
+        .map_err(|error| AppError::InvalidConfig(format!("模型响应格式无效：{error}")))
 }
 
 pub fn build_models_url_candidates(base_url: &str) -> Result<Vec<String>, AppError> {

@@ -3,12 +3,5 @@
   "identifier": "default",
   "description": "Codex Tools desktop permissions",
   "windows": ["main"],
-  "permissions": [
-    "core:default",
-    "dialog:default",
-    {
-      "identifier": "opener:allow-open-url",
-      "allow": [{ "url": "https://auth.openai.com/codex/device" }]
-    }
-  ]
+  "permissions": ["core:default"]
 }

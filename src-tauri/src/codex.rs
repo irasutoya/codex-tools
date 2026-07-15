@@ -1,673 +1,598 @@
-use crate::models::*;
-use crate::protocol_proxy::ProxyEndpoint;
-use rusqlite::{Connection, params};
+use crate::{
+    model_catalog,
+    models::{
+        AppError, CodexAuthCredential, ConfigInspection, ConfigPatchPreview, ProviderProfile,
+        RouteSettings,
+    },
+    storage::atomic_write,
+};
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use rand::RngCore;
+use sha2::{Digest, Sha256};
 use std::{
+    collections::HashMap,
     fs,
     path::{Path, PathBuf},
+    sync::Mutex,
+    time::{Duration, Instant},
 };
 use toml_edit::{DocumentMut, Item, Table, value};
-use walkdir::WalkDir;
 
 pub const MANAGED_PROVIDER_ID: &str = "custom";
-pub const MODEL_CATALOG_FILENAME: &str = "codex-tools-model-catalog.json";
+pub const MODEL_CATALOG_FILENAME: &str = "model_catalog.json";
+const BASE_URL: &str = "http://127.0.0.1:16384/v1";
 
-pub fn home() -> PathBuf {
+#[derive(Clone)]
+struct PendingPatch {
+    base_hash: String,
+    auth_base_hash: String,
+    target: PathBuf,
+    rendered: String,
+    created_at: Instant,
+}
+
+struct PatchDraft<'a> {
+    target: PathBuf,
+    original: &'a str,
+    rendered: String,
+    public_preview: String,
+    changes: Vec<String>,
+    token: &'a str,
+}
+
+#[derive(Default)]
+pub struct ConfigManager {
+    pending: Mutex<HashMap<String, PendingPatch>>,
+}
+
+impl ConfigManager {
+    pub fn preview_custom(
+        &self,
+        codex_home: &Path,
+        data_root: &Path,
+        model: &str,
+        route_settings: &RouteSettings,
+        regenerate_token: bool,
+    ) -> Result<ConfigPatchPreview, AppError> {
+        let path = codex_home.join("config.toml");
+        let original = read_optional(&path)?;
+        let original_document = parse_document(&original).ok();
+        let catalog = absolute_path(&data_root.join(MODEL_CATALOG_FILENAME))?;
+        let existing_token = original_document
+            .as_ref()
+            .and_then(|document| document.get("model_providers"))
+            .and_then(Item::as_table)
+            .and_then(|providers| providers.get(MANAGED_PROVIDER_ID))
+            .and_then(Item::as_table)
+            .and_then(|provider| provider.get("experimental_bearer_token"))
+            .and_then(Item::as_str)
+            .filter(|token| token.starts_with("ct_") && token.len() >= 40)
+            .map(str::to_owned);
+        let token = if regenerate_token {
+            compatibility_token()
+        } else {
+            existing_token.unwrap_or_else(compatibility_token)
+        };
+        let mut document = DocumentMut::new();
+        apply_custom_fields(&mut document, model, &catalog, &token, route_settings)?;
+        let rendered = document.to_string();
+        let public_preview = managed_custom_preview(&document, &token);
+        let changes = describe_changes();
+        self.remember(PatchDraft {
+            target: path,
+            original: &original,
+            rendered,
+            public_preview,
+            changes,
+            token: &token,
+        })
+    }
+
+    pub fn apply(&self, operation_id: &str) -> Result<(), AppError> {
+        let pending = self
+            .pending
+            .lock()
+            .map_err(|_| AppError::Internal("配置预览锁已损坏".into()))?
+            .remove(operation_id)
+            .ok_or(AppError::StaleOperation)?;
+        let current = read_optional(&pending.target)?;
+        if digest(&current) != pending.base_hash {
+            return Err(AppError::StaleOperation);
+        }
+        let auth = read_optional_bytes(&pending.target.with_file_name("auth.json"))?;
+        if digest_bytes(&auth) != pending.auth_base_hash {
+            return Err(AppError::StaleOperation);
+        }
+        let _: DocumentMut = pending
+            .rendered
+            .parse()
+            .map_err(|error| AppError::InvalidConfig(format!("生成的 TOML 无效：{error}")))?;
+        if let Some(parent) = pending.target.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        atomic_write(&pending.target.with_file_name("auth.json"), b"{}\n")?;
+        atomic_write(&pending.target, pending.rendered.as_bytes())?;
+        Ok(())
+    }
+
+    fn remember(&self, draft: PatchDraft<'_>) -> Result<ConfigPatchPreview, AppError> {
+        let operation_id = uuid::Uuid::new_v4().to_string();
+        let base_hash = digest(draft.original);
+        let auth_base_hash = digest_bytes(&read_optional_bytes(
+            &draft.target.with_file_name("auth.json"),
+        )?);
+        let mut pending = self
+            .pending
+            .lock()
+            .map_err(|_| AppError::Internal("配置预览锁已损坏".into()))?;
+        pending.retain(|_, patch| patch.created_at.elapsed() < Duration::from_secs(600));
+        if pending.len() >= 32
+            && let Some(oldest) = pending
+                .iter()
+                .min_by_key(|(_, patch)| patch.created_at)
+                .map(|(id, _)| id.clone())
+        {
+            pending.remove(&oldest);
+        }
+        pending.insert(
+            operation_id.clone(),
+            PendingPatch {
+                base_hash: base_hash.clone(),
+                auth_base_hash,
+                target: draft.target.clone(),
+                rendered: draft.rendered.clone(),
+                created_at: Instant::now(),
+            },
+        );
+        Ok(ConfigPatchPreview {
+            operation_id,
+            target_path: draft.target.display().to_string(),
+            base_hash,
+            rendered: draft.public_preview,
+            changes: draft.changes,
+            compatibility_token_masked: mask_token(draft.token),
+        })
+    }
+}
+
+pub fn home(configured: &str) -> PathBuf {
+    if !configured.trim().is_empty() {
+        return PathBuf::from(configured.trim());
+    }
+    if let Some(value) = std::env::var_os("CODEX_HOME") {
+        return PathBuf::from(value);
+    }
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".codex")
 }
-pub fn databases() -> Vec<PathBuf> {
-    let h = home();
-    let mut out = Vec::new();
-    let legacy = h.join("state_5.sqlite");
-    if legacy.exists() {
-        out.push(legacy)
-    }
-    let dir = h.join("sqlite");
-    if let Ok(entries) = fs::read_dir(dir) {
-        for e in entries.flatten() {
-            let p = e.path();
-            if p.extension().is_some_and(|x| x == "db" || x == "sqlite") {
-                out.push(p)
-            }
-        }
-    }
-    out
-}
-fn has_threads(db: &Connection) -> bool {
-    db.query_row(
-        "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='threads'",
-        [],
-        |r| r.get::<_, i64>(0),
-    )
-    .unwrap_or(0)
-        > 0
-}
-fn columns(db: &Connection) -> Vec<String> {
-    table_columns(db, "threads")
-}
-fn table_columns(db: &Connection, table: &str) -> Vec<String> {
-    if !matches!(table, "threads" | "local_thread_catalog") {
-        return vec![];
-    }
-    let Ok(mut s) = db.prepare(&format!("PRAGMA table_info({table})")) else {
-        return vec![];
-    };
-    s.query_map([], |r| r.get(1))
-        .map(|x| x.flatten().collect())
-        .unwrap_or_default()
-}
-pub fn scan() -> RepairScan {
-    let mut warnings = vec![];
-    let mut scans = vec![];
-    for p in databases() {
-        match Connection::open(&p) {
-            Ok(db) => {
-                let health = db
-                    .query_row("PRAGMA quick_check", [], |r| r.get::<_, String>(0))
-                    .unwrap_or_else(|_| "unreadable".into());
-                let legacy_columns = columns(&db);
-                let catalog_columns = table_columns(&db, "local_thread_catalog");
-                let legacy = has_threads(&db)
-                    && legacy_columns.iter().any(|column| column == "id")
-                    && legacy_columns
-                        .iter()
-                        .any(|column| column == "model_provider");
-                let catalog = catalog_columns.iter().any(|column| column == "thread_id")
-                    && catalog_columns
-                        .iter()
-                        .any(|column| column == "model_provider");
-                let has_legacy_table = has_threads(&db);
-                let has_catalog_table = !catalog_columns.is_empty();
-                let known = legacy || catalog;
-                let count = if known {
-                    let table = if legacy {
-                        "threads"
-                    } else {
-                        "local_thread_catalog"
-                    };
-                    db.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| {
-                        r.get::<_, u64>(0)
-                    })
-                    .unwrap_or(0)
-                } else {
-                    0
-                };
-                if !known && (has_legacy_table || has_catalog_table) {
-                    warnings.push(format!("未知会话目录 schema：{}", p.display()));
-                    scans.push(DatabaseScan {
-                        path: p.display().to_string(),
-                        health,
-                        known_schema: false,
-                        thread_count: 0,
-                    });
-                    continue;
-                }
-                if !known {
-                    warnings.push(format!("已跳过不包含会话目录的辅助数据库：{}", p.display()));
-                    continue;
-                }
-                scans.push(DatabaseScan {
-                    path: p.display().to_string(),
-                    health,
-                    known_schema: known,
-                    thread_count: count,
-                })
-            }
-            Err(e) => warnings.push(format!("无法打开 {}：{e}", p.display())),
-        }
-    }
-    let rollouts = rollout_files();
-    RepairScan {
-        operation_id: uuid::Uuid::new_v4().to_string(),
-        can_repair: scans.iter().all(|x| x.known_schema && x.health == "ok"),
-        databases: scans,
-        rollout_files: rollouts.len(),
-        warnings,
-    }
-}
-pub fn rollout_files() -> Vec<PathBuf> {
-    let h = home();
-    [h.join("sessions"), h.join("archived_sessions")]
-        .into_iter()
-        .flat_map(|d| {
-            WalkDir::new(d)
-                .into_iter()
-                .filter_map(Result::ok)
-                .map(|e| e.into_path())
-                .filter(|p| p.extension().is_some_and(|x| x == "jsonl"))
-        })
-        .collect()
-}
-pub fn list_sessions(query: Option<String>) -> anyhow::Result<Vec<SessionSummary>> {
-    let q = query.unwrap_or_default().to_lowercase();
-    let mut out = vec![];
-    for path in databases() {
-        let db = Connection::open(&path)?;
-        let legacy_columns = columns(&db);
-        let catalog_columns = table_columns(&db, "local_thread_catalog");
-        let (table, id, cols) = if legacy_columns.contains(&"id".into()) {
-            ("threads", "id", legacy_columns)
-        } else if catalog_columns.contains(&"thread_id".into()) {
-            ("local_thread_catalog", "thread_id", catalog_columns)
-        } else {
-            continue;
-        };
-        let sql = session_list_query(table, id, &cols);
-        let mut st = db.prepare(&sql)?;
-        let rows = st.query_map([], |r| {
-            Ok(SessionSummary {
-                identity: format!("{}#{}", path.display(), r.get::<_, String>(0)?),
-                id: r.get(0)?,
-                title: r.get::<_, String>(1).unwrap_or_default(),
-                provider: r.get::<_, String>(2).unwrap_or_default(),
-                cwd: r.get::<_, String>(3).unwrap_or_default(),
-                archived: r.get::<_, i64>(4).unwrap_or(0) != 0,
-                updated_at: r.get::<_, i64>(5).unwrap_or(0),
-                source_db: path.display().to_string(),
-                source_rollout: None,
-                original_provider: r.get::<_, String>(2).unwrap_or_default(),
-                has_user_event: false,
-            })
-        })?;
-        for row in rows.flatten() {
-            if q.is_empty()
-                || format!("{} {} {} {}", row.id, row.title, row.provider, row.cwd)
-                    .to_lowercase()
-                    .contains(&q)
-            {
-                out.push(row)
-            }
-        }
-    }
-    Ok(out)
-}
 
-fn session_list_query(table: &str, id: &str, cols: &[String]) -> String {
-    let title = if cols.contains(&"title".into()) {
-        "title"
-    } else if cols.contains(&"display_title".into()) {
-        "display_title"
-    } else {
-        "''"
-    };
-    let provider = if cols.contains(&"model_provider".into()) {
-        "model_provider"
-    } else {
-        "''"
-    };
-    let cwd = if cols.contains(&"cwd".into()) {
-        "cwd"
-    } else {
-        "''"
-    };
-    let archived = if cols.contains(&"archived".into()) {
-        "archived"
-    } else {
-        "0"
-    };
-    let updated = if cols.contains(&"updated_at".into()) {
-        "updated_at"
-    } else if cols.contains(&"source_updated_at".into()) {
-        "CAST(source_updated_at AS INTEGER)"
-    } else {
-        "0"
-    };
-    format!(
-        "SELECT {id},{title},{provider},{cwd},{archived},{updated} AS sort_updated FROM {table} ORDER BY sort_updated DESC LIMIT 1000"
-    )
-}
-fn atomic_write(path: &Path, data: &[u8]) -> anyhow::Result<()> {
-    use std::io::Write;
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("codex-tools");
-    let tmp = path.with_file_name(format!(
-        ".{file_name}.{}.tmp",
-        uuid::Uuid::new_v4().simple()
-    ));
-    let mut file = fs::File::create(&tmp)?;
-    file.write_all(data)?;
-    file.sync_all()?;
-    drop(file);
-    if let Err(error) = replace_file(&tmp, path) {
-        let _ = fs::remove_file(&tmp);
-        return Err(error);
-    }
-    Ok(())
-}
-
-#[cfg(windows)]
-fn replace_file(source: &Path, target: &Path) -> anyhow::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows::{
-        Win32::Storage::FileSystem::{
-            MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
-        },
-        core::PCWSTR,
-    };
-    let source = source
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect::<Vec<_>>();
-    let target = target
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect::<Vec<_>>();
-    unsafe {
-        MoveFileExW(
-            PCWSTR(source.as_ptr()),
-            PCWSTR(target.as_ptr()),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )?;
-    }
-    Ok(())
-}
-
-#[cfg(not(windows))]
-fn replace_file(source: &Path, target: &Path) -> anyhow::Result<()> {
-    fs::rename(source, target)?;
-    Ok(())
-}
-
-#[derive(Clone)]
-pub(crate) struct ConfigState {
-    files: Vec<(&'static str, Option<Vec<u8>>)>,
-}
-
-pub(crate) fn capture_config_state() -> Result<ConfigState, AppError> {
-    let files = ["config.toml", "auth.json", MODEL_CATALOG_FILENAME]
-        .into_iter()
-        .map(|name| {
-            let path = home().join(name);
-            let data = if path.exists() {
-                Some(fs::read(path).map_err(|error| AppError::Internal(error.to_string()))?)
-            } else {
-                None
-            };
-            Ok((name, data))
-        })
-        .collect::<Result<Vec<_>, AppError>>()?;
-    Ok(ConfigState { files })
-}
-
-pub(crate) fn restore_config_state(state: &ConfigState) -> Result<(), AppError> {
-    for (name, data) in &state.files {
-        let path = home().join(name);
-        match data {
-            Some(data) => atomic_write(&path, data)?,
-            None if path.exists() => {
-                fs::remove_file(path).map_err(|error| AppError::Internal(error.to_string()))?;
-            }
-            None => {}
-        }
-    }
-    Ok(())
-}
-pub fn apply_provider_with_proxy(
-    p: &ProviderProfile,
-    account: &ProviderAccount,
-    proxy: Option<&ProxyEndpoint>,
+pub fn activate_official_account(
+    codex_home: &Path,
+    credential: &CodexAuthCredential,
 ) -> Result<(), AppError> {
-    if p.name.trim().is_empty()
-        || p.base_url.trim().is_empty()
-        || account
-            .api_key
-            .as_deref()
-            .unwrap_or_default()
-            .trim()
-            .is_empty()
+    validate_official_credential(credential)?;
+    fs::create_dir_all(codex_home)?;
+    // Clear the custom route first. A crash can leave Codex signed out, but it
+    // can never leave both custom provider configuration and official auth active.
+    atomic_write(&codex_home.join("config.toml"), b"")?;
+    let bytes = serde_json::to_vec_pretty(credential)
+        .map_err(|error| AppError::Internal(error.to_string()))?;
+    atomic_write(&codex_home.join("auth.json"), &bytes)?;
+    Ok(())
+}
+
+pub fn read_official_account(codex_home: &Path) -> Result<Option<CodexAuthCredential>, AppError> {
+    let path = codex_home.join("auth.json");
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if bytes.iter().all(u8::is_ascii_whitespace) || bytes == b"{}" || bytes == b"{}\n" {
+        return Ok(None);
+    }
+    let credential = serde_json::from_slice::<CodexAuthCredential>(&bytes)
+        .map_err(|_| AppError::InvalidConfig("auth.json 不是可识别的 Codex 登录凭据".into()))?;
+    validate_official_credential(&credential)?;
+    Ok(Some(credential))
+}
+
+fn validate_official_credential(credential: &CodexAuthCredential) -> Result<(), AppError> {
+    if credential.auth_mode != "chatgpt"
+        || credential.tokens.id_token.trim().is_empty()
+        || credential.tokens.access_token.trim().is_empty()
+        || credential.tokens.refresh_token.trim().is_empty()
+        || credential.tokens.account_id.trim().is_empty()
     {
         return Err(AppError::InvalidConfig(
-            "provider fields are required".into(),
+            "OpenAI Account 登录凭据不完整".into(),
         ));
     }
-    let token = match p.protocol {
-        ProviderProtocol::Responses => account.api_key.clone().unwrap_or_default(),
-        ProviderProtocol::ChatCompletions => {
-            let endpoint = proxy.ok_or_else(|| AppError::Proxy("proxy is not running".into()))?;
-            endpoint.token.clone()
-        }
-    };
-    let base_url = match p.protocol {
-        ProviderProtocol::Responses => p.base_url.trim_end_matches('/'),
-        ProviderProtocol::ChatCompletions => proxy
-            .ok_or_else(|| AppError::Proxy("proxy is not running".into()))?
-            .base_url
-            .trim_end_matches('/'),
-    };
-    let config = build_managed_config(p, account, base_url, &token)?;
-    let auth = build_managed_auth(&token);
-    let catalog = if p.models.is_empty() {
-        None
-    } else {
-        Some(build_model_catalog(p)?)
-    };
-    let catalog_bytes = catalog
-        .as_ref()
-        .map(serde_json::to_vec_pretty)
-        .transpose()
+    Ok(())
+}
+
+pub fn regenerate_model_catalog(
+    provider: &ProviderProfile,
+    codex_home: &Path,
+    data_root: &Path,
+) -> Result<String, AppError> {
+    let catalog = model_catalog::build(provider, codex_home)?;
+    let bytes = serde_json::to_vec_pretty(&catalog)
         .map_err(|error| AppError::Internal(error.to_string()))?;
-    let auth_bytes =
-        serde_json::to_vec_pretty(&auth).map_err(|error| AppError::Internal(error.to_string()))?;
-    let original = capture_config_state()?;
-    let update = (|| -> Result<(), AppError> {
-        fs::create_dir_all(home()).map_err(|error| AppError::Internal(error.to_string()))?;
-        let catalog_path = home().join(MODEL_CATALOG_FILENAME);
-        if let Some(catalog_bytes) = catalog_bytes {
-            atomic_write(&catalog_path, &catalog_bytes)
-                .map_err(|error| AppError::Internal(error.to_string()))?;
-        } else if catalog_path.exists() {
-            fs::remove_file(&catalog_path)
-                .map_err(|error| AppError::Internal(error.to_string()))?;
-        }
-        atomic_write(&home().join("auth.json"), &auth_bytes)
-            .map_err(|error| AppError::Internal(error.to_string()))?;
-        atomic_write(&home().join("config.toml"), config.as_bytes())
-            .map_err(|error| AppError::Internal(error.to_string()))?;
-        Ok(())
-    })();
-    match update {
-        Ok(()) => Ok(()),
-        Err(error) => match restore_config_state(&original) {
-            Ok(()) => Err(error),
-            Err(restore_error) => Err(AppError::Backup(format!(
-                "configuration update failed: {error}; rollback failed: {restore_error}"
-            ))),
-        },
-    }
+    let path = data_root.join(MODEL_CATALOG_FILENAME);
+    atomic_write(&path, &bytes)?;
+    Ok(path.display().to_string())
 }
 
-fn build_managed_config(
-    provider: &ProviderProfile,
-    account: &ProviderAccount,
-    base_url: &str,
-    token: &str,
-) -> Result<String, AppError> {
-    build_managed_config_from(provider, account, base_url, token)
-}
-
-fn build_managed_config_from(
-    provider: &ProviderProfile,
-    account: &ProviderAccount,
-    base_url: &str,
-    token: &str,
-) -> Result<String, AppError> {
-    let mut doc = DocumentMut::new();
-    doc["model_provider"] = value(MANAGED_PROVIDER_ID);
-    if !provider.models.is_empty() {
-        doc["model_catalog_json"] = value(MODEL_CATALOG_FILENAME);
-    }
-    let mut providers = Table::new();
-    let mut managed = Table::new();
-    managed["name"] = value(provider.name.trim());
-    managed["base_url"] = value(base_url);
-    managed["wire_api"] = value("responses");
-    managed["requires_openai_auth"] = value(true);
-    managed["experimental_bearer_token"] = value(token);
-    if provider.protocol == ProviderProtocol::Responses {
-        let headers = merged_header_table(&provider.headers, &account.headers);
-        if !headers.is_empty() {
-            managed["http_headers"] = Item::Table(headers);
-        }
-    }
-    providers[MANAGED_PROVIDER_ID] = Item::Table(managed);
-    doc["model_providers"] = Item::Table(providers);
-    Ok(doc.to_string())
-}
-
-fn merged_header_table(provider: &serde_json::Value, account: &serde_json::Value) -> Table {
-    let mut headers = std::collections::BTreeMap::new();
-    for source in [provider, account] {
-        if let Some(values) = source.as_object() {
-            for (name, value) in values {
-                if let Some(value) = value.as_str() {
-                    let name = name.trim();
-                    if !name.is_empty() && !value.is_empty() {
-                        headers.insert(name.to_string(), value.to_string());
-                    }
-                }
+pub fn inspect(codex_home: &Path, data_root: &Path) -> ConfigInspection {
+    let path = codex_home.join("config.toml");
+    let expected_catalog = data_root.join(MODEL_CATALOG_FILENAME);
+    let text = fs::read_to_string(&path).unwrap_or_default();
+    match text.parse::<DocumentMut>() {
+        Ok(document) => {
+            let custom = document
+                .get("model_providers")
+                .and_then(Item::as_table)
+                .and_then(|providers| providers.get(MANAGED_PROVIDER_ID))
+                .and_then(Item::as_table);
+            let mut warnings = vec![];
+            if !expected_catalog.exists() {
+                warnings.push("model_catalog.json 尚未生成".into());
+            }
+            ConfigInspection {
+                path: path.display().to_string(),
+                valid: true,
+                active_provider: document
+                    .get("model_provider")
+                    .and_then(Item::as_str)
+                    .map(str::to_owned),
+                managed_provider_present: custom.is_some(),
+                model_catalog_path: expected_catalog.display().to_string(),
+                warnings,
             }
         }
-    }
-    let mut table = Table::new();
-    for (name, header_value) in headers {
-        table[&name] = value(header_value);
-    }
-    table
-}
-
-fn build_managed_auth(token: &str) -> serde_json::Value {
-    serde_json::json!({
-        "OPENAI_API_KEY": token,
-    })
-}
-
-fn build_model_catalog(provider: &ProviderProfile) -> Result<serde_json::Value, AppError> {
-    crate::model_catalog::build(provider, &home())
-}
-
-pub fn apply_official_account(auth: &serde_json::Value) -> Result<(), AppError> {
-    let original = capture_config_state()?;
-    let update = (|| -> Result<(), AppError> {
-        atomic_write(&home().join("config.toml"), b"")?;
-        atomic_write(
-            &home().join("auth.json"),
-            &serde_json::to_vec_pretty(auth)
-                .map_err(|error| AppError::Internal(error.to_string()))?,
-        )?;
-        let catalog = home().join(MODEL_CATALOG_FILENAME);
-        if catalog.exists() {
-            fs::remove_file(catalog).map_err(|error| AppError::Internal(error.to_string()))?;
-        }
-        Ok(())
-    })();
-    match update {
-        Ok(()) => Ok(()),
-        Err(error) => match restore_config_state(&original) {
-            Ok(()) => Err(error),
-            Err(rollback) => Err(AppError::Backup(format!(
-                "官方账号配置失败：{error}；内存回滚失败：{rollback}"
-            ))),
+        Err(error) => ConfigInspection {
+            path: path.display().to_string(),
+            valid: false,
+            active_provider: None,
+            managed_provider_present: false,
+            model_catalog_path: expected_catalog.display().to_string(),
+            warnings: vec![format!("config.toml 无效：{error}")],
         },
     }
 }
 
-pub fn repair(provider: &str) -> Result<RepairResult, AppError> {
-    crate::provider_sync::synchronize(&home(), provider)
-}
-pub fn delete_sessions(ids: &[String]) -> anyhow::Result<usize> {
-    let sessions = crate::session_index::rebuild()?;
-    let rollout_paths = sessions
-        .iter()
-        .filter(|session| ids.contains(&session.id))
-        .filter_map(|session| session.source_rollout.as_deref())
-        .map(PathBuf::from)
-        .collect::<std::collections::HashSet<_>>();
-    let mut n = 0;
-    for p in databases() {
-        let mut db = Connection::open(p)?;
-        let (table, id_column) = if has_threads(&db) {
-            ("threads", "id")
-        } else if table_columns(&db, "local_thread_catalog").contains(&"thread_id".into()) {
-            ("local_thread_catalog", "thread_id")
-        } else {
-            continue;
-        };
-        let tx = db.transaction()?;
-        for id in ids {
-            n += tx.execute(
-                &format!("DELETE FROM {table} WHERE {id_column}=?1"),
-                params![id],
-            )?
-        }
-        tx.commit()?
+fn apply_custom_fields(
+    document: &mut DocumentMut,
+    model: &str,
+    catalog: &str,
+    token: &str,
+    route_settings: &RouteSettings,
+) -> Result<(), AppError> {
+    if model.trim().is_empty() {
+        return Err(AppError::InvalidConfig("请先选择模型".into()));
     }
-    for path in rollout_paths {
-        if path.exists() {
-            fs::remove_file(path)?;
-            n += 1;
+    document["model"] = value(model.trim());
+    document["model_provider"] = value(MANAGED_PROVIDER_ID);
+    document["model_catalog_json"] = value(catalog);
+    if document.get("model_providers").is_none() {
+        document["model_providers"] = Item::Table(Table::new());
+    }
+    let providers = document["model_providers"]
+        .as_table_mut()
+        .ok_or_else(|| AppError::InvalidConfig("model_providers 必须是 TOML table".into()))?;
+    if providers.get(MANAGED_PROVIDER_ID).is_none() {
+        providers.insert(MANAGED_PROVIDER_ID, Item::Table(Table::new()));
+    }
+    let custom = providers
+        .get_mut(MANAGED_PROVIDER_ID)
+        .and_then(Item::as_table_mut)
+        .ok_or_else(|| {
+            AppError::InvalidConfig("model_providers.custom 必须是 TOML table".into())
+        })?;
+    custom["name"] = value("Custom");
+    custom["base_url"] = value(BASE_URL);
+    custom["wire_api"] = value("responses");
+    custom["experimental_bearer_token"] = value(token);
+    custom["request_max_retries"] = value(i64::from(route_settings.request_max_retries));
+    custom["stream_max_retries"] = value(i64::from(route_settings.stream_max_retries));
+    custom["stream_idle_timeout_ms"] = value(300_000);
+    Ok(())
+}
+
+fn compatibility_token() -> String {
+    let mut bytes = [0u8; 32];
+    rand::rng().fill_bytes(&mut bytes);
+    format!("ct_{}", URL_SAFE_NO_PAD.encode(bytes))
+}
+
+fn parse_document(text: &str) -> Result<DocumentMut, AppError> {
+    if text.trim().is_empty() {
+        Ok(DocumentMut::new())
+    } else {
+        text.parse::<DocumentMut>()
+            .map_err(|error| AppError::InvalidConfig(format!("config.toml 无效：{error}")))
+    }
+}
+
+fn read_optional(path: &Path) -> Result<String, AppError> {
+    match fs::read_to_string(path) {
+        Ok(value) => Ok(value),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn read_optional_bytes(path: &Path) -> Result<Vec<u8>, AppError> {
+    match fs::read(path) {
+        Ok(value) => Ok(value),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn digest(value: &str) -> String {
+    digest_bytes(value.as_bytes())
+}
+
+fn digest_bytes(value: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(value))
+}
+
+fn absolute_path(path: &Path) -> Result<String, AppError> {
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    Ok(path.display().to_string())
+}
+
+fn describe_changes() -> Vec<String> {
+    vec![
+        "清空 auth.json 中的官方账号".into(),
+        "替换整个 config.toml（MCP、Skills、Hooks、沙箱和未知字段将删除）".into(),
+        "model_provider → custom".into(),
+        "更新 model_providers.custom".into(),
+        "更新 model_catalog_json".into(),
+    ]
+}
+
+fn mask_token(token: &str) -> String {
+    if token.is_empty() {
+        return String::new();
+    }
+    format!(
+        "{}…{}",
+        &token[..token.len().min(7)],
+        &token[token.len().saturating_sub(4)..]
+    )
+}
+
+fn managed_custom_preview(document: &DocumentMut, token: &str) -> String {
+    let mut preview = DocumentMut::new();
+    for key in ["model", "model_provider", "model_catalog_json"] {
+        if let Some(item) = document.get(key) {
+            preview[key] = item.clone();
         }
     }
-    Ok(n)
-}
-pub fn export_sessions(ids: &[String], target: &Path) -> anyhow::Result<String> {
-    let sessions = list_sessions(None)?;
-    let mut text = String::from("# Codex 会话导出\n\n");
-    for s in sessions
-        .into_iter()
-        .filter(|x| ids.is_empty() || ids.contains(&x.id))
+    if let Some(custom) = document
+        .get("model_providers")
+        .and_then(Item::as_table)
+        .and_then(|providers| providers.get(MANAGED_PROVIDER_ID))
     {
-        text.push_str(&format!(
-            "## {}\n\n- ID: `{}`\n- Provider: `{}`\n- 项目: `{}`\n- 更新时间: {}\n\n",
-            if s.title.is_empty() {
-                "未命名会话"
-            } else {
-                &s.title
-            },
-            s.id,
-            s.provider,
-            s.cwd,
-            s.updated_at
-        ))
+        let mut providers = Table::new();
+        providers.insert(MANAGED_PROVIDER_ID, custom.clone());
+        preview["model_providers"] = Item::Table(providers);
     }
-    fs::write(target, &text)?;
-    Ok(target.display().to_string())
+    preview.to_string().replace(token, &mask_token(token))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
 
     #[test]
-    fn current_catalog_query_uses_named_sort_alias() {
-        let db = Connection::open_in_memory().unwrap();
-        db.execute_batch(
-            "CREATE TABLE local_thread_catalog(
-                thread_id TEXT PRIMARY KEY,
-                display_title TEXT NOT NULL,
-                model_provider TEXT NOT NULL,
-                cwd TEXT NOT NULL,
-                source_updated_at REAL NOT NULL
-            );
-            INSERT INTO local_thread_catalog VALUES('thread-1','Title','custom','C:/work',123.0);",
+    fn custom_config_writes_only_required_values() {
+        let mut document = DocumentMut::new();
+        let settings = RouteSettings {
+            request_max_retries: 7,
+            stream_max_retries: 6,
+            ..RouteSettings::default()
+        };
+        apply_custom_fields(
+            &mut document,
+            "gpt-test",
+            "C:/data/model_catalog.json",
+            "ct_test_token_value_abcdefghijklmnopqrstuvwxyz",
+            &settings,
         )
         .unwrap();
-        let columns = table_columns(&db, "local_thread_catalog");
-        let sql = session_list_query("local_thread_catalog", "thread_id", &columns);
-        let row: (String, String, i64) = db
-            .query_row(&sql, [], |row| Ok((row.get(0)?, row.get(1)?, row.get(5)?)))
-            .unwrap();
-        assert_eq!(row, ("thread-1".into(), "Title".into(), 123));
-        assert!(sql.contains("ORDER BY sort_updated"));
-    }
-
-    fn test_provider() -> ProviderProfile {
-        ProviderProfile {
-            id: "provider-1".into(),
-            name: "Example Gateway".into(),
-            protocol: ProviderProtocol::Responses,
-            base_url: "https://example.test/v1".into(),
-            models: vec!["model-b".into(), "model-a".into(), " ".into()],
-            model_metadata: vec![],
-            codex_chat_reasoning: None,
-            headers: json!({"X-Provider": "provider", "X-Override": "provider"}),
-            timeout_secs: 30,
-            context_window: Some(64_000),
-            auto_compact_threshold: Some(48_000),
-            enabled: true,
-            active: false,
-            active_account_id: None,
-            account_count: 1,
-        }
-    }
-
-    fn test_account() -> ProviderAccount {
-        ProviderAccount {
-            id: "account-1".into(),
-            provider_id: Some("provider-1".into()),
-            name: "Account".into(),
-            auth_kind: AccountAuthKind::ApiKey,
-            api_key: Some("secret-key".into()),
-            auth_json: None,
-            headers: json!({"X-Account": "account", "X-Override": "account"}),
-            active: false,
-            email: None,
-            created_at: 0,
-            updated_at: 0,
-        }
-    }
-
-    #[test]
-    fn provider_switch_rebuilds_minimal_config() {
-        let config = build_managed_config_from(
-            &test_provider(),
-            &test_account(),
-            "https://example.test/v1",
-            "secret-key",
-        )
-        .unwrap();
-        let parsed = config.parse::<DocumentMut>().unwrap();
-        assert_eq!(
-            parsed.get("model_provider").and_then(Item::as_str),
-            Some(MANAGED_PROVIDER_ID)
-        );
-        assert!(parsed.get("model").is_none());
-        assert_eq!(
-            parsed.get("model_catalog_json").and_then(Item::as_str),
-            Some(MODEL_CATALOG_FILENAME)
-        );
+        let text = document.to_string();
+        let parsed: DocumentMut = text.parse().unwrap();
+        let custom = parsed["model_providers"]["custom"].as_table().unwrap();
         assert_eq!(
             parsed
-                .get("model_providers")
-                .and_then(Item::as_table)
-                .and_then(|providers| providers.get(MANAGED_PROVIDER_ID))
-                .and_then(Item::as_table)
-                .and_then(|provider| provider.get("http_headers"))
-                .and_then(Item::as_table)
-                .and_then(|headers| headers.get("X-Override"))
-                .and_then(Item::as_str),
-            Some("account")
+                .as_table()
+                .iter()
+                .map(|(key, _)| key)
+                .collect::<Vec<_>>(),
+            vec![
+                "model",
+                "model_provider",
+                "model_catalog_json",
+                "model_providers"
+            ]
         );
-        assert!(parsed.get("mcp_servers").is_none());
-        assert!(parsed.get("features").is_none());
+        assert_eq!(
+            custom.iter().map(|(key, _)| key).collect::<Vec<_>>(),
+            vec![
+                "name",
+                "base_url",
+                "wire_api",
+                "experimental_bearer_token",
+                "request_max_retries",
+                "stream_max_retries",
+                "stream_idle_timeout_ms"
+            ]
+        );
+        assert_eq!(parsed["model"].as_str(), Some("gpt-test"));
+        assert_eq!(parsed["model_provider"].as_str(), Some("custom"));
+        assert_eq!(custom["name"].as_str(), Some("Custom"));
+        assert_eq!(custom["base_url"].as_str(), Some(BASE_URL));
+        assert_eq!(custom["wire_api"].as_str(), Some("responses"));
+        assert_eq!(custom["request_max_retries"].as_integer(), Some(7));
+        assert_eq!(custom["stream_max_retries"].as_integer(), Some(6));
+        assert_eq!(custom["stream_idle_timeout_ms"].as_integer(), Some(300_000));
+        assert!(custom.get("supports_websockets").is_none());
     }
 
     #[test]
-    fn provider_switch_config_contains_only_managed_fields() {
-        let config = build_managed_config_from(
-            &test_provider(),
-            &test_account(),
-            "https://example.test/v1",
-            "secret-key",
+    fn token_is_32_random_bytes_in_url_safe_form() {
+        let token = compatibility_token();
+        assert!(token.starts_with("ct_"));
+        assert_eq!(URL_SAFE_NO_PAD.decode(&token[3..]).unwrap().len(), 32);
+    }
+
+    #[test]
+    fn preview_reuses_token_and_rejects_concurrent_change() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex");
+        let data = temp.path().join("data");
+        fs::create_dir_all(&home).unwrap();
+        let manager = ConfigManager::default();
+        fs::write(
+            home.join("auth.json"),
+            br#"{"auth_mode":"chatgpt","tokens":{"access_token":"secret"}}"#,
         )
         .unwrap();
-        let parsed = config.parse::<DocumentMut>().unwrap();
+        let settings = RouteSettings::default();
+        let first = manager
+            .preview_custom(&home, &data, "model", &settings, false)
+            .unwrap();
+        manager.apply(&first.operation_id).unwrap();
+        assert_eq!(fs::read(home.join("auth.json")).unwrap(), b"{}\n");
+        let second = manager
+            .preview_custom(&home, &data, "model", &settings, false)
+            .unwrap();
         assert_eq!(
-            parsed.get("model_provider").and_then(Item::as_str),
-            Some(MANAGED_PROVIDER_ID)
+            first.compatibility_token_masked,
+            second.compatibility_token_masked
         );
-        assert!(parsed.get("model").is_none());
-        let keys = parsed
-            .as_table()
-            .iter()
-            .map(|(key, _)| key)
-            .collect::<Vec<_>>();
-        assert_eq!(
-            keys,
-            vec!["model_provider", "model_catalog_json", "model_providers"]
-        );
+        fs::write(home.join("config.toml"), "model = \"external\"\n").unwrap();
+        assert!(matches!(
+            manager.apply(&second.operation_id),
+            Err(AppError::StaleOperation)
+        ));
     }
 
     #[test]
-    fn third_party_auth_is_rebuilt_with_only_active_key() {
+    fn preview_never_returns_unmanaged_toml_secrets() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex");
+        let data = temp.path().join("data");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(
+            home.join("config.toml"),
+            r#"model = "official-model"
+[mcp_servers.private]
+command = "server"
+env = { PRIVATE_TOKEN = "must-not-enter-webview" }
+"#,
+        )
+        .unwrap();
+
+        let manager = ConfigManager::default();
+        let preview = manager
+            .preview_custom(
+                &home,
+                &data,
+                "custom-model",
+                &RouteSettings::default(),
+                false,
+            )
+            .unwrap();
+
+        assert!(!preview.rendered.contains("must-not-enter-webview"));
+        assert!(!preview.rendered.contains("mcp_servers"));
+        assert!(preview.rendered.contains("[model_providers.custom]"));
+        manager.apply(&preview.operation_id).unwrap();
+        let written = fs::read_to_string(home.join("config.toml")).unwrap();
+        assert!(!written.contains("must-not-enter-webview"));
+        assert!(!written.contains("mcp_servers"));
+        assert!(written.contains("model_provider = \"custom\""));
+    }
+
+    #[test]
+    fn custom_activation_rejects_concurrent_auth_change() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(home.join("config.toml"), "").unwrap();
+        fs::write(home.join("auth.json"), b"{\"before\":true}").unwrap();
+        let manager = ConfigManager::default();
+        let preview = manager
+            .preview_custom(
+                &home,
+                temp.path(),
+                "model",
+                &RouteSettings::default(),
+                false,
+            )
+            .unwrap();
+        fs::write(home.join("auth.json"), b"{\"concurrent\":true}").unwrap();
+
+        assert!(matches!(
+            manager.apply(&preview.operation_id),
+            Err(AppError::StaleOperation)
+        ));
         assert_eq!(
-            build_managed_auth("secret-key"),
-            json!({"OPENAI_API_KEY": "secret-key"})
+            fs::read(home.join("auth.json")).unwrap(),
+            b"{\"concurrent\":true}"
+        );
+        assert!(fs::read(home.join("config.toml")).unwrap().is_empty());
+    }
+
+    #[test]
+    fn official_account_clears_config_and_writes_codex_auth_shape() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(
+            temp.path().join("config.toml"),
+            "model_provider = \"custom\"\n[mcp_servers.remove]\ncommand = \"server\"\n",
+        )
+        .unwrap();
+        let credential = CodexAuthCredential {
+            auth_mode: "chatgpt".into(),
+            openai_api_key: None,
+            tokens: crate::models::CodexAuthTokens {
+                id_token: "id-token".into(),
+                access_token: "access-token".into(),
+                refresh_token: "refresh-token".into(),
+                account_id: "account-id".into(),
+            },
+            last_refresh: "2026-07-14T00:00:00Z".into(),
+        };
+
+        activate_official_account(temp.path(), &credential).unwrap();
+
+        assert!(
+            fs::read(temp.path().join("config.toml"))
+                .unwrap()
+                .is_empty()
+        );
+        let written: serde_json::Value =
+            serde_json::from_slice(&fs::read(temp.path().join("auth.json")).unwrap()).unwrap();
+        assert_eq!(written.as_object().unwrap().len(), 4);
+        assert_eq!(written["auth_mode"], "chatgpt");
+        assert!(written["OPENAI_API_KEY"].is_null());
+        assert_eq!(
+            read_official_account(temp.path())
+                .unwrap()
+                .unwrap()
+                .tokens
+                .account_id,
+            "account-id"
         );
     }
 }

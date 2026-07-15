@@ -1,1009 +1,458 @@
-use crate::models::{AppError, RepairResult};
+use crate::{
+    models::{AppError, DatabaseScan, RepairResult, RepairScan, RepairTarget, SessionSummary},
+    storage::atomic_write_if_unchanged,
+};
 use rusqlite::{Connection, OpenFlags};
-use serde_json::{Map, Value, json};
-use std::collections::{HashMap, HashSet};
-use std::fs;
-use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use serde_json::Value;
+use std::{
+    collections::{BTreeMap, BTreeSet, HashSet},
+    fs,
+    io::BufRead,
+    path::{Path, PathBuf},
+};
 use walkdir::WalkDir;
 
-#[derive(Clone)]
-struct RolloutChange {
-    path: PathBuf,
-    original: String,
-    updated: String,
-    mtime: Option<SystemTime>,
-    thread_id: String,
-    cwd: Option<String>,
-    has_user_event: bool,
-    changed: bool,
-}
-
-#[derive(Default)]
-struct UpdateCounts {
-    provider: usize,
-    user_event: usize,
-    cwd: usize,
-}
-
-#[derive(Clone, Copy)]
-enum DatabaseKind {
-    LegacyThreads,
-    LocalThreadCatalog,
-}
-
-#[derive(Clone)]
-struct DatabaseTarget {
-    path: PathBuf,
-    kind: DatabaseKind,
-}
-
-impl UpdateCounts {
-    fn total(&self) -> usize {
-        self.provider + self.user_event + self.cwd
-    }
-}
-
-pub fn synchronize(home: &Path, provider: &str) -> Result<RepairResult, AppError> {
-    validate_provider(provider)?;
-    if !home.exists() {
-        return Err(AppError::Internal(format!(
-            "Codex 目录不存在：{}",
-            home.display()
-        )));
-    }
-    let lock = SyncLock::acquire(&home.join("tmp/codex-tools-provider-sync.lock"))?;
-    let changes = collect_rollouts(home, provider, None)?;
-    let projectless = projectless_threads(&home.join(".codex-global-state.json"))?;
-    let user_threads = changes
-        .iter()
-        .filter(|item| item.has_user_event)
-        .map(|item| item.thread_id.clone())
-        .collect::<HashSet<_>>();
-    let cwd_by_thread = changes
-        .iter()
-        .filter(|item| !projectless.contains(&item.thread_id))
-        .filter_map(|item| Some((item.thread_id.clone(), item.cwd.clone()?)))
-        .collect::<HashMap<_, _>>();
-    let discovered_dbs = database_paths(home);
-    let (dbs, mut database_warnings) = classify_databases(&discovered_dbs)?;
-    let db_paths = dbs.iter().map(|db| db.path.clone()).collect::<Vec<_>>();
-    let backup = create_backup(home, provider, &changes, &db_paths)?;
-    let global_path = home.join(".codex-global-state.json");
-    let original_global = fs::read(&global_path).ok();
-    let applied = apply_rollouts(&changes)?;
-    let result = (|| -> anyhow::Result<(UpdateCounts, usize)> {
-        let counts = update_databases(&dbs, provider, None, &user_threads, &cwd_by_thread)?;
-        let globals = normalize_global_state(&global_path)?;
-        Ok((counts, globals))
-    })();
-    drop(lock);
-    match result {
-        Ok((counts, global_updates)) => {
-            remove_temporary_backup(&backup);
-            let mut warnings = Vec::new();
-            warnings.append(&mut database_warnings);
-            let encrypted = changes
-                .iter()
-                .filter(|item| item.original.contains("encrypted_content"))
-                .count();
-            if encrypted > 0 {
-                warnings.push(format!(
-                    "{encrypted} 个历史会话包含 encrypted_content，切换供应商后继续对话可能不兼容"
-                ));
+pub fn scan(codex_home: &Path) -> RepairScan {
+    let mut warnings = vec![];
+    let rollouts = rollout_files(codex_home);
+    let mut providers = BTreeMap::<String, BTreeSet<String>>::new();
+    let mut session_meta_count = 0;
+    for path in &rollouts {
+        match rollout_provider(path) {
+            Ok(Some(provider)) => {
+                session_meta_count += 1;
+                providers
+                    .entry(provider)
+                    .or_default()
+                    .insert("rollout".into());
             }
-            if global_updates > 0 {
-                warnings.push(format!("规范化了 {global_updates} 个工作区状态字段"));
+            Ok(None) => {}
+            Err(error) => warnings.push(format!("无法读取 {}：{error}", path.display())),
+        }
+    }
+    let mut databases = vec![];
+    for path in database_paths(codex_home) {
+        match inspect_database(&path) {
+            Ok(Some((schema, count, found))) => {
+                for provider in found {
+                    providers
+                        .entry(provider)
+                        .or_default()
+                        .insert("sqlite".into());
+                }
+                databases.push(DatabaseScan {
+                    path: path.display().to_string(),
+                    schema,
+                    thread_count: count,
+                });
             }
-            Ok(RepairResult {
-                backup_path: String::new(),
-                databases_repaired: dbs.len(),
-                rows_updated: counts.total(),
-                warnings,
+            Ok(None) => {}
+            Err(error) => warnings.push(format!("无法检查 {}：{error}", path.display())),
+        }
+    }
+    let current_provider = fs::read_to_string(codex_home.join("config.toml"))
+        .ok()
+        .and_then(|text| text.parse::<toml_edit::DocumentMut>().ok())
+        .and_then(|doc| {
+            doc.get("model_provider")
+                .and_then(toml_edit::Item::as_str)
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| "openai".into());
+    providers
+        .entry(current_provider.clone())
+        .or_default()
+        .insert("config".into());
+    RepairScan {
+        current_provider: current_provider.clone(),
+        targets: providers
+            .into_iter()
+            .map(|(id, sources)| RepairTarget {
+                current: id == current_provider,
+                id,
+                sources: sources.into_iter().collect(),
             })
-        }
-        Err(error) => {
-            restore_rollouts(&applied);
-            restore_file(&global_path, original_global.as_deref());
-            let restored = restore_database_backup(home, &backup, &db_paths);
-            remove_temporary_backup(&backup);
-            match restored {
-                Ok(()) => Err(AppError::Internal(format!(
-                    "修复失败，已回滚会话文件、全局状态和数据库：{error}"
-                ))),
-                Err(restore_error) => Err(AppError::Backup(format!(
-                    "修复失败：{error}；数据库回滚也失败：{restore_error}"
-                ))),
-            }
-        }
+            .collect(),
+        rollout_files: rollouts.len(),
+        session_meta_count,
+        databases,
+        warnings,
     }
 }
 
-fn validate_provider(provider: &str) -> Result<(), AppError> {
-    if provider.is_empty()
-        || !provider
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
-    {
-        return Err(AppError::InvalidConfig(format!(
-            "非法 Provider ID：{provider:?}"
-        )));
+pub fn migrate(codex_home: &Path, target: &str) -> Result<RepairResult, AppError> {
+    let target = target.trim();
+    if !matches!(target, "openai" | "custom") {
+        return Err(AppError::InvalidConfig(
+            "会话迁移只允许 openai 与 custom 互切".into(),
+        ));
     }
-    Ok(())
-}
+    let rollouts = rollout_files(codex_home);
+    let mut result = RepairResult {
+        target_provider: target.to_owned(),
+        files_scanned: rollouts.len(),
+        ..RepairResult::default()
+    };
 
-fn collect_rollouts(
-    home: &Path,
-    provider: &str,
-    source_providers: Option<&HashSet<String>>,
-) -> Result<Vec<RolloutChange>, AppError> {
-    let mut result = Vec::new();
-    for root in [home.join("sessions"), home.join("archived_sessions")] {
-        if !root.exists() {
-            continue;
-        }
-        for entry in WalkDir::new(root).into_iter().filter_map(Result::ok) {
-            let path = entry.path();
-            let is_rollout = path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with("rollout-") && name.ends_with(".jsonl"));
-            if !is_rollout {
-                continue;
+    for path in rollouts {
+        match migrate_rollout(&path, target) {
+            Ok((changed, metas)) => {
+                result.session_meta_updated += metas;
+                if changed {
+                    result.files_modified += 1
+                } else {
+                    result.files_skipped += 1
+                }
             }
-            let original = match fs::read_to_string(path) {
-                Ok(value) => value,
-                Err(error) if is_locked(&error) => continue,
-                Err(error) => return Err(AppError::Internal(error.to_string())),
-            };
-            if let Some(change) = rewrite_rollout(path, original, provider, source_providers)? {
-                result.push(change);
+            Err(error) => {
+                result.files_failed += 1;
+                result.warnings.push(format!("{}：{error}", path.display()));
             }
         }
     }
-    result.sort_by(|a, b| a.path.cmp(&b.path));
+
+    for path in database_paths(codex_home) {
+        match migrate_database(&path, target) {
+            Ok(rows) => result.rows_updated += rows,
+            Err(error) => result.warnings.push(format!("{}：{error}", path.display())),
+        }
+    }
     Ok(result)
 }
 
-fn rewrite_rollout(
-    path: &Path,
-    original: String,
-    provider: &str,
-    source_providers: Option<&HashSet<String>>,
-) -> Result<Option<RolloutChange>, AppError> {
-    let mut updated = String::new();
-    let mut thread_id = None;
-    let mut cwd = None;
-    let mut changed = false;
-    for segment in original.split_inclusive('\n') {
-        let (line, ending) = split_ending(segment);
-        let mut next = line.to_string();
-        if let Ok(mut record) = serde_json::from_str::<Value>(line)
-            && record.get("type").and_then(Value::as_str) == Some("session_meta")
-            && let Some(payload) = record.get_mut("payload").and_then(Value::as_object_mut)
-        {
-            thread_id =
-                thread_id.or_else(|| payload.get("id").and_then(Value::as_str).map(str::to_owned));
-            cwd = cwd.or_else(|| {
-                payload
-                    .get("cwd")
-                    .and_then(Value::as_str)
-                    .and_then(normalize_path)
-            });
-            let current = payload.get("model_provider").and_then(Value::as_str);
-            if current != Some(provider)
-                && source_providers
-                    .is_none_or(|sources| current.is_none_or(|value| sources.contains(value)))
-            {
-                payload.insert("model_provider".into(), json!(provider));
-                next = serde_json::to_string(&record)
-                    .map_err(|e| AppError::Internal(e.to_string()))?;
-                changed = true;
-            }
-        }
-        updated.push_str(&next);
-        updated.push_str(ending);
-    }
-    let Some(thread_id) = thread_id else {
-        return Ok(None);
-    };
-    let mtime = fs::metadata(path).and_then(|m| m.modified()).ok();
-    Ok(Some(RolloutChange {
-        path: path.to_path_buf(),
-        original: original.clone(),
-        updated,
-        mtime,
-        thread_id,
-        cwd,
-        has_user_event: original.contains("\"user_message\"")
-            || original.contains("\"user_input\""),
-        changed,
-    }))
-}
-
-fn apply_rollouts(changes: &[RolloutChange]) -> Result<Vec<RolloutChange>, AppError> {
-    let mut applied = Vec::new();
-    for item in changes.iter().filter(|item| item.changed) {
-        if let Err(error) = atomic_write(&item.path, item.updated.as_bytes()) {
-            restore_rollouts(&applied);
-            return Err(AppError::Internal(error.to_string()));
-        }
-        restore_mtime(&item.path, item.mtime);
-        applied.push(item.clone());
-    }
-    Ok(applied)
-}
-
-fn restore_rollouts(changes: &[RolloutChange]) {
-    for item in changes {
-        let _ = atomic_write(&item.path, item.original.as_bytes());
-        restore_mtime(&item.path, item.mtime);
-    }
-}
-
-fn classify_databases(paths: &[PathBuf]) -> Result<(Vec<DatabaseTarget>, Vec<String>), AppError> {
-    let mut targets = Vec::new();
-    let mut warnings = Vec::new();
+pub fn list_database_sessions_from_paths(paths: &[PathBuf]) -> anyhow::Result<Vec<SessionSummary>> {
+    let mut sessions = vec![];
     for path in paths {
-        let db = open_read_only(path)?;
-        let quick: String = db
-            .query_row("PRAGMA quick_check", [], |row| row.get(0))
-            .map_err(|e| AppError::Internal(e.to_string()))?;
-        if quick != "ok" {
-            let detail: String = db
-                .query_row("PRAGMA integrity_check", [], |row| row.get(0))
-                .unwrap_or(quick);
-            return Err(AppError::Internal(format!(
-                "数据库完整性检查失败 {}：{detail}",
-                path.display()
-            )));
-        }
-        if table_exists(&db, "threads")? {
-            let columns = table_columns(&db, "threads")?;
-            if !columns.contains("id") || !columns.contains("model_provider") {
-                return Err(AppError::UnknownSchema(path.display().to_string()));
-            }
-            targets.push(DatabaseTarget {
-                path: path.clone(),
-                kind: DatabaseKind::LegacyThreads,
-            });
-        } else if table_exists(&db, "local_thread_catalog")? {
-            let columns = table_columns(&db, "local_thread_catalog")?;
-            if !columns.contains("thread_id") || !columns.contains("model_provider") {
-                return Err(AppError::UnknownSchema(path.display().to_string()));
-            }
-            targets.push(DatabaseTarget {
-                path: path.clone(),
-                kind: DatabaseKind::LocalThreadCatalog,
-            });
-        } else {
-            warnings.push(format!(
-                "已跳过不包含会话目录的辅助数据库：{}",
-                path.display()
-            ));
-        }
-    }
-    Ok((targets, warnings))
-}
-
-fn update_databases(
-    targets: &[DatabaseTarget],
-    provider: &str,
-    source_providers: Option<&HashSet<String>>,
-    users: &HashSet<String>,
-    cwd: &HashMap<String, String>,
-) -> anyhow::Result<UpdateCounts> {
-    let mut total = UpdateCounts::default();
-    for target in targets {
-        let mut db = Connection::open(&target.path)?;
-        db.execute_batch("PRAGMA wal_checkpoint(PASSIVE);")?;
-        let (table, id_column) = match target.kind {
-            DatabaseKind::LegacyThreads => ("threads", "id"),
-            DatabaseKind::LocalThreadCatalog => ("local_thread_catalog", "thread_id"),
+        let db = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        let Some((table, id, columns)) = session_table(&db)? else {
+            continue;
         };
-        let columns = table_columns_anyhow(&db, table)?;
-        let tx = db.transaction()?;
-        if let Some(sources) = source_providers {
-            for source in sources {
-                let sql = format!("UPDATE {table} SET model_provider=?1 WHERE model_provider=?2");
-                total.provider += tx.execute(&sql, (provider, source))?;
-            }
-        } else {
-            let sql = format!(
-                "UPDATE {table} SET model_provider=?1 WHERE COALESCE(model_provider,'')<>?1"
-            );
-            total.provider += tx.execute(&sql, [provider])?;
-        }
-        if columns.contains("has_user_event") {
-            for id in users {
-                let sql = format!(
-                    "UPDATE {table} SET has_user_event=1 WHERE {id_column}=?1 AND COALESCE(has_user_event,0)<>1"
-                );
-                total.user_event += tx.execute(&sql, [id])?;
-            }
-        }
-        if columns.contains("cwd") {
-            for (id, path) in cwd {
-                let sql = format!(
-                    "UPDATE {table} SET cwd=?1 WHERE {id_column}=?2 AND COALESCE(cwd,'')<>?1"
-                );
-                total.cwd += tx.execute(&sql, (path, id))?;
-            }
-        }
-        tx.commit()?;
+        let title = choose(&columns, &["title", "display_title"], "''");
+        let provider = choose(&columns, &["model_provider"], "''");
+        let cwd = choose(&columns, &["cwd"], "''");
+        let archived = choose(&columns, &["archived"], "0");
+        let updated = choose(&columns, &["updated_at", "source_updated_at"], "0");
+        let sql = format!(
+            "SELECT {id},{title},{provider},{cwd},{archived},CAST({updated} AS INTEGER) FROM {table} ORDER BY {updated} DESC LIMIT 2000"
+        );
+        let mut statement = db.prepare(&sql)?;
+        let rows = statement.query_map([], |row| {
+            let id: String = row.get(0)?;
+            let provider: String = row.get(2).unwrap_or_default();
+            Ok(SessionSummary {
+                identity: format!("{}#{id}", path.display()),
+                id,
+                title: row.get(1).unwrap_or_default(),
+                provider: provider.clone(),
+                cwd: row.get(3).unwrap_or_default(),
+                archived: row.get::<_, i64>(4).unwrap_or_default() != 0,
+                updated_at: row.get(5).unwrap_or_default(),
+                source_db: path.display().to_string(),
+                source_rollout: None,
+                original_provider: provider,
+                has_user_event: false,
+            })
+        })?;
+        sessions.extend(rows.flatten());
     }
-    Ok(total)
+    Ok(sessions)
 }
 
-fn create_backup(
-    home: &Path,
-    provider: &str,
-    changes: &[RolloutChange],
-    dbs: &[PathBuf],
-) -> Result<PathBuf, AppError> {
-    let dir = std::env::temp_dir()
-        .join("codex-tools")
-        .join(format!("provider-sync-{}", uuid::Uuid::new_v4().simple()));
-    fs::create_dir_all(&dir).map_err(|e| AppError::Backup(e.to_string()))?;
-    let result = create_backup_contents(home, provider, changes, dbs, &dir);
-    if result.is_err() {
-        remove_temporary_backup(&dir);
-    }
-    result.map(|()| dir)
+pub fn rollout_files(codex_home: &Path) -> Vec<PathBuf> {
+    [
+        codex_home.join("sessions"),
+        codex_home.join("archived_sessions"),
+    ]
+    .into_iter()
+    .flat_map(|directory| {
+        WalkDir::new(directory)
+            .follow_links(false)
+            .into_iter()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().is_file())
+            .map(|entry| entry.into_path())
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "jsonl")
+            })
+    })
+    .collect()
 }
 
-fn create_backup_contents(
-    home: &Path,
-    provider: &str,
-    changes: &[RolloutChange],
-    dbs: &[PathBuf],
-    dir: &Path,
-) -> Result<(), AppError> {
-    for name in [
-        "config.toml",
-        ".codex-global-state.json",
-        ".codex-global-state.json.bak",
-    ] {
-        let source = home.join(name);
-        if source.exists() {
-            fs::copy(&source, dir.join(name)).map_err(|e| AppError::Backup(e.to_string()))?;
-        }
+pub fn database_paths(codex_home: &Path) -> Vec<PathBuf> {
+    let mut output = vec![];
+    let legacy = codex_home.join("state_5.sqlite");
+    if legacy.is_file() {
+        output.push(legacy);
     }
-    let mut db_files = Vec::new();
-    for db in dbs {
-        for source in sqlite_files(db) {
-            if !source.exists() {
-                continue;
-            }
-            let relative = backup_relative_path(home, &source);
-            let target = dir.join("db").join(&relative);
-            if let Some(parent) = target.parent() {
-                fs::create_dir_all(parent).map_err(|e| AppError::Backup(e.to_string()))?;
-            }
-            fs::copy(&source, &target).map_err(|e| AppError::Backup(e.to_string()))?;
-            db_files.push(relative.to_string_lossy().replace('\\', "/"));
-        }
+    collect_databases(&codex_home.join("sqlite"), &mut output);
+    if let Some(path) = std::env::var_os("CODEX_SQLITE_HOME") {
+        collect_databases(&PathBuf::from(path), &mut output);
     }
-    let manifest = changes
-        .iter()
-        .filter(|item| item.changed)
-        .map(|item| json!({"path":item.path,"threadId":item.thread_id}))
-        .collect::<Vec<_>>();
-    fs::write(dir.join("metadata.json"), serde_json::to_vec_pretty(&json!({"version":1,"managedBy":"Codex Tools provider sync","provider":provider,"dbFiles":db_files,"rollouts":manifest})).map_err(|e|AppError::Backup(e.to_string()))?).map_err(|e|AppError::Backup(e.to_string()))?;
-    Ok(())
-}
-
-fn remove_temporary_backup(path: &Path) {
-    let _ = fs::remove_dir_all(path);
-    if let Some(parent) = path.parent() {
-        let _ = fs::remove_dir(parent);
-    }
-}
-
-fn restore_database_backup(home: &Path, backup: &Path, dbs: &[PathBuf]) -> anyhow::Result<()> {
-    for db in dbs {
-        for destination in sqlite_files(db) {
-            let relative = backup_relative_path(home, &destination);
-            let source = backup.join("db").join(relative);
-            if source.exists() {
-                let bytes = fs::read(&source)?;
-                atomic_write(&destination, &bytes)?;
-            } else if destination.exists() {
-                fs::remove_file(&destination)?;
-            }
-        }
-    }
-    Ok(())
-}
-
-fn backup_relative_path(home: &Path, source: &Path) -> PathBuf {
-    if let Ok(relative) = source.strip_prefix(home) {
-        return relative.to_path_buf();
-    }
-    let identity = source
-        .to_string_lossy()
-        .bytes()
-        .fold(0xcbf29ce484222325_u64, |hash, byte| {
-            (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
-        });
-    PathBuf::from("external")
-        .join(format!("{identity:016x}"))
-        .join(source.file_name().unwrap_or_default())
-}
-
-fn normalize_global_state(path: &Path) -> anyhow::Result<usize> {
-    if !path.exists() {
-        return Ok(0);
-    }
-    let original = fs::read_to_string(path)?;
-    let mut state = serde_json::from_str::<Value>(&original)?
-        .as_object()
-        .cloned()
-        .unwrap_or_default();
-    let mut changed = 0;
-    for key in [
-        "electron-saved-workspace-roots",
-        "project-order",
-        "active-workspace-roots",
-    ] {
-        if let Some(value) = state.get(key).cloned() {
-            let was_array = value.is_array();
-            let normalized = dedupe_paths(value.clone());
-            let next = if was_array {
-                json!(normalized)
-            } else {
-                normalized.first().map_or(value, |v| json!(v))
-            };
-            if state.get(key) != Some(&next) {
-                state.insert(key.into(), next);
-                changed += 1;
-            }
-        }
-    }
-    for key in ["electron-workspace-root-labels"] {
-        if let Some(object) = state.get(key).and_then(Value::as_object).cloned() {
-            let next = normalize_object_keys(object);
-            if state.get(key) != Some(&Value::Object(next.clone())) {
-                state.insert(key.into(), Value::Object(next));
-                changed += 1;
-            }
-        }
-    }
-    if let Some(mut targets) = state
-        .get("open-in-target-preferences")
-        .and_then(Value::as_object)
-        .cloned()
+    if let Ok(text) = fs::read_to_string(codex_home.join("config.toml"))
+        && let Ok(document) = text.parse::<toml_edit::DocumentMut>()
+        && let Some(path) = document
+            .get("sqlite_home")
+            .and_then(toml_edit::Item::as_str)
     {
-        if let Some(paths) = targets.get("perPath").and_then(Value::as_object).cloned() {
-            targets.insert(
-                "perPath".into(),
-                Value::Object(normalize_object_keys(paths)),
-            );
-        }
-        let next = Value::Object(targets);
-        if state.get("open-in-target-preferences") != Some(&next) {
-            state.insert("open-in-target-preferences".into(), next);
-            changed += 1;
-        }
+        collect_databases(&PathBuf::from(path), &mut output);
     }
-    if changed > 0 {
-        let text = serde_json::to_vec_pretty(&Value::Object(state))?;
-        atomic_write(path, &text)?;
-        atomic_write(&path.with_extension("json.bak"), &text)?;
-    }
-    Ok(changed)
+    output.sort();
+    output.dedup();
+    output
 }
 
-fn projectless_threads(path: &Path) -> Result<HashSet<String>, AppError> {
-    let value = fs::read_to_string(path)
-        .ok()
-        .and_then(|s| serde_json::from_str::<Value>(&s).ok());
-    Ok(value
-        .as_ref()
-        .and_then(|v| v.get("projectless-thread-ids"))
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-        .map(str::to_owned)
-        .collect())
-}
-
-fn normalize_object_keys(value: Map<String, Value>) -> Map<String, Value> {
-    value
-        .into_iter()
-        .map(|(k, v)| (normalize_path(&k).unwrap_or(k), v))
-        .collect()
-}
-fn dedupe_paths(value: Value) -> Vec<String> {
-    let items = if let Some(a) = value.as_array() {
-        a.iter()
-            .filter_map(Value::as_str)
-            .map(str::to_owned)
-            .collect()
-    } else {
-        value
-            .as_str()
-            .map(|s| vec![s.to_owned()])
-            .unwrap_or_default()
-    };
-    let mut seen = HashSet::new();
-    items
-        .into_iter()
-        .filter_map(|p| normalize_path(&p))
-        .filter(|p| {
-            seen.insert(
-                p.replace('/', "\\")
-                    .trim_end_matches('\\')
-                    .to_ascii_lowercase(),
-            )
-        })
-        .collect()
-}
-fn normalize_path(value: &str) -> Option<String> {
-    let s = value.trim();
-    if s.is_empty() {
-        None
-    } else if s.to_ascii_lowercase().starts_with(r"\\?\unc\") {
-        Some(format!(r"\\{}", s[8..].replace('/', "\\")))
-    } else if let Some(stripped) = s.strip_prefix(r"\\?\") {
-        Some(stripped.replace('\\', "/"))
-    } else {
-        Some(s.to_owned())
-    }
-}
-fn database_paths(home: &Path) -> Vec<PathBuf> {
-    let mut v = Vec::new();
-    let old = home.join("state_5.sqlite");
-    if old.exists() {
-        v.push(old)
-    }
-    if let Ok(entries) = fs::read_dir(home.join("sqlite")) {
-        v.extend(
-            entries
-                .flatten()
-                .map(|e| e.path())
-                .filter(|p| p.extension().is_some_and(|x| x == "db" || x == "sqlite")),
-        )
-    }
-    if let Ok(value) = std::env::var("CODEX_SQLITE_HOME") {
-        collect_sqlite_home(Path::new(&value), &mut v);
-    }
-    let config = fs::read_to_string(home.join("config.toml")).unwrap_or_default();
-    if let Ok(doc) = config.parse::<toml_edit::DocumentMut>()
-        && let Some(value) = doc.get("sqlite_home").and_then(toml_edit::Item::as_str)
-    {
-        collect_sqlite_home(Path::new(value), &mut v);
-    }
-    v.sort();
-    v.dedup();
-    v
-}
-
-fn collect_sqlite_home(path: &Path, output: &mut Vec<PathBuf>) {
+fn collect_databases(path: &Path, output: &mut Vec<PathBuf>) {
     if path.is_file() {
         output.push(path.to_path_buf());
-        return;
-    }
-    if let Ok(entries) = fs::read_dir(path) {
+    } else if let Ok(entries) = fs::read_dir(path) {
         output.extend(entries.flatten().map(|entry| entry.path()).filter(|path| {
             path.extension()
                 .is_some_and(|extension| extension == "db" || extension == "sqlite")
         }));
     }
 }
-fn sqlite_files(path: &Path) -> Vec<PathBuf> {
-    let s = path.to_string_lossy();
-    vec![
-        path.to_path_buf(),
-        PathBuf::from(format!("{s}-wal")),
-        PathBuf::from(format!("{s}-shm")),
-    ]
-}
-fn open_read_only(path: &Path) -> Result<Connection, AppError> {
-    Connection::open_with_flags(
-        path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY
-            | OpenFlags::SQLITE_OPEN_URI
-            | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .map_err(|error| AppError::Internal(error.to_string()))
+
+fn migrate_rollout(path: &Path, target: &str) -> anyhow::Result<(bool, usize)> {
+    let original_bytes = fs::read(path)?;
+    let original = std::str::from_utf8(&original_bytes)?;
+    let mut changed = false;
+    let mut meta_count = 0;
+    let mut output = String::with_capacity(original.len());
+    for segment in original.split_inclusive('\n') {
+        let (line, ending) = segment.strip_suffix('\n').map_or((segment, ""), |line| {
+            (
+                line.strip_suffix('\r').unwrap_or(line),
+                if line.ends_with('\r') { "\r\n" } else { "\n" },
+            )
+        });
+        let Ok(mut record) = serde_json::from_str::<Value>(line) else {
+            output.push_str(segment);
+            continue;
+        };
+        let mut record_changed = false;
+        if record.get("type").and_then(Value::as_str) == Some("session_meta") {
+            let original_provider = record
+                .pointer("/payload/model_provider")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            if original_provider != target {
+                record["payload"]["model_provider"] = Value::String(target.to_owned());
+                changed = true;
+                record_changed = true;
+                meta_count += 1;
+            }
+        }
+        if record_changed {
+            output.push_str(&serde_json::to_string(&record)?);
+            output.push_str(ending);
+        } else {
+            output.push_str(segment);
+        }
+    }
+    if changed && !atomic_write_if_unchanged(path, &original_bytes, output.as_bytes())? {
+        anyhow::bail!("会话文件在迁移期间发生变化，已保留 Codex 的并发写入，请重试");
+    }
+    Ok((changed, meta_count))
 }
 
-fn table_exists(db: &Connection, table: &str) -> Result<bool, AppError> {
-    db.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name=?1)",
-        [table],
-        |row| row.get(0),
-    )
-    .map_err(|error| AppError::Internal(error.to_string()))
-}
-
-fn table_columns(db: &Connection, table: &str) -> Result<HashSet<String>, AppError> {
-    table_columns_anyhow(db, table).map_err(|e| AppError::Internal(e.to_string()))
-}
-fn table_columns_anyhow(db: &Connection, table: &str) -> anyhow::Result<HashSet<String>> {
-    let mut s = db.prepare(&format!("PRAGMA table_info({table})"))?;
-    Ok(s.query_map([], |r| r.get::<_, String>(1))?
-        .collect::<rusqlite::Result<_>>()?)
-}
-fn split_ending(s: &str) -> (&str, &str) {
-    if let Some(v) = s.strip_suffix("\r\n") {
-        (v, "\r\n")
-    } else if let Some(v) = s.strip_suffix('\n') {
-        (v, "\n")
-    } else {
-        (s, "")
-    }
-}
-fn restore_mtime(path: &Path, mtime: Option<SystemTime>) {
-    if let (Some(time), Ok(file)) = (mtime, fs::File::options().write(true).open(path)) {
-        let _ = file.set_times(fs::FileTimes::new().set_modified(time));
-    }
-}
-fn is_locked(e: &std::io::Error) -> bool {
-    e.kind() == std::io::ErrorKind::PermissionDenied || matches!(e.raw_os_error(), Some(32 | 33))
-}
-fn atomic_write(path: &Path, data: &[u8]) -> anyhow::Result<()> {
-    use std::io::Write;
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("codex-tools");
-    let temp = path.with_file_name(format!(
-        ".{file_name}.{}.tmp",
-        uuid::Uuid::new_v4().simple()
-    ));
-    let mut file = fs::File::create(&temp)?;
-    file.write_all(data)?;
-    file.sync_all()?;
-    drop(file);
-    if let Err(error) = replace_file(&temp, path) {
-        let _ = fs::remove_file(&temp);
-        return Err(error);
-    }
-    Ok(())
-}
-
-#[cfg(windows)]
-fn replace_file(source: &Path, target: &Path) -> anyhow::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows::{
-        Win32::Storage::FileSystem::{
-            MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
-        },
-        core::PCWSTR,
+fn migrate_database(path: &Path, target: &str) -> anyhow::Result<usize> {
+    let mut db = Connection::open(path)?;
+    let Some((table, _, columns)) = session_table(&db)? else {
+        return Ok(0);
     };
-    let source = source
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect::<Vec<_>>();
-    let target = target
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect::<Vec<_>>();
-    unsafe {
-        MoveFileExW(
-            PCWSTR(source.as_ptr()),
-            PCWSTR(target.as_ptr()),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )?;
+    if !columns.contains("model_provider") {
+        return Ok(0);
     }
-    Ok(())
+    let transaction = db.transaction()?;
+    let rows = transaction.execute(
+        &format!("UPDATE {table} SET model_provider=?1 WHERE COALESCE(model_provider,'')<>?1"),
+        [target],
+    )?;
+    transaction.commit()?;
+    Ok(rows)
 }
 
-#[cfg(not(windows))]
-fn replace_file(source: &Path, target: &Path) -> anyhow::Result<()> {
-    fs::rename(source, target)?;
-    Ok(())
+fn inspect_database(path: &Path) -> anyhow::Result<Option<(String, u64, Vec<String>)>> {
+    let db = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    let Some((table, _, columns)) = session_table(&db)? else {
+        return Ok(None);
+    };
+    if !columns.contains("model_provider") {
+        anyhow::bail!("会话表缺少 model_provider 字段");
+    }
+    let count = db.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+        row.get(0)
+    })?;
+    let mut statement = db.prepare(&format!(
+        "SELECT DISTINCT model_provider FROM {table} WHERE model_provider IS NOT NULL"
+    ))?;
+    let providers = statement
+        .query_map([], |row| row.get::<_, String>(0))?
+        .flatten()
+        .collect();
+    Ok(Some((table.into(), count, providers)))
 }
-fn restore_file(path: &Path, data: Option<&[u8]>) {
-    match data {
-        Some(v) => {
-            let _ = atomic_write(path, v);
-        }
-        None => {
-            let _ = fs::remove_file(path);
+
+fn session_table(
+    db: &Connection,
+) -> anyhow::Result<Option<(&'static str, &'static str, HashSet<String>)>> {
+    for (table, id) in [("threads", "id"), ("local_thread_catalog", "thread_id")] {
+        let columns = table_columns(db, table)?;
+        if columns.contains(id) {
+            return Ok(Some((table, id, columns)));
         }
     }
+    Ok(None)
 }
-struct SyncLock(PathBuf);
-impl SyncLock {
-    fn acquire(path: &Path) -> Result<Self, AppError> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|e| AppError::Internal(e.to_string()))?
+
+fn table_columns(db: &Connection, table: &str) -> anyhow::Result<HashSet<String>> {
+    let mut statement = db.prepare(&format!("PRAGMA table_info({table})"))?;
+    Ok(statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .flatten()
+        .collect())
+}
+
+fn choose<'a>(columns: &HashSet<String>, names: &'a [&'a str], fallback: &'a str) -> &'a str {
+    names
+        .iter()
+        .copied()
+        .find(|name| columns.contains(*name))
+        .unwrap_or(fallback)
+}
+
+fn rollout_provider(path: &Path) -> anyhow::Result<Option<String>> {
+    for line in std::io::BufReader::new(fs::File::open(path)?).lines() {
+        let line = line?;
+        let Ok(record) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if record.get("type").and_then(Value::as_str) == Some("session_meta") {
+            return Ok(Some(
+                record
+                    .pointer("/payload/model_provider")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+            ));
         }
-        fs::create_dir(path)
-            .map_err(|_| AppError::Internal("已有数据库修复任务正在运行".into()))?;
-        fs::write(
-            path.join("owner.json"),
-            json!({"pid":std::process::id()}).to_string(),
-        )
-        .map_err(|e| AppError::Internal(e.to_string()))?;
-        Ok(Self(path.to_path_buf()))
     }
-}
-impl Drop for SyncLock {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
+    Ok(None)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rusqlite::Connection;
-    use tempfile::tempdir;
 
-    fn fixture(projectless: bool) -> (tempfile::TempDir, PathBuf) {
-        let tmp = tempdir().unwrap();
-        let home = tmp.path().join(".codex");
+    #[test]
+    fn migration_unifies_all_provider_metadata_without_app_state_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex");
+        let data = temp.path().join("data");
         fs::create_dir_all(home.join("sessions/2026")).unwrap();
+        let rollout = home.join("sessions/2026/rollout.jsonl");
+        let before = format!(
+            "{}\n{}\n",
+            serde_json::json!({"type":"session_meta","payload":{"id":"one","model_provider":"legacy-provider","cwd":"C:/keep"}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"user_message","message":"unchanged"}})
+        );
+        fs::write(&rollout, before).unwrap();
+        let result = migrate(&home, "custom").unwrap();
+        assert_eq!(result.session_meta_updated, 1);
+        let after = fs::read_to_string(rollout).unwrap();
+        assert!(after.contains("\"model_provider\":\"custom\""));
+        assert!(after.contains("\"message\":\"unchanged\""));
+        assert!(!data.exists());
+        assert!(!data.join("backup").exists());
+    }
+
+    #[test]
+    fn migration_preserves_already_matching_metadata_byte_for_byte() {
+        let temp = tempfile::tempdir().unwrap();
+        let rollout = temp.path().join("rollout.jsonl");
+        let unchanged = r#"{ "type": "session_meta", "payload": { "id": "two", "model_provider": "custom", "future": true } }"#;
+        let original = format!(
+            "{}\n{unchanged}\n",
+            serde_json::json!({"type":"session_meta","payload":{"id":"one","model_provider":"openai"}})
+        );
+        fs::write(&rollout, &original).unwrap();
+        let (changed, count) = migrate_rollout(&rollout, "custom").unwrap();
+
+        assert!(changed);
+        assert_eq!(count, 1);
+        let migrated = fs::read_to_string(rollout).unwrap();
+        assert!(migrated.ends_with(&format!("{unchanged}\n")));
+    }
+
+    #[test]
+    fn sqlite_update_is_narrow_and_transactional() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("state.sqlite");
+        let connection = Connection::open(&db).unwrap();
+        connection.execute_batch("CREATE TABLE threads(id TEXT PRIMARY KEY, model_provider TEXT, title TEXT); INSERT INTO threads VALUES('one','legacy-provider','keep'); INSERT INTO threads VALUES('two','custom','same'); INSERT INTO threads VALUES('three',NULL,'missing');").unwrap();
+        drop(connection);
+        assert_eq!(migrate_database(&db, "custom").unwrap(), 2);
+        let connection = Connection::open(db).unwrap();
+        let providers = connection
+            .prepare("SELECT model_provider FROM threads ORDER BY id")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(providers, vec!["custom", "custom", "custom"]);
+        let title: String = connection
+            .query_row("SELECT title FROM threads WHERE id='one'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(title, "keep");
+    }
+
+    #[test]
+    fn migration_toggles_all_metadata_between_managed_providers() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex");
+        fs::create_dir_all(home.join("sessions")).unwrap();
+        let rollout = home.join("sessions/rollout.jsonl");
         fs::write(
-            home.join("sessions/2026/rollout-test.jsonl"),
+            &rollout,
             format!(
-                "{}\n{}\n",
-                json!({"type":"session_meta","payload":{"id":"thread-1","model_provider":"openai","cwd":r"\\?\C:\workspace"}}),
-                json!({"type":"event_msg","payload":{"type":"user_message"}})
+                "{}\n",
+                serde_json::json!({"type":"session_meta","payload":{"id":"one","model_provider":"legacy-provider"}})
             ),
         )
         .unwrap();
-        if projectless {
-            fs::write(
-                home.join(".codex-global-state.json"),
-                json!({"projectless-thread-ids":["thread-1"]}).to_string(),
-            )
-            .unwrap();
-        }
-        let db = Connection::open(home.join("state_5.sqlite")).unwrap();
-        db.execute_batch("CREATE TABLE threads(id TEXT PRIMARY KEY, model_provider TEXT, has_user_event INTEGER, cwd TEXT); INSERT INTO threads VALUES('thread-1','openai',0,'C:/old');").unwrap();
-        drop(db);
-        (tmp, home)
-    }
 
-    #[test]
-    fn syncs_rollout_provider_and_targeted_sqlite_fields() {
-        let (_tmp, home) = fixture(false);
-        let result = synchronize(&home, "custom").unwrap();
-        assert_eq!(result.rows_updated, 3);
-        let rollout = fs::read_to_string(home.join("sessions/2026/rollout-test.jsonl")).unwrap();
-        assert!(rollout.contains("\"model_provider\":\"custom\""));
-        let db = Connection::open(home.join("state_5.sqlite")).unwrap();
-        let row: (String, i64, String) = db
-            .query_row(
-                "SELECT model_provider,has_user_event,cwd FROM threads",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )
-            .unwrap();
-        assert_eq!(row, ("custom".into(), 1, "C:/workspace".into()));
-        assert!(result.backup_path.is_empty());
-    }
-
-    #[test]
-    fn projectless_thread_keeps_existing_cwd() {
-        let (_tmp, home) = fixture(true);
-        synchronize(&home, "custom").unwrap();
-        let db = Connection::open(home.join("state_5.sqlite")).unwrap();
-        let cwd: String = db
-            .query_row("SELECT cwd FROM threads", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(cwd, "C:/old");
-    }
-
-    #[test]
-    fn syncs_current_local_thread_catalog_schema() {
-        let (_tmp, home) = fixture(false);
-        fs::create_dir_all(home.join("sqlite")).unwrap();
-        let catalog_path = home.join("sqlite/codex-dev.db");
-        let catalog = Connection::open(&catalog_path).unwrap();
-        catalog
-            .execute_batch(
-                "CREATE TABLE local_thread_catalog(
-                    host_id TEXT NOT NULL,
-                    thread_id TEXT NOT NULL,
-                    display_title TEXT NOT NULL,
-                    source_created_at REAL NOT NULL,
-                    source_updated_at REAL NOT NULL,
-                    cwd TEXT NOT NULL,
-                    source_kind TEXT NOT NULL,
-                    source_detail TEXT,
-                    model_provider TEXT NOT NULL,
-                    git_branch TEXT,
-                    observation_sequence INTEGER NOT NULL,
-                    missing_candidate INTEGER NOT NULL DEFAULT 0,
-                    PRIMARY KEY(host_id, thread_id)
-                );
-                INSERT INTO local_thread_catalog VALUES(
-                    'local','thread-1','Test',0,0,'C:/old','cli',NULL,
-                    'openai',NULL,0,0
-                );",
-            )
-            .unwrap();
-        drop(catalog);
-
-        let result = synchronize(&home, "custom").unwrap();
-
-        assert_eq!(result.databases_repaired, 2);
-        let catalog = Connection::open(catalog_path).unwrap();
-        let row: (String, String) = catalog
-            .query_row(
-                "SELECT model_provider,cwd FROM local_thread_catalog WHERE thread_id='thread-1'",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!(row, ("custom".into(), "C:/workspace".into()));
-    }
-
-    #[test]
-    fn skips_auxiliary_database_without_session_tables() {
-        let (_tmp, home) = fixture(false);
-        fs::create_dir_all(home.join("sqlite")).unwrap();
-        let auxiliary_path = home.join("sqlite/auxiliary.db");
-        let auxiliary = Connection::open(&auxiliary_path).unwrap();
-        auxiliary
-            .execute_batch("CREATE TABLE automations(id TEXT PRIMARY KEY);")
-            .unwrap();
-        drop(auxiliary);
-
-        let result = synchronize(&home, "custom").unwrap();
-
-        assert_eq!(result.databases_repaired, 1);
+        let to_custom = migrate(&home, "custom").unwrap();
+        assert_eq!(to_custom.session_meta_updated, 1);
         assert!(
-            result
-                .warnings
-                .iter()
-                .any(|warning| warning.contains("辅助数据库"))
+            fs::read_to_string(&rollout)
+                .unwrap()
+                .contains("\"model_provider\":\"custom\"")
         );
-        let auxiliary = Connection::open(auxiliary_path).unwrap();
-        let table_count: i64 = auxiliary
-            .query_row("SELECT count(*) FROM automations", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(table_count, 0);
-    }
 
-    #[test]
-    fn rejects_unknown_session_catalog_schema() {
-        let (_tmp, home) = fixture(false);
-        fs::create_dir_all(home.join("sqlite")).unwrap();
-        let path = home.join("sqlite/unknown.db");
-        let database = Connection::open(&path).unwrap();
-        database
-            .execute_batch("CREATE TABLE local_thread_catalog(thread_id TEXT PRIMARY KEY);")
-            .unwrap();
-        drop(database);
-
-        let error = synchronize(&home, "custom").unwrap_err();
-        assert!(matches!(error, AppError::UnknownSchema(_)));
-    }
-
-    #[test]
-    fn normalizes_workspace_state_paths() {
-        let (_tmp, home) = fixture(false);
-        fs::write(
-            home.join(".codex-global-state.json"),
-            json!({
-                "electron-saved-workspace-roots":[r"\\?\C:\workspace", "C:/workspace"],
-                "electron-workspace-root-labels":{r"\\?\C:\workspace":"Workspace"}
-            })
-            .to_string(),
-        )
-        .unwrap();
-        synchronize(&home, "custom").unwrap();
-        let state: Value = serde_json::from_str(
-            &fs::read_to_string(home.join(".codex-global-state.json")).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(
-            state["electron-saved-workspace-roots"],
-            json!(["C:/workspace"])
-        );
-        assert_eq!(
-            state["electron-workspace-root-labels"],
-            json!({"C:/workspace":"Workspace"})
+        let to_openai = migrate(&home, "openai").unwrap();
+        assert_eq!(to_openai.session_meta_updated, 1);
+        assert!(
+            fs::read_to_string(rollout)
+                .unwrap()
+                .contains("\"model_provider\":\"openai\"")
         );
     }
 
     #[test]
-    fn atomic_write_replaces_existing_file() {
-        let tmp = tempdir().unwrap();
-        let path = tmp.path().join("state.json");
-        fs::write(&path, b"old").unwrap();
-        atomic_write(&path, b"new").unwrap();
-        assert_eq!(fs::read(&path).unwrap(), b"new");
-        assert_eq!(
-            fs::read_dir(tmp.path()).unwrap().count(),
-            1,
-            "temporary file should be removed after replacement"
-        );
-    }
-
-    #[test]
-    fn database_backup_restores_database_and_removes_new_sidecars() {
-        let (_tmp, home) = fixture(false);
-        let db = home.join("state_5.sqlite");
-        let changes = collect_rollouts(&home, "custom", None).unwrap();
-        let backup = create_backup(&home, "custom", &changes, std::slice::from_ref(&db)).unwrap();
-
-        {
-            let connection = Connection::open(&db).unwrap();
-            connection
-                .execute("UPDATE threads SET model_provider='broken'", [])
-                .unwrap();
-        }
-        let wal = PathBuf::from(format!("{}-wal", db.display()));
-        fs::write(&wal, b"new sidecar").unwrap();
-
-        restore_database_backup(&home, &backup, std::slice::from_ref(&db)).unwrap();
-
-        let connection = Connection::open(&db).unwrap();
-        let provider: String = connection
-            .query_row("SELECT model_provider FROM threads", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(provider, "openai");
-        assert!(!wal.exists());
-    }
-
-    #[test]
-    fn unifies_all_provider_history_to_current_target() {
-        let (_tmp, home) = fixture(false);
-        let rollout_path = home.join("sessions/2026/rollout-test.jsonl");
-        let original = fs::read_to_string(&rollout_path)
-            .unwrap()
-            .replace("\"openai\"", "\"user_owned_provider\"");
-        fs::write(&rollout_path, original).unwrap();
-        let db = Connection::open(home.join("state_5.sqlite")).unwrap();
-        db.execute(
-            "UPDATE threads SET model_provider='user_owned_provider'",
-            [],
-        )
-        .unwrap();
-        drop(db);
-
-        synchronize(&home, "custom").unwrap();
-
-        let rollout = fs::read_to_string(rollout_path).unwrap();
-        assert!(rollout.contains("\"model_provider\":\"custom\""));
-        let db = Connection::open(home.join("state_5.sqlite")).unwrap();
-        let provider: String = db
-            .query_row("SELECT model_provider FROM threads", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(provider, "custom");
-    }
-
-    #[test]
-    fn external_database_backup_round_trip_uses_stable_mapping() {
-        let (_tmp, home) = fixture(false);
-        let external_root = tempdir().unwrap();
-        let external_db = external_root.path().join("state.sqlite");
-        let connection = Connection::open(&external_db).unwrap();
-        connection
-            .execute_batch(
-                "CREATE TABLE marker(value TEXT); INSERT INTO marker VALUES('original');",
-            )
-            .unwrap();
-        drop(connection);
-
-        let backup =
-            create_backup(&home, "custom", &[], std::slice::from_ref(&external_db)).unwrap();
-        let relative = backup_relative_path(&home, &external_db);
-        assert!(relative.starts_with("external"));
-        assert!(backup.join("db").join(&relative).exists());
-
-        let connection = Connection::open(&external_db).unwrap();
-        connection
-            .execute("UPDATE marker SET value='changed'", [])
-            .unwrap();
-        drop(connection);
-        restore_database_backup(&home, &backup, std::slice::from_ref(&external_db)).unwrap();
-
-        let connection = Connection::open(&external_db).unwrap();
-        let value: String = connection
-            .query_row("SELECT value FROM marker", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(value, "original");
+    fn migration_rejects_unmanaged_provider_targets() {
+        let temp = tempfile::tempdir().unwrap();
+        let error = migrate(temp.path(), "third-party").unwrap_err();
+        assert!(error.to_string().contains("只允许 openai 与 custom"));
     }
 }

@@ -1,85 +1,89 @@
 # Codex Tools
 
-Codex Tools 是面向 Windows 10/11 x64 的单体 Codex Provider、账号和会话管理工具。它不会使用 CDP、不会向 Codex 注入脚本，也不会修改 Codex 安装目录。
-
-> 当前版本为 `0.1.0` 早期预览版。Provider 切换和数据库修复会直接更新 Codex 数据，建议用户按需自行备份 `%USERPROFILE%\.codex`。
+Codex Tools 是面向 Windows 10/11 x64 的轻量 Tauri 2 + Rust 桌面工具。它通过固定的 `custom` provider 把 Codex 连接到本机 Responses 代理，并在代理内部切换第三方上游，不注入或修改 Codex 客户端。
 
 ## 功能
 
-- 保存多个 Responses 或 Chat Completions 兼容 Provider。
-- 每个 Provider 管理多个 API 账号并一键切换。
-- 保存和切换 Codex 官方 OAuth 登录账号。
-- 在应用进程内运行仅监听 loopback 的 Responses → Chat Completions 适配代理。
-- 切换账号时同步已识别的 Codex 会话 Provider，统一历史可见性。
-- 扫描默认 SQLite、`sqlite_home`、`CODEX_SQLITE_HOME` 和 rollout JSONL。
-- 修复操作仅在系统临时目录创建事务回滚副本，结束后立即删除，不保留历史备份。
-- 搜索、Markdown 导出和永久删除已识别会话。
+- 管理 OpenAI Responses、Chat Completions、Anthropic Messages 上游及多个 API 账号。
+- 固定监听 `127.0.0.1:16384`；拒绝非回环、代理转发头和跨域请求。
+- Responses 上游原样流式转发，Chat Completions 转换文本、推理、usage 和工具调用，Anthropic Messages 转换为 Responses 结果。
+- 支持 OpenAI Account 设备码登录，并可在多个官方账号与第三方 API 之间切换。
+- 官方模式只写入 Codex 原生 `auth.json` 并清空 `config.toml`；第三方模式清空 `auth.json`，再写入最小 `custom` provider 配置。
+- 第三方供应商切换时 Codex provider 始终为 `custom`；仅在 `openai` 与 `custom` 模式互切后，自动把全部已识别会话的 provider 元数据统一到新模式。
+- 直接读取 Codex JSONL/SQLite，不创建应用 SQLite，不保存聊天正文，不生成会话备份。
 
-## 安全说明
+## Codex 配置
 
-按项目设计，Provider、账号、API Key 和应用设置以明文保存在本机 `codex-tools.sqlite`：
+应用维护以下字段；兼容 token 由系统安全随机数生成，并在连续使用第三方模式时保持稳定：
 
-- 不要将数据库或诊断附件上传到公开位置。
-- Provider 测试不会在界面或日志中返回完整上游响应。
-- 未识别的 Codex SQLite schema 只读扫描，不猜测字段并写入。
-- 仅改写当前账号切换所需的 Provider 和已识别会话字段。
+```toml
+model = "<当前模型>"
+model_provider = "custom"
+model_catalog_json = "<程序数据目录>/model_catalog.json"
 
-## 开发环境
+[model_providers.custom]
+name = "Custom"
+base_url = "http://127.0.0.1:16384/v1"
+wire_api = "responses"
+experimental_bearer_token = "ct_<随机32字节Base64URL>"
+request_max_retries = 4
+stream_max_retries = 3
+stream_idle_timeout_ms = 300000
+```
 
-- Node.js 22 LTS（Node.js 24 也可用于当前依赖）
-- npm 10+
-- Rust 1.85+
-- Visual Studio 2022 Build Tools
-  - Desktop development with C++
-  - MSVC v143 x64/x86 build tools
-  - Windows 10/11 SDK
-- Microsoft Edge WebView2 Runtime
+两个重试参数可在“本地代理”页面设置，范围均为 `0–100`，默认值分别为 `4` 和 `3`。
+
+当前使用第三方 Provider 时，保存当前 Provider、账号或本地代理设置，以及应用启动，都会自动同步 `config.toml`、`model_catalog.json` 和代理运行配置。
+
+本地代理不验证 `experimental_bearer_token`；它仅作为 Codex 第三方 API 的兼容占位符。
+
+## OpenAI Account 登录与切换
+
+应用使用与 Codex CLI 相同的 OpenAI 设备授权端点和 Codex CLI 风格的 `User-Agent` 发起登录。登录完成后，完整凭据只在 Rust 后端处理，并保存到 `data/app.yaml`；前端只会收到账号名称、邮箱、到期时间等脱敏元数据。
+
+两种模式严格互斥：
+
+- 切换到官方账号：先清空 `config.toml`，再将所选账号凭据写入 `~/.codex/auth.json`。
+- 切换到第三方 API：先将 `auth.json` 清空为 `{}`，再用必要字段替换 `config.toml`。
+
+切换不会创建配置或会话备份。第三方模式会删除原 `config.toml` 中的 MCP、Skills、Hooks、沙箱及未知字段，界面会在执行前明确确认这一破坏性操作。
+
+## 数据与安全
+
+便携式数据位于可执行文件同级 `data/`：
+
+```text
+Codex Tools.exe
+data/
+  app.yaml
+  model_catalog.json
+```
+
+第三方 API Key 和 OpenAI Account OAuth 凭据按产品约定以明文保存在 `data/app.yaml`，请勿上传、同步或分享该文件。旧 `data/config.yaml` 不会导入或读取。日志和前端诊断不包含 API Key、OAuth token、完整兼容 token、请求体或响应体。
+
+## 开发
+
+需要 Node.js 24、Rust 1.85+、Windows WebView2 和 NSIS 构建依赖。
 
 ```powershell
 npm ci
-npm run tauri:dev
+npm run dev
 ```
 
-## 质量检查
+质量检查：
 
 ```powershell
 npm run check
-cd src-tauri
-cargo fmt --all -- --check
-cargo clippy --all-targets -- -D warnings
-cargo test
+cargo test --manifest-path src-tauri/Cargo.toml --locked
 ```
 
-## 构建安装包
+Windows 安装包：
 
 ```powershell
-npm ci
-npm run tauri:build
+npm run dist:win
 ```
 
-NSIS 安装包输出到 `src-tauri\target\release\bundle\nsis`。应用采用 current-user 安装，不需要管理员权限。
-
-## 项目结构
-
-```text
-src/
-  components/ui/          shadcn/ui 源码组件
-  features/providers/     Provider 与账号领域逻辑
-  lib/                    前端基础设施与 Tauri IPC
-  types.ts                前后端 IPC 数据契约
-src-tauri/src/
-  codex.rs                Codex 配置、扫描与会话操作
-  protocol_proxy.rs       loopback 协议适配代理
-  provider_sync.rs        会话统一与临时事务回滚
-  storage.rs              codex-tools.sqlite 当前数据结构
-  models.rs               Rust IPC 数据类型和稳定错误
-```
-
-## 发布
-
-- 推送普通提交会运行 Windows CI。
-- 推送形如 `v0.1.0` 的 tag 会构建 NSIS 安装包并创建 GitHub Release。
-- 发布前需同步 `package.json`、`src-tauri/Cargo.toml` 与 `src-tauri/tauri.conf.json` 的版本号。
+输出位于 `src-tauri/target/release/bundle/nsis/`。
 
 ## 许可证
 

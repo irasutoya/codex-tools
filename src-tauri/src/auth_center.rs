@@ -1,12 +1,18 @@
 use crate::models::{
-    AppError, AuthAccount, AuthService, OpenAiDeviceAuthorization, OpenAiDevicePoll,
+    AppError, CodexAuthCredential, CodexAuthTokens, OpenAiDeviceAuthorization,
+    StoredOfficialAccount,
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use reqwest::header::{CONTENT_TYPE, USER_AGENT};
+use futures_util::StreamExt;
+use reqwest::StatusCode;
+use reqwest::header::{HeaderMap, HeaderValue, USER_AGENT};
 use serde::Deserialize;
+use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use std::collections::HashMap;
-use std::time::Duration;
+use std::process::Command;
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
 const CODEX_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
@@ -14,33 +20,60 @@ const DEVICE_START_URL: &str = "https://auth.openai.com/api/accounts/deviceauth/
 const DEVICE_POLL_URL: &str = "https://auth.openai.com/api/accounts/deviceauth/token";
 const TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 const VERIFICATION_URL: &str = "https://auth.openai.com/codex/device";
-const REDIRECT_URI: &str = "https://auth.openai.com/deviceauth/callback";
-// Device Auth uses a stable, product-specific fingerprint across polling and token refresh.
-const CODEX_OAUTH_USER_AGENT: &str = "codex-tools-device-auth";
-const JSON_CONTENT_TYPE: &str = "application/json";
-const FORM_CONTENT_TYPE: &str = "application/x-www-form-urlencoded";
+const DEVICE_REDIRECT_URI: &str = "https://auth.openai.com/deviceauth/callback";
+const CODEX_ORIGINATOR: &str = "codex_cli_rs";
+const CODEX_LOGIN_SUFFIX: &str = "codex_login";
+const FALLBACK_CODEX_VERSION: &str = "0.144.1";
+const DEFAULT_DEVICE_LIFETIME_SECS: u64 = 15 * 60;
+const MAX_DEVICE_LIFETIME_SECS: u64 = 60 * 60;
+const MAX_OAUTH_RESPONSE_BYTES: usize = 64 * 1024;
+const ACCESS_TOKEN_REFRESH_WINDOW_SECS: i64 = 5 * 60;
 
-#[derive(Clone)]
 struct PendingDeviceAuth {
     device_auth_id: String,
     user_code: String,
+    deadline: Instant,
     expires_at: i64,
+    interval: Duration,
+    next_poll_at: Instant,
 }
 
-#[derive(Default)]
+struct PendingPoll {
+    device_auth_id: String,
+    user_code: String,
+}
+
+enum LocalPollState {
+    Ready(PendingPoll),
+    Pending,
+    Expired,
+}
+
+/// Internal result of device polling. It intentionally does not implement
+/// `Serialize`: credentials must be persisted before a redacted view reaches
+/// a Tauri command response.
+#[derive(Debug)]
+pub(crate) enum DevicePollResult {
+    Pending,
+    Expired,
+    Complete(Box<StoredOfficialAccount>),
+}
+
 pub struct AuthCenter {
+    client: Result<reqwest::Client, String>,
     pending: Mutex<HashMap<String, PendingDeviceAuth>>,
-    refresh_locks: Mutex<HashMap<String, std::sync::Arc<Mutex<()>>>>,
+    refresh_lock: Mutex<()>,
 }
 
 #[derive(Deserialize)]
 struct DeviceStartResponse {
     device_auth_id: String,
+    #[serde(alias = "usercode")]
     user_code: String,
     #[serde(default)]
     interval: Option<Value>,
     #[serde(default)]
-    expires_in: Option<i64>,
+    expires_in: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -51,47 +84,87 @@ struct DevicePollResponse {
 
 #[derive(Deserialize)]
 struct TokenResponse {
-    access_token: String,
-    #[serde(default)]
-    refresh_token: Option<String>,
     #[serde(default)]
     id_token: Option<String>,
+    #[serde(default)]
+    access_token: Option<String>,
+    #[serde(default)]
+    refresh_token: Option<String>,
     #[serde(default)]
     expires_in: Option<i64>,
 }
 
+struct CompleteTokens {
+    id_token: String,
+    access_token: String,
+    refresh_token: String,
+    expires_in: Option<i64>,
+}
+
+#[derive(Default)]
+struct TokenIdentity {
+    account_id: Option<String>,
+    email: Option<String>,
+    expires_at: Option<i64>,
+}
+
+impl Default for AuthCenter {
+    fn default() -> Self {
+        let user_agent = codex_user_agent();
+        let client = build_oauth_client(&user_agent)
+            .map_err(|error| format!("OpenAI OAuth 客户端初始化失败：{}", error.without_url()));
+        Self {
+            client,
+            pending: Mutex::new(HashMap::new()),
+            refresh_lock: Mutex::new(()),
+        }
+    }
+}
+
 impl AuthCenter {
     pub async fn start_openai(&self) -> Result<OpenAiDeviceAuthorization, AppError> {
-        let response = oauth_client()?
+        let response = self
+            .client()?
             .post(DEVICE_START_URL)
-            .header(CONTENT_TYPE, JSON_CONTENT_TYPE)
-            .header(USER_AGENT, CODEX_OAUTH_USER_AGENT)
-            .json(&json!({"client_id": CODEX_CLIENT_ID}))
+            .json(&json!({ "client_id": CODEX_CLIENT_ID }))
             .send()
             .await
             .map_err(safe_network_error)?;
-        if !response.status().is_success() {
-            return Err(AppError::InvalidConfig(format!(
-                "OpenAI 设备登录启动失败（HTTP {}）",
-                response.status().as_u16()
-            )));
+        let response = require_success(response, "OpenAI 设备登录启动失败")?;
+        let payload: DeviceStartResponse = read_json_bounded(response, "设备登录启动").await?;
+
+        if payload.device_auth_id.trim().is_empty() || payload.user_code.trim().is_empty() {
+            return Err(AppError::InvalidConfig(
+                "OpenAI 设备登录响应缺少设备码".into(),
+            ));
         }
-        let payload: DeviceStartResponse = response.json().await.map_err(safe_network_error)?;
-        let expires_in = payload.expires_in.unwrap_or(900).max(30);
-        let expires_at = chrono::Utc::now().timestamp() + expires_in;
-        let interval_secs = parse_interval(payload.interval.as_ref()).saturating_add(3);
-        let operation_id = uuid::Uuid::new_v4().to_string();
-        let mut pending = self.pending.lock().await;
+
+        let interval_secs = parse_interval(payload.interval.as_ref());
+        let lifetime_secs = payload
+            .expires_in
+            .unwrap_or(DEFAULT_DEVICE_LIFETIME_SECS)
+            .clamp(30, MAX_DEVICE_LIFETIME_SECS);
         let now = chrono::Utc::now().timestamp();
-        pending.retain(|_, value| value.expires_at > now);
+        let expires_at = now.saturating_add(lifetime_secs as i64);
+        let operation_id = uuid::Uuid::new_v4().to_string();
+        let instant_now = Instant::now();
+
+        let mut pending = self.pending.lock().await;
+        // The desktop UI supports one login at a time. Replacing an abandoned
+        // operation keeps device credentials short-lived when the WebView is closed.
+        pending.clear();
         pending.insert(
             operation_id.clone(),
             PendingDeviceAuth {
                 device_auth_id: payload.device_auth_id,
                 user_code: payload.user_code.clone(),
+                deadline: instant_now + Duration::from_secs(lifetime_secs),
                 expires_at,
+                interval: Duration::from_secs(interval_secs),
+                next_poll_at: instant_now,
             },
         );
+
         Ok(OpenAiDeviceAuthorization {
             operation_id,
             user_code: payload.user_code,
@@ -101,128 +174,306 @@ impl AuthCenter {
         })
     }
 
-    pub async fn poll_openai(&self, operation_id: &str) -> Result<OpenAiDevicePoll, AppError> {
-        let pending = self
-            .pending
-            .lock()
-            .await
-            .get(operation_id)
-            .cloned()
-            .ok_or(AppError::StaleOperation)?;
-        if pending.expires_at <= chrono::Utc::now().timestamp() {
-            self.pending.lock().await.remove(operation_id);
-            return Ok(OpenAiDevicePoll::Expired);
-        }
-        let response = oauth_client()?
+    pub async fn poll_openai(&self, operation_id: &str) -> Result<DevicePollResult, AppError> {
+        let poll = match self.poll_snapshot(operation_id).await? {
+            LocalPollState::Ready(poll) => poll,
+            LocalPollState::Pending => return Ok(DevicePollResult::Pending),
+            LocalPollState::Expired => return Ok(DevicePollResult::Expired),
+        };
+
+        let response = self
+            .client()?
             .post(DEVICE_POLL_URL)
-            .header(CONTENT_TYPE, JSON_CONTENT_TYPE)
-            .header(USER_AGENT, CODEX_OAUTH_USER_AGENT)
             .json(&json!({
-                "device_auth_id": pending.device_auth_id,
-                "user_code": pending.user_code,
+                "device_auth_id": poll.device_auth_id,
+                "user_code": poll.user_code,
             }))
             .send()
             .await
             .map_err(safe_network_error)?;
-        match classify_poll_status(response.status().as_u16()) {
-            PollStatus::Pending => return Ok(OpenAiDevicePoll::Pending),
+
+        match classify_poll_status(response.status()) {
+            PollStatus::Pending => Ok(DevicePollResult::Pending),
             PollStatus::Expired => {
                 self.pending.lock().await.remove(operation_id);
-                return Ok(OpenAiDevicePoll::Expired);
+                Ok(DevicePollResult::Expired)
             }
-            PollStatus::Failed(status) => {
-                return Err(AppError::InvalidConfig(format!(
-                    "OpenAI 设备登录轮询失败（HTTP {status}）"
-                )));
+            PollStatus::Failed(status) => Err(AppError::InvalidConfig(format!(
+                "OpenAI 设备登录轮询失败（HTTP {status}）"
+            ))),
+            PollStatus::Complete => {
+                let code: DevicePollResponse = read_json_bounded(response, "设备登录轮询").await?;
+                if code.authorization_code.trim().is_empty() || code.code_verifier.trim().is_empty()
+                {
+                    return Err(AppError::InvalidConfig(
+                        "OpenAI 设备登录响应缺少授权信息".into(),
+                    ));
+                }
+                let tokens = self.exchange_code(&code).await?;
+                let account = account_from_tokens(tokens, None)?;
+                self.pending.lock().await.remove(operation_id);
+                Ok(DevicePollResult::Complete(Box::new(account)))
             }
-            PollStatus::Complete => {}
         }
-        let code: DevicePollResponse = response.json().await.map_err(safe_network_error)?;
-        let tokens = exchange_code(&code.authorization_code, &code.code_verifier).await?;
-        let account = account_from_tokens(tokens, None)?;
-        self.pending.lock().await.remove(operation_id);
-        Ok(OpenAiDevicePoll::Complete {
-            account: Box::new(account),
-        })
     }
 
-    pub async fn refresh_account(&self, account: &AuthAccount) -> Result<AuthAccount, AppError> {
-        let refresh_token = account
-            .credential
-            .as_ref()
-            .and_then(|value| value.pointer("/tokens/refresh_token"))
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-                AppError::InvalidConfig("官方账号缺少 refresh_token，请重新登录".into())
-            })?
-            .to_string();
-        let lock = {
-            let mut locks = self.refresh_locks.lock().await;
-            locks
-                .entry(account.id.clone())
-                .or_insert_with(|| std::sync::Arc::new(Mutex::new(())))
-                .clone()
-        };
-        let _guard = lock.lock().await;
-        let response = oauth_client()?
+    pub async fn refresh_account(
+        &self,
+        account: &StoredOfficialAccount,
+    ) -> Result<StoredOfficialAccount, AppError> {
+        if account.expires_at.is_some_and(|expires_at| {
+            expires_at
+                > chrono::Utc::now()
+                    .timestamp()
+                    .saturating_add(ACCESS_TOKEN_REFRESH_WINDOW_SECS)
+        }) {
+            return Ok(account.clone());
+        }
+        // Refresh tokens can rotate and are single-use. Serializing refreshes prevents
+        // two activations from consuming the same token concurrently.
+        let _guard = self.refresh_lock.lock().await;
+        let response = self
+            .client()?
             .post(TOKEN_URL)
-            .header(CONTENT_TYPE, FORM_CONTENT_TYPE)
-            .header(USER_AGENT, CODEX_OAUTH_USER_AGENT)
+            .json(&json!({
+                "client_id": CODEX_CLIENT_ID,
+                "grant_type": "refresh_token",
+                "refresh_token": account.credential.tokens.refresh_token,
+            }))
+            .send()
+            .await
+            .map_err(safe_network_error)?;
+
+        if response.status() == StatusCode::UNAUTHORIZED {
+            return Err(AppError::InvalidConfig(
+                "OpenAI 登录已失效，请重新登录".into(),
+            ));
+        }
+        let response = require_success(response, "OpenAI 登录刷新失败")?;
+        let refreshed: TokenResponse = read_json_bounded(response, "登录刷新").await?;
+        let tokens = merge_refreshed_tokens(refreshed, account)?;
+        account_from_tokens(tokens, Some(account))
+    }
+
+    fn client(&self) -> Result<&reqwest::Client, AppError> {
+        self.client
+            .as_ref()
+            .map_err(|message| AppError::Internal(message.clone()))
+    }
+
+    async fn poll_snapshot(&self, operation_id: &str) -> Result<LocalPollState, AppError> {
+        let now = Instant::now();
+        let unix_now = chrono::Utc::now().timestamp();
+        let mut pending = self.pending.lock().await;
+        let Some(state) = pending.get_mut(operation_id) else {
+            return Err(AppError::StaleOperation);
+        };
+        if state.is_expired(now, unix_now) {
+            pending.remove(operation_id);
+            return Ok(LocalPollState::Expired);
+        }
+        if now < state.next_poll_at {
+            return Ok(LocalPollState::Pending);
+        }
+        state.next_poll_at = now + state.interval;
+        Ok(LocalPollState::Ready(PendingPoll {
+            device_auth_id: state.device_auth_id.clone(),
+            user_code: state.user_code.clone(),
+        }))
+    }
+
+    async fn exchange_code(&self, code: &DevicePollResponse) -> Result<CompleteTokens, AppError> {
+        let response = self
+            .client()?
+            .post(TOKEN_URL)
             .form(&[
-                ("grant_type", "refresh_token"),
-                ("refresh_token", refresh_token.as_str()),
+                ("grant_type", "authorization_code"),
+                ("code", code.authorization_code.as_str()),
+                ("redirect_uri", DEVICE_REDIRECT_URI),
                 ("client_id", CODEX_CLIENT_ID),
-                ("scope", "openid profile email"),
+                ("code_verifier", code.code_verifier.as_str()),
             ])
             .send()
             .await
             .map_err(safe_network_error)?;
-        if !response.status().is_success() {
-            return Err(AppError::InvalidConfig(format!(
-                "OpenAI 登录已失效，请重新登录（HTTP {}）",
-                response.status().as_u16()
-            )));
-        }
-        let tokens: TokenResponse = response.json().await.map_err(safe_network_error)?;
-        account_from_tokens(tokens, Some((account, refresh_token)))
+        let response = require_success(response, "OpenAI 登录令牌交换失败")?;
+        let response: TokenResponse = read_json_bounded(response, "登录令牌交换").await?;
+        complete_login_tokens(response)
     }
 }
 
-async fn exchange_code(code: &str, verifier: &str) -> Result<TokenResponse, AppError> {
-    let response = oauth_client()?
-        .post(TOKEN_URL)
-        .header(CONTENT_TYPE, FORM_CONTENT_TYPE)
-        .header(USER_AGENT, CODEX_OAUTH_USER_AGENT)
-        .form(&[
-            ("grant_type", "authorization_code"),
-            ("code", code),
-            ("redirect_uri", REDIRECT_URI),
-            ("client_id", CODEX_CLIENT_ID),
-            ("code_verifier", verifier),
-        ])
-        .send()
-        .await
-        .map_err(safe_network_error)?;
-    if !response.status().is_success() {
-        return Err(AppError::InvalidConfig(format!(
-            "OpenAI 登录令牌交换失败（HTTP {}）",
-            response.status().as_u16()
-        )));
+impl PendingDeviceAuth {
+    fn is_expired(&self, now: Instant, unix_now: i64) -> bool {
+        now >= self.deadline || unix_now >= self.expires_at
     }
-    response.json().await.map_err(safe_network_error)
 }
 
-fn oauth_client() -> Result<reqwest::Client, AppError> {
+fn build_oauth_client(user_agent: &str) -> Result<reqwest::Client, reqwest::Error> {
+    let mut headers = HeaderMap::new();
+    headers.insert("originator", HeaderValue::from_static(CODEX_ORIGINATOR));
+    if let Ok(value) = HeaderValue::from_str(user_agent) {
+        headers.insert(USER_AGENT, value);
+    }
     reqwest::Client::builder()
+        .default_headers(headers)
+        .redirect(reqwest::redirect::Policy::none())
+        .https_only(true)
         .connect_timeout(Duration::from_secs(30))
-        .timeout(Duration::from_secs(600))
-        .pool_max_idle_per_host(10)
+        .timeout(Duration::from_secs(60))
+        .pool_max_idle_per_host(4)
+        .pool_idle_timeout(Duration::from_secs(90))
         .tcp_keepalive(Duration::from_secs(60))
         .build()
-        .map_err(safe_network_error)
 }
 
-#[derive(Debug, PartialEq)]
+fn complete_login_tokens(response: TokenResponse) -> Result<CompleteTokens, AppError> {
+    Ok(CompleteTokens {
+        id_token: required_token(response.id_token, "id_token")?,
+        access_token: required_token(response.access_token, "access_token")?,
+        refresh_token: required_token(response.refresh_token, "refresh_token")?,
+        expires_in: response.expires_in,
+    })
+}
+
+fn merge_refreshed_tokens(
+    response: TokenResponse,
+    previous: &StoredOfficialAccount,
+) -> Result<CompleteTokens, AppError> {
+    let id_token =
+        non_empty(response.id_token).unwrap_or_else(|| previous.credential.tokens.id_token.clone());
+    let access_token = non_empty(response.access_token)
+        .unwrap_or_else(|| previous.credential.tokens.access_token.clone());
+    let refresh_token = non_empty(response.refresh_token)
+        .unwrap_or_else(|| previous.credential.tokens.refresh_token.clone());
+    if id_token.is_empty() || access_token.is_empty() || refresh_token.is_empty() {
+        return Err(AppError::InvalidConfig(
+            "OpenAI 登录刷新响应缺少令牌".into(),
+        ));
+    }
+    Ok(CompleteTokens {
+        id_token,
+        access_token,
+        refresh_token,
+        expires_in: response.expires_in,
+    })
+}
+
+fn required_token(value: Option<String>, name: &str) -> Result<String, AppError> {
+    non_empty(value).ok_or_else(|| AppError::InvalidConfig(format!("OpenAI 登录响应缺少 {name}")))
+}
+
+fn non_empty(value: Option<String>) -> Option<String> {
+    value.filter(|value| !value.trim().is_empty())
+}
+
+fn account_from_tokens(
+    tokens: CompleteTokens,
+    previous: Option<&StoredOfficialAccount>,
+) -> Result<StoredOfficialAccount, AppError> {
+    let id_claims = token_identity(&tokens.id_token).unwrap_or_default();
+    let access_claims = token_identity(&tokens.access_token).unwrap_or_default();
+    let account_id = id_claims
+        .account_id
+        .or(access_claims.account_id)
+        .or_else(|| previous.map(|account| account.account_id.clone()))
+        .ok_or_else(|| AppError::InvalidConfig("OpenAI 登录响应缺少账号标识".into()))?;
+
+    if previous.is_some_and(|account| account.account_id != account_id) {
+        return Err(AppError::InvalidConfig(
+            "OpenAI 刷新令牌返回了其他账号，请重新登录".into(),
+        ));
+    }
+
+    let email = id_claims
+        .email
+        .or(access_claims.email)
+        .or_else(|| previous.map(|account| account.email.clone()))
+        .unwrap_or_default();
+    let now = chrono::Utc::now();
+    let now_timestamp = now.timestamp();
+    let expires_at = tokens
+        .expires_in
+        .filter(|seconds| *seconds > 0)
+        .map(|seconds| now_timestamp.saturating_add(seconds))
+        .or(access_claims.expires_at)
+        .or(id_claims.expires_at)
+        .or_else(|| previous.and_then(|account| account.expires_at));
+    let credential = CodexAuthCredential {
+        auth_mode: "chatgpt".into(),
+        openai_api_key: None,
+        tokens: CodexAuthTokens {
+            id_token: tokens.id_token,
+            access_token: tokens.access_token,
+            refresh_token: tokens.refresh_token,
+            account_id: account_id.clone(),
+        },
+        last_refresh: now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+    };
+
+    Ok(StoredOfficialAccount {
+        id: previous.map_or_else(String::new, |account| account.id.clone()),
+        name: if email.is_empty() {
+            previous.map_or_else(|| "OpenAI 官方账号".into(), |account| account.name.clone())
+        } else {
+            email.clone()
+        },
+        account_id,
+        email,
+        credential,
+        expires_at,
+        created_at: previous.map_or(now_timestamp, |account| account.created_at),
+        updated_at: now_timestamp,
+    })
+}
+
+fn token_identity(token: &str) -> Option<TokenIdentity> {
+    let payload = token.split('.').nth(1)?;
+    let bytes = URL_SAFE_NO_PAD.decode(payload).ok()?;
+    let claims: Value = serde_json::from_slice(&bytes).ok()?;
+    let auth = claims.get("https://api.openai.com/auth");
+    let profile = claims.get("https://api.openai.com/profile");
+    let account_id = claims
+        .get("chatgpt_account_id")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            auth.and_then(|value| value.get("chatgpt_account_id"))
+                .and_then(Value::as_str)
+        })
+        .or_else(|| {
+            claims
+                .pointer("/organizations/0/id")
+                .and_then(Value::as_str)
+        })
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_owned);
+    let email = claims
+        .get("email")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            profile
+                .and_then(|value| value.get("email"))
+                .and_then(Value::as_str)
+        })
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_owned);
+    let expires_at = claims.get("exp").and_then(Value::as_i64);
+    Some(TokenIdentity {
+        account_id,
+        email,
+        expires_at,
+    })
+}
+
+fn parse_interval(value: Option<&Value>) -> u64 {
+    match value {
+        Some(Value::Number(value)) => value.as_u64().unwrap_or(5),
+        Some(Value::String(value)) => value.trim().parse().unwrap_or(5),
+        _ => 5,
+    }
+    .clamp(1, 60)
+}
+
+#[derive(Debug, PartialEq, Eq)]
 enum PollStatus {
     Pending,
     Expired,
@@ -230,8 +481,8 @@ enum PollStatus {
     Failed(u16),
 }
 
-fn classify_poll_status(status: u16) -> PollStatus {
-    match status {
+fn classify_poll_status(status: StatusCode) -> PollStatus {
+    match status.as_u16() {
         403 | 404 => PollStatus::Pending,
         410 => PollStatus::Expired,
         200..=299 => PollStatus::Complete,
@@ -239,137 +490,265 @@ fn classify_poll_status(status: u16) -> PollStatus {
     }
 }
 
-fn account_from_tokens(
-    tokens: TokenResponse,
-    previous: Option<(&AuthAccount, String)>,
-) -> Result<AuthAccount, AppError> {
-    let (account_id, email) = extract_identity(&tokens)
-        .ok_or_else(|| AppError::InvalidConfig("OpenAI 登录响应缺少账号标识".into()))?;
-    let now = chrono::Utc::now();
-    let refresh_token = tokens
-        .refresh_token
-        .or_else(|| previous.as_ref().map(|(_, token)| token.clone()))
-        .ok_or_else(|| AppError::InvalidConfig("OpenAI 登录响应缺少 refresh_token".into()))?;
-    let previous_account = previous.as_ref().map(|(account, _)| *account);
-    let credential = json!({
-        "auth_mode": "chatgpt",
-        "tokens": {
-            "id_token": tokens.id_token,
-            "access_token": tokens.access_token,
-            "refresh_token": refresh_token,
-            "account_id": account_id,
-        },
-        "last_refresh": now.to_rfc3339(),
-    });
-    Ok(AuthAccount {
-        id: previous_account
-            .map(|account| account.id.clone())
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
-        service: AuthService::OpenAi,
-        name: email.clone().unwrap_or_else(|| "OpenAI 官方账号".into()),
-        login: Some(account_id),
-        email,
-        credential: Some(credential),
-        scopes: vec!["openid".into(), "profile".into(), "email".into()],
-        expires_at: Some(now.timestamp() + tokens.expires_in.unwrap_or(3600)),
-        active: previous_account.is_some_and(|account| account.active),
-        created_at: previous_account.map_or(now.timestamp(), |account| account.created_at),
-        updated_at: now.timestamp(),
-    })
-}
-
-fn extract_identity(tokens: &TokenResponse) -> Option<(String, Option<String>)> {
-    tokens
-        .id_token
-        .as_deref()
-        .and_then(parse_claims)
-        .or_else(|| parse_claims(&tokens.access_token))
-        .and_then(|claims| {
-            let account_id = claims
-                .get("chatgpt_account_id")
-                .and_then(Value::as_str)
-                .or_else(|| {
-                    claims
-                        .pointer("/https:~1~1api.openai.com~1auth/chatgpt_account_id")
-                        .and_then(Value::as_str)
-                })
-                .or_else(|| {
-                    claims
-                        .pointer("/organizations/0/id")
-                        .and_then(Value::as_str)
-                })?;
-            let email = claims
-                .get("email")
-                .and_then(Value::as_str)
-                .map(str::to_owned);
-            Some((account_id.to_owned(), email))
-        })
-}
-
-fn parse_claims(token: &str) -> Option<Value> {
-    let payload = token.split('.').nth(1)?;
-    let bytes = URL_SAFE_NO_PAD.decode(payload).ok()?;
-    serde_json::from_slice(&bytes).ok()
-}
-
-fn parse_interval(value: Option<&Value>) -> u64 {
-    match value {
-        Some(Value::Number(number)) => number.as_u64().unwrap_or(5),
-        Some(Value::String(value)) => value.parse().unwrap_or(5),
-        _ => 5,
+fn require_success(
+    response: reqwest::Response,
+    context: &str,
+) -> Result<reqwest::Response, AppError> {
+    if response.status().is_success() {
+        Ok(response)
+    } else {
+        Err(AppError::InvalidConfig(format!(
+            "{context}（HTTP {}）",
+            response.status().as_u16()
+        )))
     }
-    .max(1)
+}
+
+async fn read_json_bounded<T: DeserializeOwned>(
+    response: reqwest::Response,
+    context: &str,
+) -> Result<T, AppError> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_OAUTH_RESPONSE_BYTES as u64)
+    {
+        return Err(AppError::InvalidConfig(format!("OpenAI {context}响应过大")));
+    }
+
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(safe_network_error)?;
+        if body.len().saturating_add(chunk.len()) > MAX_OAUTH_RESPONSE_BYTES {
+            return Err(AppError::InvalidConfig(format!("OpenAI {context}响应过大")));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&body)
+        .map_err(|_| AppError::InvalidConfig(format!("OpenAI {context}响应格式无效")))
 }
 
 fn safe_network_error(error: reqwest::Error) -> AppError {
-    AppError::Internal(format!(
-        "OpenAI OAuth 网络请求失败：{}",
-        error.without_url()
-    ))
+    let kind = if error.is_timeout() {
+        "请求超时"
+    } else if error.is_connect() {
+        "无法连接到认证服务"
+    } else if error.is_body() || error.is_decode() {
+        "响应读取失败"
+    } else {
+        "网络请求失败"
+    };
+    AppError::Internal(format!("OpenAI OAuth {kind}"))
+}
+
+fn codex_user_agent() -> String {
+    static USER_AGENT: OnceLock<String> = OnceLock::new();
+    USER_AGENT
+        .get_or_init(|| {
+            build_codex_user_agent(
+                detected_codex_version(),
+                &windows_version(),
+                std::env::consts::ARCH,
+            )
+        })
+        .clone()
+}
+
+fn build_codex_user_agent(version: &str, os_version: &str, arch: &str) -> String {
+    format!(
+        "{CODEX_ORIGINATOR}/{version} (Windows {os_version}; {arch}) unknown ({CODEX_LOGIN_SUFFIX}; {version})"
+    )
+}
+
+fn detected_codex_version() -> &'static str {
+    static VERSION: OnceLock<String> = OnceLock::new();
+    VERSION
+        .get_or_init(|| detect_codex_version().unwrap_or_else(|| FALLBACK_CODEX_VERSION.into()))
+        .as_str()
+}
+
+fn detect_codex_version() -> Option<String> {
+    #[cfg(windows)]
+    let programs = ["codex.exe"];
+    #[cfg(not(windows))]
+    let programs = ["codex"];
+
+    programs.into_iter().find_map(|program| {
+        let mut command = Command::new(program);
+        command.arg("--version");
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            command.creation_flags(CREATE_NO_WINDOW);
+        }
+        let output = command.output().ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        parse_codex_version(&String::from_utf8_lossy(&output.stdout))
+    })
+}
+
+fn parse_codex_version(output: &str) -> Option<String> {
+    let mut fields = output.split_whitespace();
+    let product = fields.next()?;
+    if !matches!(product, "codex-cli" | "codex") {
+        return None;
+    }
+    let version = fields.next()?.trim_start_matches('v');
+    if version.is_empty()
+        || version.len() > 32
+        || !version
+            .bytes()
+            .all(|value| value.is_ascii_alphanumeric() || matches!(value, b'.' | b'-' | b'+'))
+    {
+        return None;
+    }
+    Some(version.to_owned())
+}
+
+#[cfg(windows)]
+fn windows_version() -> String {
+    #[repr(C)]
+    struct RtlOsVersionInfo {
+        size: u32,
+        major: u32,
+        minor: u32,
+        build: u32,
+        platform_id: u32,
+        service_pack: [u16; 128],
+    }
+
+    #[link(name = "ntdll")]
+    unsafe extern "system" {
+        fn RtlGetVersion(version_information: *mut RtlOsVersionInfo) -> i32;
+    }
+
+    let mut version = RtlOsVersionInfo {
+        size: std::mem::size_of::<RtlOsVersionInfo>() as u32,
+        major: 0,
+        minor: 0,
+        build: 0,
+        platform_id: 0,
+        service_pack: [0; 128],
+    };
+    // SAFETY: `version` has the documented RTL_OSVERSIONINFOW layout, its size
+    // field is initialized, and the pointer remains valid for the duration of
+    // the synchronous ntdll call.
+    let status = unsafe { RtlGetVersion(&mut version) };
+    if status >= 0 && version.major > 0 {
+        format!("{}.{}.{}", version.major, version.minor, version.build)
+    } else {
+        "unknown".into()
+    }
+}
+
+#[cfg(not(windows))]
+fn windows_version() -> String {
+    "unknown".into()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn jwt(claims: Value) -> String {
+        let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap());
+        format!("e30.{payload}.signature")
+    }
+
     #[test]
-    fn interval_accepts_number_and_string() {
+    fn extracts_namespaced_codex_claims() {
+        let token = jwt(json!({
+            "https://api.openai.com/auth": {
+                "chatgpt_account_id": "acct-1"
+            },
+            "https://api.openai.com/profile": {
+                "email": "sakura@example.com"
+            },
+            "exp": 1_800_000_000_i64
+        }));
+        let identity = token_identity(&token).unwrap();
+        assert_eq!(identity.account_id.as_deref(), Some("acct-1"));
+        assert_eq!(identity.email.as_deref(), Some("sakura@example.com"));
+        assert_eq!(identity.expires_at, Some(1_800_000_000));
+    }
+
+    #[test]
+    fn rejects_malformed_claims_without_echoing_tokens() {
+        assert!(token_identity("not-a-jwt").is_none());
+        assert!(token_identity("a.invalid-base64.c").is_none());
+    }
+
+    #[test]
+    fn classifies_device_poll_states() {
+        assert_eq!(
+            classify_poll_status(StatusCode::FORBIDDEN),
+            PollStatus::Pending
+        );
+        assert_eq!(
+            classify_poll_status(StatusCode::NOT_FOUND),
+            PollStatus::Pending
+        );
+        assert_eq!(classify_poll_status(StatusCode::GONE), PollStatus::Expired);
+        assert_eq!(classify_poll_status(StatusCode::OK), PollStatus::Complete);
+        assert_eq!(
+            classify_poll_status(StatusCode::TOO_MANY_REQUESTS),
+            PollStatus::Failed(429)
+        );
+    }
+
+    #[test]
+    fn interval_accepts_string_and_number_with_safe_bounds() {
         assert_eq!(parse_interval(Some(&json!(2))), 2);
         assert_eq!(parse_interval(Some(&json!("7"))), 7);
+        assert_eq!(parse_interval(Some(&json!(0))), 1);
+        assert_eq!(parse_interval(Some(&json!(600))), 60);
         assert_eq!(parse_interval(None), 5);
     }
 
     #[test]
-    fn extracts_nested_openai_identity() {
-        let claims = URL_SAFE_NO_PAD.encode(
-            br#"{"https://api.openai.com/auth":{"chatgpt_account_id":"acct-1"},"email":"a@example.com"}"#,
+    fn user_agent_matches_codex_cli_shape() {
+        assert_eq!(
+            build_codex_user_agent("0.144.1", "10.0.26100", "x86_64"),
+            "codex_cli_rs/0.144.1 (Windows 10.0.26100; x86_64) unknown (codex_login; 0.144.1)"
         );
-        let token = format!("e30.{claims}.sig");
-        let tokens = TokenResponse {
-            access_token: token,
-            refresh_token: Some("refresh".into()),
-            id_token: None,
+        assert_eq!(
+            parse_codex_version("codex-cli 0.144.1\r\n"),
+            Some("0.144.1".into())
+        );
+        assert_eq!(parse_codex_version("malicious token value"), None);
+    }
+
+    #[test]
+    fn refresh_cannot_change_account_identity() {
+        let previous = StoredOfficialAccount {
+            id: "local-id".into(),
+            name: "old@example.com".into(),
+            account_id: "acct-old".into(),
+            email: "old@example.com".into(),
+            credential: CodexAuthCredential {
+                auth_mode: "chatgpt".into(),
+                openai_api_key: None,
+                tokens: CodexAuthTokens {
+                    id_token: jwt(json!({"chatgpt_account_id": "acct-old"})),
+                    access_token: jwt(json!({"chatgpt_account_id": "acct-old"})),
+                    refresh_token: "refresh-old".into(),
+                    account_id: "acct-old".into(),
+                },
+                last_refresh: "2026-01-01T00:00:00Z".into(),
+            },
+            expires_at: None,
+            created_at: 1,
+            updated_at: 1,
+        };
+        let tokens = CompleteTokens {
+            id_token: jwt(json!({"chatgpt_account_id": "acct-other"})),
+            access_token: jwt(json!({"chatgpt_account_id": "acct-other"})),
+            refresh_token: "refresh-new".into(),
             expires_in: Some(3600),
         };
-        assert_eq!(
-            extract_identity(&tokens),
-            Some(("acct-1".into(), Some("a@example.com".into())))
-        );
-    }
-
-    #[test]
-    fn uses_stable_oauth_request_fingerprint() {
-        assert_eq!(CODEX_OAUTH_USER_AGENT, "codex-tools-device-auth");
-        assert_eq!(JSON_CONTENT_TYPE, "application/json");
-        assert_eq!(FORM_CONTENT_TYPE, "application/x-www-form-urlencoded");
-    }
-
-    #[test]
-    fn maps_device_poll_status() {
-        assert_eq!(classify_poll_status(403), PollStatus::Pending);
-        assert_eq!(classify_poll_status(404), PollStatus::Pending);
-        assert_eq!(classify_poll_status(410), PollStatus::Expired);
-        assert_eq!(classify_poll_status(200), PollStatus::Complete);
-        assert_eq!(classify_poll_status(429), PollStatus::Failed(429));
+        assert!(account_from_tokens(tokens, Some(&previous)).is_err());
     }
 }

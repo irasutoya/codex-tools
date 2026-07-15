@@ -15,20 +15,15 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 24
           cache: npm
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
       - run: npm ci
-      - run: npm run check
-      - run: cargo fmt --all -- --check
-        working-directory: src-tauri
-      - run: cargo clippy --all-targets -- -D warnings
-        working-directory: src-tauri
-      - run: cargo test
-        working-directory: src-tauri
-      - run: npm run tauri:build
+      - run: npm run verify
+      - run: cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
+      - run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --locked -- -D warnings
+      - run: cargo test --manifest-path src-tauri/Cargo.toml --locked
+      - run: npm run dist:win

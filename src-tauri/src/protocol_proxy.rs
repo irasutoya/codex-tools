@@ -2,9 +2,10 @@ use crate::models::{
     AppError, CodexChatReasoningConfig, ProviderAccount, ProviderProfile, RouteConsoleSnapshot,
     RouteLogEntry, RouteSettings,
 };
+use arc_swap::ArcSwapOption;
 use futures_util::StreamExt;
 use reqwest::{
-    Client,
+    Client, Url,
     header::{HeaderMap, HeaderName, HeaderValue},
 };
 use serde_json::{Value, json};
@@ -13,7 +14,7 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     net::SocketAddr,
     sync::{
-        Arc,
+        Arc, Mutex as StdMutex,
         atomic::{AtomicU64, Ordering},
     },
     time::Duration,
@@ -27,7 +28,7 @@ use tokio::{
 const MAX_HEADER_BYTES: usize = 32 * 1024;
 const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
 const MAX_ERROR_BYTES: usize = 8 * 1024;
-const MAX_CONCURRENT_REQUESTS: usize = 64;
+const REQUEST_ID_HEADER: &str = "x-codex-tools-request-id";
 const TOOL_SEARCH_PROXY_NAME: &str = "tool_search";
 const CUSTOM_TOOL_INPUT_FIELD: &str = "input";
 const CHAT_TOOL_NAME_MAX_LEN: usize = 64;
@@ -75,6 +76,7 @@ struct CodexToolContext {
     chat_tools: Vec<Value>,
     seen_names: HashSet<String>,
     specs: HashMap<String, CodexToolSpec>,
+    reasoning_output_field: Option<String>,
 }
 
 impl CodexToolContext {
@@ -405,34 +407,62 @@ fn collect_tool_search_output_tools(value: &Value, context: &mut CodexToolContex
 #[derive(Debug, Clone)]
 pub struct ProxyEndpoint {
     pub base_url: String,
-    pub token: String,
 }
 
 struct RunningProxy {
     endpoint: ProxyEndpoint,
     shutdown: oneshot::Sender<()>,
+    route: Arc<ArcSwapOption<ProxyConfig>>,
     telemetry: Arc<ProxyTelemetry>,
+}
+
+enum PendingProxy {
+    Listener {
+        proxy: RunningProxy,
+        config: Arc<ProxyConfig>,
+    },
+    Route(Arc<ProxyConfig>),
 }
 
 #[derive(Default)]
 struct ProxyState {
     current: Option<RunningProxy>,
-    pending: Option<RunningProxy>,
+    pending: Option<PendingProxy>,
 }
 
-#[derive(Default)]
 pub struct ProxyManager {
     inner: Mutex<ProxyState>,
     activation: Mutex<()>,
+    client: Client,
+}
+
+impl Default for ProxyManager {
+    fn default() -> Self {
+        let client = Client::builder()
+            .connect_timeout(Duration::from_secs(30))
+            .redirect(reqwest::redirect::Policy::none())
+            .pool_idle_timeout(Duration::from_secs(90))
+            .pool_max_idle_per_host(100)
+            .tcp_keepalive(Duration::from_secs(30))
+            .tcp_nodelay(true)
+            .build()
+            .expect("reqwest client configuration is valid");
+        Self {
+            inner: Mutex::new(ProxyState::default()),
+            activation: Mutex::new(()),
+            client,
+        }
+    }
 }
 
 #[derive(Clone)]
 struct ProxyConfig {
-    upstream_url: String,
+    upstream_url: Url,
+    compact_url: Url,
     client: Client,
     headers: HeaderMap,
-    token: String,
     timeout: Duration,
+    request_timeout: Duration,
     concurrency: Arc<Semaphore>,
     telemetry: Arc<ProxyTelemetry>,
     provider: ProviderProfile,
@@ -450,10 +480,35 @@ struct ProxyTelemetry {
     active_requests: AtomicU64,
     last_latency_ms: AtomicU64,
     next_log_id: AtomicU64,
-    logs: Mutex<VecDeque<RouteLogEntry>>,
+    logs: StdMutex<VecDeque<RouteLogEntry>>,
+}
+
+struct RequestOutcome {
+    status: u16,
+    method: String,
+    path: String,
+}
+
+struct UpstreamRequestContext {
+    id: String,
+    headers: HeaderMap,
+}
+
+impl RequestOutcome {
+    fn unknown(status: u16) -> Self {
+        Self {
+            status,
+            method: "UNKNOWN".into(),
+            path: "-".into(),
+        }
+    }
 }
 
 impl ProxyManager {
+    pub fn client(&self) -> Client {
+        self.client.clone()
+    }
+
     pub async fn activation_guard(&self) -> tokio::sync::MutexGuard<'_, ()> {
         self.activation.lock().await
     }
@@ -464,28 +519,35 @@ impl ProxyManager {
         account: &ProviderAccount,
         settings: &RouteSettings,
     ) -> Result<ProxyEndpoint, AppError> {
-        if settings.port != 0 {
-            self.stop().await;
+        self.prepare_inner(provider, account, settings, false).await
+    }
+
+    async fn prepare_inner(
+        &self,
+        provider: &ProviderProfile,
+        account: &ProviderAccount,
+        settings: &RouteSettings,
+        allow_ephemeral_port: bool,
+    ) -> Result<ProxyEndpoint, AppError> {
+        if settings.listen_address != "127.0.0.1"
+            || (!allow_ephemeral_port && settings.port != 16_384)
+            || (allow_ephemeral_port && !matches!(settings.port, 0 | 16_384))
+        {
+            return Err(AppError::InvalidConfig(
+                "本地代理固定监听 127.0.0.1:16384".into(),
+            ));
         }
-        let address = settings.listen_address.trim();
-        let bind = format!("{address}:{}", settings.port);
-        let listener = TcpListener::bind(&bind)
-            .await
-            .map_err(|error| AppError::Proxy(format!("无法监听 {bind}：{error}")))?;
-        let address = listener
-            .local_addr()
-            .map_err(|error| AppError::Proxy(error.to_string()))?;
-        let token = format!("ct_{}", uuid::Uuid::new_v4().simple());
-        let endpoint = ProxyEndpoint {
-            base_url: format!("http://{}:{}/v1", settings.listen_address, address.port()),
-            token: token.clone(),
+        let suffix = match provider.protocol {
+            crate::models::ProviderProtocol::Responses => "responses",
+            crate::models::ProviderProtocol::ChatCompletions => "chat/completions",
+            crate::models::ProviderProtocol::AnthropicMessages => "messages",
         };
-        let upstream_url = format!(
-            "{}/chat/completions",
-            provider.base_url.trim_end_matches('/')
-        );
+        let upstream_url = Url::parse(&endpoint_url(&provider.base_url, suffix))
+            .map_err(|error| AppError::InvalidConfig(format!("Invalid upstream URL: {error}")))?;
+        let compact_url = Url::parse(&endpoint_url(&provider.base_url, "responses/compact"))
+            .map_err(|error| AppError::InvalidConfig(format!("Invalid compact URL: {error}")))?;
         let telemetry = Arc::new(ProxyTelemetry {
-            upstream_url: upstream_url.clone(),
+            upstream_url: upstream_url.as_str().to_owned(),
             provider_name: provider.name.clone(),
             account_name: account.name.clone(),
             model: provider.models.first().cloned().unwrap_or_default(),
@@ -496,7 +558,7 @@ impl ProxyManager {
             active_requests: AtomicU64::new(0),
             last_latency_ms: AtomicU64::new(0),
             next_log_id: AtomicU64::new(1),
-            logs: Mutex::new(VecDeque::with_capacity(200)),
+            logs: StdMutex::new(VecDeque::with_capacity(200)),
         });
         let timeout = Duration::from_secs(provider.timeout_secs.max(1));
         let headers = build_upstream_headers(
@@ -504,23 +566,65 @@ impl ProxyManager {
             &provider.headers,
             &account.headers,
         )?;
-        let client = Client::builder()
-            .connect_timeout(timeout.min(Duration::from_secs(30)))
-            .pool_idle_timeout(Duration::from_secs(90))
-            .pool_max_idle_per_host(16)
-            .tcp_keepalive(Duration::from_secs(30))
-            .build()
-            .map_err(|error| AppError::Proxy(error.to_string()))?;
+        let mut headers = headers;
+        if !headers.contains_key(reqwest::header::CONTENT_TYPE) {
+            headers.insert(
+                reqwest::header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            );
+        }
+        if provider.protocol == crate::models::ProviderProtocol::AnthropicMessages {
+            headers.remove(reqwest::header::AUTHORIZATION);
+            if let Some(api_key) = account.api_key.as_deref().filter(|value| !value.is_empty()) {
+                headers.insert(
+                    HeaderName::from_static("x-api-key"),
+                    HeaderValue::from_str(api_key)
+                        .map_err(|_| AppError::InvalidConfig("API Key 包含无效字符".into()))?,
+                );
+            }
+            if !headers.contains_key("anthropic-version") {
+                headers.insert(
+                    HeaderName::from_static("anthropic-version"),
+                    HeaderValue::from_static("2023-06-01"),
+                );
+            }
+        }
         let config = Arc::new(ProxyConfig {
             upstream_url,
-            client,
+            compact_url,
+            client: self.client.clone(),
             headers,
-            token,
             timeout,
-            concurrency: Arc::new(Semaphore::new(MAX_CONCURRENT_REQUESTS)),
+            request_timeout: Duration::from_millis(settings.request_timeout_ms.max(1)),
+            concurrency: Arc::new(Semaphore::new(settings.max_concurrent_requests)),
             telemetry: telemetry.clone(),
             provider: provider.clone(),
         });
+
+        let mut state = self.inner.lock().await;
+        if let Some(PendingProxy::Listener { proxy, .. }) = state.pending.take() {
+            let _ = proxy.shutdown.send(());
+        }
+        if let Some(current) = state.current.as_ref() {
+            let endpoint = current.endpoint.clone();
+            state.pending = Some(PendingProxy::Route(config));
+            return Ok(endpoint);
+        }
+        drop(state);
+
+        let address = settings.listen_address.trim();
+        let bind = format!("{address}:{}", settings.port);
+        let listener = TcpListener::bind(&bind)
+            .await
+            .map_err(|error| AppError::Proxy(format!("无法监听 {bind}：{error}")))?;
+        let address = listener
+            .local_addr()
+            .map_err(|error| AppError::Proxy(error.to_string()))?;
+        let endpoint = ProxyEndpoint {
+            base_url: format!("http://{}:{}/v1", settings.listen_address, address.port()),
+        };
+        let route: Arc<ArcSwapOption<ProxyConfig>> = Arc::new(ArcSwapOption::empty());
+        let listener_route = route.clone();
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
 
         tokio::spawn(async move {
@@ -529,8 +633,29 @@ impl ProxyManager {
                     _ = &mut shutdown_rx => break,
                     accepted = listener.accept() => {
                         let Ok((stream, peer)) = accepted else { break };
-                        let config = config.clone();
+                        let _ = stream.set_nodelay(true);
+                        let config = listener_route.load_full();
                         tokio::spawn(async move {
+                            let Some(config) = config else {
+                                let mut stream = stream;
+                                // Drain a complete bounded request before closing. On Windows,
+                                // dropping a socket with unread request bytes can reset the
+                                // connection and hide the 503 response from the client.
+                                let _ = tokio::time::timeout(
+                                    Duration::from_secs(2),
+                                    read_request(&mut stream),
+                                )
+                                .await;
+                                let _ = write_json_error(
+                                    &mut stream,
+                                    503,
+                                    "proxy_not_ready",
+                                    "Proxy activation has not been committed",
+                                )
+                                .await;
+                                let _ = stream.shutdown().await;
+                                return;
+                            };
                             let started = std::time::Instant::now();
                             config.telemetry.request_count.fetch_add(1, Ordering::Relaxed);
                             config.telemetry.active_requests.fetch_add(1, Ordering::Relaxed);
@@ -538,28 +663,42 @@ impl ProxyManager {
                             config.telemetry.active_requests.fetch_sub(1, Ordering::Relaxed);
                             let latency = started.elapsed().as_millis() as u64;
                             config.telemetry.last_latency_ms.store(latency, Ordering::Relaxed);
-                            let (status, message) = match result {
-                                Ok(status) if status < 400 => {
+                            let (status, method, path, message) = match result {
+                                Ok(outcome) if outcome.status < 400 => {
                                     config.telemetry.success_count.fetch_add(1, Ordering::Relaxed);
-                                    (status, None)
+                                    (outcome.status, outcome.method, outcome.path, None)
                                 }
-                                Ok(status) => {
+                                Ok(outcome) => {
                                     config.telemetry.error_count.fetch_add(1, Ordering::Relaxed);
-                                    (status, Some("请求失败（敏感详情已隐藏）".into()))
+                                    (
+                                        outcome.status,
+                                        outcome.method,
+                                        outcome.path,
+                                        Some("请求失败（敏感详情已隐藏）".into()),
+                                    )
                                 }
                                 Err(_) => {
                                     config.telemetry.error_count.fetch_add(1, Ordering::Relaxed);
-                                    (500, Some("代理内部错误（敏感详情已隐藏）".into()))
+                                    (
+                                        500,
+                                        "UNKNOWN".into(),
+                                        "-".into(),
+                                        Some("代理内部错误（敏感详情已隐藏）".into()),
+                                    )
                                 }
                             };
                             let id = config.telemetry.next_log_id.fetch_add(1, Ordering::Relaxed);
-                            let mut logs = config.telemetry.logs.lock().await;
+                            let mut logs = config
+                                .telemetry
+                                .logs
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
                             if logs.len() >= 200 { logs.pop_front(); }
                             logs.push_back(RouteLogEntry {
                                 id,
                                 timestamp: chrono::Utc::now().timestamp(),
-                                method: "POST".into(),
-                                path: "/v1/responses".into(),
+                                method,
+                                path,
                                 status,
                                 latency_ms: latency,
                                 message,
@@ -571,38 +710,62 @@ impl ProxyManager {
         });
 
         let mut state = self.inner.lock().await;
-        if let Some(previous_pending) = state.pending.take() {
-            let _ = previous_pending.shutdown.send(());
+        if state.current.is_some() {
+            let _ = shutdown_tx.send(());
+            return Err(AppError::Proxy("代理状态已并发变更，请重新激活上游".into()));
         }
-        state.pending = Some(RunningProxy {
-            endpoint: endpoint.clone(),
-            shutdown: shutdown_tx,
-            telemetry,
+        if let Some(PendingProxy::Listener { proxy, .. }) = state.pending.take() {
+            let _ = proxy.shutdown.send(());
+        }
+        state.pending = Some(PendingProxy::Listener {
+            proxy: RunningProxy {
+                endpoint: endpoint.clone(),
+                shutdown: shutdown_tx,
+                route,
+                telemetry,
+            },
+            config,
         });
         Ok(endpoint)
     }
 
     pub async fn commit(&self) -> Result<(), AppError> {
         let mut state = self.inner.lock().await;
-        let next = state
+        let pending = state
             .pending
             .take()
             .ok_or_else(|| AppError::Proxy("no pending proxy activation".into()))?;
-        if let Some(previous) = state.current.replace(next) {
-            let _ = previous.shutdown.send(());
+        match pending {
+            PendingProxy::Listener {
+                proxy: next,
+                config,
+            } => {
+                next.route.store(Some(config));
+                if let Some(previous) = state.current.replace(next) {
+                    let _ = previous.shutdown.send(());
+                }
+            }
+            PendingProxy::Route(config) => {
+                let current = state
+                    .current
+                    .as_mut()
+                    .ok_or_else(|| AppError::Proxy("proxy stopped before route commit".into()))?;
+                current.route.store(Some(config.clone()));
+                current.telemetry = config.telemetry.clone();
+            }
         }
         Ok(())
     }
 
-    pub async fn abort(&self) {
-        if let Some(proxy) = self.inner.lock().await.pending.take() {
+    pub async fn abort_pending(&self) {
+        if let Some(PendingProxy::Listener { proxy, .. }) = self.inner.lock().await.pending.take() {
             let _ = proxy.shutdown.send(());
         }
     }
 
     pub async fn stop(&self) {
         let mut state = self.inner.lock().await;
-        if let Some(proxy) = state.pending.take() {
+        if let Some(PendingProxy::Listener { proxy, .. }) = state.pending.take() {
             let _ = proxy.shutdown.send(());
         }
         if let Some(proxy) = state.current.take() {
@@ -620,6 +783,16 @@ impl ProxyManager {
             .map(|proxy| proxy.endpoint.clone())
     }
 
+    #[cfg(test)]
+    async fn provider_name(&self) -> Option<String> {
+        self.inner
+            .lock()
+            .await
+            .current
+            .as_ref()
+            .map(|proxy| proxy.telemetry.provider_name.clone())
+    }
+
     pub async fn console(
         &self,
         settings: RouteSettings,
@@ -629,14 +802,21 @@ impl ProxyManager {
         let page = page.max(1);
         let page_size = page_size.clamp(1, 100);
         let state = self.inner.lock().await;
-        let Some(proxy) = state.current.as_ref() else {
+        let Some((endpoint, telemetry)) = state
+            .current
+            .as_ref()
+            .map(|proxy| (proxy.endpoint.clone(), proxy.telemetry.clone()))
+        else {
             return RouteConsoleSnapshot {
                 settings,
                 ..Default::default()
             };
         };
-        let telemetry = &proxy.telemetry;
-        let logs = telemetry.logs.lock().await;
+        drop(state);
+        let logs = telemetry
+            .logs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let log_total = logs.len();
         let start = (page - 1).saturating_mul(page_size).min(log_total);
         let page_logs = logs
@@ -649,7 +829,7 @@ impl ProxyManager {
         RouteConsoleSnapshot {
             settings,
             running: true,
-            base_url: Some(proxy.endpoint.base_url.clone()),
+            base_url: Some(endpoint.base_url),
             upstream_url: Some(telemetry.upstream_url.clone()),
             provider_name: Some(telemetry.provider_name.clone()),
             account_name: Some(telemetry.account_name.clone()),
@@ -679,15 +859,19 @@ impl ProxyManager {
             .as_ref()
             .map(|proxy| proxy.telemetry.clone());
         if let Some(telemetry) = telemetry {
-            telemetry.logs.lock().await.clear();
+            telemetry
+                .logs
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clear();
         }
     }
 }
 
 pub(crate) fn build_upstream_headers(
     api_key: &str,
-    provider: &Value,
-    account: &Value,
+    provider: &BTreeMap<String, String>,
+    account: &BTreeMap<String, String>,
 ) -> Result<HeaderMap, AppError> {
     let mut headers = HeaderMap::new();
     if !api_key.is_empty() {
@@ -698,15 +882,10 @@ pub(crate) fn build_upstream_headers(
         );
     }
     for values in [provider, account] {
-        let Some(values) = values.as_object() else {
-            continue;
-        };
         for (name, value) in values {
-            let (Ok(name), Some(value)) = (
+            let (Ok(name), Ok(value)) = (
                 HeaderName::from_bytes(name.as_bytes()),
-                value
-                    .as_str()
-                    .and_then(|value| HeaderValue::from_str(value).ok()),
+                HeaderValue::from_str(value),
             ) else {
                 continue;
             };
@@ -718,11 +897,79 @@ pub(crate) fn build_upstream_headers(
     Ok(headers)
 }
 
+fn build_request_headers(
+    configured: &HeaderMap,
+    incoming: &HeaderMap,
+    request_id: &str,
+    wants_stream: bool,
+) -> HeaderMap {
+    let mut headers = configured.clone();
+    for (name, value) in incoming {
+        if !is_forwarded_client_header(name.as_str()) || headers.contains_key(name) {
+            continue;
+        }
+        headers.insert(name.clone(), value.clone());
+    }
+    if wants_stream && !headers.contains_key(reqwest::header::ACCEPT) {
+        headers.insert(
+            reqwest::header::ACCEPT,
+            HeaderValue::from_static("text/event-stream"),
+        );
+    }
+    if let Ok(value) = HeaderValue::from_str(request_id) {
+        headers.insert(HeaderName::from_static(REQUEST_ID_HEADER), value);
+    }
+    headers
+}
+
+fn is_forwarded_client_header(name: &str) -> bool {
+    matches!(
+        name,
+        "accept"
+            | "anthropic-beta"
+            | "conversation_id"
+            | "openai-beta"
+            | "originator"
+            | "session_id"
+            | "user-agent"
+            | "x-codex-beta-features"
+            | "x-codex-turn-metadata"
+    )
+}
+
+fn build_response_headers(request_id: &str, upstream: &HeaderMap) -> HeaderMap {
+    let mut headers = HeaderMap::with_capacity(12);
+    if let Ok(value) = HeaderValue::from_str(request_id) {
+        headers.insert(HeaderName::from_static(REQUEST_ID_HEADER), value);
+    }
+    for (name, value) in upstream {
+        if is_forwarded_response_header(name.as_str()) {
+            headers.append(name.clone(), value.clone());
+        }
+    }
+    headers
+}
+
+fn is_forwarded_response_header(name: &str) -> bool {
+    matches!(
+        name,
+        "openai-processing-ms"
+            | "request-id"
+            | "retry-after"
+            | "x-codex-turn-state"
+            | "x-oneapi-request-id"
+            | "x-reasoning-included"
+            | "x-request-id"
+            | "x-upstream-request-id"
+    ) || name.starts_with("x-ratelimit-")
+        || name.starts_with("anthropic-ratelimit-")
+}
+
 async fn handle_connection(
     mut stream: TcpStream,
     peer: SocketAddr,
     config: Arc<ProxyConfig>,
-) -> anyhow::Result<u16> {
+) -> anyhow::Result<RequestOutcome> {
     let _permit = match config.concurrency.clone().try_acquire_owned() {
         Ok(permit) => permit,
         Err(_) => {
@@ -733,165 +980,1142 @@ async fn handle_connection(
                 "Too many concurrent requests",
             )
             .await?;
-            return Ok(503);
+            return Ok(RequestOutcome::unknown(503));
         }
     };
     if !peer.ip().is_loopback() {
         write_json_error(&mut stream, 403, "loopback_only", "Loopback access only").await?;
-        return Ok(403);
+        return Ok(RequestOutcome::unknown(403));
     }
 
-    let request = match read_request(&mut stream).await {
-        Ok(request) => request,
-        Err((status, code, message)) => {
-            write_json_error(&mut stream, status, code, &message).await?;
-            return Ok(status);
-        }
+    let request =
+        match tokio::time::timeout(config.request_timeout, read_request(&mut stream)).await {
+            Ok(Ok(request)) => request,
+            Ok(Err((status, code, message))) => {
+                write_json_error(&mut stream, status, code, &message).await?;
+                return Ok(RequestOutcome::unknown(status));
+            }
+            Err(_) => {
+                write_json_error(
+                    &mut stream,
+                    408,
+                    "request_timeout",
+                    "Request headers or body timed out",
+                )
+                .await?;
+                return Ok(RequestOutcome::unknown(408));
+            }
+        };
+    let request_method = request.method.clone();
+    let request_path = request.path.clone();
+    let outcome = |status| RequestOutcome {
+        status,
+        method: request_method.clone(),
+        path: request_path.clone(),
     };
-    if request.method != "POST" || !matches!(request.path.as_str(), "/v1/responses" | "/responses")
+    let request_id = format!("req_{}", uuid::Uuid::new_v4().simple());
+    let local_headers = build_response_headers(&request_id, &HeaderMap::new());
+    if request.method != "POST"
+        || !matches!(
+            request.path.as_str(),
+            "/v1/responses" | "/responses" | "/v1/responses/compact" | "/responses/compact"
+        )
     {
-        write_json_error(
+        write_json_error_with_headers(
             &mut stream,
             404,
             "not_found",
             "Only POST /v1/responses is supported",
+            &local_headers,
         )
         .await?;
-        return Ok(404);
+        return Ok(outcome(404));
     }
-    let expected = format!("Bearer {}", config.token);
-    if request.headers.get("authorization") != Some(&expected) {
-        write_json_error(
+    let host_is_local = request
+        .headers
+        .get(reqwest::header::HOST)
+        .and_then(|host| host.to_str().ok())
+        .is_some_and(|host| {
+            host == "127.0.0.1:16384" || host == "localhost:16384" || host == "127.0.0.1"
+        });
+    let has_forwarding_headers = request.headers.keys().any(|name| {
+        let name = name.as_str();
+        name == "forwarded"
+            || name == "via"
+            || name == "x-real-ip"
+            || name.starts_with("x-forwarded-")
+    });
+    if !host_is_local || has_forwarding_headers || request.headers.contains_key("origin") {
+        write_json_error_with_headers(
             &mut stream,
-            401,
-            "invalid_loopback_token",
-            "Invalid proxy token",
+            403,
+            "loopback_only",
+            "Only direct loopback requests are accepted",
+            &local_headers,
         )
         .await?;
-        return Ok(401);
+        return Ok(outcome(403));
     }
 
-    let input: Value = match serde_json::from_slice(&request.body) {
+    let mut input: Value = match serde_json::from_slice(&request.body) {
         Ok(value) => value,
         Err(error) => {
-            write_json_error(&mut stream, 400, "invalid_json", &error.to_string()).await?;
-            return Ok(400);
+            write_json_error_with_headers(
+                &mut stream,
+                400,
+                "invalid_json",
+                &error.to_string(),
+                &local_headers,
+            )
+            .await?;
+            return Ok(outcome(400));
         }
     };
     let wants_stream = input
         .get("stream")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let upstream_headers =
+        build_request_headers(&config.headers, &request.headers, &request_id, wants_stream);
+    let upstream_context = UpstreamRequestContext {
+        id: request_id,
+        headers: upstream_headers,
+    };
+    if config.provider.protocol == crate::models::ProviderProtocol::Responses {
+        let compact = request.path.ends_with("/compact");
+        let status = proxy_responses(
+            &mut stream,
+            &config,
+            input,
+            request.body,
+            upstream_context,
+            wants_stream,
+            compact,
+        )
+        .await?;
+        return Ok(outcome(status));
+    }
+    apply_model_alias(&mut input, &config.provider);
+    if config.provider.protocol == crate::models::ProviderProtocol::AnthropicMessages {
+        let status =
+            proxy_anthropic(&mut stream, &config, input, upstream_context, wants_stream).await?;
+        return Ok(outcome(status));
+    }
     let reasoning = resolve_reasoning_config(&config.provider, &input);
     let (upstream_body, tool_context) =
         match responses_to_chat_with_context(&input, reasoning.as_ref()) {
             Ok(value) => value,
             Err(message) => {
-                write_json_error(&mut stream, 400, "invalid_request", &message).await?;
-                return Ok(400);
+                write_json_error_with_headers(
+                    &mut stream,
+                    400,
+                    "invalid_request",
+                    &message,
+                    &local_headers,
+                )
+                .await?;
+                return Ok(outcome(400));
             }
         };
 
     let upstream = config
         .client
-        .post(&config.upstream_url)
-        .headers(config.headers.clone())
-        .json(&upstream_body);
+        .post(config.upstream_url.clone())
+        .headers(upstream_context.headers)
+        .body(serde_json::to_vec(&upstream_body)?);
     let response = match tokio::time::timeout(config.timeout, upstream.send()).await {
         Ok(Ok(response)) => response,
         Err(_) => {
-            write_json_error(
+            write_json_error_with_headers(
                 &mut stream,
                 504,
                 "upstream_timeout",
                 "Upstream response timed out",
+                &local_headers,
             )
             .await?;
-            return Ok(504);
+            return Ok(outcome(504));
         }
         Ok(Err(error)) => {
-            write_json_error(
+            write_json_error_with_headers(
                 &mut stream,
                 502,
                 "upstream_unavailable",
                 &safe_error(&error.to_string()),
+                &local_headers,
             )
             .await?;
-            return Ok(502);
+            return Ok(outcome(502));
         }
     };
     let status = response.status();
+    let response_headers = build_response_headers(&upstream_context.id, response.headers());
     if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
-        let message = sanitize_upstream_error(&body);
-        write_json_error(&mut stream, status.as_u16(), "upstream_error", &message).await?;
-        return Ok(status.as_u16());
+        let body = collect_response_body(response, MAX_ERROR_BYTES, config.timeout)
+            .await
+            .map(|(body, _)| body)
+            .unwrap_or_default();
+        write_upstream_error(&mut stream, status.as_u16(), &body, &response_headers).await?;
+        return Ok(outcome(status.as_u16()));
     }
 
     if wants_stream {
-        proxy_stream(&mut stream, response, config.timeout, &tool_context).await?;
+        proxy_stream(
+            &mut stream,
+            response,
+            config.timeout,
+            &tool_context,
+            &response_headers,
+        )
+        .await?;
     } else {
-        let body = match tokio::time::timeout(config.timeout, response.bytes()).await {
-            Ok(Ok(body)) if body.len() <= MAX_BODY_BYTES => body,
-            Ok(Ok(_)) => {
-                write_json_error(
+        let body = match collect_response_body(response, MAX_BODY_BYTES, config.timeout).await {
+            Ok((body, false)) => body,
+            Ok((_, true)) => {
+                write_json_error_with_headers(
                     &mut stream,
                     502,
                     "upstream_response_too_large",
                     "Upstream response exceeds 8 MiB",
+                    &response_headers,
                 )
                 .await?;
-                return Ok(502);
+                return Ok(outcome(502));
             }
-            Ok(Err(error)) => {
-                write_json_error(
+            Err(BodyReadError::Transport(error)) => {
+                write_json_error_with_headers(
                     &mut stream,
                     502,
                     "invalid_upstream_response",
                     &error.to_string(),
+                    &response_headers,
                 )
                 .await?;
-                return Ok(502);
+                return Ok(outcome(502));
             }
-            Err(_) => {
-                write_json_error(
+            Err(BodyReadError::Timeout) => {
+                write_json_error_with_headers(
                     &mut stream,
                     504,
                     "upstream_timeout",
                     "Upstream response body timed out",
+                    &response_headers,
                 )
                 .await?;
-                return Ok(504);
+                return Ok(outcome(504));
             }
         };
         let value: Value = match serde_json::from_slice(&body) {
             Ok(value) => value,
             Err(error) => {
-                write_json_error(
+                write_json_error_with_headers(
                     &mut stream,
                     502,
                     "invalid_upstream_response",
                     &safe_error(&error.to_string()),
+                    &response_headers,
                 )
                 .await?;
-                return Ok(502);
+                return Ok(outcome(502));
             }
         };
         let converted = chat_to_response_with_context(&value, &tool_context);
-        write_json(&mut stream, 200, &converted).await?;
+        write_json_with_headers(&mut stream, status.as_u16(), &converted, &response_headers)
+            .await?;
     }
-    Ok(200)
+    Ok(outcome(status.as_u16()))
+}
+
+fn endpoint_url(base_url: &str, suffix: &str) -> String {
+    let base = base_url.trim_end_matches('/');
+    if base.rsplit('/').next().is_some_and(|part| {
+        part.len() > 1
+            && part.starts_with('v')
+            && part[1..].chars().all(|value| value.is_ascii_digit())
+    }) {
+        format!("{base}/{suffix}")
+    } else {
+        format!("{base}/v1/{suffix}")
+    }
+}
+
+fn apply_model_alias(input: &mut Value, provider: &ProviderProfile) {
+    let Some(model) = input.get("model").and_then(Value::as_str) else {
+        return;
+    };
+    let Some(alias) = provider.model_aliases.get(model) else {
+        return;
+    };
+    input["model"] = Value::String(alias.clone());
+}
+
+async fn proxy_responses(
+    stream: &mut TcpStream,
+    config: &ProxyConfig,
+    mut input: Value,
+    original_body: Vec<u8>,
+    context: UpstreamRequestContext,
+    wants_stream: bool,
+    compact: bool,
+) -> anyhow::Result<u16> {
+    let local_headers = build_response_headers(&context.id, &HeaderMap::new());
+    let mut body_changed = false;
+    if let Some(model) = input.get("model").and_then(Value::as_str)
+        && let Some(alias) = config.provider.model_aliases.get(model)
+    {
+        input["model"] = Value::String(alias.clone());
+        body_changed = true;
+    }
+    let body = if body_changed {
+        serde_json::to_vec(&input)?
+    } else {
+        original_body
+    };
+    let url = if compact {
+        config.compact_url.clone()
+    } else {
+        config.upstream_url.clone()
+    };
+    let request = config.client.post(url).headers(context.headers).body(body);
+    let response = match tokio::time::timeout(config.timeout, request.send()).await {
+        Ok(Ok(response)) => response,
+        Ok(Err(error)) => {
+            write_json_error_with_headers(
+                stream,
+                502,
+                "upstream_unavailable",
+                &safe_error(&error.to_string()),
+                &local_headers,
+            )
+            .await?;
+            return Ok(502);
+        }
+        Err(_) => {
+            write_json_error_with_headers(
+                stream,
+                504,
+                "upstream_timeout",
+                "Upstream response timed out",
+                &local_headers,
+            )
+            .await?;
+            return Ok(504);
+        }
+    };
+    let status = response.status();
+    let response_headers = build_response_headers(&context.id, response.headers());
+    if !status.is_success() {
+        let body = collect_response_body(response, MAX_ERROR_BYTES, config.timeout)
+            .await
+            .map(|(body, _)| body)
+            .unwrap_or_default();
+        write_upstream_error(stream, status.as_u16(), &body, &response_headers).await?;
+        return Ok(status.as_u16());
+    }
+    if wants_stream {
+        write_stream_headers(stream, status.as_u16(), &response_headers).await?;
+        let mut body = response.bytes_stream();
+        while let Some(next) = tokio::time::timeout(config.timeout, body.next())
+            .await
+            .map_err(|_| anyhow::anyhow!("upstream stream idle timeout"))?
+        {
+            write_chunk(stream, &next?).await?;
+        }
+        finish_chunks(stream).await?;
+    } else {
+        let (body, truncated) =
+            match collect_response_body(response, MAX_BODY_BYTES, config.timeout).await {
+                Ok(value) => value,
+                Err(BodyReadError::Transport(error)) => {
+                    write_json_error_with_headers(
+                        stream,
+                        502,
+                        "invalid_upstream_response",
+                        &error,
+                        &response_headers,
+                    )
+                    .await?;
+                    return Ok(502);
+                }
+                Err(BodyReadError::Timeout) => {
+                    write_json_error_with_headers(
+                        stream,
+                        504,
+                        "upstream_timeout",
+                        "Upstream response body timed out",
+                        &response_headers,
+                    )
+                    .await?;
+                    return Ok(504);
+                }
+            };
+        if truncated {
+            write_json_error_with_headers(
+                stream,
+                502,
+                "upstream_response_too_large",
+                "Upstream response exceeds 8 MiB",
+                &response_headers,
+            )
+            .await?;
+            return Ok(502);
+        }
+        write_raw_json_with_headers(stream, status.as_u16(), &body, &response_headers).await?;
+    }
+    Ok(status.as_u16())
+}
+
+async fn proxy_anthropic(
+    stream: &mut TcpStream,
+    config: &ProxyConfig,
+    input: Value,
+    context: UpstreamRequestContext,
+    wants_stream: bool,
+) -> anyhow::Result<u16> {
+    let local_headers = build_response_headers(&context.id, &HeaderMap::new());
+    let (mut body, tool_context) = responses_to_anthropic(&input)?;
+    body["stream"] = Value::Bool(wants_stream);
+    let requested_model = body
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let request = config
+        .client
+        .post(config.upstream_url.clone())
+        .headers(context.headers)
+        .body(serde_json::to_vec(&body)?);
+    let response = match tokio::time::timeout(config.timeout, request.send()).await {
+        Ok(Ok(response)) => response,
+        Ok(Err(error)) => {
+            write_json_error_with_headers(
+                stream,
+                502,
+                "upstream_unavailable",
+                &safe_error(&error.to_string()),
+                &local_headers,
+            )
+            .await?;
+            return Ok(502);
+        }
+        Err(_) => {
+            write_json_error_with_headers(
+                stream,
+                504,
+                "upstream_timeout",
+                "Upstream response timed out",
+                &local_headers,
+            )
+            .await?;
+            return Ok(504);
+        }
+    };
+    let status = response.status();
+    let response_headers = build_response_headers(&context.id, response.headers());
+    if status.is_success() && wants_stream {
+        proxy_anthropic_stream(
+            stream,
+            response,
+            config.timeout,
+            &requested_model,
+            &tool_context,
+            &response_headers,
+        )
+        .await?;
+        return Ok(status.as_u16());
+    }
+    let limit = if status.is_success() {
+        MAX_BODY_BYTES
+    } else {
+        MAX_ERROR_BYTES
+    };
+    let (bytes, truncated) = match collect_response_body(response, limit, config.timeout).await {
+        Ok(value) => value,
+        Err(BodyReadError::Transport(error)) => {
+            write_json_error_with_headers(
+                stream,
+                502,
+                "invalid_upstream_response",
+                &error,
+                &response_headers,
+            )
+            .await?;
+            return Ok(502);
+        }
+        Err(BodyReadError::Timeout) => {
+            write_json_error_with_headers(
+                stream,
+                504,
+                "upstream_timeout",
+                "Upstream response body timed out",
+                &response_headers,
+            )
+            .await?;
+            return Ok(504);
+        }
+    };
+    if !status.is_success() {
+        write_upstream_error(stream, status.as_u16(), &bytes, &response_headers).await?;
+        return Ok(status.as_u16());
+    }
+    if truncated {
+        write_json_error_with_headers(
+            stream,
+            502,
+            "upstream_response_too_large",
+            "Upstream response exceeds 8 MiB",
+            &response_headers,
+        )
+        .await?;
+        return Ok(502);
+    }
+    let anthropic: Value = serde_json::from_slice(&bytes)?;
+    let converted = anthropic_to_response(&anthropic, &tool_context);
+    if wants_stream {
+        write_completed_response_sse(stream, &converted, &response_headers).await?;
+    } else {
+        write_json_with_headers(stream, status.as_u16(), &converted, &response_headers).await?;
+    }
+    Ok(status.as_u16())
+}
+
+fn responses_to_anthropic(input: &Value) -> anyhow::Result<(Value, CodexToolContext)> {
+    let (chat, context) =
+        responses_to_chat_with_context(input, None).map_err(anyhow::Error::msg)?;
+    let mut system = vec![];
+    let mut messages = vec![];
+    for message in chat
+        .get("messages")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let role = message
+            .get("role")
+            .and_then(Value::as_str)
+            .unwrap_or("user");
+        if role == "system" {
+            if let Some(text) = message.get("content").and_then(Value::as_str) {
+                system.push(text.to_owned());
+            }
+            continue;
+        }
+        if role == "tool" {
+            messages.push(json!({"role":"user","content":[{"type":"tool_result","tool_use_id":message.get("tool_call_id").cloned().unwrap_or(Value::Null),"content":message.get("content").cloned().unwrap_or(Value::String(String::new()))}]}));
+            continue;
+        }
+        let mut content = vec![];
+        if let Some(text) = message
+            .get("content")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+        {
+            content.push(json!({"type":"text","text":text}));
+        }
+        if let Some(calls) = message.get("tool_calls").and_then(Value::as_array) {
+            for call in calls {
+                let arguments = call
+                    .pointer("/function/arguments")
+                    .and_then(Value::as_str)
+                    .and_then(|value| serde_json::from_str::<Value>(value).ok())
+                    .unwrap_or_else(|| json!({}));
+                content.push(json!({"type":"tool_use","id":call.get("id").cloned().unwrap_or(Value::Null),"name":call.pointer("/function/name").cloned().unwrap_or(Value::Null),"input":arguments}));
+            }
+        }
+        messages.push(json!({"role":if role == "assistant" { "assistant" } else { "user" },"content":content}));
+    }
+    let tools = chat.get("tools").and_then(Value::as_array).map(|tools| tools.iter().filter_map(|tool| {
+        let function = tool.get("function")?;
+        Some(json!({"name":function.get("name")?,"description":function.get("description").cloned().unwrap_or(Value::Null),"input_schema":function.get("parameters").cloned().unwrap_or_else(|| json!({"type":"object"}))}))
+    }).collect::<Vec<_>>()).unwrap_or_default();
+    let mut output = json!({
+        "model": chat.get("model").cloned().unwrap_or(Value::Null),
+        "messages": messages,
+        "max_tokens": chat.get("max_tokens").cloned().unwrap_or(json!(4096)),
+        "stream": false
+    });
+    if !system.is_empty() {
+        output["system"] = Value::String(system.join("\n\n"));
+    }
+    if !tools.is_empty() {
+        output["tools"] = Value::Array(tools);
+    }
+    for key in ["temperature", "top_p"] {
+        if let Some(value) = chat.get(key) {
+            output[key] = value.clone();
+        }
+    }
+    Ok((output, context))
+}
+
+fn anthropic_to_response(input: &Value, context: &CodexToolContext) -> Value {
+    let mut text = String::new();
+    let mut reasoning = String::new();
+    let mut calls = vec![];
+    for block in input
+        .get("content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        match block.get("type").and_then(Value::as_str) {
+            Some("text") => text.push_str(block.get("text").and_then(Value::as_str).unwrap_or_default()),
+            Some("thinking") => reasoning.push_str(
+                block
+                    .get("thinking")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+            ),
+            Some("tool_use") => calls.push(json!({
+                "id":block.get("id").cloned().unwrap_or(Value::Null),
+                "type":"function",
+                "function":{
+                    "name":block.get("name").cloned().unwrap_or(Value::Null),
+                    "arguments":serde_json::to_string(&block.get("input").cloned().unwrap_or_else(|| json!({}))).unwrap_or_else(|_| "{}".into())
+                }
+            })),
+            _ => {}
+        }
+    }
+    let finish_reason = if !calls.is_empty() {
+        "tool_calls"
+    } else if input.get("stop_reason").and_then(Value::as_str) == Some("max_tokens") {
+        "length"
+    } else {
+        "stop"
+    };
+    let mut message = json!({"role":"assistant","content":text,"tool_calls":calls});
+    if !reasoning.is_empty() {
+        message["reasoning_content"] = Value::String(reasoning);
+    }
+    let chat = json!({
+        "id":input.get("id").cloned().unwrap_or(Value::Null),
+        "model":input.get("model").cloned().unwrap_or(Value::Null),
+        "choices":[{"message":message,"finish_reason":finish_reason}],
+        "usage":{
+            "prompt_tokens":input.pointer("/usage/input_tokens").cloned().unwrap_or(json!(0)),
+            "completion_tokens":input.pointer("/usage/output_tokens").cloned().unwrap_or(json!(0)),
+            "total_tokens":input.pointer("/usage/input_tokens").and_then(Value::as_u64).unwrap_or(0) + input.pointer("/usage/output_tokens").and_then(Value::as_u64).unwrap_or(0)
+        }
+    });
+    chat_to_response_with_context(&chat, context)
+}
+
+struct AnthropicStreamTool {
+    id: String,
+    name: String,
+    arguments: String,
+    output_index: usize,
+    completed: bool,
+}
+
+async fn proxy_anthropic_stream(
+    stream: &mut TcpStream,
+    response: reqwest::Response,
+    idle_timeout: Duration,
+    requested_model: &str,
+    tool_context: &CodexToolContext,
+    response_headers: &HeaderMap,
+) -> anyhow::Result<()> {
+    write_stream_headers(stream, response.status().as_u16(), response_headers).await?;
+    let response_id = format!("resp_{}", uuid::Uuid::new_v4().simple());
+    let message_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
+    let reasoning_id = format!("rs_{}", uuid::Uuid::new_v4().simple());
+    let mut model = requested_model.to_owned();
+    let mut usage = map_anthropic_usage(None, None);
+    let mut response_status = "completed";
+    let mut incomplete_details = Value::Null;
+    let mut sequence = 0_u64;
+    let mut next_output_index = 0_usize;
+    let mut text_output_index = None;
+    let mut reasoning_output_index = None;
+    let mut full_text = String::new();
+    let mut reasoning_text = String::new();
+    let mut tools = BTreeMap::<u64, AnthropicStreamTool>::new();
+    let mut indexed_output = Vec::<(usize, Value)>::new();
+    let mut accumulated_output_bytes = 0_usize;
+
+    send_sse(
+        stream,
+        "response.created",
+        &json!({"type":"response.created","sequence_number":sequence,"response":stream_response(&response_id,"in_progress",&model,vec![],usage.clone())}),
+    )
+    .await?;
+    sequence += 1;
+
+    let mut pending = Vec::new();
+    let mut chunks = response.bytes_stream();
+    loop {
+        let Some(chunk) = tokio::time::timeout(idle_timeout, chunks.next())
+            .await
+            .map_err(|_| anyhow::anyhow!("upstream stream idle timeout"))?
+        else {
+            break;
+        };
+        let chunk = chunk?;
+        pending.extend_from_slice(&chunk);
+        if pending.len() > MAX_BODY_BYTES {
+            anyhow::bail!("upstream SSE event exceeds 8 MiB");
+        }
+        while let Some((position, separator)) = find_sse_separator(&pending) {
+            let block = String::from_utf8_lossy(&pending[..position]).into_owned();
+            pending.drain(..position + separator);
+            for line in block
+                .lines()
+                .map(str::trim)
+                .filter(|line| line.starts_with("data:"))
+            {
+                let data = line.trim_start_matches("data:").trim();
+                if data.is_empty() || data == "[DONE]" {
+                    continue;
+                }
+                let Ok(event): Result<Value, _> = serde_json::from_str(data) else {
+                    continue;
+                };
+                match event.get("type").and_then(Value::as_str) {
+                    Some("message_start") => {
+                        let message = event.get("message");
+                        if let Some(value) = message
+                            .and_then(|value| value.get("model"))
+                            .and_then(Value::as_str)
+                            .filter(|value| !value.is_empty())
+                        {
+                            model = value.to_owned();
+                        }
+                        usage = map_anthropic_usage(
+                            message.and_then(|value| value.get("usage")),
+                            Some(&usage),
+                        );
+                    }
+                    Some("content_block_start") => {
+                        let index = event.get("index").and_then(Value::as_u64).unwrap_or(0);
+                        let block = event.get("content_block").unwrap_or(&Value::Null);
+                        match block.get("type").and_then(Value::as_str) {
+                            Some("text") => {
+                                let output_index = match text_output_index {
+                                    Some(index) => index,
+                                    None => {
+                                        let index = next_output_index;
+                                        next_output_index += 1;
+                                        text_output_index = Some(index);
+                                        send_sse(stream, "response.output_item.added", &json!({"type":"response.output_item.added","sequence_number":sequence,"output_index":index,"item":{"id":message_id,"type":"message","status":"in_progress","role":"assistant","content":[]}})).await?;
+                                        sequence += 1;
+                                        send_sse(stream, "response.content_part.added", &json!({"type":"response.content_part.added","sequence_number":sequence,"output_index":index,"content_index":0,"part":{"type":"output_text","text":"","annotations":[]}})).await?;
+                                        sequence += 1;
+                                        index
+                                    }
+                                };
+                                if let Some(text) = block
+                                    .get("text")
+                                    .and_then(Value::as_str)
+                                    .filter(|text| !text.is_empty())
+                                {
+                                    add_stream_bytes(&mut accumulated_output_bytes, text.len())?;
+                                    full_text.push_str(text);
+                                    send_sse(stream, "response.output_text.delta", &json!({"type":"response.output_text.delta","sequence_number":sequence,"output_index":output_index,"content_index":0,"delta":text})).await?;
+                                    sequence += 1;
+                                }
+                            }
+                            Some("tool_use") => {
+                                let output_index = next_output_index;
+                                next_output_index += 1;
+                                let id = block
+                                    .get("id")
+                                    .and_then(Value::as_str)
+                                    .filter(|value| !value.is_empty())
+                                    .map(str::to_owned)
+                                    .unwrap_or_else(|| format!("call_{index}"));
+                                let name = block
+                                    .get("name")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or_default()
+                                    .to_owned();
+                                let arguments = block
+                                    .get("input")
+                                    .filter(|input| {
+                                        input.as_object().is_some_and(|value| !value.is_empty())
+                                    })
+                                    .and_then(|input| serde_json::to_string(input).ok())
+                                    .unwrap_or_default();
+                                add_stream_bytes(&mut accumulated_output_bytes, arguments.len())?;
+                                let call = anthropic_tool_call(&id, &name, &arguments);
+                                let mut item = chat_tool_call_to_response(&call, tool_context);
+                                item["status"] = json!("in_progress");
+                                match item.get("type").and_then(Value::as_str) {
+                                    Some("custom_tool_call") => item["input"] = json!(""),
+                                    Some("function_call") => item["arguments"] = json!(""),
+                                    Some("tool_search_call") => item["arguments"] = json!({}),
+                                    _ => {}
+                                }
+                                send_sse(stream, "response.output_item.added", &json!({"type":"response.output_item.added","sequence_number":sequence,"output_index":output_index,"item":item})).await?;
+                                sequence += 1;
+                                tools.insert(
+                                    index,
+                                    AnthropicStreamTool {
+                                        id,
+                                        name,
+                                        arguments,
+                                        output_index,
+                                        completed: false,
+                                    },
+                                );
+                            }
+                            Some("thinking") if reasoning_output_index.is_none() => {
+                                let output_index = next_output_index;
+                                next_output_index += 1;
+                                reasoning_output_index = Some(output_index);
+                                send_sse(stream, "response.output_item.added", &json!({"type":"response.output_item.added","sequence_number":sequence,"output_index":output_index,"item":{"id":reasoning_id,"type":"reasoning","status":"in_progress","summary":[]}})).await?;
+                                sequence += 1;
+                                send_sse(stream, "response.reasoning_summary_part.added", &json!({"type":"response.reasoning_summary_part.added","sequence_number":sequence,"item_id":reasoning_id,"output_index":output_index,"summary_index":0,"part":{"type":"summary_text","text":""}})).await?;
+                                sequence += 1;
+                                if let Some(thinking) = block
+                                    .get("thinking")
+                                    .and_then(Value::as_str)
+                                    .filter(|thinking| !thinking.is_empty())
+                                {
+                                    add_stream_bytes(
+                                        &mut accumulated_output_bytes,
+                                        thinking.len(),
+                                    )?;
+                                    reasoning_text.push_str(thinking);
+                                    send_sse(stream, "response.reasoning_summary_text.delta", &json!({"type":"response.reasoning_summary_text.delta","sequence_number":sequence,"item_id":reasoning_id,"output_index":output_index,"summary_index":0,"delta":thinking})).await?;
+                                    sequence += 1;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    Some("content_block_delta") => {
+                        let index = event.get("index").and_then(Value::as_u64).unwrap_or(0);
+                        let delta = event.get("delta").unwrap_or(&Value::Null);
+                        match delta.get("type").and_then(Value::as_str) {
+                            Some("text_delta") => {
+                                let text = delta
+                                    .get("text")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or_default();
+                                if text.is_empty() {
+                                    continue;
+                                }
+                                add_stream_bytes(&mut accumulated_output_bytes, text.len())?;
+                                let output_index = match text_output_index {
+                                    Some(index) => index,
+                                    None => {
+                                        let index = next_output_index;
+                                        next_output_index += 1;
+                                        text_output_index = Some(index);
+                                        send_sse(stream, "response.output_item.added", &json!({"type":"response.output_item.added","sequence_number":sequence,"output_index":index,"item":{"id":message_id,"type":"message","status":"in_progress","role":"assistant","content":[]}})).await?;
+                                        sequence += 1;
+                                        send_sse(stream, "response.content_part.added", &json!({"type":"response.content_part.added","sequence_number":sequence,"output_index":index,"content_index":0,"part":{"type":"output_text","text":"","annotations":[]}})).await?;
+                                        sequence += 1;
+                                        index
+                                    }
+                                };
+                                full_text.push_str(text);
+                                send_sse(stream, "response.output_text.delta", &json!({"type":"response.output_text.delta","sequence_number":sequence,"output_index":output_index,"content_index":0,"delta":text})).await?;
+                                sequence += 1;
+                            }
+                            Some("input_json_delta") => {
+                                let partial = delta
+                                    .get("partial_json")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or_default();
+                                if partial.is_empty() {
+                                    continue;
+                                }
+                                add_stream_bytes(&mut accumulated_output_bytes, partial.len())?;
+                                if let Some(tool) = tools.get_mut(&index) {
+                                    tool.arguments.push_str(partial);
+                                    let custom = tool_context
+                                        .specs
+                                        .get(&tool.name)
+                                        .is_some_and(|spec| spec.kind == CodexToolKind::Custom);
+                                    if !custom {
+                                        let item_id = response_tool_item_id(
+                                            &tool.id,
+                                            &tool.name,
+                                            tool_context,
+                                        );
+                                        send_sse(stream, "response.function_call_arguments.delta", &json!({"type":"response.function_call_arguments.delta","sequence_number":sequence,"item_id":item_id,"output_index":tool.output_index,"delta":partial})).await?;
+                                        sequence += 1;
+                                    }
+                                }
+                            }
+                            Some("thinking_delta") => {
+                                let thinking = delta
+                                    .get("thinking")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or_default();
+                                if !thinking.is_empty() {
+                                    add_stream_bytes(
+                                        &mut accumulated_output_bytes,
+                                        thinking.len(),
+                                    )?;
+                                    reasoning_text.push_str(thinking);
+                                    if let Some(output_index) = reasoning_output_index {
+                                        send_sse(stream, "response.reasoning_summary_text.delta", &json!({"type":"response.reasoning_summary_text.delta","sequence_number":sequence,"item_id":reasoning_id,"output_index":output_index,"summary_index":0,"delta":thinking})).await?;
+                                        sequence += 1;
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    Some("content_block_stop") => {
+                        let index = event.get("index").and_then(Value::as_u64).unwrap_or(0);
+                        if let Some(tool) = tools.get_mut(&index)
+                            && !tool.completed
+                        {
+                            let call = anthropic_tool_call(&tool.id, &tool.name, &tool.arguments);
+                            let item = chat_tool_call_to_response(&call, tool_context);
+                            let item_id = response_tool_item_id(&tool.id, &tool.name, tool_context);
+                            for (name, mut payload) in completed_tool_input_events(
+                                &item,
+                                &item_id,
+                                &tool.arguments,
+                                tool.output_index,
+                            ) {
+                                payload["sequence_number"] = json!(sequence);
+                                send_sse(stream, name, &payload).await?;
+                                sequence += 1;
+                            }
+                            send_sse(stream, "response.output_item.done", &json!({"type":"response.output_item.done","sequence_number":sequence,"output_index":tool.output_index,"item":item})).await?;
+                            sequence += 1;
+                            indexed_output.push((tool.output_index, item));
+                            tool.completed = true;
+                        }
+                    }
+                    Some("message_delta") => {
+                        usage = map_anthropic_usage(event.get("usage"), Some(&usage));
+                        if event.pointer("/delta/stop_reason").and_then(Value::as_str)
+                            == Some("max_tokens")
+                        {
+                            (response_status, incomplete_details) =
+                                response_status_from_finish_reason(Some("length"));
+                        }
+                    }
+                    Some("error") => {
+                        anyhow::bail!("anthropic upstream stream returned an error");
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    for tool in tools.values_mut().filter(|tool| !tool.completed) {
+        let call = anthropic_tool_call(&tool.id, &tool.name, &tool.arguments);
+        let item = chat_tool_call_to_response(&call, tool_context);
+        let item_id = response_tool_item_id(&tool.id, &tool.name, tool_context);
+        for (name, mut payload) in
+            completed_tool_input_events(&item, &item_id, &tool.arguments, tool.output_index)
+        {
+            payload["sequence_number"] = json!(sequence);
+            send_sse(stream, name, &payload).await?;
+            sequence += 1;
+        }
+        send_sse(stream, "response.output_item.done", &json!({"type":"response.output_item.done","sequence_number":sequence,"output_index":tool.output_index,"item":item})).await?;
+        sequence += 1;
+        indexed_output.push((tool.output_index, item));
+        tool.completed = true;
+    }
+
+    if let Some(output_index) = text_output_index {
+        send_sse(stream, "response.output_text.done", &json!({"type":"response.output_text.done","sequence_number":sequence,"output_index":output_index,"content_index":0,"text":full_text})).await?;
+        sequence += 1;
+        send_sse(stream, "response.content_part.done", &json!({"type":"response.content_part.done","sequence_number":sequence,"output_index":output_index,"content_index":0,"part":{"type":"output_text","text":full_text,"annotations":[]}})).await?;
+        sequence += 1;
+        let item = json!({"id":message_id,"type":"message","status":response_status,"role":"assistant","content":[{"type":"output_text","text":full_text,"annotations":[]}]});
+        send_sse(stream, "response.output_item.done", &json!({"type":"response.output_item.done","sequence_number":sequence,"output_index":output_index,"item":item})).await?;
+        sequence += 1;
+        indexed_output.push((output_index, item));
+    }
+    if let Some(output_index) = reasoning_output_index {
+        send_sse(stream, "response.reasoning_summary_text.done", &json!({"type":"response.reasoning_summary_text.done","sequence_number":sequence,"item_id":reasoning_id,"output_index":output_index,"summary_index":0,"text":reasoning_text})).await?;
+        sequence += 1;
+        send_sse(stream, "response.reasoning_summary_part.done", &json!({"type":"response.reasoning_summary_part.done","sequence_number":sequence,"item_id":reasoning_id,"output_index":output_index,"summary_index":0,"part":{"type":"summary_text","text":reasoning_text}})).await?;
+        sequence += 1;
+        let summary = if reasoning_text.is_empty() {
+            vec![]
+        } else {
+            vec![json!({"type":"summary_text","text":reasoning_text})]
+        };
+        let item = json!({"id":reasoning_id,"type":"reasoning","status":response_status,"summary":summary});
+        send_sse(stream, "response.output_item.done", &json!({"type":"response.output_item.done","sequence_number":sequence,"output_index":output_index,"item":item})).await?;
+        sequence += 1;
+        indexed_output.push((output_index, item));
+    }
+    for (_, item) in &mut indexed_output {
+        item["status"] = json!(response_status);
+    }
+    indexed_output.sort_by_key(|(index, _)| *index);
+    let output = indexed_output.into_iter().map(|(_, item)| item).collect();
+    let mut completed = stream_response(&response_id, response_status, &model, output, usage);
+    completed["incomplete_details"] = incomplete_details;
+    let terminal_event = if response_status == "incomplete" {
+        "response.incomplete"
+    } else {
+        "response.completed"
+    };
+    send_sse(
+        stream,
+        terminal_event,
+        &json!({"type":terminal_event,"sequence_number":sequence,"response":completed}),
+    )
+    .await?;
+    finish_chunks(stream).await
+}
+
+fn anthropic_tool_call(id: &str, name: &str, arguments: &str) -> Value {
+    json!({
+        "id": id,
+        "type": "function",
+        "function": {
+            "name": name,
+            "arguments": if arguments.trim().is_empty() { "{}" } else { arguments }
+        }
+    })
+}
+
+fn add_stream_bytes(total: &mut usize, amount: usize) -> anyhow::Result<()> {
+    *total = total
+        .checked_add(amount)
+        .filter(|size| *size <= MAX_BODY_BYTES)
+        .ok_or_else(|| anyhow::anyhow!("upstream stream exceeds 8 MiB"))?;
+    Ok(())
+}
+
+fn map_anthropic_usage(current: Option<&Value>, previous: Option<&Value>) -> Value {
+    let previous_input = previous
+        .and_then(|usage| usage.get("input_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let previous_output = previous
+        .and_then(|usage| usage.get("output_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let input = current
+        .and_then(|usage| usage.get("input_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(previous_input);
+    let output = current
+        .and_then(|usage| usage.get("output_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(previous_output);
+    let cached = current
+        .and_then(|usage| usage.get("cache_read_input_tokens"))
+        .and_then(Value::as_u64)
+        .or_else(|| {
+            previous
+                .and_then(|usage| usage.pointer("/input_tokens_details/cached_tokens"))
+                .and_then(Value::as_u64)
+        })
+        .unwrap_or(0);
+    json!({
+        "input_tokens": input,
+        "input_tokens_details": {"cached_tokens": cached},
+        "output_tokens": output,
+        "output_tokens_details": {"reasoning_tokens": 0},
+        "total_tokens": input.saturating_add(output)
+    })
+}
+
+async fn write_completed_response_sse(
+    stream: &mut TcpStream,
+    response: &Value,
+    response_headers: &HeaderMap,
+) -> anyhow::Result<()> {
+    write_stream_headers(stream, 200, response_headers).await?;
+    let mut created = response.clone();
+    created["status"] = Value::String("in_progress".into());
+    created["output"] = Value::Array(vec![]);
+    send_sse(
+        stream,
+        "response.created",
+        &json!({"type":"response.created","sequence_number":0,"response":created}),
+    )
+    .await?;
+    send_sse(
+        stream,
+        "response.completed",
+        &json!({"type":"response.completed","sequence_number":1,"response":response}),
+    )
+    .await?;
+    write_chunk(stream, b"data: [DONE]\n\n").await?;
+    finish_chunks(stream).await
+}
+
+async fn write_raw_json_with_headers(
+    stream: &mut TcpStream,
+    status: u16,
+    body: &[u8],
+    headers: &HeaderMap,
+) -> anyhow::Result<()> {
+    write_response_headers(
+        stream,
+        status,
+        "application/json",
+        Some(body.len()),
+        false,
+        headers,
+    )
+    .await?;
+    stream.write_all(body).await?;
+    Ok(())
+}
+
+#[derive(Debug, thiserror::Error)]
+enum BodyReadError {
+    #[error("upstream response body timed out")]
+    Timeout,
+    #[error("{0}")]
+    Transport(String),
+}
+
+async fn collect_response_body(
+    response: reqwest::Response,
+    limit: usize,
+    idle_timeout: Duration,
+) -> Result<(Vec<u8>, bool), BodyReadError> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > limit as u64)
+    {
+        return Ok((Vec::new(), true));
+    }
+    let capacity = response
+        .content_length()
+        .map(|length| length.min(limit as u64) as usize)
+        .unwrap_or(0);
+    let mut output = Vec::with_capacity(capacity);
+    let mut chunks = response.bytes_stream();
+    loop {
+        let next = tokio::time::timeout(idle_timeout, chunks.next())
+            .await
+            .map_err(|_| BodyReadError::Timeout)?;
+        let Some(chunk) = next else { break };
+        let chunk =
+            chunk.map_err(|error| BodyReadError::Transport(safe_error(&error.to_string())))?;
+        let remaining = limit.saturating_sub(output.len());
+        if chunk.len() > remaining {
+            output.extend_from_slice(&chunk[..remaining]);
+            return Ok((output, true));
+        }
+        output.extend_from_slice(&chunk);
+    }
+    Ok((output, false))
 }
 
 struct HttpRequest {
     method: String,
     path: String,
-    headers: BTreeMap<String, String>,
+    headers: HeaderMap,
     body: Vec<u8>,
 }
 
 async fn read_request(stream: &mut TcpStream) -> Result<HttpRequest, (u16, &'static str, String)> {
     let mut buffer = Vec::with_capacity(4096);
+    let mut search_start = 0;
     let header_end = loop {
         if buffer.len() >= MAX_HEADER_BYTES {
             return Err((
@@ -913,9 +2137,10 @@ async fn read_request(stream: &mut TcpStream) -> Result<HttpRequest, (u16, &'sta
             ));
         }
         buffer.extend_from_slice(&chunk[..read]);
-        if let Some(index) = find_bytes(&buffer, b"\r\n\r\n") {
-            break index + 4;
+        if let Some(index) = find_bytes(&buffer[search_start..], b"\r\n\r\n") {
+            break search_start + index + 4;
         }
+        search_start = buffer.len().saturating_sub(3);
     };
     let header_text = std::str::from_utf8(&buffer[..header_end])
         .map_err(|error| (400, "invalid_headers", error.to_string()))?;
@@ -923,16 +2148,51 @@ async fn read_request(stream: &mut TcpStream) -> Result<HttpRequest, (u16, &'sta
     let mut request_line = lines.next().unwrap_or_default().split_whitespace();
     let method = request_line.next().unwrap_or_default().to_string();
     let path = request_line.next().unwrap_or_default().to_string();
-    let mut headers = BTreeMap::new();
+    let version = request_line.next().unwrap_or_default();
+    if version != "HTTP/1.1" || request_line.next().is_some() || !path.starts_with('/') {
+        return Err((
+            400,
+            "invalid_request_line",
+            "Only origin-form HTTP/1.1 requests are supported".into(),
+        ));
+    }
+    let mut headers = HeaderMap::with_capacity(16);
     for line in lines.filter(|line| !line.is_empty()) {
+        if line.starts_with(' ') || line.starts_with('\t') {
+            return Err((
+                400,
+                "invalid_headers",
+                "Folded request headers are not supported".into(),
+            ));
+        }
         let Some((name, value)) = line.split_once(':') else {
-            continue;
+            return Err((400, "invalid_headers", "Malformed request header".into()));
         };
-        headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
+        let name = HeaderName::from_bytes(name.trim().as_bytes())
+            .map_err(|_| (400, "invalid_headers", "Invalid request header name".into()))?;
+        if headers.contains_key(&name)
+            && (name == reqwest::header::HOST
+                || name == reqwest::header::CONTENT_LENGTH
+                || name == reqwest::header::TRANSFER_ENCODING)
+        {
+            return Err((
+                400,
+                "duplicate_headers",
+                "Duplicate framing or Host header".into(),
+            ));
+        }
+        let value = HeaderValue::from_bytes(value.trim().as_bytes()).map_err(|_| {
+            (
+                400,
+                "invalid_headers",
+                "Invalid request header value".into(),
+            )
+        })?;
+        headers.insert(name, value);
     }
     if headers
-        .get("transfer-encoding")
-        .is_some_and(|value| value.to_ascii_lowercase().contains("chunked"))
+        .get(reqwest::header::TRANSFER_ENCODING)
+        .is_some_and(|value| contains_ascii_case_insensitive(value.as_bytes(), b"chunked"))
     {
         return Err((
             411,
@@ -940,10 +2200,20 @@ async fn read_request(stream: &mut TcpStream) -> Result<HttpRequest, (u16, &'sta
             "Chunked request bodies are not supported".into(),
         ));
     }
-    let content_length = headers
-        .get("content-length")
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(0);
+    let content_length = match headers.get(reqwest::header::CONTENT_LENGTH) {
+        Some(value) => value
+            .to_str()
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .ok_or_else(|| {
+                (
+                    400,
+                    "invalid_content_length",
+                    "Content-Length must be a non-negative integer".into(),
+                )
+            })?,
+        None => 0,
+    };
     if content_length > MAX_BODY_BYTES {
         return Err((
             413,
@@ -967,12 +2237,21 @@ async fn read_request(stream: &mut TcpStream) -> Result<HttpRequest, (u16, &'sta
         }
         buffer.extend_from_slice(&chunk[..read]);
     }
+    buffer.drain(..header_end);
+    buffer.truncate(content_length);
     Ok(HttpRequest {
         method,
         path,
         headers,
-        body: buffer[header_end..header_end + content_length].to_vec(),
+        body: buffer,
     })
+}
+
+fn contains_ascii_case_insensitive(value: &[u8], needle: &[u8]) -> bool {
+    needle.is_empty()
+        || value
+            .windows(needle.len())
+            .any(|window| window.eq_ignore_ascii_case(needle))
 }
 
 #[cfg(test)]
@@ -992,7 +2271,12 @@ fn responses_to_chat_with_context(
     input: &Value,
     reasoning: Option<&CodexChatReasoningConfig>,
 ) -> Result<(Value, CodexToolContext), String> {
-    let tool_context = build_tool_context(input);
+    let mut tool_context = build_tool_context(input);
+    tool_context.reasoning_output_field = reasoning
+        .and_then(|config| config.output_format.as_deref())
+        .map(str::trim)
+        .filter(|field| !field.is_empty())
+        .map(str::to_owned);
     let model = input
         .get("model")
         .and_then(Value::as_str)
@@ -1541,6 +2825,10 @@ fn chat_to_response(chat: &Value) -> Value {
 
 fn chat_to_response_with_context(chat: &Value, context: &CodexToolContext) -> Value {
     let response_id = response_id(chat);
+    let (status, incomplete_details) = response_status_from_finish_reason(
+        chat.pointer("/choices/0/finish_reason")
+            .and_then(Value::as_str),
+    );
     let message = chat
         .pointer("/choices/0/message")
         .cloned()
@@ -1551,24 +2839,56 @@ fn chat_to_response_with_context(chat: &Value, context: &CodexToolContext) -> Va
         .and_then(Value::as_str)
         .filter(|text| !text.is_empty())
     {
-        output.push(json!({"id":format!("msg_{}", uuid::Uuid::new_v4().simple()),"type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":text,"annotations":[]}]}));
+        output.push(json!({"id":format!("msg_{}", uuid::Uuid::new_v4().simple()),"type":"message","status":status,"role":"assistant","content":[{"type":"output_text","text":text,"annotations":[]}]}));
+    }
+    if let Some(reasoning) = chat_reasoning_text(&message, context) {
+        output.push(json!({
+            "id":format!("rs_{}", uuid::Uuid::new_v4().simple()),
+            "type":"reasoning",
+            "status":status,
+            "summary":[{"type":"summary_text","text":reasoning}]
+        }));
     }
     if let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array) {
         for call in tool_calls {
-            output.push(chat_tool_call_to_response(call, context));
+            let mut item = chat_tool_call_to_response(call, context);
+            item["status"] = json!(status);
+            output.push(item);
         }
     }
     json!({
         "id":response_id,
         "object":"response",
         "created_at":chat.get("created").cloned().unwrap_or_else(|| json!(chrono::Utc::now().timestamp())),
-        "status":"completed",
+        "status":status,
         "error":Value::Null,
-        "incomplete_details":Value::Null,
+        "incomplete_details":incomplete_details,
         "model":chat.get("model").cloned().unwrap_or(Value::String(String::new())),
         "output":output,
         "usage":map_usage(chat.get("usage")),
     })
+}
+
+fn response_status_from_finish_reason(finish_reason: Option<&str>) -> (&'static str, Value) {
+    match finish_reason.map(str::trim) {
+        Some("length") => ("incomplete", json!({"reason":"max_output_tokens"})),
+        Some("content_filter") => ("incomplete", json!({"reason":"content_filter"})),
+        _ => ("completed", Value::Null),
+    }
+}
+
+fn chat_reasoning_text<'a>(value: &'a Value, context: &CodexToolContext) -> Option<&'a str> {
+    context
+        .reasoning_output_field
+        .as_deref()
+        .and_then(|field| value.get(field))
+        .and_then(Value::as_str)
+        .or_else(|| {
+            ["reasoning_content", "reasoning", "thinking"]
+                .into_iter()
+                .find_map(|field| value.get(field).and_then(Value::as_str))
+        })
+        .filter(|text| !text.is_empty())
 }
 
 fn chat_tool_call_to_response(call: &Value, context: &CodexToolContext) -> Value {
@@ -2034,18 +3354,25 @@ async fn proxy_stream(
     response: reqwest::Response,
     idle_timeout: Duration,
     tool_context: &CodexToolContext,
+    response_headers: &HeaderMap,
 ) -> anyhow::Result<()> {
-    stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\nTransfer-Encoding: chunked\r\nX-Content-Type-Options: nosniff\r\n\r\n").await?;
+    write_stream_headers(stream, response.status().as_u16(), response_headers).await?;
     let response_id = format!("resp_{}", uuid::Uuid::new_v4().simple());
     let message_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
+    let reasoning_id = format!("rs_{}", uuid::Uuid::new_v4().simple());
     let mut sequence = 0_u64;
     let mut full_text = String::new();
+    let mut full_reasoning = String::new();
     let mut usage = map_usage(None);
     let mut model = String::new();
+    let mut response_status = "completed";
+    let mut incomplete_details = Value::Null;
     let mut tool_calls: BTreeMap<u64, Value> = BTreeMap::new();
     let mut tool_output_indices = HashMap::new();
     let mut text_output_index = None;
+    let mut reasoning_output_index = None;
     let mut next_output_index = 0_usize;
+    let mut accumulated_output_bytes = 0_usize;
     send_sse(stream, "response.created", &json!({"type":"response.created","sequence_number":sequence,"response":stream_response(&response_id,"in_progress",&model,vec![],usage.clone())})).await?;
     sequence += 1;
 
@@ -2088,10 +3415,41 @@ async fn proxy_stream(
                 if chunk.get("usage").is_some_and(|v| !v.is_null()) {
                     usage = map_usage(chunk.get("usage"));
                 }
+                if let Some(finish_reason) = chunk
+                    .pointer("/choices/0/finish_reason")
+                    .and_then(Value::as_str)
+                    .filter(|reason| !reason.is_empty())
+                {
+                    (response_status, incomplete_details) =
+                        response_status_from_finish_reason(Some(finish_reason));
+                }
                 let Some(delta) = chunk.pointer("/choices/0/delta") else {
                     continue;
                 };
+                if let Some(reasoning) = chat_reasoning_text(delta, tool_context) {
+                    add_stream_bytes(&mut accumulated_output_bytes, reasoning.len())?;
+                    let output_index = match reasoning_output_index {
+                        Some(index) => index,
+                        None => {
+                            let index = next_output_index;
+                            next_output_index += 1;
+                            reasoning_output_index = Some(index);
+                            send_sse(stream, "response.output_item.added", &json!({"type":"response.output_item.added","sequence_number":sequence,"output_index":index,"item":{"id":reasoning_id,"type":"reasoning","status":"in_progress","summary":[]}})).await?;
+                            sequence += 1;
+                            send_sse(stream, "response.reasoning_summary_part.added", &json!({"type":"response.reasoning_summary_part.added","sequence_number":sequence,"item_id":reasoning_id,"output_index":index,"summary_index":0,"part":{"type":"summary_text","text":""}})).await?;
+                            sequence += 1;
+                            index
+                        }
+                    };
+                    full_reasoning.push_str(reasoning);
+                    send_sse(stream, "response.reasoning_summary_text.delta", &json!({"type":"response.reasoning_summary_text.delta","sequence_number":sequence,"item_id":reasoning_id,"output_index":output_index,"summary_index":0,"delta":reasoning})).await?;
+                    sequence += 1;
+                }
                 if let Some(text) = delta.get("content").and_then(Value::as_str) {
+                    accumulated_output_bytes = accumulated_output_bytes
+                        .checked_add(text.len())
+                        .filter(|size| *size <= MAX_BODY_BYTES)
+                        .ok_or_else(|| anyhow::anyhow!("upstream stream exceeds 8 MiB"))?;
                     let output_index = match text_output_index {
                         Some(index) => index,
                         None => {
@@ -2111,6 +3469,14 @@ async fn proxy_stream(
                 }
                 if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
                     for call in calls {
+                        if let Some(arguments) =
+                            call.pointer("/function/arguments").and_then(Value::as_str)
+                        {
+                            accumulated_output_bytes = accumulated_output_bytes
+                                .checked_add(arguments.len())
+                                .filter(|size| *size <= MAX_BODY_BYTES)
+                                .ok_or_else(|| anyhow::anyhow!("upstream stream exceeds 8 MiB"))?;
+                        }
                         let index = call.get("index").and_then(Value::as_u64).unwrap_or(0);
                         merge_tool_call_deltas(&mut tool_calls, std::slice::from_ref(call));
                         let Some(merged) = tool_calls.get_mut(&index) else {
@@ -2182,12 +3548,22 @@ async fn proxy_stream(
     }
 
     let mut indexed_output = Vec::new();
+    if let Some(output_index) = reasoning_output_index {
+        send_sse(stream, "response.reasoning_summary_text.done", &json!({"type":"response.reasoning_summary_text.done","sequence_number":sequence,"item_id":reasoning_id,"output_index":output_index,"summary_index":0,"text":full_reasoning})).await?;
+        sequence += 1;
+        send_sse(stream, "response.reasoning_summary_part.done", &json!({"type":"response.reasoning_summary_part.done","sequence_number":sequence,"item_id":reasoning_id,"output_index":output_index,"summary_index":0,"part":{"type":"summary_text","text":full_reasoning}})).await?;
+        sequence += 1;
+        let item = json!({"id":reasoning_id,"type":"reasoning","status":response_status,"summary":[{"type":"summary_text","text":full_reasoning}]});
+        send_sse(stream, "response.output_item.done", &json!({"type":"response.output_item.done","sequence_number":sequence,"output_index":output_index,"item":item})).await?;
+        sequence += 1;
+        indexed_output.push((output_index, item));
+    }
     if let Some(output_index) = text_output_index {
         send_sse(stream, "response.output_text.done", &json!({"type":"response.output_text.done","sequence_number":sequence,"output_index":output_index,"content_index":0,"text":full_text})).await?;
         sequence += 1;
         send_sse(stream, "response.content_part.done", &json!({"type":"response.content_part.done","sequence_number":sequence,"output_index":output_index,"content_index":0,"part":{"type":"output_text","text":full_text,"annotations":[]}})).await?;
         sequence += 1;
-        let message = json!({"id":message_id,"type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":full_text,"annotations":[]}]});
+        let message = json!({"id":message_id,"type":"message","status":response_status,"role":"assistant","content":[{"type":"output_text","text":full_text,"annotations":[]}]});
         send_sse(stream, "response.output_item.done", &json!({"type":"response.output_item.done","sequence_number":sequence,"output_index":output_index,"item":message})).await?;
         sequence += 1;
         indexed_output.push((output_index, message));
@@ -2214,7 +3590,8 @@ async fn proxy_stream(
             .pointer("/function/arguments")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        let item = chat_tool_call_to_response(&call, tool_context);
+        let mut item = chat_tool_call_to_response(&call, tool_context);
+        item["status"] = json!(response_status);
         let output_index = match tool_output_indices.get(&tool_index).copied() {
             Some(index) => index,
             None => {
@@ -2246,11 +3623,17 @@ async fn proxy_stream(
     }
     indexed_output.sort_by_key(|(index, _)| *index);
     let output = indexed_output.into_iter().map(|(_, item)| item).collect();
-    let completed = stream_response(&response_id, "completed", &model, output, usage);
+    let mut completed = stream_response(&response_id, response_status, &model, output, usage);
+    completed["incomplete_details"] = incomplete_details;
+    let terminal_event = if response_status == "incomplete" {
+        "response.incomplete"
+    } else {
+        "response.completed"
+    };
     send_sse(
         stream,
-        "response.completed",
-        &json!({"type":"response.completed","sequence_number":sequence,"response":completed}),
+        terminal_event,
+        &json!({"type":terminal_event,"sequence_number":sequence,"response":completed}),
     )
     .await?;
     finish_chunks(stream).await?;
@@ -2321,12 +3704,68 @@ async fn finish_chunks(stream: &mut TcpStream) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn write_json(stream: &mut TcpStream, status: u16, value: &Value) -> anyhow::Result<()> {
-    let body = serde_json::to_vec(value)?;
+async fn write_response_headers(
+    stream: &mut TcpStream,
+    status: u16,
+    content_type: &str,
+    content_length: Option<usize>,
+    chunked: bool,
+    headers: &HeaderMap,
+) -> anyhow::Result<()> {
     let reason = status_reason(status);
-    stream.write_all(format!("HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\nX-Content-Type-Options: nosniff\r\n\r\n", body.len()).as_bytes()).await?;
+    let mut output = format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nConnection: close\r\nX-Content-Type-Options: nosniff\r\n"
+    )
+    .into_bytes();
+    if let Some(length) = content_length {
+        output.extend_from_slice(format!("Content-Length: {length}\r\n").as_bytes());
+    }
+    if chunked {
+        output.extend_from_slice(
+            b"Transfer-Encoding: chunked\r\nCache-Control: no-cache\r\nX-Accel-Buffering: no\r\n",
+        );
+    }
+    for (name, value) in headers {
+        output.extend_from_slice(name.as_str().as_bytes());
+        output.extend_from_slice(b": ");
+        output.extend_from_slice(value.as_bytes());
+        output.extend_from_slice(b"\r\n");
+    }
+    output.extend_from_slice(b"\r\n");
+    stream.write_all(&output).await?;
+    Ok(())
+}
+
+async fn write_stream_headers(
+    stream: &mut TcpStream,
+    status: u16,
+    headers: &HeaderMap,
+) -> anyhow::Result<()> {
+    write_response_headers(stream, status, "text/event-stream", None, true, headers).await
+}
+
+async fn write_json_with_headers(
+    stream: &mut TcpStream,
+    status: u16,
+    value: &Value,
+    headers: &HeaderMap,
+) -> anyhow::Result<()> {
+    let body = serde_json::to_vec(value)?;
+    write_response_headers(
+        stream,
+        status,
+        "application/json",
+        Some(body.len()),
+        false,
+        headers,
+    )
+    .await?;
     stream.write_all(&body).await?;
     Ok(())
+}
+
+async fn write_json(stream: &mut TcpStream, status: u16, value: &Value) -> anyhow::Result<()> {
+    write_json_with_headers(stream, status, value, &HeaderMap::new()).await
 }
 
 async fn write_json_error(
@@ -2343,14 +3782,74 @@ async fn write_json_error(
     .await
 }
 
-fn sanitize_upstream_error(body: &str) -> String {
-    let truncated: String = body.chars().take(MAX_ERROR_BYTES).collect();
-    if let Ok(value) = serde_json::from_str::<Value>(&truncated)
-        && let Some(message) = value.pointer("/error/message").and_then(Value::as_str)
-    {
-        return safe_error(message);
+async fn write_json_error_with_headers(
+    stream: &mut TcpStream,
+    status: u16,
+    code: &str,
+    message: &str,
+    headers: &HeaderMap,
+) -> anyhow::Result<()> {
+    write_json_with_headers(
+        stream,
+        status,
+        &json!({"error":{"message":message,"type":"proxy_error","code":code}}),
+        headers,
+    )
+    .await
+}
+
+async fn write_upstream_error(
+    stream: &mut TcpStream,
+    status: u16,
+    body: &[u8],
+    headers: &HeaderMap,
+) -> anyhow::Result<()> {
+    write_json_with_headers(stream, status, &sanitized_upstream_error(body), headers).await
+}
+
+fn sanitized_upstream_error(body: &[u8]) -> Value {
+    let parsed = serde_json::from_slice::<Value>(body).ok();
+    let source = parsed.as_ref().and_then(|value| value.get("error"));
+    let message = source
+        .and_then(|error| error.get("message"))
+        .and_then(Value::as_str)
+        .map(safe_error)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| {
+            let value = String::from_utf8_lossy(body);
+            let message = safe_error(&value);
+            if message.trim().is_empty() {
+                "Upstream request failed".into()
+            } else {
+                message
+            }
+        });
+    let mut error = serde_json::Map::new();
+    error.insert("message".into(), Value::String(message));
+    for field in ["type", "code", "param"] {
+        let Some(value) = source.and_then(|error| error.get(field)) else {
+            continue;
+        };
+        match value {
+            Value::Null | Value::Bool(_) | Value::Number(_) => {
+                error.insert(field.into(), value.clone());
+            }
+            Value::String(value) => {
+                let value = safe_error(value);
+                if !value.trim().is_empty() {
+                    error.insert(field.into(), Value::String(value));
+                }
+            }
+            _ => {}
+        }
     }
-    safe_error(&truncated)
+    error
+        .entry("type")
+        .or_insert_with(|| Value::String("upstream_error".into()));
+    error
+        .entry("code")
+        .or_insert_with(|| Value::String("upstream_error".into()));
+    json!({"error":error})
 }
 
 fn safe_error(value: &str) -> String {
@@ -2365,12 +3864,23 @@ fn safe_error(value: &str) -> String {
 fn status_reason(status: u16) -> &'static str {
     match status {
         200 => "OK",
+        201 => "Created",
+        202 => "Accepted",
+        204 => "No Content",
+        301 => "Moved Permanently",
+        302 => "Found",
+        307 => "Temporary Redirect",
+        308 => "Permanent Redirect",
         400 => "Bad Request",
         401 => "Unauthorized",
         403 => "Forbidden",
         404 => "Not Found",
+        408 => "Request Timeout",
+        409 => "Conflict",
         411 => "Length Required",
         413 => "Payload Too Large",
+        422 => "Unprocessable Content",
+        429 => "Too Many Requests",
         431 => "Request Header Fields Too Large",
         500 => "Internal Server Error",
         502 => "Bad Gateway",
@@ -2408,8 +3918,9 @@ mod tests {
             base_url: "http://127.0.0.1:9/v1".into(),
             models: vec![],
             model_metadata: vec![],
+            model_aliases: Default::default(),
             codex_chat_reasoning: None,
-            headers: json!({}),
+            headers: Default::default(),
             timeout_secs: 1,
             context_window: None,
             auto_compact_threshold: None,
@@ -2427,8 +3938,7 @@ mod tests {
             name: "Default".into(),
             auth_kind: crate::models::AccountAuthKind::ApiKey,
             api_key: Some("secret".into()),
-            auth_json: None,
-            headers: json!({}),
+            headers: Default::default(),
             active: false,
             email: None,
             created_at: 0,
@@ -2437,51 +3947,707 @@ mod tests {
     }
 
     fn route_settings() -> RouteSettings {
-        RouteSettings::default()
+        RouteSettings {
+            port: 0,
+            ..RouteSettings::default()
+        }
+    }
+
+    async fn status_upstream(
+        request_count: usize,
+    ) -> (String, tokio::task::JoinHandle<Vec<Option<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let mut authorization = Vec::with_capacity(request_count);
+            for _ in 0..request_count {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let request = read_request(&mut socket).await.unwrap();
+                authorization.push(
+                    request
+                        .headers
+                        .get("authorization")
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_owned),
+                );
+                socket
+                    .write_all(
+                        b"HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .await
+                    .unwrap();
+                socket.shutdown().await.unwrap();
+            }
+            authorization
+        });
+        (format!("http://{address}/v1"), task)
+    }
+
+    async fn capture_upstream() -> (String, oneshot::Receiver<HttpRequest>) {
+        capture_upstream_response(200, "OK", "", br#"{"id":"resp_test","output":[]}"#.to_vec())
+            .await
+    }
+
+    async fn capture_upstream_response(
+        status: u16,
+        reason: &str,
+        headers: &str,
+        body: Vec<u8>,
+    ) -> (String, oneshot::Receiver<HttpRequest>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (request_tx, request_rx) = oneshot::channel();
+        let reason = reason.to_owned();
+        let headers = headers.to_owned();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let request = read_request(&mut socket).await.unwrap();
+            let _ = request_tx.send(request);
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n{headers}\r\n",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            socket.write_all(&body).await.unwrap();
+        });
+        (format!("http://{address}/v1"), request_rx)
     }
 
     #[tokio::test]
     async fn aborted_prepare_keeps_current_proxy_running() {
         let manager = ProxyManager::default();
+        let (upstream, received) = status_upstream(1).await;
+        let mut test_provider = provider();
+        test_provider.base_url = upstream;
         let first = manager
-            .prepare(&provider(), &account(), &route_settings())
+            .prepare_inner(&test_provider, &account(), &route_settings(), true)
             .await
             .unwrap();
         manager.commit().await.unwrap();
         let second = manager
-            .prepare(&provider(), &account(), &route_settings())
+            .prepare_inner(&test_provider, &account(), &route_settings(), true)
             .await
             .unwrap();
-        assert_ne!(first.base_url, second.base_url);
-        manager.abort().await;
+        assert_eq!(first.base_url, second.base_url);
+        manager.abort_pending().await;
         assert_eq!(manager.endpoint().await.unwrap().base_url, first.base_url);
         let response = reqwest::Client::new()
             .post(format!("{}/responses", first.base_url))
-            .bearer_auth(&first.token)
+            .header(reqwest::header::HOST, "127.0.0.1:16384")
+            .bearer_auth("ignored-placeholder")
             .json(&json!({"model":"test-model","input":"hello"}))
             .send()
             .await
             .unwrap();
-        assert_eq!(response.status(), reqwest::StatusCode::BAD_GATEWAY);
+        assert_eq!(response.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(received.await.unwrap(), vec![Some("Bearer secret".into())]);
         manager.stop().await;
     }
 
     #[tokio::test]
-    async fn committing_prepare_replaces_current_proxy() {
+    async fn pending_listener_never_serves_upstream_secrets_before_commit() {
         let manager = ProxyManager::default();
-        let first = manager
-            .prepare(&provider(), &account(), &route_settings())
+        let endpoint = manager
+            .prepare_inner(&provider(), &account(), &route_settings(), true)
+            .await
+            .unwrap();
+
+        let response = reqwest::Client::new()
+            .post(format!("{}/responses", endpoint.base_url))
+            .json(&json!({"model":"test-model","input":"hello"}))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+        manager.abort_pending().await;
+    }
+
+    #[tokio::test]
+    async fn loopback_policy_rejects_forwarding_but_never_authenticates_bearer() {
+        let manager = ProxyManager::default();
+        let (upstream, received) = status_upstream(2).await;
+        let mut test_provider = provider();
+        test_provider.base_url = upstream;
+        let endpoint = manager
+            .prepare_inner(&test_provider, &account(), &route_settings(), true)
             .await
             .unwrap();
         manager.commit().await.unwrap();
+
+        let without_bearer = raw_proxy_request(&endpoint, "", None).await;
+        assert!(
+            without_bearer.contains(" 429 "),
+            "unexpected response without bearer: {without_bearer:?}"
+        );
+        let arbitrary_bearer =
+            raw_proxy_request(&endpoint, "Authorization: Bearer arbitrary\r\n", None).await;
+        assert!(
+            arbitrary_bearer.contains(" 429 "),
+            "unexpected response with arbitrary bearer: {arbitrary_bearer:?}"
+        );
+        assert_eq!(
+            received.await.unwrap(),
+            vec![Some("Bearer secret".into()), Some("Bearer secret".into())]
+        );
+        assert!(
+            raw_proxy_request(&endpoint, "Origin: https://evil.test\r\n", None)
+                .await
+                .contains(" 403 ")
+        );
+        assert!(
+            raw_proxy_request(&endpoint, "X-Forwarded-For: 127.0.0.1\r\n", None)
+                .await
+                .contains(" 403 ")
+        );
+        assert!(
+            raw_proxy_request(&endpoint, "", Some("evil.test"))
+                .await
+                .contains(" 403 ")
+        );
+        manager.stop().await;
+    }
+
+    async fn raw_proxy_request(
+        endpoint: &ProxyEndpoint,
+        extra_headers: &str,
+        host_override: Option<&str>,
+    ) -> String {
+        let url = reqwest::Url::parse(&endpoint.base_url).unwrap();
+        let address = format!("127.0.0.1:{}", url.port().unwrap());
+        let host = host_override
+            .map(str::to_owned)
+            .unwrap_or_else(|| "127.0.0.1:16384".into());
+        let body = r#"{"model":"test-model","input":"hello"}"#;
+        let mut stream = TcpStream::connect(address).await.unwrap();
+        stream
+            .write_all(
+                format!(
+                    "POST /v1/responses HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{extra_headers}\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut output = Vec::new();
+        stream.read_to_end(&mut output).await.unwrap();
+        String::from_utf8_lossy(&output).into_owned()
+    }
+
+    #[tokio::test]
+    async fn committing_prepare_hot_swaps_route_without_rebinding() {
+        let manager = ProxyManager::default();
+        let first_provider = provider();
+        let first = manager
+            .prepare_inner(&first_provider, &account(), &route_settings(), true)
+            .await
+            .unwrap();
+        manager.commit().await.unwrap();
+        let mut second_provider = provider();
+        second_provider.name = "second provider".into();
         let second = manager
-            .prepare(&provider(), &account(), &route_settings())
+            .prepare_inner(&second_provider, &account(), &route_settings(), true)
             .await
             .unwrap();
         manager.commit().await.unwrap();
         assert_eq!(manager.endpoint().await.unwrap().base_url, second.base_url);
-        assert_ne!(first.base_url, second.base_url);
+        assert_eq!(first.base_url, second.base_url);
+        assert_eq!(
+            manager.provider_name().await.as_deref(),
+            Some("second provider")
+        );
         manager.stop().await;
+    }
+
+    #[tokio::test]
+    async fn native_responses_forwards_original_json_bytes() {
+        let manager = ProxyManager::default();
+        let (upstream, captured) = capture_upstream().await;
+        let mut test_provider = provider();
+        test_provider.protocol = crate::models::ProviderProtocol::Responses;
+        test_provider.base_url = upstream;
+        let endpoint = manager
+            .prepare_inner(&test_provider, &account(), &route_settings(), true)
+            .await
+            .unwrap();
+        manager.commit().await.unwrap();
+
+        let body =
+            b"{\n  \"model\": \"test-model\",\n  \"input\": \"hello\",\n  \"stream\": false\n}";
+        let response = Client::new()
+            .post(format!("{}/responses", endpoint.base_url))
+            .header(reqwest::header::HOST, "127.0.0.1:16384")
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body.as_slice())
+            .send()
+            .await
+            .unwrap();
+
+        assert!(response.status().is_success());
+        assert_eq!(captured.await.unwrap().body, body);
+        manager.stop().await;
+    }
+
+    #[tokio::test]
+    async fn native_responses_serializes_only_when_model_alias_changes() {
+        let manager = ProxyManager::default();
+        let (upstream, captured) = capture_upstream().await;
+        let mut test_provider = provider();
+        test_provider.protocol = crate::models::ProviderProtocol::Responses;
+        test_provider.base_url = upstream;
+        test_provider
+            .model_aliases
+            .insert("test-model".into(), "upstream-model".into());
+        let endpoint = manager
+            .prepare_inner(&test_provider, &account(), &route_settings(), true)
+            .await
+            .unwrap();
+        manager.commit().await.unwrap();
+
+        let response = Client::new()
+            .post(format!("{}/responses", endpoint.base_url))
+            .header(reqwest::header::HOST, "127.0.0.1:16384")
+            .json(&json!({"model":"test-model","input":"hello"}))
+            .send()
+            .await
+            .unwrap();
+
+        assert!(response.status().is_success());
+        let request = captured.await.unwrap();
+        let value: Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(value["model"], "upstream-model");
+        manager.stop().await;
+    }
+
+    #[tokio::test]
+    async fn chat_provider_converts_local_responses_request_and_response() {
+        let manager = ProxyManager::default();
+        let upstream_body = serde_json::to_vec(&json!({
+            "id":"chatcmpl_test",
+            "model":"upstream-model",
+            "created":123,
+            "choices":[{
+                "message":{
+                    "role":"assistant",
+                    "content":"done",
+                    "reasoning_content":"checked the request"
+                },
+                "finish_reason":"stop"
+            }],
+            "usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}
+        }))
+        .unwrap();
+        let (upstream, received) = capture_upstream_response(200, "OK", "", upstream_body).await;
+        let mut test_provider = provider();
+        test_provider.base_url = upstream;
+        test_provider
+            .model_aliases
+            .insert("codex-model".into(), "upstream-model".into());
+        test_provider.codex_chat_reasoning = Some(reasoning_config(
+            false,
+            false,
+            "thinking",
+            "reasoning_effort",
+            None,
+            "reasoning_content",
+        ));
+        let endpoint = manager
+            .prepare_inner(&test_provider, &account(), &route_settings(), true)
+            .await
+            .unwrap();
+        manager.commit().await.unwrap();
+
+        let response = Client::new()
+            .post(format!("{}/responses", endpoint.base_url))
+            .header(reqwest::header::HOST, "127.0.0.1:16384")
+            .json(&json!({
+                "model":"codex-model",
+                "input":"hello",
+                "stream":false
+            }))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let converted: Value = response.json().await.unwrap();
+        assert_eq!(converted["object"], "response");
+        assert_eq!(converted["status"], "completed");
+        assert_eq!(converted["output"][0]["type"], "message");
+        assert_eq!(converted["output"][0]["content"][0]["text"], "done");
+        assert_eq!(converted["output"][1]["type"], "reasoning");
+        assert_eq!(
+            converted["output"][1]["summary"][0]["text"],
+            "checked the request"
+        );
+        assert_eq!(converted["usage"]["total_tokens"], 5);
+
+        let request = received.await.unwrap();
+        let upstream_request: Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(request.path, "/v1/chat/completions");
+        assert_eq!(
+            request.headers.get("authorization").unwrap(),
+            "Bearer secret"
+        );
+        assert_eq!(upstream_request["model"], "upstream-model");
+        assert_eq!(upstream_request["messages"][0]["role"], "user");
+        assert_eq!(upstream_request["messages"][0]["content"], "hello");
+        manager.stop().await;
+    }
+
+    #[tokio::test]
+    async fn anthropic_provider_converts_local_responses_request_and_response() {
+        let manager = ProxyManager::default();
+        let upstream_body = serde_json::to_vec(&json!({
+            "id":"msg_test",
+            "type":"message",
+            "role":"assistant",
+            "model":"claude-test",
+            "content":[
+                {"type":"thinking","thinking":"inspect the file"},
+                {"type":"text","text":"done"},
+                {"type":"tool_use","id":"call_1","name":"read","input":{"path":"a"}}
+            ],
+            "stop_reason":"tool_use",
+            "usage":{"input_tokens":4,"output_tokens":3}
+        }))
+        .unwrap();
+        let (upstream, received) = capture_upstream_response(200, "OK", "", upstream_body).await;
+        let mut test_provider = provider();
+        test_provider.protocol = crate::models::ProviderProtocol::AnthropicMessages;
+        test_provider.base_url = upstream;
+        let endpoint = manager
+            .prepare_inner(&test_provider, &account(), &route_settings(), true)
+            .await
+            .unwrap();
+        manager.commit().await.unwrap();
+
+        let response = Client::new()
+            .post(format!("{}/responses", endpoint.base_url))
+            .header(reqwest::header::HOST, "127.0.0.1:16384")
+            .json(&json!({
+                "model":"claude-test",
+                "instructions":"Be concise",
+                "input":"inspect",
+                "tools":[{
+                    "type":"function",
+                    "name":"read",
+                    "description":"Read a file",
+                    "parameters":{"type":"object","properties":{"path":{"type":"string"}}}
+                }],
+                "stream":false
+            }))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let converted: Value = response.json().await.unwrap();
+        assert_eq!(converted["object"], "response");
+        assert_eq!(converted["status"], "completed");
+        assert_eq!(converted["output"][0]["type"], "message");
+        assert_eq!(converted["output"][1]["type"], "reasoning");
+        assert_eq!(
+            converted["output"][1]["summary"][0]["text"],
+            "inspect the file"
+        );
+        assert_eq!(converted["output"][2]["type"], "function_call");
+        assert_eq!(converted["output"][2]["name"], "read");
+        assert_eq!(converted["usage"]["total_tokens"], 7);
+
+        let request = received.await.unwrap();
+        let upstream_request: Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(request.path, "/v1/messages");
+        assert_eq!(request.headers.get("x-api-key").unwrap(), "secret");
+        assert!(!request.headers.contains_key("authorization"));
+        assert_eq!(upstream_request["system"], "Be concise");
+        assert_eq!(upstream_request["messages"][0]["role"], "user");
+        assert_eq!(
+            upstream_request["messages"][0]["content"][0]["text"],
+            "inspect"
+        );
+        assert_eq!(upstream_request["tools"][0]["name"], "read");
+        manager.stop().await;
+    }
+
+    #[tokio::test]
+    async fn forwards_codex_metadata_but_provider_headers_keep_priority() {
+        let manager = ProxyManager::default();
+        let (upstream, captured) = capture_upstream().await;
+        let mut test_provider = provider();
+        test_provider.protocol = crate::models::ProviderProtocol::Responses;
+        test_provider.base_url = upstream;
+        test_provider
+            .headers
+            .insert("originator".into(), "configured-origin".into());
+        let endpoint = manager
+            .prepare_inner(&test_provider, &account(), &route_settings(), true)
+            .await
+            .unwrap();
+        manager.commit().await.unwrap();
+
+        let response = Client::new()
+            .post(format!("{}/responses/compact", endpoint.base_url))
+            .header(reqwest::header::HOST, "127.0.0.1:16384")
+            .header("originator", "client-origin")
+            .header("session_id", "session-123")
+            .header("x-codex-beta-features", "feature-a")
+            .header("cookie", "private-cookie")
+            .header("x-api-key", "client-api-key")
+            .header(reqwest::header::USER_AGENT, "codex-cli-test")
+            .bearer_auth("client-bearer")
+            .json(&json!({"model":"test-model","input":"hello"}))
+            .send()
+            .await
+            .unwrap();
+
+        assert!(response.status().is_success());
+        let response_request_id = response
+            .headers()
+            .get(REQUEST_ID_HEADER)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let request = captured.await.unwrap();
+        assert_eq!(request.path, "/v1/responses/compact");
+        assert_eq!(
+            request.headers.get("originator").unwrap(),
+            "configured-origin"
+        );
+        assert_eq!(request.headers.get("session_id").unwrap(), "session-123");
+        assert_eq!(request.headers.get("user-agent").unwrap(), "codex-cli-test");
+        assert_eq!(
+            request.headers.get("x-codex-beta-features").unwrap(),
+            "feature-a"
+        );
+        assert_eq!(
+            request.headers.get("authorization").unwrap(),
+            "Bearer secret"
+        );
+        assert_eq!(
+            request.headers.get(REQUEST_ID_HEADER).unwrap(),
+            &response_request_id
+        );
+        assert!(!request.headers.contains_key("cookie"));
+        assert!(!request.headers.contains_key("x-api-key"));
+
+        let mut snapshot = manager.console(route_settings(), 1, 20).await;
+        for _ in 0..10 {
+            if snapshot.log_total > 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+            snapshot = manager.console(route_settings(), 1, 20).await;
+        }
+        assert_eq!(snapshot.logs[0].method, "POST");
+        assert_eq!(snapshot.logs[0].path, "/v1/responses/compact");
+        manager.stop().await;
+    }
+
+    #[tokio::test]
+    async fn preserves_safe_upstream_error_and_rate_limit_metadata() {
+        let manager = ProxyManager::default();
+        let body = br#"{"error":{"message":"slow down","type":"rate_limit_error","code":"rate_limit_exceeded","param":"model","details":{"secret":"hidden"}}}"#.to_vec();
+        let (upstream, _) = capture_upstream_response(
+            429,
+            "Too Many Requests",
+            "Retry-After: 2\r\nX-Request-Id: upstream-1\r\nX-RateLimit-Remaining-Requests: 0\r\nSet-Cookie: private=secret\r\n",
+            body,
+        )
+        .await;
+        let mut test_provider = provider();
+        test_provider.protocol = crate::models::ProviderProtocol::Responses;
+        test_provider.base_url = upstream;
+        let endpoint = manager
+            .prepare_inner(&test_provider, &account(), &route_settings(), true)
+            .await
+            .unwrap();
+        manager.commit().await.unwrap();
+
+        let response = Client::new()
+            .post(format!("{}/responses", endpoint.base_url))
+            .header(reqwest::header::HOST, "127.0.0.1:16384")
+            .json(&json!({"model":"test-model","input":"hello"}))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers().get("retry-after").unwrap(), "2");
+        assert_eq!(
+            response.headers().get("x-request-id").unwrap(),
+            "upstream-1"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("x-ratelimit-remaining-requests")
+                .unwrap(),
+            "0"
+        );
+        assert!(response.headers().get("set-cookie").is_none());
+        assert!(response.headers().get(REQUEST_ID_HEADER).is_some());
+        let value: Value = response.json().await.unwrap();
+        assert_eq!(value["error"]["message"], "slow down");
+        assert_eq!(value["error"]["type"], "rate_limit_error");
+        assert_eq!(value["error"]["code"], "rate_limit_exceeded");
+        assert_eq!(value["error"]["param"], "model");
+        assert!(value["error"].get("details").is_none());
+        manager.stop().await;
+    }
+
+    #[test]
+    fn upstream_error_redacts_credentials_and_drops_unknown_fields() {
+        let value = sanitized_upstream_error(
+            br#"{"error":{"message":"Bearer top-secret","type":"upstream","code":"bad","credentials":{"token":"top-secret"}}}"#,
+        );
+        let serialized = serde_json::to_string(&value).unwrap();
+        assert!(!serialized.contains("top-secret"));
+        assert!(value["error"].get("credentials").is_none());
+    }
+
+    #[tokio::test]
+    async fn anthropic_sse_is_forwarded_incrementally_with_tools() {
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_address = upstream.local_addr().unwrap();
+        let sse = [
+            json!({"type":"message_start","message":{"model":"claude-test","usage":{"input_tokens":3,"output_tokens":0}}}),
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Check"}}),
+            json!({"type":"content_block_stop","index":0}),
+            json!({"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}),
+            json!({"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"Hi"}}),
+            json!({"type":"content_block_stop","index":1}),
+            json!({"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"call_1","name":"read","input":{}}}),
+            json!({"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"a\"}"}}),
+            json!({"type":"content_block_stop","index":2}),
+            json!({"type":"message_delta","usage":{"output_tokens":2}}),
+            json!({"type":"message_stop"}),
+        ]
+        .into_iter()
+        .map(|event| format!("event: {}\ndata: {event}\n\n", event["type"].as_str().unwrap()))
+        .collect::<String>();
+        tokio::spawn(async move {
+            let (mut socket, _) = upstream.accept().await.unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = socket.read(&mut request).await;
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{sse}",
+                        sse.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        });
+        let response = Client::new()
+            .get(format!("http://{upstream_address}"))
+            .send()
+            .await
+            .unwrap();
+
+        let downstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let downstream_address = downstream.local_addr().unwrap();
+        let mut client = TcpStream::connect(downstream_address).await.unwrap();
+        let (mut server, _) = downstream.accept().await.unwrap();
+        let reader = tokio::spawn(async move {
+            let mut output = Vec::new();
+            client.read_to_end(&mut output).await.unwrap();
+            output
+        });
+
+        let response_headers = HeaderMap::new();
+        proxy_anthropic_stream(
+            &mut server,
+            response,
+            Duration::from_secs(2),
+            "claude-test",
+            &CodexToolContext::default(),
+            &response_headers,
+        )
+        .await
+        .unwrap();
+        drop(server);
+        let output = String::from_utf8(reader.await.unwrap()).unwrap();
+        assert!(output.contains("response.reasoning_summary_text.delta"));
+        assert!(output.contains("response.reasoning_summary_text.done"));
+        assert!(output.contains("response.output_text.delta"));
+        assert!(output.contains("response.function_call_arguments.delta"));
+        assert!(output.contains("response.completed"));
+        assert!(output.contains("claude-test"));
+    }
+
+    #[tokio::test]
+    async fn chat_sse_converts_reasoning_and_incomplete_status() {
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_address = upstream.local_addr().unwrap();
+        let sse = [
+            json!({"id":"chatcmpl_test","model":"chat-test","choices":[{"delta":{"reasoning_content":"Check"}}]}),
+            json!({"choices":[{"delta":{"content":"partial"}}]}),
+            json!({"choices":[{"delta":{},"finish_reason":"length"}]}),
+            json!({"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}),
+        ]
+        .into_iter()
+        .map(|chunk| format!("data: {chunk}\n\n"))
+        .chain(std::iter::once("data: [DONE]\n\n".into()))
+        .collect::<String>();
+        tokio::spawn(async move {
+            let (mut socket, _) = upstream.accept().await.unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = socket.read(&mut request).await;
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{sse}",
+                        sse.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        });
+        let response = Client::new()
+            .get(format!("http://{upstream_address}"))
+            .send()
+            .await
+            .unwrap();
+
+        let downstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let downstream_address = downstream.local_addr().unwrap();
+        let mut client = TcpStream::connect(downstream_address).await.unwrap();
+        let (mut server, _) = downstream.accept().await.unwrap();
+        let reader = tokio::spawn(async move {
+            let mut output = Vec::new();
+            client.read_to_end(&mut output).await.unwrap();
+            output
+        });
+
+        proxy_stream(
+            &mut server,
+            response,
+            Duration::from_secs(2),
+            &CodexToolContext::default(),
+            &HeaderMap::new(),
+        )
+        .await
+        .unwrap();
+        drop(server);
+        let output = String::from_utf8(reader.await.unwrap()).unwrap();
+        assert!(output.contains("response.reasoning_summary_text.delta"));
+        assert!(output.contains("response.reasoning_summary_text.done"));
+        assert!(output.contains("response.output_text.delta"));
+        assert!(output.contains("response.incomplete"));
+        assert!(output.contains("max_output_tokens"));
+        assert!(output.contains("\"status\":\"incomplete\""));
     }
 
     #[test]
@@ -3008,8 +5174,15 @@ mod tests {
     fn custom_headers_override_auth_without_forwarding_transport_headers() {
         let headers = build_upstream_headers(
             "default-key",
-            &json!({"x-provider":"one","authorization":"Bearer provider"}),
-            &json!({"x-provider":"two","authorization":"Bearer account","host":"bad"}),
+            &BTreeMap::from([
+                ("x-provider".into(), "one".into()),
+                ("authorization".into(), "Bearer provider".into()),
+            ]),
+            &BTreeMap::from([
+                ("x-provider".into(), "two".into()),
+                ("authorization".into(), "Bearer account".into()),
+                ("host".into(), "bad".into()),
+            ]),
         )
         .unwrap();
         assert_eq!(headers.get("x-provider").unwrap(), "two");
@@ -3030,6 +5203,26 @@ mod tests {
         assert_eq!(response["output"][0]["content"][0]["text"], "done");
         assert_eq!(response["output"][1]["type"], "function_call");
         assert_eq!(response["usage"]["total_tokens"], 5);
+    }
+
+    #[test]
+    fn maps_chat_incomplete_finish_reasons_to_responses_status() {
+        for (finish_reason, expected_reason) in [
+            ("length", "max_output_tokens"),
+            ("content_filter", "content_filter"),
+        ] {
+            let response = chat_to_response(&json!({
+                "id":"chatcmpl_1",
+                "model":"test-model",
+                "choices":[{
+                    "message":{"role":"assistant","content":"partial"},
+                    "finish_reason":finish_reason
+                }]
+            }));
+            assert_eq!(response["status"], "incomplete");
+            assert_eq!(response["incomplete_details"]["reason"], expected_reason);
+            assert_eq!(response["output"][0]["status"], "incomplete");
+        }
     }
 
     #[test]

@@ -103,7 +103,7 @@ fn build_from_catalog(provider: &ProviderProfile, installed: &Value, template: &
             }
 
             if let Some(mut entry) = find_exact_model(installed, model) {
-                if provider.protocol == crate::models::ProviderProtocol::ChatCompletions {
+                if provider.protocol != crate::models::ProviderProtocol::Responses {
                     make_proxy_transport_safe(&mut entry);
                 }
                 return Some(entry);
@@ -217,8 +217,9 @@ mod tests {
                 }))
                 .unwrap(),
             }],
+            model_aliases: Default::default(),
             codex_chat_reasoning: None,
-            headers: json!({}),
+            headers: Default::default(),
             timeout_secs: 30,
             context_window: None,
             auto_compact_threshold: None,
@@ -360,28 +361,33 @@ mod tests {
     }
 
     #[test]
-    fn chat_exact_match_only_removes_transport_specific_switches() {
+    fn converted_protocols_remove_transport_specific_switches() {
         let exact = exact_model();
         let template = complete_template();
         let installed = json!({"models":[template.clone(),exact.clone()]});
-        let mut provider = provider();
-        provider.protocol = ProviderProtocol::ChatCompletions;
-        provider.models = vec!["gpt-5.6-sol".into()];
+        for protocol in [
+            ProviderProtocol::ChatCompletions,
+            ProviderProtocol::AnthropicMessages,
+        ] {
+            let mut provider = provider();
+            provider.protocol = protocol;
+            provider.models = vec!["gpt-5.6-sol".into()];
 
-        let generated = build_from_catalog(&provider, &installed, &template);
-        let model = &generated["models"][0];
-        assert_eq!(model["context_window"], 372000);
-        assert_eq!(model["effective_context_window_percent"], 95);
-        assert_eq!(model["base_instructions"], "model-specific instructions");
-        assert_eq!(model["model_messages"]["future_variable"], "kept");
-        assert_eq!(
-            model["supported_reasoning_levels"],
-            exact["supported_reasoning_levels"]
-        );
-        assert_eq!(model["future_codex_field"], exact["future_codex_field"]);
-        assert_eq!(model["use_responses_lite"], false);
-        assert!(model.get("tool_mode").is_none());
-        assert!(model.get("multi_agent_version").is_none());
+            let generated = build_from_catalog(&provider, &installed, &template);
+            let model = &generated["models"][0];
+            assert_eq!(model["context_window"], 372000);
+            assert_eq!(model["effective_context_window_percent"], 95);
+            assert_eq!(model["base_instructions"], "model-specific instructions");
+            assert_eq!(model["model_messages"]["future_variable"], "kept");
+            assert_eq!(
+                model["supported_reasoning_levels"],
+                exact["supported_reasoning_levels"]
+            );
+            assert_eq!(model["future_codex_field"], exact["future_codex_field"]);
+            assert_eq!(model["use_responses_lite"], false);
+            assert!(model.get("tool_mode").is_none());
+            assert!(model.get("multi_agent_version").is_none());
+        }
     }
 
     #[test]

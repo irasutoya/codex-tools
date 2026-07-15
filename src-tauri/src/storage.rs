@@ -1,518 +1,899 @@
-use crate::models::{
-    AccountAuthKind, AuthAccount, AuthService, ProviderAccount, ProviderProfile, ProviderProtocol,
-    RouteSettings,
+use crate::models::*;
+use std::{
+    fs,
+    io::Write,
+    path::{Path, PathBuf},
+    sync::{RwLock, RwLockReadGuard},
 };
-use rusqlite::{Connection, OptionalExtension, params};
-use std::path::PathBuf;
 
-#[derive(Clone)]
 pub struct Store {
+    root: PathBuf,
     path: PathBuf,
+    state: RwLock<AppConfig>,
 }
 
 impl Store {
-    pub fn open() -> anyhow::Result<Self> {
-        let root = dirs::data_local_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("CodexTools");
-        std::fs::create_dir_all(&root)?;
-        let store = Self {
-            path: root.join("codex-tools.sqlite"),
-        };
-        store.initialize()?;
-        Ok(store)
+    pub fn new() -> anyhow::Result<Self> {
+        let root = data_root();
+        Self::open(root)
     }
 
-    fn initialize(&self) -> anyhow::Result<()> {
-        self.connect()?.execute_batch(
-            "PRAGMA journal_mode=WAL;
-             CREATE TABLE IF NOT EXISTS providers(
-               id TEXT PRIMARY KEY,name TEXT NOT NULL,protocol TEXT NOT NULL,base_url TEXT NOT NULL,
-               models_json TEXT NOT NULL DEFAULT '[]',headers_json TEXT NOT NULL DEFAULT '{}',
-               timeout_secs INTEGER NOT NULL DEFAULT 30,active INTEGER NOT NULL DEFAULT 0,
-               context_window INTEGER,auto_compact_threshold INTEGER,enabled INTEGER NOT NULL DEFAULT 1,
-               codex_chat_reasoning_json TEXT,model_metadata_json TEXT NOT NULL DEFAULT '[]',
-               updated_at INTEGER NOT NULL
-             );
-             CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);
-             CREATE TABLE IF NOT EXISTS provider_accounts(
-               id TEXT PRIMARY KEY,provider_id TEXT NOT NULL,name TEXT NOT NULL,api_key TEXT NOT NULL,
-               headers_json TEXT NOT NULL DEFAULT '{}',active INTEGER NOT NULL DEFAULT 0,
-               created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,
-               FOREIGN KEY(provider_id) REFERENCES providers(id) ON DELETE CASCADE
-             );
-             CREATE INDEX IF NOT EXISTS idx_provider_accounts_provider ON provider_accounts(provider_id);
-             CREATE UNIQUE INDEX IF NOT EXISTS idx_provider_accounts_one_active
-               ON provider_accounts(provider_id) WHERE active=1;
-             CREATE TABLE IF NOT EXISTS auth_accounts(
-               id TEXT PRIMARY KEY,service TEXT NOT NULL,name TEXT NOT NULL,login TEXT,email TEXT,
-               credential_json TEXT,scopes_json TEXT NOT NULL DEFAULT '[]',expires_at INTEGER,
-               active INTEGER NOT NULL DEFAULT 0,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL
-             );
-             CREATE INDEX IF NOT EXISTS idx_auth_accounts_service ON auth_accounts(service);
-             CREATE UNIQUE INDEX IF NOT EXISTS idx_auth_accounts_active_openai
-               ON auth_accounts(service) WHERE active=1 AND service='openai';",
-        )?;
-        Ok(())
-    }
-
-    pub fn connect(&self) -> anyhow::Result<Connection> {
-        let db = Connection::open(&self.path)?;
-        db.execute_batch("PRAGMA foreign_keys=ON;")?;
-        Ok(db)
-    }
-
-    pub fn providers(&self) -> anyhow::Result<Vec<ProviderProfile>> {
-        let db = self.connect()?;
-        let mut statement = db.prepare(
-            "SELECT p.id,p.name,p.protocol,p.base_url,p.models_json,p.headers_json,
-                    p.timeout_secs,p.context_window,p.auto_compact_threshold,p.enabled,p.active,
-                    p.codex_chat_reasoning_json,p.model_metadata_json,
-                    (SELECT id FROM provider_accounts a WHERE a.provider_id=p.id AND a.active=1 LIMIT 1),
-                    (SELECT count(*) FROM provider_accounts a WHERE a.provider_id=p.id)
-             FROM providers p ORDER BY p.active DESC,p.name",
-        )?;
-        let rows = statement.query_map([], |row| {
-            Ok(ProviderProfile {
-                id: row.get(0)?,
-                name: row.get(1)?,
-                protocol: protocol_from_db(&row.get::<_, String>(2)?),
-                base_url: row.get(3)?,
-                models: json_or_default(row.get(4)?),
-                headers: json_or_default(row.get(5)?),
-                timeout_secs: row.get::<_, i64>(6)? as u64,
-                context_window: row.get::<_, Option<i64>>(7)?.map(|value| value as u64),
-                auto_compact_threshold: row.get::<_, Option<i64>>(8)?.map(|value| value as u64),
-                enabled: row.get::<_, i64>(9)? != 0,
-                active: row.get::<_, i64>(10)? != 0,
-                codex_chat_reasoning: row
-                    .get::<_, Option<String>>(11)?
-                    .and_then(|value| serde_json::from_str(&value).ok()),
-                model_metadata: json_or_default(row.get(12)?),
-                active_account_id: row.get(13)?,
-                account_count: row.get::<_, i64>(14)? as u64,
-            })
-        })?;
-        Ok(rows.collect::<rusqlite::Result<_>>()?)
-    }
-
-    pub fn save_provider(&self, provider: &ProviderProfile) -> anyhow::Result<()> {
-        self.connect()?.execute(
-            "INSERT INTO providers(
-               id,name,protocol,base_url,models_json,headers_json,timeout_secs,active,
-               context_window,auto_compact_threshold,enabled,codex_chat_reasoning_json,
-               model_metadata_json,updated_at
-             ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,strftime('%s','now'))
-             ON CONFLICT(id) DO UPDATE SET name=excluded.name,protocol=excluded.protocol,
-               base_url=excluded.base_url,models_json=excluded.models_json,
-               headers_json=excluded.headers_json,timeout_secs=excluded.timeout_secs,
-               context_window=excluded.context_window,
-               auto_compact_threshold=excluded.auto_compact_threshold,enabled=excluded.enabled,
-               codex_chat_reasoning_json=excluded.codex_chat_reasoning_json,
-               model_metadata_json=excluded.model_metadata_json,updated_at=excluded.updated_at",
-            params![
-                provider.id,
-                provider.name,
-                protocol_to_db(provider.protocol),
-                provider.base_url,
-                serde_json::to_string(&provider.models)?,
-                serde_json::to_string(&provider.headers)?,
-                provider.timeout_secs,
-                provider.active,
-                provider.context_window,
-                provider.auto_compact_threshold,
-                provider.enabled,
-                provider
-                    .codex_chat_reasoning
-                    .as_ref()
-                    .map(serde_json::to_string)
-                    .transpose()?,
-                serde_json::to_string(&provider.model_metadata)?,
-            ],
-        )?;
-        Ok(())
-    }
-
-    pub fn delete_provider(&self, id: &str) -> anyhow::Result<()> {
-        let changed = self
-            .connect()?
-            .execute("DELETE FROM providers WHERE id=?1 AND active=0", [id])?;
-        if changed != 1 {
-            anyhow::bail!("当前 Provider 不能删除");
-        }
-        Ok(())
-    }
-
-    pub fn provider(&self, id: &str) -> anyhow::Result<ProviderProfile> {
-        self.providers()?
-            .into_iter()
-            .find(|provider| provider.id == id)
-            .ok_or_else(|| anyhow::anyhow!("Provider 不存在"))
-    }
-
-    pub fn accounts(&self, provider_id: Option<&str>) -> anyhow::Result<Vec<ProviderAccount>> {
-        let db = self.connect()?;
-        let sql = if provider_id.is_some() {
-            "SELECT id,provider_id,name,api_key,headers_json,active,created_at,updated_at
-             FROM provider_accounts WHERE provider_id=?1 ORDER BY active DESC,name"
+    pub fn open(root: PathBuf) -> anyhow::Result<Self> {
+        fs::create_dir_all(&root)?;
+        let path = root.join("app.yaml");
+        let state = if path.exists() {
+            let text = fs::read_to_string(&path)?;
+            serde_yaml::from_str::<AppConfig>(&text)
+                .map_err(|error| anyhow::anyhow!("app.yaml 无效：{error}"))?
         } else {
-            "SELECT id,provider_id,name,api_key,headers_json,active,created_at,updated_at
-             FROM provider_accounts ORDER BY active DESC,name"
+            let state = AppConfig::default();
+            atomic_yaml(&path, &state)?;
+            state
         };
-        let mut statement = db.prepare(sql)?;
-        let map = |row: &rusqlite::Row<'_>| {
-            Ok(ProviderAccount {
-                id: row.get(0)?,
-                provider_id: row.get(1)?,
-                name: row.get(2)?,
-                auth_kind: AccountAuthKind::ApiKey,
-                api_key: row.get(3)?,
-                auth_json: None,
-                headers: json_or_default(row.get(4)?),
-                active: row.get::<_, i64>(5)? != 0,
-                email: None,
-                created_at: row.get(6)?,
-                updated_at: row.get(7)?,
-            })
-        };
-        let rows = match provider_id {
-            Some(id) => statement
-                .query_map([id], map)?
-                .collect::<rusqlite::Result<_>>()?,
-            None => statement
-                .query_map([], map)?
-                .collect::<rusqlite::Result<_>>()?,
-        };
-        Ok(rows)
+        Ok(Self {
+            root,
+            path,
+            state: RwLock::new(state),
+        })
     }
 
-    pub fn account(&self, id: &str) -> anyhow::Result<ProviderAccount> {
-        self.accounts(None)?
-            .into_iter()
-            .find(|account| account.id == id)
-            .ok_or_else(|| anyhow::anyhow!("账号不存在"))
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 
-    pub fn save_account(&self, account: &ProviderAccount) -> anyhow::Result<()> {
-        self.connect()?.execute(
-            "INSERT INTO provider_accounts(
-               id,provider_id,name,api_key,headers_json,active,created_at,updated_at
-             ) VALUES(?1,?2,?3,?4,?5,?6,COALESCE(NULLIF(?7,0),strftime('%s','now')),strftime('%s','now'))
-             ON CONFLICT(id) DO UPDATE SET provider_id=excluded.provider_id,name=excluded.name,
-               api_key=excluded.api_key,headers_json=excluded.headers_json,updated_at=excluded.updated_at",
-            params![
-                account.id,
-                account.provider_id,
-                account.name,
-                account.api_key,
-                serde_json::to_string(&account.headers)?,
-                account.active,
-                account.created_at,
-            ],
-        )?;
-        Ok(())
+    fn read_state(&self) -> Result<RwLockReadGuard<'_, AppConfig>, AppError> {
+        self.state
+            .read()
+            .map_err(|_| AppError::Internal("配置锁已损坏".into()))
     }
 
-    pub fn delete_account(&self, id: &str) -> anyhow::Result<()> {
-        let changed = self.connect()?.execute(
-            "DELETE FROM provider_accounts WHERE id=?1 AND active=0",
-            [id],
-        )?;
-        if changed != 1 {
-            anyhow::bail!("当前账号不能删除");
-        }
-        Ok(())
+    pub(crate) fn read<T>(&self, project: impl FnOnce(&AppConfig) -> T) -> Result<T, AppError> {
+        let state = self.read_state()?;
+        Ok(project(&state))
     }
 
-    pub fn activate(&self, provider_id: &str, account_id: &str) -> anyhow::Result<()> {
-        let mut db = self.connect()?;
-        let tx = db.transaction()?;
-        tx.execute("UPDATE providers SET active=0", [])?;
-        tx.execute("UPDATE provider_accounts SET active=0", [])?;
-        tx.execute("UPDATE auth_accounts SET active=0", [])?;
-        tx.execute("UPDATE providers SET active=1 WHERE id=?1", [provider_id])?;
-        let changed = tx.execute(
-            "UPDATE provider_accounts SET active=1 WHERE id=?1 AND provider_id=?2",
-            params![account_id, provider_id],
-        )?;
-        if changed != 1 {
-            anyhow::bail!("账号不属于所选 Provider");
-        }
-        tx.commit()?;
-        Ok(())
+    #[cfg(test)]
+    pub fn snapshot(&self) -> Result<AppConfig, AppError> {
+        self.read(Clone::clone)
     }
 
-    pub fn active_state(&self) -> anyhow::Result<(Option<String>, Option<String>, Option<String>)> {
-        let db = self.connect()?;
-        let provider = active_id(&db, "providers")?;
-        let account = active_id(&db, "provider_accounts")?;
-        let official = active_id(&db, "auth_accounts")?;
-        Ok((provider, account, official))
+    pub fn codex_home_setting(&self) -> Result<String, AppError> {
+        Ok(self.read_state()?.codex.home.clone())
     }
 
-    pub fn restore_active(
+    pub fn is_active_provider(&self, id: &str) -> Result<bool, AppError> {
+        let state = self.read_state()?;
+        Ok(matches!(state.active.kind, ActiveKind::Provider)
+            && state.active.provider_id.as_deref() == Some(id))
+    }
+
+    pub fn is_active_account(&self, id: &str) -> Result<bool, AppError> {
+        let state = self.read_state()?;
+        Ok(state.active.account_id.as_deref() == Some(id))
+    }
+
+    pub fn update<T>(
         &self,
-        state: (Option<&str>, Option<&str>, Option<&str>),
-    ) -> anyhow::Result<()> {
-        let mut db = self.connect()?;
-        let tx = db.transaction()?;
-        tx.execute("UPDATE providers SET active=0", [])?;
-        tx.execute("UPDATE provider_accounts SET active=0", [])?;
-        tx.execute("UPDATE auth_accounts SET active=0", [])?;
-        for (table, id) in [
-            ("providers", state.0),
-            ("provider_accounts", state.1),
-            ("auth_accounts", state.2),
-        ] {
-            if let Some(id) = id {
-                tx.execute(&format!("UPDATE {table} SET active=1 WHERE id=?1"), [id])?;
+        mutate: impl FnOnce(&mut AppConfig) -> Result<T, AppError>,
+    ) -> Result<T, AppError> {
+        let mut guard = self
+            .state
+            .write()
+            .map_err(|_| AppError::Internal("配置锁已损坏".into()))?;
+        let mut draft = guard.clone();
+        let result = mutate(&mut draft)?;
+        draft.route.normalize();
+        atomic_yaml(&self.path, &draft).map_err(|error| AppError::Internal(error.to_string()))?;
+        *guard = draft;
+        Ok(result)
+    }
+
+    pub fn providers(&self) -> Result<Vec<ProviderProfile>, AppError> {
+        let state = self.read_state()?;
+        Ok(state
+            .providers
+            .iter()
+            .map(|stored| {
+                let mut profile = stored.profile.clone();
+                profile.active = matches!(state.active.kind, ActiveKind::Provider)
+                    && state.active.provider_id.as_deref() == Some(profile.id.as_str());
+                profile.active_account_id = if profile.active {
+                    state.active.account_id.clone()
+                } else {
+                    stored.profile.active_account_id.clone()
+                };
+                profile.account_count = stored.accounts.len() as u64;
+                profile
+            })
+            .collect())
+    }
+
+    pub fn provider(&self, id: &str) -> Result<ProviderProfile, AppError> {
+        let state = self.read_state()?;
+        let stored = state
+            .providers
+            .iter()
+            .find(|provider| provider.profile.id == id)
+            .ok_or_else(|| AppError::InvalidConfig("Provider 不存在".into()))?;
+        let mut profile = stored.profile.clone();
+        profile.active = matches!(state.active.kind, ActiveKind::Provider)
+            && state.active.provider_id.as_deref() == Some(profile.id.as_str());
+        profile.active_account_id = if profile.active {
+            state.active.account_id.clone()
+        } else {
+            stored.profile.active_account_id.clone()
+        };
+        profile.account_count = stored.accounts.len() as u64;
+        Ok(profile)
+    }
+
+    pub fn save_provider(
+        &self,
+        mut provider: ProviderProfile,
+    ) -> Result<ProviderProfile, AppError> {
+        if provider.id.trim().is_empty() {
+            provider.id = uuid::Uuid::new_v4().to_string();
+        }
+        provider.normalize_and_validate()?;
+        let existing_headers = {
+            let state = self.read_state()?;
+            state
+                .providers
+                .iter()
+                .find(|value| value.profile.id == provider.id)
+                .map(|value| value.profile.headers.clone())
+        };
+        if let Some(existing_headers) = existing_headers {
+            preserve_redacted_headers(&mut provider.headers, &existing_headers);
+        }
+        provider.active = false;
+        provider.account_count = 0;
+        let saved = provider.clone();
+        self.update(|state| {
+            if let Some(existing) = state
+                .providers
+                .iter_mut()
+                .find(|value| value.profile.id == provider.id)
+            {
+                let accounts = std::mem::take(&mut existing.accounts);
+                let active_account_id = existing.profile.active_account_id.clone();
+                *existing = StoredProvider {
+                    profile: provider.clone(),
+                    accounts,
+                };
+                existing.profile.active_account_id = active_account_id;
+            } else {
+                state.providers.push(StoredProvider {
+                    profile: provider.clone(),
+                    accounts: vec![],
+                });
             }
-        }
-        tx.commit()?;
-        Ok(())
-    }
-
-    pub fn route_settings(&self) -> anyhow::Result<RouteSettings> {
-        let value = self
-            .connect()?
-            .query_row(
-                "SELECT value FROM settings WHERE key='local_route'",
-                [],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?;
-        Ok(value
-            .as_deref()
-            .and_then(|value| serde_json::from_str(value).ok())
-            .unwrap_or_default())
-    }
-
-    pub fn save_route_settings(&self, settings: &RouteSettings) -> anyhow::Result<()> {
-        self.connect()?.execute(
-            "INSERT INTO settings(key,value) VALUES('local_route',?1)
-             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            [serde_json::to_string(settings)?],
-        )?;
-        Ok(())
-    }
-
-    pub fn auth_accounts(&self) -> anyhow::Result<Vec<AuthAccount>> {
-        let db = self.connect()?;
-        let mut statement = db.prepare(
-            "SELECT id,name,login,email,credential_json,scopes_json,expires_at,active,created_at,updated_at
-             FROM auth_accounts WHERE service='openai' ORDER BY active DESC,name",
-        )?;
-        let rows = statement.query_map([], |row| {
-            Ok(AuthAccount {
-                id: row.get(0)?,
-                service: AuthService::OpenAi,
-                name: row.get(1)?,
-                login: row.get(2)?,
-                email: row.get(3)?,
-                credential: row
-                    .get::<_, Option<String>>(4)?
-                    .and_then(|value| serde_json::from_str(&value).ok()),
-                scopes: json_or_default(row.get(5)?),
-                expires_at: row.get(6)?,
-                active: row.get::<_, i64>(7)? != 0,
-                created_at: row.get(8)?,
-                updated_at: row.get(9)?,
-            })
+            Ok(())
         })?;
-        Ok(rows.collect::<rusqlite::Result<_>>()?)
+        Ok(saved)
     }
 
-    pub fn auth_account(&self, id: &str) -> anyhow::Result<AuthAccount> {
-        self.auth_accounts()?
-            .into_iter()
-            .find(|account| account.id == id)
-            .ok_or_else(|| anyhow::anyhow!("认证账号不存在"))
+    pub fn delete_provider(&self, id: &str) -> Result<(), AppError> {
+        self.update(|state| {
+            if state.active.provider_id.as_deref() == Some(id) {
+                return Err(AppError::InvalidConfig("不能删除当前 Provider".into()));
+            }
+            let before = state.providers.len();
+            state.providers.retain(|value| value.profile.id != id);
+            if before == state.providers.len() {
+                return Err(AppError::InvalidConfig("Provider 不存在".into()));
+            }
+            Ok(())
+        })
     }
 
-    pub fn save_auth_account(&self, account: &AuthAccount) -> anyhow::Result<()> {
-        let mut db = self.connect()?;
-        let tx = db.transaction()?;
-        let existing: Option<(String, bool, i64)> = account
-            .login
-            .as_deref()
-            .filter(|login| !login.trim().is_empty())
-            .map(|login| {
-                tx.query_row(
-                    "SELECT id,active,created_at FROM auth_accounts
-                     WHERE service='openai' AND login=?1 ORDER BY active DESC,updated_at DESC LIMIT 1",
-                    [login],
-                    |row| Ok((row.get(0)?, row.get::<_, i64>(1)? != 0, row.get(2)?)),
-                )
-                .optional()
-            })
-            .transpose()?
-            .flatten();
-        let id = existing
-            .as_ref()
-            .map(|value| value.0.as_str())
-            .unwrap_or(&account.id);
-        let active = existing
-            .as_ref()
-            .map(|value| value.1)
-            .unwrap_or(account.active);
-        let created_at = existing
-            .as_ref()
-            .map(|value| value.2)
-            .unwrap_or(account.created_at);
-        tx.execute(
-            "INSERT INTO auth_accounts(
-               id,service,name,login,email,credential_json,scopes_json,expires_at,active,created_at,updated_at
-             ) VALUES(?1,'openai',?2,?3,?4,?5,?6,?7,?8,
-               COALESCE(NULLIF(?9,0),strftime('%s','now')),strftime('%s','now'))
-             ON CONFLICT(id) DO UPDATE SET name=excluded.name,login=excluded.login,
-               email=excluded.email,credential_json=excluded.credential_json,
-               scopes_json=excluded.scopes_json,expires_at=excluded.expires_at,
-               updated_at=excluded.updated_at",
-            params![
-                id,
-                account.name,
-                account.login,
-                account.email,
+    pub fn accounts(&self, provider_id: Option<&str>) -> Result<Vec<ProviderAccount>, AppError> {
+        let state = self.read_state()?;
+        Ok(state
+            .providers
+            .iter()
+            .filter(|provider| provider_id.is_none_or(|id| provider.profile.id == id))
+            .flat_map(|provider| provider.accounts.iter().cloned())
+            .map(|mut account| {
+                account.active = matches!(state.active.kind, ActiveKind::Provider)
+                    && state.active.account_id.as_deref() == Some(account.id.as_str());
                 account
-                    .credential
-                    .as_ref()
-                    .map(serde_json::to_string)
-                    .transpose()?,
-                serde_json::to_string(&account.scopes)?,
-                account.expires_at,
-                active,
-                created_at,
-            ],
+            })
+            .collect())
+    }
+
+    pub fn account(&self, id: &str) -> Result<ProviderAccount, AppError> {
+        let state = self.read_state()?;
+        let mut account = state
+            .providers
+            .iter()
+            .flat_map(|provider| &provider.accounts)
+            .find(|account| account.id == id)
+            .cloned()
+            .ok_or_else(|| AppError::InvalidConfig("账号不存在".into()))?;
+        account.active = matches!(state.active.kind, ActiveKind::Provider)
+            && state.active.account_id.as_deref() == Some(account.id.as_str());
+        Ok(account)
+    }
+
+    pub fn provider_overview(&self) -> Result<ProviderOverview, AppError> {
+        let state = self.read_state()?;
+        let providers = state
+            .providers
+            .iter()
+            .map(|stored| {
+                let mut profile = stored.profile.clone();
+                profile.active = matches!(state.active.kind, ActiveKind::Provider)
+                    && state.active.provider_id.as_deref() == Some(profile.id.as_str());
+                profile.active_account_id = if profile.active {
+                    state.active.account_id.clone()
+                } else {
+                    stored.profile.active_account_id.clone()
+                };
+                profile.account_count = stored.accounts.len() as u64;
+                profile.redacted()
+            })
+            .collect();
+        let accounts = state
+            .providers
+            .iter()
+            .flat_map(|provider| provider.accounts.iter())
+            .cloned()
+            .map(|mut account| {
+                account.active = matches!(state.active.kind, ActiveKind::Provider)
+                    && state.active.account_id.as_deref() == Some(account.id.as_str());
+                account.redacted()
+            })
+            .collect();
+        let official_accounts = state
+            .official_accounts
+            .iter()
+            .map(|account| {
+                let active = matches!(state.active.kind, ActiveKind::Official)
+                    && state.active.account_id.as_deref() == Some(account.id.as_str());
+                account.view(active)
+            })
+            .collect();
+        Ok(ProviderOverview {
+            providers,
+            accounts,
+            official_accounts,
+        })
+    }
+
+    pub fn save_account(&self, mut account: ProviderAccount) -> Result<ProviderAccount, AppError> {
+        if account.id.trim().is_empty() {
+            account.id = uuid::Uuid::new_v4().to_string();
+        }
+        let existing = {
+            let state = self.read_state()?;
+            state
+                .providers
+                .iter()
+                .flat_map(|provider| &provider.accounts)
+                .find(|value| value.id == account.id)
+                .cloned()
+        };
+        if let Some(existing) = existing {
+            if account
+                .api_key
+                .as_deref()
+                .is_none_or(|value| value.trim().is_empty())
+            {
+                account.api_key = existing.api_key;
+            }
+            preserve_redacted_headers(&mut account.headers, &existing.headers);
+        }
+        account.normalize_and_validate()?;
+        let now = chrono::Utc::now().timestamp();
+        if account.created_at == 0 {
+            account.created_at = now;
+        }
+        account.updated_at = now;
+        account.active = false;
+        let provider_id = account
+            .provider_id
+            .clone()
+            .ok_or_else(|| AppError::InvalidConfig("账号缺少 Provider".into()))?;
+        let saved = account.clone();
+        self.update(|state| {
+            let provider = state
+                .providers
+                .iter_mut()
+                .find(|value| value.profile.id == provider_id)
+                .ok_or_else(|| AppError::InvalidConfig("Provider 不存在".into()))?;
+            if let Some(existing) = provider
+                .accounts
+                .iter_mut()
+                .find(|value| value.id == account.id)
+            {
+                *existing = account.clone();
+            } else {
+                provider.accounts.push(account.clone());
+            }
+            Ok(())
+        })?;
+        Ok(saved)
+    }
+
+    pub fn delete_account(&self, id: &str) -> Result<(), AppError> {
+        self.update(|state| {
+            if state.active.account_id.as_deref() == Some(id) {
+                return Err(AppError::InvalidConfig("不能删除当前账号".into()));
+            }
+            let mut found = false;
+            for provider in &mut state.providers {
+                let before = provider.accounts.len();
+                provider.accounts.retain(|value| value.id != id);
+                found |= before != provider.accounts.len();
+            }
+            if !found {
+                return Err(AppError::InvalidConfig("账号不存在".into()));
+            }
+            Ok(())
+        })
+    }
+
+    pub fn activate(&self, provider_id: &str, account_id: &str) -> Result<(), AppError> {
+        self.update(|state| {
+            let provider = state
+                .providers
+                .iter_mut()
+                .find(|value| value.profile.id == provider_id)
+                .ok_or_else(|| AppError::InvalidConfig("Provider 不存在".into()))?;
+            if !provider
+                .accounts
+                .iter()
+                .any(|account| account.id == account_id)
+            {
+                return Err(AppError::InvalidConfig("账号不属于所选 Provider".into()));
+            }
+            provider.profile.active_account_id = Some(account_id.to_owned());
+            state.active = ActiveState {
+                kind: ActiveKind::Provider,
+                provider_id: Some(provider_id.to_owned()),
+                account_id: Some(account_id.to_owned()),
+            };
+            Ok(())
+        })
+    }
+
+    pub fn official_accounts(&self) -> Result<Vec<OfficialAccountView>, AppError> {
+        let state = self.read_state()?;
+        Ok(state
+            .official_accounts
+            .iter()
+            .map(|account| {
+                let active = matches!(state.active.kind, ActiveKind::Official)
+                    && state.active.account_id.as_deref() == Some(account.id.as_str());
+                account.view(active)
+            })
+            .collect())
+    }
+
+    pub fn official_account_view(&self, id: &str) -> Result<OfficialAccountView, AppError> {
+        let state = self.read_state()?;
+        let account = state
+            .official_accounts
+            .iter()
+            .find(|account| account.id == id)
+            .ok_or_else(|| AppError::InvalidConfig("OpenAI 官方账号不存在".into()))?;
+        let active = matches!(state.active.kind, ActiveKind::Official)
+            && state.active.account_id.as_deref() == Some(account.id.as_str());
+        Ok(account.view(active))
+    }
+
+    /// Returns the sensitive stored record for backend-only auth operations.
+    /// Tauri commands must return `official_account_view` instead.
+    pub fn official_account(&self, id: &str) -> Result<StoredOfficialAccount, AppError> {
+        self.read_state()?
+            .official_accounts
+            .iter()
+            .find(|account| account.id == id)
+            .cloned()
+            .ok_or_else(|| AppError::InvalidConfig("OpenAI 官方账号不存在".into()))
+    }
+
+    pub fn save_official_account(
+        &self,
+        account: &StoredOfficialAccount,
+    ) -> Result<StoredOfficialAccount, AppError> {
+        let mut incoming = account.clone();
+        normalize_official_account(&mut incoming)?;
+        let now = chrono::Utc::now().timestamp();
+
+        self.update(|state| {
+            if let Some(existing_index) = state
+                .official_accounts
+                .iter()
+                .position(|saved| saved.account_id == incoming.account_id)
+            {
+                let existing = &state.official_accounts[existing_index];
+                incoming.id = existing.id.clone();
+                incoming.created_at = existing.created_at;
+                incoming.updated_at = now;
+                state.official_accounts[existing_index] = incoming.clone();
+                let mut kept_match = false;
+                state.official_accounts.retain(|saved| {
+                    if saved.account_id != incoming.account_id {
+                        true
+                    } else if kept_match {
+                        false
+                    } else {
+                        kept_match = true;
+                        true
+                    }
+                });
+                return Ok(incoming);
+            }
+
+            if incoming.id.trim().is_empty()
+                || state
+                    .official_accounts
+                    .iter()
+                    .any(|saved| saved.id == incoming.id)
+            {
+                incoming.id = uuid::Uuid::new_v4().to_string();
+            }
+            if incoming.created_at == 0 {
+                incoming.created_at = now;
+            }
+            incoming.updated_at = now;
+            state.official_accounts.push(incoming.clone());
+            Ok(incoming)
+        })
+    }
+
+    pub fn sync_official_credential(
+        &self,
+        id: &str,
+        credential: &CodexAuthCredential,
+        expires_at: Option<i64>,
+    ) -> Result<StoredOfficialAccount, AppError> {
+        validate_official_credential(credential)?;
+        self.update(|state| {
+            let account = state
+                .official_accounts
+                .iter_mut()
+                .find(|account| account.id == id)
+                .ok_or_else(|| AppError::InvalidConfig("OpenAI 官方账号不存在".into()))?;
+            if account.account_id != credential.tokens.account_id {
+                return Err(AppError::InvalidConfig(
+                    "刷新凭据与保存的 OpenAI 账号不匹配".into(),
+                ));
+            }
+            account.credential = credential.clone();
+            account.expires_at = expires_at;
+            account.updated_at = chrono::Utc::now().timestamp();
+            Ok(account.clone())
+        })
+    }
+
+    pub fn activate_official_account(&self, id: &str) -> Result<(), AppError> {
+        self.update(|state| {
+            if !state
+                .official_accounts
+                .iter()
+                .any(|account| account.id == id)
+            {
+                return Err(AppError::InvalidConfig("OpenAI 官方账号不存在".into()));
+            }
+            state.active = ActiveState {
+                kind: ActiveKind::Official,
+                provider_id: None,
+                account_id: Some(id.to_owned()),
+            };
+            Ok(())
+        })
+    }
+
+    pub fn delete_official_account(&self, id: &str) -> Result<(), AppError> {
+        self.update(|state| {
+            if matches!(state.active.kind, ActiveKind::Official)
+                && state.active.account_id.as_deref() == Some(id)
+            {
+                return Err(AppError::InvalidConfig(
+                    "不能删除当前使用的 OpenAI 官方账号".into(),
+                ));
+            }
+            let before = state.official_accounts.len();
+            state.official_accounts.retain(|account| account.id != id);
+            if before == state.official_accounts.len() {
+                return Err(AppError::InvalidConfig("OpenAI 官方账号不存在".into()));
+            }
+            Ok(())
+        })
+    }
+
+    pub fn clear_managed_codex_fields(&self) -> Result<(), AppError> {
+        self.update(|state| {
+            state.codex.managed_original = ManagedCodexFields::default();
+            Ok(())
+        })
+    }
+
+    pub fn route_settings(&self) -> Result<RouteSettings, AppError> {
+        Ok(self.read_state()?.route.clone())
+    }
+
+    pub fn save_route_settings(&self, mut settings: RouteSettings) -> Result<(), AppError> {
+        settings.normalize();
+        self.update(|state| {
+            state.route = settings;
+            Ok(())
+        })
+    }
+}
+
+fn normalize_official_account(account: &mut StoredOfficialAccount) -> Result<(), AppError> {
+    account.id = account.id.trim().to_owned();
+    account.name = account.name.trim().to_owned();
+    account.account_id = account.account_id.trim().to_owned();
+    account.email = account.email.trim().to_owned();
+    if account.name.is_empty() {
+        account.name = if account.email.is_empty() {
+            "OpenAI".into()
+        } else {
+            account.email.clone()
+        };
+    }
+    if account.account_id.is_empty() {
+        return Err(AppError::InvalidConfig(
+            "OpenAI 官方账号缺少 account_id".into(),
+        ));
+    }
+    validate_official_credential(&account.credential)?;
+    if account.account_id != account.credential.tokens.account_id {
+        return Err(AppError::InvalidConfig(
+            "OpenAI 账号与登录凭据不匹配".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_official_credential(credential: &CodexAuthCredential) -> Result<(), AppError> {
+    let tokens = &credential.tokens;
+    if credential.auth_mode != "chatgpt"
+        || credential.last_refresh.trim().is_empty()
+        || tokens.id_token.trim().is_empty()
+        || tokens.access_token.trim().is_empty()
+        || tokens.refresh_token.trim().is_empty()
+        || tokens.account_id.trim().is_empty()
+    {
+        return Err(AppError::InvalidConfig(
+            "OpenAI 官方账号登录凭据不完整".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn preserve_redacted_headers(
+    incoming: &mut std::collections::BTreeMap<String, String>,
+    existing: &std::collections::BTreeMap<String, String>,
+) {
+    for (name, value) in incoming.iter_mut() {
+        if value.is_empty()
+            && let Some(saved) = existing.get(name)
+        {
+            *value = saved.clone();
+        }
+    }
+}
+
+pub fn data_root() -> PathBuf {
+    if let Some(value) = std::env::var_os("CODEX_TOOLS_DATA_DIR") {
+        return PathBuf::from(value);
+    }
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(Path::to_path_buf))
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("data")
+}
+
+pub fn atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("data");
+    let temporary = path.with_file_name(format!(".{name}.{}.tmp", uuid::Uuid::new_v4().simple()));
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    drop(file);
+    if let Err(error) = replace_file(&temporary, path) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
+    Ok(())
+}
+
+pub fn atomic_write_if_unchanged(
+    path: &Path,
+    expected: &[u8],
+    bytes: &[u8],
+) -> anyhow::Result<bool> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("data");
+    let temporary = path.with_file_name(format!(".{name}.{}.tmp", uuid::Uuid::new_v4().simple()));
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    drop(file);
+
+    let unchanged = fs::read(path).is_ok_and(|current| current == expected);
+    if !unchanged {
+        let _ = fs::remove_file(&temporary);
+        return Ok(false);
+    }
+    if let Err(error) = replace_file(&temporary, path) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
+    Ok(true)
+}
+
+fn atomic_yaml(path: &Path, value: &AppConfig) -> anyhow::Result<()> {
+    let text = serde_yaml::to_string(value)?;
+    atomic_write(path, text.as_bytes())
+}
+
+#[cfg(windows)]
+fn replace_file(source: &Path, target: &Path) -> anyhow::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::{
+        Win32::Storage::FileSystem::{
+            MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+        },
+        core::PCWSTR,
+    };
+    let source = source
+        .as_os_str()
+        .encode_wide()
+        .chain([0])
+        .collect::<Vec<_>>();
+    let target = target
+        .as_os_str()
+        .encode_wide()
+        .chain([0])
+        .collect::<Vec<_>>();
+    unsafe {
+        MoveFileExW(
+            PCWSTR(source.as_ptr()),
+            PCWSTR(target.as_ptr()),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
         )?;
-        if let Some(login) = account.login.as_deref() {
-            tx.execute(
-                "DELETE FROM auth_accounts WHERE service='openai' AND login=?1 AND id<>?2",
-                params![login, id],
-            )?;
-        }
-        tx.commit()?;
-        Ok(())
     }
-
-    pub fn activate_auth_account(&self, id: &str) -> anyhow::Result<()> {
-        let mut db = self.connect()?;
-        let tx = db.transaction()?;
-        tx.execute("UPDATE providers SET active=0", [])?;
-        tx.execute("UPDATE provider_accounts SET active=0", [])?;
-        tx.execute("UPDATE auth_accounts SET active=0", [])?;
-        let changed = tx.execute(
-            "UPDATE auth_accounts SET active=1 WHERE id=?1 AND service='openai'",
-            [id],
-        )?;
-        if changed != 1 {
-            anyhow::bail!("只能激活 OpenAI 官方登录账号");
-        }
-        tx.commit()?;
-        Ok(())
-    }
-
-    pub fn delete_auth_account(&self, id: &str) -> anyhow::Result<()> {
-        let changed = self
-            .connect()?
-            .execute("DELETE FROM auth_accounts WHERE id=?1 AND active=0", [id])?;
-        if changed != 1 {
-            anyhow::bail!("当前认证账号不能删除");
-        }
-        Ok(())
-    }
+    Ok(())
 }
 
-fn active_id(db: &Connection, table: &str) -> anyhow::Result<Option<String>> {
-    Ok(db
-        .query_row(
-            &format!("SELECT id FROM {table} WHERE active=1 LIMIT 1"),
-            [],
-            |row| row.get(0),
-        )
-        .optional()?)
-}
-
-fn json_or_default<T: serde::de::DeserializeOwned + Default>(value: String) -> T {
-    serde_json::from_str(&value).unwrap_or_default()
-}
-
-fn protocol_to_db(protocol: ProviderProtocol) -> &'static str {
-    match protocol {
-        ProviderProtocol::Responses => "responses",
-        ProviderProtocol::ChatCompletions => "chat_completions",
-    }
-}
-
-fn protocol_from_db(value: &str) -> ProviderProtocol {
-    match value {
-        "chat_completions" => ProviderProtocol::ChatCompletions,
-        _ => ProviderProtocol::Responses,
-    }
+#[cfg(not(windows))]
+fn replace_file(source: &Path, target: &Path) -> anyhow::Result<()> {
+    fs::rename(source, target)?;
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
 
-    fn store() -> (tempfile::TempDir, Store) {
-        let temp = tempdir().unwrap();
-        let store = Store {
-            path: temp.path().join("codex-tools.sqlite"),
-        };
-        store.initialize().unwrap();
-        (temp, store)
+    fn official_account(account_id: &str, suffix: &str) -> StoredOfficialAccount {
+        StoredOfficialAccount {
+            id: String::new(),
+            name: format!("OpenAI {suffix}"),
+            account_id: account_id.into(),
+            email: format!("{suffix}@example.test"),
+            credential: CodexAuthCredential {
+                auth_mode: "chatgpt".into(),
+                openai_api_key: None,
+                tokens: CodexAuthTokens {
+                    id_token: format!("id-secret-{suffix}"),
+                    access_token: format!("access-secret-{suffix}"),
+                    refresh_token: format!("refresh-secret-{suffix}"),
+                    account_id: account_id.into(),
+                },
+                last_refresh: "2026-07-14T00:00:00Z".into(),
+            },
+            expires_at: Some(1_800_000_000),
+            created_at: 0,
+            updated_at: 0,
+        }
     }
 
     #[test]
-    fn creates_only_current_application_schema() {
-        let (_temp, store) = store();
-        let db = store.connect().unwrap();
-        let tables = db
-            .prepare(
-                "SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
-            )
-            .unwrap()
-            .query_map([], |row| row.get::<_, String>(0))
-            .unwrap()
-            .collect::<rusqlite::Result<Vec<_>>>()
+    fn uses_app_yaml_and_ignores_legacy_config() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("config.yaml"), "invalid: [").unwrap();
+        let store = Store::open(temp.path().to_path_buf()).unwrap();
+        assert!(store.path().ends_with("app.yaml"));
+        assert_eq!(store.snapshot().unwrap().version, 1);
+    }
+
+    #[test]
+    fn yaml_updates_are_atomic_and_round_trip() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path().to_path_buf()).unwrap();
+        store
+            .update(|state| {
+                state.app.theme = "dark".into();
+                Ok(())
+            })
             .unwrap();
-        assert_eq!(
-            tables,
-            vec![
-                "auth_accounts",
-                "provider_accounts",
-                "providers",
-                "settings"
-            ]
-        );
-        let provider_columns = db
-            .prepare("PRAGMA table_info(providers)")
-            .unwrap()
-            .query_map([], |row| row.get::<_, String>(1))
-            .unwrap()
-            .collect::<rusqlite::Result<Vec<_>>>()
+        let reopened = Store::open(temp.path().to_path_buf()).unwrap();
+        assert_eq!(reopened.snapshot().unwrap().app.theme, "dark");
+        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn conditional_atomic_write_rejects_concurrent_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("rollout.jsonl");
+        fs::write(&path, b"before").unwrap();
+        fs::write(&path, b"concurrent append").unwrap();
+
+        let written = atomic_write_if_unchanged(&path, b"before", b"replacement").unwrap();
+
+        assert!(!written);
+        assert_eq!(fs::read(path).unwrap(), b"concurrent append");
+        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn official_account_save_deduplicates_external_account_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path().to_path_buf()).unwrap();
+        let first = store
+            .save_official_account(&official_account("workspace-1", "first"))
             .unwrap();
-        assert_eq!(provider_columns.len(), 14);
-        assert_eq!(provider_columns.first().map(String::as_str), Some("id"));
-        assert_eq!(
-            provider_columns.last().map(String::as_str),
-            Some("updated_at")
+        store
+            .update(|state| {
+                let mut duplicate = state.official_accounts[0].clone();
+                duplicate.id = "legacy-duplicate".into();
+                state.official_accounts.push(duplicate);
+                Ok(())
+            })
+            .unwrap();
+        let second = store
+            .save_official_account(&official_account("workspace-1", "second"))
+            .unwrap();
+
+        assert_eq!(second.id, first.id);
+        assert_eq!(second.created_at, first.created_at);
+        assert_eq!(second.name, "OpenAI second");
+        assert_eq!(store.snapshot().unwrap().official_accounts.len(), 1);
+        assert!(
+            fs::read_to_string(store.path())
+                .unwrap()
+                .contains("access-secret-second")
         );
     }
 
     #[test]
-    fn route_settings_round_trip() {
-        let (_temp, store) = store();
-        let settings = RouteSettings {
-            enabled: false,
-            listen_address: "127.0.0.1".into(),
-            port: 8123,
-        };
-        store.save_route_settings(&settings).unwrap();
-        let saved = store.route_settings().unwrap();
-        assert!(!saved.enabled);
-        assert_eq!(saved.listen_address, "127.0.0.1");
-        assert_eq!(saved.port, 8123);
+    fn official_views_are_redacted_and_active_uses_local_record_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path().to_path_buf()).unwrap();
+        let saved = store
+            .save_official_account(&official_account("workspace-1", "person"))
+            .unwrap();
+        store.activate_official_account(&saved.id).unwrap();
+
+        let state = store.snapshot().unwrap();
+        assert!(matches!(state.active.kind, ActiveKind::Official));
+        assert_eq!(state.active.provider_id, None);
+        assert_eq!(state.active.account_id.as_deref(), Some(saved.id.as_str()));
+
+        let view = store.official_account_view(&saved.id).unwrap();
+        assert!(view.active);
+        let serialized = serde_json::to_string(&store.official_accounts().unwrap()).unwrap();
+        assert!(!serialized.contains("credential"));
+        assert!(!serialized.contains("access-secret"));
+        assert!(!serialized.contains("refresh-secret"));
+        assert!(!serialized.contains("id-secret"));
+    }
+
+    #[test]
+    fn provider_overview_is_single_snapshot_and_redacts_secrets() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path().to_path_buf()).unwrap();
+        store
+            .update(|state| {
+                state.providers.push(StoredProvider {
+                    profile: ProviderProfile {
+                        id: "provider-1".into(),
+                        name: "Provider".into(),
+                        protocol: ProviderProtocol::Responses,
+                        base_url: "https://example.test/v1".into(),
+                        models: vec!["model".into()],
+                        model_metadata: vec![],
+                        model_aliases: Default::default(),
+                        codex_chat_reasoning: None,
+                        headers: [("x-secret".into(), "provider-secret".into())]
+                            .into_iter()
+                            .collect(),
+                        timeout_secs: 30,
+                        context_window: None,
+                        auto_compact_threshold: None,
+                        enabled: true,
+                        active: false,
+                        active_account_id: None,
+                        account_count: 0,
+                    },
+                    accounts: vec![ProviderAccount {
+                        id: "account-1".into(),
+                        provider_id: Some("provider-1".into()),
+                        name: "Account".into(),
+                        auth_kind: AccountAuthKind::ApiKey,
+                        api_key: Some("api-secret".into()),
+                        headers: [("x-secret".into(), "account-secret".into())]
+                            .into_iter()
+                            .collect(),
+                        active: false,
+                        email: None,
+                        created_at: 1,
+                        updated_at: 1,
+                    }],
+                });
+                state.active = ActiveState {
+                    kind: ActiveKind::Provider,
+                    provider_id: Some("provider-1".into()),
+                    account_id: Some("account-1".into()),
+                };
+                Ok(())
+            })
+            .unwrap();
+
+        let overview = store.provider_overview().unwrap();
+        assert!(overview.providers[0].active);
+        assert_eq!(overview.providers[0].account_count, 1);
+        assert_eq!(overview.providers[0].headers["x-secret"], "");
+        assert!(overview.accounts[0].active);
+        assert!(overview.accounts[0].api_key.is_none());
+        assert_eq!(overview.accounts[0].headers["x-secret"], "");
+        let serialized = serde_json::to_string(&overview).unwrap();
+        assert!(!serialized.contains("provider-secret"));
+        assert!(!serialized.contains("account-secret"));
+        assert!(!serialized.contains("api-secret"));
+    }
+
+    #[test]
+    fn credential_sync_checks_identity_and_active_account_cannot_be_deleted() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path().to_path_buf()).unwrap();
+        let saved = store
+            .save_official_account(&official_account("workspace-1", "old"))
+            .unwrap();
+        let replacement = official_account("workspace-1", "new").credential;
+        let updated = store
+            .sync_official_credential(&saved.id, &replacement, Some(1_900_000_000))
+            .unwrap();
+        assert_eq!(updated.credential.tokens.access_token, "access-secret-new");
+        assert_eq!(updated.expires_at, Some(1_900_000_000));
+
+        let wrong = official_account("workspace-2", "wrong").credential;
+        assert!(
+            store
+                .sync_official_credential(&saved.id, &wrong, None)
+                .is_err()
+        );
+
+        store.activate_official_account(&saved.id).unwrap();
+        assert!(store.delete_official_account(&saved.id).is_err());
     }
 }
