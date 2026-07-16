@@ -20,16 +20,19 @@ impl Store {
 
     pub fn open(root: PathBuf) -> anyhow::Result<Self> {
         fs::create_dir_all(&root)?;
+        secure_directory(&root)?;
         let path = root.join("app.yaml");
         let state = if path.exists() {
             let text = fs::read_to_string(&path)?;
-            serde_yaml::from_str::<AppConfig>(&text)
-                .map_err(|error| anyhow::anyhow!("app.yaml 无效：{error}"))?
+            serde_yaml::from_str::<AppConfig>(&text).map_err(|error| {
+                anyhow::anyhow!("应用数据文件损坏，无法读取已保存的账号和服务：{error}")
+            })?
         } else {
             let state = AppConfig::default();
             atomic_yaml(&path, &state)?;
             state
         };
+        secure_file(&path)?;
         Ok(Self {
             root,
             path,
@@ -47,7 +50,7 @@ impl Store {
     fn read_state(&self) -> Result<RwLockReadGuard<'_, AppConfig>, AppError> {
         self.state
             .read()
-            .map_err(|_| AppError::Internal("配置锁已损坏".into()))
+            .map_err(|_| AppError::Internal("暂时无法读取应用数据，请重启应用后再试。".into()))
     }
 
     pub(crate) fn read<T>(&self, project: impl FnOnce(&AppConfig) -> T) -> Result<T, AppError> {
@@ -82,33 +85,12 @@ impl Store {
         let mut guard = self
             .state
             .write()
-            .map_err(|_| AppError::Internal("配置锁已损坏".into()))?;
+            .map_err(|_| AppError::Internal("暂时无法保存应用数据，请重启应用后再试。".into()))?;
         let mut draft = guard.clone();
         let result = mutate(&mut draft)?;
-        draft.route.normalize();
         atomic_yaml(&self.path, &draft).map_err(|error| AppError::Internal(error.to_string()))?;
         *guard = draft;
         Ok(result)
-    }
-
-    pub fn providers(&self) -> Result<Vec<ProviderProfile>, AppError> {
-        let state = self.read_state()?;
-        Ok(state
-            .providers
-            .iter()
-            .map(|stored| {
-                let mut profile = stored.profile.clone();
-                profile.active = matches!(state.active.kind, ActiveKind::Provider)
-                    && state.active.provider_id.as_deref() == Some(profile.id.as_str());
-                profile.active_account_id = if profile.active {
-                    state.active.account_id.clone()
-                } else {
-                    stored.profile.active_account_id.clone()
-                };
-                profile.account_count = stored.accounts.len() as u64;
-                profile
-            })
-            .collect())
     }
 
     pub fn provider(&self, id: &str) -> Result<ProviderProfile, AppError> {
@@ -117,7 +99,7 @@ impl Store {
             .providers
             .iter()
             .find(|provider| provider.profile.id == id)
-            .ok_or_else(|| AppError::InvalidConfig("Provider 不存在".into()))?;
+            .ok_or_else(|| AppError::InvalidConfig("第三方 API 服务不存在，请刷新页面。".into()))?;
         let mut profile = stored.profile.clone();
         profile.active = matches!(state.active.kind, ActiveKind::Provider)
             && state.active.provider_id.as_deref() == Some(profile.id.as_str());
@@ -153,6 +135,14 @@ impl Store {
         provider.account_count = 0;
         let saved = provider.clone();
         self.update(|state| {
+            if matches!(state.active.kind, ActiveKind::Provider)
+                && state.active.provider_id.as_deref() == Some(provider.id.as_str())
+                && !provider.enabled
+            {
+                return Err(AppError::InvalidConfig(
+                    "正在使用此服务，切换到其他账号或服务后才能停用。".into(),
+                ));
+            }
             if let Some(existing) = state
                 .providers
                 .iter_mut()
@@ -179,30 +169,19 @@ impl Store {
     pub fn delete_provider(&self, id: &str) -> Result<(), AppError> {
         self.update(|state| {
             if state.active.provider_id.as_deref() == Some(id) {
-                return Err(AppError::InvalidConfig("不能删除当前 Provider".into()));
+                return Err(AppError::InvalidConfig(
+                    "正在使用此服务，切换后才能删除。".into(),
+                ));
             }
             let before = state.providers.len();
             state.providers.retain(|value| value.profile.id != id);
             if before == state.providers.len() {
-                return Err(AppError::InvalidConfig("Provider 不存在".into()));
+                return Err(AppError::InvalidConfig(
+                    "第三方 API 服务不存在，可能已被删除。".into(),
+                ));
             }
             Ok(())
         })
-    }
-
-    pub fn accounts(&self, provider_id: Option<&str>) -> Result<Vec<ProviderAccount>, AppError> {
-        let state = self.read_state()?;
-        Ok(state
-            .providers
-            .iter()
-            .filter(|provider| provider_id.is_none_or(|id| provider.profile.id == id))
-            .flat_map(|provider| provider.accounts.iter().cloned())
-            .map(|mut account| {
-                account.active = matches!(state.active.kind, ActiveKind::Provider)
-                    && state.active.account_id.as_deref() == Some(account.id.as_str());
-                account
-            })
-            .collect())
     }
 
     pub fn account(&self, id: &str) -> Result<ProviderAccount, AppError> {
@@ -213,7 +192,7 @@ impl Store {
             .flat_map(|provider| &provider.accounts)
             .find(|account| account.id == id)
             .cloned()
-            .ok_or_else(|| AppError::InvalidConfig("账号不存在".into()))?;
+            .ok_or_else(|| AppError::InvalidConfig("API Key 不存在，可能已被删除。".into()))?;
         account.active = matches!(state.active.kind, ActiveKind::Provider)
             && state.active.account_id.as_deref() == Some(account.id.as_str());
         Ok(account)
@@ -270,14 +249,21 @@ impl Store {
         }
         let existing = {
             let state = self.read_state()?;
-            state
-                .providers
-                .iter()
-                .flat_map(|provider| &provider.accounts)
-                .find(|value| value.id == account.id)
-                .cloned()
+            state.providers.iter().find_map(|provider| {
+                provider
+                    .accounts
+                    .iter()
+                    .find(|value| value.id == account.id)
+                    .cloned()
+                    .map(|account| (provider.profile.id.clone(), account))
+            })
         };
-        if let Some(existing) = existing {
+        if let Some((existing_provider_id, existing)) = existing {
+            if account.provider_id.as_deref() != Some(existing_provider_id.as_str()) {
+                return Err(AppError::InvalidConfig(
+                    "不能把已保存的 API Key 移到其他服务，请新建一个 API Key。".into(),
+                ));
+            }
             if account
                 .api_key
                 .as_deref()
@@ -297,14 +283,26 @@ impl Store {
         let provider_id = account
             .provider_id
             .clone()
-            .ok_or_else(|| AppError::InvalidConfig("账号缺少 Provider".into()))?;
+            .ok_or_else(|| AppError::InvalidConfig("请选择 API Key 所属的第三方服务。".into()))?;
         let saved = account.clone();
         self.update(|state| {
+            if let Some(owner) = state
+                .providers
+                .iter()
+                .find(|provider| provider.accounts.iter().any(|value| value.id == account.id))
+                && owner.profile.id != provider_id
+            {
+                return Err(AppError::InvalidConfig(
+                    "不能把已保存的 API Key 移到其他服务，请新建一个 API Key。".into(),
+                ));
+            }
             let provider = state
                 .providers
                 .iter_mut()
                 .find(|value| value.profile.id == provider_id)
-                .ok_or_else(|| AppError::InvalidConfig("Provider 不存在".into()))?;
+                .ok_or_else(|| {
+                    AppError::InvalidConfig("第三方 API 服务不存在，请刷新页面。".into())
+                })?;
             if let Some(existing) = provider
                 .accounts
                 .iter_mut()
@@ -322,7 +320,9 @@ impl Store {
     pub fn delete_account(&self, id: &str) -> Result<(), AppError> {
         self.update(|state| {
             if state.active.account_id.as_deref() == Some(id) {
-                return Err(AppError::InvalidConfig("不能删除当前账号".into()));
+                return Err(AppError::InvalidConfig(
+                    "正在使用这个 API Key，切换后才能删除。".into(),
+                ));
             }
             let mut found = false;
             for provider in &mut state.providers {
@@ -331,7 +331,9 @@ impl Store {
                 found |= before != provider.accounts.len();
             }
             if !found {
-                return Err(AppError::InvalidConfig("账号不存在".into()));
+                return Err(AppError::InvalidConfig(
+                    "API Key 不存在，可能已被删除。".into(),
+                ));
             }
             Ok(())
         })
@@ -343,13 +345,22 @@ impl Store {
                 .providers
                 .iter_mut()
                 .find(|value| value.profile.id == provider_id)
-                .ok_or_else(|| AppError::InvalidConfig("Provider 不存在".into()))?;
+                .ok_or_else(|| {
+                    AppError::InvalidConfig("第三方 API 服务不存在，请刷新页面。".into())
+                })?;
+            if !provider.profile.enabled {
+                return Err(AppError::InvalidConfig(
+                    "此服务已停用，请先编辑并启用它。".into(),
+                ));
+            }
             if !provider
                 .accounts
                 .iter()
                 .any(|account| account.id == account_id)
             {
-                return Err(AppError::InvalidConfig("账号不属于所选 Provider".into()));
+                return Err(AppError::InvalidConfig(
+                    "所选 API Key 不属于这个服务，请刷新页面。".into(),
+                ));
             }
             provider.profile.active_account_id = Some(account_id.to_owned());
             state.active = ActiveState {
@@ -361,26 +372,13 @@ impl Store {
         })
     }
 
-    pub fn official_accounts(&self) -> Result<Vec<OfficialAccountView>, AppError> {
-        let state = self.read_state()?;
-        Ok(state
-            .official_accounts
-            .iter()
-            .map(|account| {
-                let active = matches!(state.active.kind, ActiveKind::Official)
-                    && state.active.account_id.as_deref() == Some(account.id.as_str());
-                account.view(active)
-            })
-            .collect())
-    }
-
     pub fn official_account_view(&self, id: &str) -> Result<OfficialAccountView, AppError> {
         let state = self.read_state()?;
         let account = state
             .official_accounts
             .iter()
             .find(|account| account.id == id)
-            .ok_or_else(|| AppError::InvalidConfig("OpenAI 官方账号不存在".into()))?;
+            .ok_or_else(|| AppError::InvalidConfig("OpenAI 账号不存在，可能已被删除。".into()))?;
         let active = matches!(state.active.kind, ActiveKind::Official)
             && state.active.account_id.as_deref() == Some(account.id.as_str());
         Ok(account.view(active))
@@ -394,7 +392,7 @@ impl Store {
             .iter()
             .find(|account| account.id == id)
             .cloned()
-            .ok_or_else(|| AppError::InvalidConfig("OpenAI 官方账号不存在".into()))
+            .ok_or_else(|| AppError::InvalidConfig("OpenAI 账号不存在，可能已被删除。".into()))
     }
 
     pub fn save_official_account(
@@ -459,11 +457,14 @@ impl Store {
                 .official_accounts
                 .iter_mut()
                 .find(|account| account.id == id)
-                .ok_or_else(|| AppError::InvalidConfig("OpenAI 官方账号不存在".into()))?;
+                .ok_or_else(|| AppError::InvalidConfig("OpenAI 账号不存在，请重新登录。".into()))?;
             if account.account_id != credential.tokens.account_id {
                 return Err(AppError::InvalidConfig(
-                    "刷新凭据与保存的 OpenAI 账号不匹配".into(),
+                    "OpenAI 返回了其他账号的登录信息，请重新登录。".into(),
                 ));
+            }
+            if account.credential == *credential && account.expires_at == expires_at {
+                return Ok(account.clone());
             }
             account.credential = credential.clone();
             account.expires_at = expires_at;
@@ -479,7 +480,9 @@ impl Store {
                 .iter()
                 .any(|account| account.id == id)
             {
-                return Err(AppError::InvalidConfig("OpenAI 官方账号不存在".into()));
+                return Err(AppError::InvalidConfig(
+                    "OpenAI 账号不存在，请重新登录。".into(),
+                ));
             }
             state.active = ActiveState {
                 kind: ActiveKind::Official,
@@ -496,33 +499,16 @@ impl Store {
                 && state.active.account_id.as_deref() == Some(id)
             {
                 return Err(AppError::InvalidConfig(
-                    "不能删除当前使用的 OpenAI 官方账号".into(),
+                    "正在使用这个 OpenAI 账号，请先切换后再删除。".into(),
                 ));
             }
             let before = state.official_accounts.len();
             state.official_accounts.retain(|account| account.id != id);
             if before == state.official_accounts.len() {
-                return Err(AppError::InvalidConfig("OpenAI 官方账号不存在".into()));
+                return Err(AppError::InvalidConfig(
+                    "OpenAI 账号不存在，可能已被删除。".into(),
+                ));
             }
-            Ok(())
-        })
-    }
-
-    pub fn clear_managed_codex_fields(&self) -> Result<(), AppError> {
-        self.update(|state| {
-            state.codex.managed_original = ManagedCodexFields::default();
-            Ok(())
-        })
-    }
-
-    pub fn route_settings(&self) -> Result<RouteSettings, AppError> {
-        Ok(self.read_state()?.route.clone())
-    }
-
-    pub fn save_route_settings(&self, mut settings: RouteSettings) -> Result<(), AppError> {
-        settings.normalize();
-        self.update(|state| {
-            state.route = settings;
             Ok(())
         })
     }
@@ -542,13 +528,13 @@ fn normalize_official_account(account: &mut StoredOfficialAccount) -> Result<(),
     }
     if account.account_id.is_empty() {
         return Err(AppError::InvalidConfig(
-            "OpenAI 官方账号缺少 account_id".into(),
+            "OpenAI 登录信息缺少账号标识，请重新登录。".into(),
         ));
     }
     validate_official_credential(&account.credential)?;
     if account.account_id != account.credential.tokens.account_id {
         return Err(AppError::InvalidConfig(
-            "OpenAI 账号与登录凭据不匹配".into(),
+            "OpenAI 账号与登录信息不匹配，请重新登录。".into(),
         ));
     }
     Ok(())
@@ -564,7 +550,7 @@ fn validate_official_credential(credential: &CodexAuthCredential) -> Result<(), 
         || tokens.account_id.trim().is_empty()
     {
         return Err(AppError::InvalidConfig(
-            "OpenAI 官方账号登录凭据不完整".into(),
+            "OpenAI 登录信息不完整，请重新登录。".into(),
         ));
     }
     Ok(())
@@ -587,34 +573,33 @@ pub fn data_root() -> PathBuf {
     if let Some(value) = std::env::var_os("CODEX_TOOLS_DATA_DIR") {
         return PathBuf::from(value);
     }
-    std::env::current_exe()
-        .ok()
-        .and_then(|path| path.parent().map(Path::to_path_buf))
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("data")
+    #[cfg(target_os = "macos")]
+    {
+        dirs::data_dir()
+            .or_else(|| dirs::home_dir().map(|home| home.join("Library/Application Support")))
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("io.github.irasutoya.codex-tools")
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        std::env::current_exe()
+            .ok()
+            .and_then(|path| path.parent().map(Path::to_path_buf))
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("data")
+    }
 }
 
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let name = path
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or("data");
-    let temporary = path.with_file_name(format!(".{name}.{}.tmp", uuid::Uuid::new_v4().simple()));
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temporary)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    drop(file);
-    if let Err(error) = replace_file(&temporary, path) {
-        let _ = fs::remove_file(&temporary);
-        return Err(error);
+    if fs::read(path).is_ok_and(|current| current == bytes) {
+        secure_file(path)?;
+        return Ok(());
     }
-    Ok(())
+    let temporary = write_temporary(path, bytes)?;
+    replace_temporary(&temporary, path)
 }
 
 pub fn atomic_write_if_unchanged(
@@ -625,34 +610,82 @@ pub fn atomic_write_if_unchanged(
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let name = path
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or("data");
-    let temporary = path.with_file_name(format!(".{name}.{}.tmp", uuid::Uuid::new_v4().simple()));
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temporary)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    drop(file);
-
+    if expected == bytes {
+        return match fs::read(path) {
+            Ok(current) if current == expected => {
+                secure_file(path)?;
+                Ok(true)
+            }
+            Ok(_) | Err(_) => Ok(false),
+        };
+    }
+    let temporary = write_temporary(path, bytes)?;
     let unchanged = fs::read(path).is_ok_and(|current| current == expected);
     if !unchanged {
         let _ = fs::remove_file(&temporary);
         return Ok(false);
     }
-    if let Err(error) = replace_file(&temporary, path) {
-        let _ = fs::remove_file(&temporary);
+    replace_temporary(&temporary, path)?;
+    Ok(true)
+}
+
+fn write_temporary(path: &Path, bytes: &[u8]) -> anyhow::Result<PathBuf> {
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("data");
+    let temporary = path.with_file_name(format!(".{name}.{}.tmp", uuid::Uuid::new_v4().simple()));
+    let mut file = create_private_file(&temporary)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    drop(file);
+    Ok(temporary)
+}
+
+fn replace_temporary(temporary: &Path, path: &Path) -> anyhow::Result<()> {
+    if let Err(error) = replace_file(temporary, path) {
+        let _ = fs::remove_file(temporary);
         return Err(error);
     }
-    Ok(true)
+    Ok(())
 }
 
 fn atomic_yaml(path: &Path, value: &AppConfig) -> anyhow::Result<()> {
     let text = serde_yaml::to_string(value)?;
     atomic_write(path, text.as_bytes())
+}
+
+fn create_private_file(path: &Path) -> std::io::Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)
+}
+
+#[cfg(unix)]
+fn secure_directory(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+}
+
+#[cfg(not(unix))]
+fn secure_directory(_path: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn secure_file(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+}
+
+#[cfg(not(unix))]
+fn secure_file(_path: &Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -717,13 +750,64 @@ mod tests {
         }
     }
 
+    fn provider(id: &str) -> ProviderProfile {
+        ProviderProfile {
+            id: id.into(),
+            name: id.into(),
+            base_url: "https://example.test/v1".into(),
+            headers: Default::default(),
+            timeout_secs: 30,
+            enabled: true,
+            active: false,
+            active_account_id: None,
+            account_count: 0,
+        }
+    }
+
+    fn account(id: &str, provider_id: &str) -> ProviderAccount {
+        ProviderAccount {
+            id: id.into(),
+            provider_id: Some(provider_id.into()),
+            name: id.into(),
+            auth_kind: AccountAuthKind::ApiKey,
+            api_key: Some("secret".into()),
+            headers: Default::default(),
+            active: false,
+            email: None,
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
     #[test]
-    fn uses_app_yaml_and_ignores_legacy_config() {
+    fn creates_app_yaml_without_touching_unrelated_files() {
         let temp = tempfile::tempdir().unwrap();
-        fs::write(temp.path().join("config.yaml"), "invalid: [").unwrap();
+        fs::write(temp.path().join("unrelated.yaml"), "invalid: [").unwrap();
+        fs::write(temp.path().join("unrelated.txt"), "user data").unwrap();
         let store = Store::open(temp.path().to_path_buf()).unwrap();
         assert!(store.path().ends_with("app.yaml"));
-        assert_eq!(store.snapshot().unwrap().version, 1);
+        assert_eq!(
+            fs::read_to_string(temp.path().join("unrelated.txt")).unwrap(),
+            "user data"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn app_data_permissions_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("data");
+        let store = Store::open(root.clone()).unwrap();
+        assert_eq!(
+            fs::metadata(root).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(store.path()).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     #[test]
@@ -755,6 +839,21 @@ mod tests {
         assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 1);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn identical_atomic_write_keeps_the_existing_file() {
+        use std::os::unix::fs::MetadataExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("data.json");
+        fs::write(&path, b"unchanged").unwrap();
+        let inode = fs::metadata(&path).unwrap().ino();
+
+        atomic_write(&path, b"unchanged").unwrap();
+
+        assert_eq!(fs::metadata(path).unwrap().ino(), inode);
+    }
+
     #[test]
     fn official_account_save_deduplicates_external_account_id() {
         let temp = tempfile::tempdir().unwrap();
@@ -765,7 +864,7 @@ mod tests {
         store
             .update(|state| {
                 let mut duplicate = state.official_accounts[0].clone();
-                duplicate.id = "legacy-duplicate".into();
+                duplicate.id = "duplicate-record".into();
                 state.official_accounts.push(duplicate);
                 Ok(())
             })
@@ -801,7 +900,7 @@ mod tests {
 
         let view = store.official_account_view(&saved.id).unwrap();
         assert!(view.active);
-        let serialized = serde_json::to_string(&store.official_accounts().unwrap()).unwrap();
+        let serialized = serde_json::to_string(&view).unwrap();
         assert!(!serialized.contains("credential"));
         assert!(!serialized.contains("access-secret"));
         assert!(!serialized.contains("refresh-secret"));
@@ -818,18 +917,11 @@ mod tests {
                     profile: ProviderProfile {
                         id: "provider-1".into(),
                         name: "Provider".into(),
-                        protocol: ProviderProtocol::Responses,
                         base_url: "https://example.test/v1".into(),
-                        models: vec!["model".into()],
-                        model_metadata: vec![],
-                        model_aliases: Default::default(),
-                        codex_chat_reasoning: None,
                         headers: [("x-secret".into(), "provider-secret".into())]
                             .into_iter()
                             .collect(),
                         timeout_secs: 30,
-                        context_window: None,
-                        auto_compact_threshold: None,
                         enabled: true,
                         active: false,
                         active_account_id: None,
@@ -895,5 +987,34 @@ mod tests {
 
         store.activate_official_account(&saved.id).unwrap();
         assert!(store.delete_official_account(&saved.id).is_err());
+    }
+
+    #[test]
+    fn account_ids_cannot_move_between_providers() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path().to_path_buf()).unwrap();
+        store.save_provider(provider("one")).unwrap();
+        store.save_provider(provider("two")).unwrap();
+        store.save_account(account("shared", "one")).unwrap();
+
+        let error = store.save_account(account("shared", "two")).unwrap_err();
+        assert!(error.to_string().contains("移到"));
+        let state = store.snapshot().unwrap();
+        assert_eq!(state.providers[0].accounts.len(), 1);
+        assert!(state.providers[1].accounts.is_empty());
+    }
+
+    #[test]
+    fn active_provider_cannot_be_disabled() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path().to_path_buf()).unwrap();
+        store.save_provider(provider("active")).unwrap();
+        store.save_account(account("account", "active")).unwrap();
+        store.activate("active", "account").unwrap();
+
+        let mut disabled = store.provider("active").unwrap();
+        disabled.enabled = false;
+        assert!(store.save_provider(disabled).is_err());
+        assert!(store.provider("active").unwrap().enabled);
     }
 }

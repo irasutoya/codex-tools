@@ -68,6 +68,18 @@ function oppositeProvider(provider: string): ManagedProvider {
   return provider === "custom" ? "openai" : "custom"
 }
 
+function providerLabel(provider: string) {
+  if (provider === "openai") return "OpenAI 官方账号"
+  if (provider === "custom") return "第三方 API"
+  return provider || "未识别"
+}
+
+function sourceLabel(source: string) {
+  if (source === "rollout") return "会话文件"
+  if (source === "sqlite") return "会话数据库"
+  return source
+}
+
 export default function SessionsPage() {
   const [scan, setScan] = useState<RepairScan>()
   const [sessions, setSessions] = useState<PageResult<Session>>()
@@ -77,7 +89,7 @@ export default function SessionsPage() {
   const [busy, setBusy] = useState(false)
   const [refreshing, setRefreshing] = useState(false)
   const [paging, setPaging] = useState(false)
-  const [migrationTarget, setMigrationTarget] = useState<ManagedProvider>()
+  const [repairTarget, setRepairTarget] = useState<ManagedProvider>()
   const loadScan = useCallback(async () => {
     setScan(await call<RepairScan>("scan_codex_data"))
   }, [])
@@ -131,7 +143,7 @@ export default function SessionsPage() {
   if (error) {
     return (
       <Alert variant="destructive">
-        <AlertTitle>无法读取 Codex 会话</AlertTitle>
+        <AlertTitle>暂时无法读取历史会话</AlertTitle>
         <AlertDescription className="flex flex-col items-start gap-3">
           <span>{error}</span>
           <Button variant="outline" disabled={refreshing} onClick={retry}>
@@ -157,56 +169,56 @@ export default function SessionsPage() {
     (sessionProviders[0].id === "openai" || sessionProviders[0].id === "custom")
       ? sessionProviders[0].id
       : scan.currentProvider
-  const target = migrationTarget ?? oppositeProvider(unifiedProvider)
+  const target = repairTarget ?? oppositeProvider(unifiedProvider)
   const totalPages = Math.max(1, Math.ceil(sessions.total / sessions.pageSize))
   const controlsDisabled = refreshing || paging || busy
 
   return (
-    <div className="flex flex-col gap-5">
-      <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+    <div className="flex flex-col gap-6">
+      <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
         <MetricCard
-          label="会话总数"
+          label="历史会话"
           value={sessions.total}
           icon={MessagesSquare}
-          detail="当前会话索引"
+          detail="在本机找到的记录"
         />
         <MetricCard
-          label="迁移元数据"
+          label="归属记录"
           value={scan.sessionMetaCount}
           icon={ScanSearch}
-          detail={`当前 ${scan.currentProvider}`}
+          detail={`当前标记为${providerLabel(scan.currentProvider)}`}
         />
         <MetricCard
-          label="JSONL 文件"
+          label="会话文件"
           value={scan.rolloutFiles}
           icon={FileText}
-          detail="已识别的 rollout"
+          detail="Codex 保存的对话文件"
         />
         <MetricCard
-          label="SQLite 来源"
+          label="数据库文件"
           value={scan.databases.length}
           icon={Database}
-          detail="已识别的数据库"
+          detail="Codex 保存的会话数据库"
         />
       </div>
 
       <Card size="sm">
         <CardHeader>
-          <CardTitle>统一迁移</CardTitle>
+          <CardTitle>修复会话归属</CardTitle>
           <CardDescription>
-            仅修改 provider 元数据，不复制会话正文或创建备份。
+            切换 OpenAI 账号和第三方 API 后，可更新旧会话的归属信息。
           </CardDescription>
-          <CardAction>
-            <Badge variant="outline">目标 {target}</Badge>
+          <CardAction className="max-sm:col-span-2 max-sm:row-start-auto max-sm:justify-self-start">
+            <Badge variant="outline">改为{providerLabel(target)}</Badge>
           </CardAction>
         </CardHeader>
         <CardContent className="flex flex-col gap-3">
           <Alert>
             <Wrench />
-            <AlertTitle>迁移按当前数据执行</AlertTitle>
+            <AlertTitle>不会修改会话内容</AlertTitle>
             <AlertDescription>
-              若 Codex
-              正在写入文件，该文件会安全中止迁移；再次执行时会重新扫描并重试。
+              此操作只更新会话使用的连接方式。如果 Codex
+              正在写入某个会话，该文件会保留原样并提示稍后重试。
             </AlertDescription>
           </Alert>
           <ItemGroup className="grid gap-2 sm:grid-cols-2">
@@ -217,14 +229,15 @@ export default function SessionsPage() {
                 size="sm"
               >
                 <ItemContent>
-                  <ItemTitle>{item.id}</ItemTitle>
+                  <ItemTitle>{providerLabel(item.id)}</ItemTitle>
                   <ItemDescription>
-                    来源：{item.sources.join(" / ") || "未知"}
+                    发现位置：
+                    {item.sources.map(sourceLabel).join("、") || "未知"}
                   </ItemDescription>
                 </ItemContent>
                 <ItemActions>
                   <Badge variant={item.current ? "default" : "secondary"}>
-                    {item.current ? "当前" : "可迁移"}
+                    {item.current ? "当前归属" : "可以切换"}
                   </Badge>
                 </ItemActions>
               </Item>
@@ -238,18 +251,18 @@ export default function SessionsPage() {
             ) : (
               <Wrench data-icon="inline-start" />
             )}
-            {busy ? "迁移中…" : "执行迁移"}
+            {busy ? "正在更新…" : "更新会话归属"}
           </Button>
         </CardFooter>
       </Card>
 
       <Card>
         <CardHeader>
-          <CardTitle>会话索引</CardTitle>
+          <CardTitle>会话记录</CardTitle>
           <CardDescription>
-            直接读取 Codex JSONL 和 SQLite，不保存会话正文。
+            直接读取 Codex 保存在本机的会话，不会复制或上传对话内容。
           </CardDescription>
-          <CardAction>
+          <CardAction className="max-sm:col-span-2 max-sm:row-start-auto max-sm:justify-self-start">
             <Button
               size="sm"
               variant="outline"
@@ -261,17 +274,17 @@ export default function SessionsPage() {
               ) : (
                 <RefreshCw data-icon="inline-start" />
               )}
-              {refreshing ? "刷新中…" : "刷新"}
+              {refreshing ? "正在刷新…" : "刷新列表"}
             </Button>
           </CardAction>
         </CardHeader>
-        <CardContent>
+        <CardContent className="min-w-0">
           {sessions.items.length ? (
             <Table>
               <TableHeader>
                 <TableRow>
                   <TableHead>标题</TableHead>
-                  <TableHead>Provider</TableHead>
+                  <TableHead>使用方式</TableHead>
                   <TableHead className="hidden lg:table-cell">项目</TableHead>
                   <TableHead>更新时间</TableHead>
                 </TableRow>
@@ -284,7 +297,7 @@ export default function SessionsPage() {
                     </TableCell>
                     <TableCell>
                       <Badge variant="outline">
-                        {session.provider || "未知"}
+                        {providerLabel(session.provider)}
                       </Badge>
                     </TableCell>
                     <TableCell className="hidden max-w-64 truncate lg:table-cell">
@@ -303,9 +316,9 @@ export default function SessionsPage() {
                 <EmptyMedia variant="icon">
                   <MessagesSquare />
                 </EmptyMedia>
-                <EmptyTitle>未找到会话</EmptyTitle>
+                <EmptyTitle>还没有可显示的会话</EmptyTitle>
                 <EmptyDescription>
-                  当前 Codex 数据目录中没有可显示的会话记录。
+                  Codex 配置目录中暂时没有找到历史会话。
                 </EmptyDescription>
               </EmptyHeader>
             </Empty>
@@ -360,10 +373,12 @@ export default function SessionsPage() {
       <AlertDialog open={confirming} onOpenChange={setConfirming}>
         <AlertDialogContent>
           <AlertDialogHeader>
-            <AlertDialogTitle>确认迁移到 {target}？</AlertDialogTitle>
+            <AlertDialogTitle>
+              将历史会话改为{providerLabel(target)}？
+            </AlertDialogTitle>
             <AlertDialogDescription>
-              仅修改识别出的 provider 字段，不备份或复制会话正文。若 Codex
-              正在写入文件，迁移会安全中止并要求重试。
+              这只会更新会话的连接归属，不会改动、复制或上传对话内容。正在由
+              Codex 写入的文件会保持原样。
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
@@ -378,17 +393,17 @@ export default function SessionsPage() {
                 })
                   .then((result) => {
                     toast.success(
-                      `修改 ${result.filesModified} 个文件、${result.rowsUpdated} 行`
+                      `会话归属已更新：${result.filesModified} 个文件、${result.rowsUpdated} 条数据库记录`
                     )
                     result.warnings.forEach((warning) => toast.warning(warning))
-                    setMigrationTarget(oppositeProvider(result.targetProvider))
+                    setRepairTarget(oppositeProvider(result.targetProvider))
                     return refreshAll()
                   })
                   .catch((reason) => toast.error(String(reason)))
                   .finally(() => setBusy(false))
               }}
             >
-              确认迁移
+              确认更新
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>

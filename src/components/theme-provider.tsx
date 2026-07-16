@@ -112,6 +112,7 @@ export function ThemeProvider({
 
       root.classList.remove("light", "dark")
       root.classList.add(resolvedTheme)
+      root.dataset.theme = resolvedTheme
 
       if (restoreTransitions) {
         restoreTransitions()
@@ -223,7 +224,7 @@ export const useTheme = () => {
   const context = React.useContext(ThemeProviderContext)
 
   if (context === undefined) {
-    throw new Error("useTheme must be used within a ThemeProvider")
+    throw new Error("界面主题未正确初始化。")
   }
 
   return context

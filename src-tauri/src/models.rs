@@ -4,12 +4,10 @@ use std::fmt;
 
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
-    #[error("配置无效：{0}")]
+    #[error("{0}")]
     InvalidConfig(String),
-    #[error("配置文件已在预览后发生变化，请重新预览")]
+    #[error("Codex 配置在预览后发生了变化，请重新打开预览再试。")]
     StaleOperation,
-    #[error("本地代理错误：{0}")]
-    Proxy(String),
     #[error("{0}")]
     Internal(String),
 }
@@ -35,59 +33,17 @@ impl From<std::io::Error> for AppError {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum ProviderProtocol {
-    #[default]
-    Responses,
-    ChatCompletions,
-    AnthropicMessages,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct CodexChatReasoningConfig {
-    pub supports_thinking: Option<bool>,
-    pub supports_effort: Option<bool>,
-    pub thinking_param: Option<String>,
-    pub effort_param: Option<String>,
-    pub effort_value_mode: Option<String>,
-    pub output_format: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct FetchedModel {
-    pub id: String,
-    #[serde(default, alias = "owned_by")]
-    pub owned_by: Option<String>,
-    #[serde(flatten)]
-    pub metadata: serde_json::Map<String, serde_json::Value>,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderProfile {
     #[serde(default)]
     pub id: String,
     pub name: String,
-    #[serde(default)]
-    pub protocol: ProviderProtocol,
     pub base_url: String,
-    #[serde(default)]
-    pub models: Vec<String>,
-    #[serde(default)]
-    pub model_metadata: Vec<FetchedModel>,
-    #[serde(default)]
-    pub model_aliases: BTreeMap<String, String>,
-    #[serde(default)]
-    pub codex_chat_reasoning: Option<CodexChatReasoningConfig>,
     #[serde(default)]
     pub headers: BTreeMap<String, String>,
     #[serde(default = "default_timeout_secs")]
     pub timeout_secs: u64,
-    pub context_window: Option<u64>,
-    pub auto_compact_threshold: Option<u64>,
     #[serde(default = "default_true")]
     pub enabled: bool,
     #[serde(default)]
@@ -102,13 +58,15 @@ impl ProviderProfile {
         self.name = self.name.trim().to_owned();
         self.base_url = self.base_url.trim().trim_end_matches('/').to_owned();
         if self.name.is_empty() || self.base_url.is_empty() {
-            return Err(AppError::InvalidConfig("名称和 Base URL 不能为空".into()));
+            return Err(AppError::InvalidConfig(
+                "请填写服务名称和 API 地址。".into(),
+            ));
         }
         let url = reqwest::Url::parse(&self.base_url)
-            .map_err(|_| AppError::InvalidConfig("Base URL 必须是 HTTP(S) URL".into()))?;
+            .map_err(|_| AppError::InvalidConfig("API 地址格式不正确。".into()))?;
         if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
             return Err(AppError::InvalidConfig(
-                "Base URL 必须是 HTTP(S) URL".into(),
+                "API 地址必须以 http:// 或 https:// 开头。".into(),
             ));
         }
         if !url.username().is_empty()
@@ -117,7 +75,7 @@ impl ProviderProfile {
             || url.fragment().is_some()
         {
             return Err(AppError::InvalidConfig(
-                "Base URL 不能包含凭据、查询参数或片段".into(),
+                "API 地址中不能包含用户名、密码、查询参数或 # 片段。".into(),
             ));
         }
         let host = url.host_str().unwrap_or_default();
@@ -127,13 +85,10 @@ impl ProviderProfile {
                 .is_ok_and(|address| address.is_loopback());
         if url.scheme() != "https" && !loopback {
             return Err(AppError::InvalidConfig(
-                "远程上游必须使用 HTTPS；HTTP 仅允许回环地址".into(),
+                "远程 API 必须使用 HTTPS；只有本机地址可以使用 HTTP。".into(),
             ));
         }
         self.timeout_secs = self.timeout_secs.clamp(1, 600);
-        self.models = dedupe(self.models.iter().map(String::as_str));
-        self.model_metadata
-            .retain(|value| self.models.iter().any(|model| model == &value.id));
         validate_headers(&self.headers)?;
         Ok(())
     }
@@ -178,9 +133,7 @@ impl ProviderAccount {
         self.name = self.name.trim().to_owned();
         let key = self.api_key.as_deref().unwrap_or_default().trim();
         if self.name.is_empty() || key.is_empty() {
-            return Err(AppError::InvalidConfig(
-                "账号名称和 API Key 不能为空".into(),
-            ));
+            return Err(AppError::InvalidConfig("请填写密钥名称和 API Key。".into()));
         }
         self.api_key = Some(key.to_owned());
         validate_headers(&self.headers)
@@ -358,50 +311,6 @@ pub enum OpenAiDevicePoll {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct RouteSettings {
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-    #[serde(default = "loopback")]
-    pub listen_address: String,
-    #[serde(default = "default_port")]
-    pub port: u16,
-    #[serde(default = "default_request_timeout")]
-    pub request_timeout_ms: u64,
-    #[serde(default = "default_request_max_retries")]
-    pub request_max_retries: u32,
-    #[serde(default = "default_stream_max_retries")]
-    pub stream_max_retries: u32,
-    #[serde(default = "default_concurrency")]
-    pub max_concurrent_requests: usize,
-}
-
-impl Default for RouteSettings {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            listen_address: loopback(),
-            port: default_port(),
-            request_timeout_ms: default_request_timeout(),
-            request_max_retries: default_request_max_retries(),
-            stream_max_retries: default_stream_max_retries(),
-            max_concurrent_requests: default_concurrency(),
-        }
-    }
-}
-
-impl RouteSettings {
-    pub fn normalize(&mut self) {
-        self.listen_address = loopback();
-        self.port = default_port();
-        self.request_timeout_ms = self.request_timeout_ms.clamp(1_000, 600_000);
-        self.request_max_retries = self.request_max_retries.min(100);
-        self.stream_max_retries = self.stream_max_retries.min(100);
-        self.max_concurrent_requests = self.max_concurrent_requests.clamp(1, 256);
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct AppPreferences {
     #[serde(default = "default_language")]
     pub language: String,
@@ -426,51 +335,21 @@ impl Default for AppPreferences {
 pub struct CodexPreferences {
     #[serde(default)]
     pub home: String,
-    #[serde(default)]
-    pub managed_original: ManagedCodexFields,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
-pub struct ManagedCodexFields {
-    #[serde(default)]
-    pub captured: bool,
-    pub model: Option<String>,
-    pub model_provider: Option<String>,
-    pub model_catalog_json: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct AppConfig {
-    #[serde(default = "config_version")]
-    pub version: u32,
     #[serde(default)]
     pub app: AppPreferences,
     #[serde(default)]
     pub codex: CodexPreferences,
-    #[serde(default)]
-    pub route: RouteSettings,
     #[serde(default)]
     pub active: ActiveState,
     #[serde(default)]
     pub providers: Vec<StoredProvider>,
     #[serde(default)]
     pub official_accounts: Vec<StoredOfficialAccount>,
-}
-
-impl Default for AppConfig {
-    fn default() -> Self {
-        Self {
-            version: config_version(),
-            app: AppPreferences::default(),
-            codex: CodexPreferences::default(),
-            route: RouteSettings::default(),
-            active: ActiveState::default(),
-            providers: vec![],
-            official_accounts: vec![],
-        }
-    }
 }
 
 #[derive(Debug, Serialize)]
@@ -521,40 +400,6 @@ pub struct PageResult<T> {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct RouteLogEntry {
-    pub id: u64,
-    pub timestamp: i64,
-    pub method: String,
-    pub path: String,
-    pub status: u16,
-    pub latency_ms: u64,
-    pub message: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Default)]
-#[serde(rename_all = "camelCase")]
-pub struct RouteConsoleSnapshot {
-    pub settings: RouteSettings,
-    pub running: bool,
-    pub base_url: Option<String>,
-    pub upstream_url: Option<String>,
-    pub provider_name: Option<String>,
-    pub account_name: Option<String>,
-    pub model: Option<String>,
-    pub started_at: Option<i64>,
-    pub request_count: u64,
-    pub success_count: u64,
-    pub error_count: u64,
-    pub active_requests: u64,
-    pub last_latency_ms: Option<u64>,
-    pub logs: Vec<RouteLogEntry>,
-    pub log_total: usize,
-    pub log_page: usize,
-    pub log_page_size: usize,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct RepairTarget {
     pub id: String,
     pub sources: Vec<String>,
@@ -601,7 +446,7 @@ pub struct ConfigPatchPreview {
     pub base_hash: String,
     pub rendered: String,
     pub changes: Vec<String>,
-    pub compatibility_token_masked: String,
+    pub api_key_masked: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -611,7 +456,6 @@ pub struct ConfigInspection {
     pub valid: bool,
     pub active_provider: Option<String>,
     pub managed_provider_present: bool,
-    pub model_catalog_path: String,
     pub warnings: Vec<String>,
 }
 
@@ -620,14 +464,15 @@ pub struct ConfigInspection {
 pub struct SettingsOverview {
     pub inspection: ConfigInspection,
     pub diagnostics: serde_json::Value,
+    pub can_preview_custom: bool,
 }
 
 fn validate_headers(headers: &BTreeMap<String, String>) -> Result<(), AppError> {
     for (name, value) in headers {
         reqwest::header::HeaderName::from_bytes(name.as_bytes())
-            .map_err(|_| AppError::InvalidConfig(format!("Header 名称无效：{name}")))?;
+            .map_err(|_| AppError::InvalidConfig(format!("自定义请求头名称无效：{name}")))?;
         reqwest::header::HeaderValue::from_str(value)
-            .map_err(|_| AppError::InvalidConfig(format!("Header 值无效：{name}")))?;
+            .map_err(|_| AppError::InvalidConfig(format!("自定义请求头的值无效：{name}")))?;
     }
     Ok(())
 }
@@ -638,38 +483,11 @@ fn redact_header_values(headers: &mut BTreeMap<String, String>) {
     }
 }
 
-fn dedupe<'a>(values: impl Iterator<Item = &'a str>) -> Vec<String> {
-    let mut seen = std::collections::HashSet::new();
-    values
-        .map(str::trim)
-        .filter(|value| !value.is_empty() && seen.insert((*value).to_owned()))
-        .map(str::to_owned)
-        .collect()
-}
-
 fn default_true() -> bool {
     true
 }
 fn default_timeout_secs() -> u64 {
     30
-}
-fn loopback() -> String {
-    "127.0.0.1".into()
-}
-fn default_port() -> u16 {
-    16_384
-}
-fn default_request_timeout() -> u64 {
-    300_000
-}
-fn default_request_max_retries() -> u32 {
-    4
-}
-fn default_stream_max_retries() -> u32 {
-    3
-}
-fn default_concurrency() -> usize {
-    64
 }
 fn default_language() -> String {
     "zh-CN".into()
@@ -677,48 +495,9 @@ fn default_language() -> String {
 fn default_theme() -> String {
     "system".into()
 }
-fn config_version() -> u32 {
-    1
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn route_is_always_loopback_and_fixed_port() {
-        let mut route = RouteSettings {
-            enabled: true,
-            listen_address: "0.0.0.0".into(),
-            port: 9999,
-            request_timeout_ms: 1,
-            request_max_retries: 101,
-            stream_max_retries: 102,
-            max_concurrent_requests: 1000,
-        };
-        route.normalize();
-        assert_eq!(route.listen_address, "127.0.0.1");
-        assert_eq!(route.port, 16_384);
-        assert_eq!(route.request_timeout_ms, 1_000);
-        assert_eq!(route.request_max_retries, 100);
-        assert_eq!(route.stream_max_retries, 100);
-        assert_eq!(route.max_concurrent_requests, 256);
-    }
-
-    #[test]
-    fn legacy_route_settings_get_retry_defaults() {
-        let route = serde_json::from_value::<RouteSettings>(serde_json::json!({
-            "enabled": true,
-            "listenAddress": "127.0.0.1",
-            "port": 16384,
-            "requestTimeoutMs": 300000,
-            "maxConcurrentRequests": 64
-        }))
-        .unwrap();
-
-        assert_eq!(route.request_max_retries, 4);
-        assert_eq!(route.stream_max_retries, 3);
-    }
 
     #[test]
     fn redacted_account_never_serializes_api_key() {

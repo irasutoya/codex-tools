@@ -29,6 +29,14 @@ src-tauri/target
 .npm-cache/
 .agents/
 
+# Generated application icons; keep only desktop bundle inputs.
+build/*
+!build/icon.ico
+!build/icon.icns
+!build/32x32.png
+!build/128x128.png
+!build/128x128@2x.png
+
 # Local signing and release credentials
 *.pfx
 *.p12

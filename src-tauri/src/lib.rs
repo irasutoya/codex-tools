@@ -1,9 +1,7 @@
 mod auth_center;
 mod codex;
-mod model_catalog;
-mod model_fetch;
 mod models;
-mod protocol_proxy;
+mod platform;
 mod provider_sync;
 mod session_index;
 mod storage;
@@ -11,9 +9,8 @@ mod storage;
 use auth_center::{AuthCenter, DevicePollResult};
 use codex::ConfigManager;
 use models::*;
-use protocol_proxy::ProxyManager;
 use session_index::SessionIndex;
-use std::{borrow::Cow, path::PathBuf, process::Command};
+use std::{borrow::Cow, path::PathBuf};
 use storage::Store;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
@@ -22,13 +19,20 @@ use tauri::{Manager, State, WindowEvent};
 const TRAY_SHOW_ID: &str = "tray_show";
 const TRAY_EXIT_ID: &str = "tray_exit";
 
-#[tauri::command]
-fn list_providers(store: State<Store>) -> Result<Vec<ProviderProfile>, AppError> {
-    Ok(store
-        .providers()?
-        .into_iter()
-        .map(ProviderProfile::redacted)
-        .collect())
+#[derive(Default)]
+struct ActivationLock(tokio::sync::Mutex<()>);
+
+struct ApiClient(reqwest::Client);
+
+impl Default for ApiClient {
+    fn default() -> Self {
+        Self(
+            reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .expect("无法初始化 HTTP 客户端"),
+        )
+    }
 }
 
 #[tauri::command]
@@ -40,13 +44,13 @@ fn get_provider_overview(store: State<Store>) -> Result<ProviderOverview, AppErr
 async fn save_provider(
     store: State<'_, Store>,
     manager: State<'_, ConfigManager>,
-    proxy: State<'_, ProxyManager>,
+    activation: State<'_, ActivationLock>,
     provider: ProviderProfile,
 ) -> Result<ProviderProfile, AppError> {
-    let _guard = proxy.activation_guard().await;
+    let _guard = activation.0.lock().await;
     let saved = store.save_provider(provider)?;
     if store.is_active_provider(&saved.id)? {
-        sync_active_codex_configuration(&store, &manager, &proxy).await?;
+        sync_active_codex_configuration(&store, &manager).await?;
     }
     Ok(saved.redacted())
 }
@@ -57,28 +61,16 @@ fn delete_provider(store: State<Store>, id: String) -> Result<(), AppError> {
 }
 
 #[tauri::command]
-fn list_provider_accounts(
-    store: State<Store>,
-    provider_id: Option<String>,
-) -> Result<Vec<ProviderAccount>, AppError> {
-    Ok(store
-        .accounts(provider_id.as_deref())?
-        .into_iter()
-        .map(ProviderAccount::redacted)
-        .collect())
-}
-
-#[tauri::command]
 async fn save_provider_account(
     store: State<'_, Store>,
     manager: State<'_, ConfigManager>,
-    proxy: State<'_, ProxyManager>,
+    activation: State<'_, ActivationLock>,
     account: ProviderAccount,
 ) -> Result<ProviderAccount, AppError> {
-    let _guard = proxy.activation_guard().await;
+    let _guard = activation.0.lock().await;
     let saved = store.save_account(account)?;
     if store.is_active_account(&saved.id)? {
-        sync_active_codex_configuration(&store, &manager, &proxy).await?;
+        sync_active_codex_configuration(&store, &manager).await?;
     }
     Ok(saved.redacted())
 }
@@ -86,11 +78,6 @@ async fn save_provider_account(
 #[tauri::command]
 fn delete_provider_account(store: State<Store>, id: String) -> Result<(), AppError> {
     store.delete_account(&id)
-}
-
-#[tauri::command]
-fn list_openai_accounts(store: State<Store>) -> Result<Vec<OfficialAccountView>, AppError> {
-    store.official_accounts()
 }
 
 #[tauri::command]
@@ -104,17 +91,18 @@ async fn start_openai_device_auth(
 async fn poll_openai_device_auth(
     store: State<'_, Store>,
     center: State<'_, AuthCenter>,
-    proxy: State<'_, ProxyManager>,
+    manager: State<'_, ConfigManager>,
+    activation: State<'_, ActivationLock>,
     operation_id: String,
 ) -> Result<OpenAiDevicePoll, AppError> {
     match center.poll_openai(&operation_id).await? {
         DevicePollResult::Pending => Ok(OpenAiDevicePoll::Pending),
         DevicePollResult::Expired => Ok(OpenAiDevicePoll::Expired),
         DevicePollResult::Complete(account) => {
-            let _guard = proxy.activation_guard().await;
+            let _guard = activation.0.lock().await;
             sync_active_openai_credential(&store, &codex::home(&store.codex_home_setting()?))?;
             let saved = store.save_official_account(&account)?;
-            let repair = activate_openai_record(&store, &proxy, &saved).await?;
+            let repair = activate_openai_record(&store, &manager, &saved).await?;
             Ok(OpenAiDevicePoll::Complete {
                 account: Box::new(store.official_account_view(&saved.id)?),
                 repair,
@@ -127,16 +115,17 @@ async fn poll_openai_device_auth(
 async fn activate_openai_account(
     store: State<'_, Store>,
     center: State<'_, AuthCenter>,
-    proxy: State<'_, ProxyManager>,
+    manager: State<'_, ConfigManager>,
+    activation: State<'_, ActivationLock>,
     id: String,
 ) -> Result<RepairResult, AppError> {
-    let _guard = proxy.activation_guard().await;
+    let _guard = activation.0.lock().await;
     sync_active_openai_credential(&store, &codex::home(&store.codex_home_setting()?))?;
     let refreshed = center
         .refresh_account(&store.official_account(&id)?)
         .await?;
     let saved = store.save_official_account(&refreshed)?;
-    activate_openai_record(&store, &proxy, &saved).await
+    activate_openai_record(&store, &manager, &saved).await
 }
 
 #[tauri::command]
@@ -146,46 +135,17 @@ fn delete_openai_account(store: State<Store>, id: String) -> Result<(), AppError
 
 #[tauri::command]
 fn open_openai_device_page() -> Result<(), AppError> {
-    #[cfg(windows)]
-    {
-        Command::new("rundll32.exe")
-            .args([
-                "url.dll,FileProtocolHandler",
-                "https://auth.openai.com/codex/device",
-            ])
-            .spawn()
-            .map(|_| ())
-            .map_err(|error| AppError::Internal(format!("无法打开 OpenAI 登录页面：{error}")))
-    }
-    #[cfg(not(windows))]
-    {
-        Err(AppError::Internal(
-            "当前版本仅支持在 Windows 打开 OpenAI 登录页面".into(),
+    platform::open_url("https://auth.openai.com/codex/device").map_err(|error| {
+        AppError::Internal(format!(
+            "无法打开 OpenAI 登录页面，请手动前往 https://auth.openai.com/codex/device：{error}"
         ))
-    }
-}
-
-#[tauri::command]
-async fn fetch_provider_models(
-    store: State<'_, Store>,
-    proxy: State<'_, ProxyManager>,
-    provider_id: String,
-    account_id: String,
-) -> Result<Vec<FetchedModel>, AppError> {
-    let mut provider = store.provider(&provider_id)?;
-    let mut account = store.account(&account_id)?;
-    provider.normalize_and_validate()?;
-    account.normalize_and_validate()?;
-    if account.provider_id.as_deref() != Some(provider_id.as_str()) {
-        return Err(AppError::InvalidConfig("账号不属于所选 Provider".into()));
-    }
-    model_fetch::fetch_models(&proxy.client(), &provider, &account).await
+    })
 }
 
 #[tauri::command]
 async fn test_provider(
     store: State<'_, Store>,
-    proxy: State<'_, ProxyManager>,
+    client: State<'_, ApiClient>,
     id: String,
     account_id: String,
 ) -> Result<ProviderTestResult, AppError> {
@@ -194,57 +154,35 @@ async fn test_provider(
     provider.normalize_and_validate()?;
     account.normalize_and_validate()?;
     if account.provider_id.as_deref() != Some(id.as_str()) {
-        return Err(AppError::InvalidConfig("账号不属于所选 Provider".into()));
+        return Err(AppError::InvalidConfig(
+            "所选 API Key 不属于这个服务，请刷新页面后重试。".into(),
+        ));
     }
-    let suffix = match provider.protocol {
-        ProviderProtocol::Responses => "responses",
-        ProviderProtocol::ChatCompletions => "chat/completions",
-        ProviderProtocol::AnthropicMessages => "messages",
-    };
-    let endpoint = endpoint_url(&provider.base_url, suffix);
-    let model = provider
-        .models
-        .first()
-        .cloned()
-        .unwrap_or_else(|| "model".into());
-    let client = proxy.client();
-    let mut request = client.post(&endpoint);
-    for (name, value) in provider.headers.iter().chain(account.headers.iter()) {
-        request = request.header(name, value);
-    }
+    let endpoint = models_endpoint(&provider.base_url);
+    let mut request = client
+        .0
+        .get(&endpoint)
+        .headers(custom_headers(&provider, &account)?);
     let key = account.api_key.as_deref().unwrap_or_default();
-    let payload = match provider.protocol {
-        ProviderProtocol::Responses => {
-            request = request.bearer_auth(key);
-            serde_json::json!({"model":model,"input":"hi","max_output_tokens":8})
-        }
-        ProviderProtocol::ChatCompletions => {
-            request = request.bearer_auth(key);
-            serde_json::json!({"model":model,"messages":[{"role":"user","content":"hi"}],"max_tokens":8})
-        }
-        ProviderProtocol::AnthropicMessages => {
-            request = request
-                .header("x-api-key", key)
-                .header("anthropic-version", "2023-06-01");
-            serde_json::json!({"model":model,"messages":[{"role":"user","content":"hi"}],"max_tokens":8})
-        }
-    };
+    request = request.bearer_auth(key);
     let response = tokio::time::timeout(
         std::time::Duration::from_secs(provider.timeout_secs),
-        request.json(&payload).send(),
+        request.send(),
     )
     .await
-    .map_err(|_| AppError::InvalidConfig("连接超时".into()))?
-    .map_err(|error| AppError::InvalidConfig(format!("连接失败：{error}")))?;
+    .map_err(|_| AppError::InvalidConfig("连接超时，请检查网络和 API 地址后重试。".into()))?
+    .map_err(|error| {
+        AppError::InvalidConfig(format!("无法连接到服务，请检查网络和 API 地址：{error}"))
+    })?;
     let status = response.status().as_u16();
     Ok(ProviderTestResult {
         ok: status < 400,
         status,
         endpoint,
         message: if status < 400 {
-            "连接成功".into()
+            "模型列表接口可以访问，Codex 可直接从此服务读取模型。".into()
         } else {
-            "上游返回错误，响应详情已隐藏".into()
+            format!("连接测试未通过（HTTP {status}），请检查 API 地址、API Key 和服务状态。")
         },
         suggest_v1: status == 404 && !provider.base_url.ends_with("/v1"),
     })
@@ -254,56 +192,37 @@ async fn test_provider(
 fn preview_activation(
     store: State<Store>,
     manager: State<ConfigManager>,
-    mode: String,
     provider_id: Option<String>,
-    regenerate_token: Option<bool>,
 ) -> Result<ConfigPatchPreview, AppError> {
-    if mode != "custom" {
-        return Err(AppError::InvalidConfig(
-            "官方模式必须通过已保存的 OpenAI 账号完整切换".into(),
-        ));
-    }
-    let (home_setting, route, active_provider_id) = store.read(|state| {
+    let (home_setting, active_provider_id, active_account_id) = store.read(|state| {
         (
             state.codex.home.clone(),
-            state.route.clone(),
             state.active.provider_id.clone(),
+            state.active.account_id.clone(),
         )
     })?;
     let home = codex::home(&home_setting);
     let provider_id = provider_id
         .as_deref()
         .or(active_provider_id.as_deref())
-        .ok_or_else(|| AppError::InvalidConfig("没有可用的 Provider".into()))?;
+        .ok_or_else(|| AppError::InvalidConfig("请先添加并启用一个第三方 API 服务。".into()))?;
     let provider = store.provider(provider_id)?;
-    let model = provider
-        .models
-        .first()
-        .ok_or_else(|| AppError::InvalidConfig("Provider 没有模型".into()))?;
-    manager.preview_custom(
-        &home,
-        store.root(),
-        model,
-        &route,
-        regenerate_token.unwrap_or(false),
-    )
+    let account_id = active_account_id
+        .filter(|_| active_provider_id.as_deref() == Some(provider_id))
+        .or(provider.active_account_id.clone())
+        .ok_or_else(|| AppError::InvalidConfig("请先为这个服务添加一个 API Key。".into()))?;
+    let account = store.account(&account_id)?;
+    manager.preview_custom(&home, &provider, &account)
 }
 
 #[tauri::command]
-fn apply_activation(manager: State<ConfigManager>, operation_id: String) -> Result<(), AppError> {
+async fn apply_activation(
+    manager: State<'_, ConfigManager>,
+    activation: State<'_, ActivationLock>,
+    operation_id: String,
+) -> Result<(), AppError> {
+    let _guard = activation.0.lock().await;
     manager.apply(&operation_id)
-}
-
-async fn rebuild_model_catalog(
-    provider: ProviderProfile,
-    home: PathBuf,
-    data_root: PathBuf,
-) -> Result<String, AppError> {
-    tokio::task::spawn_blocking(move || {
-        codex::regenerate_model_catalog(&provider, &home, &data_root)
-    })
-    .await
-    .map_err(|error| AppError::Internal(error.to_string()))?
 }
 
 async fn scan_home(home: PathBuf) -> Result<RepairScan, AppError> {
@@ -312,8 +231,8 @@ async fn scan_home(home: PathBuf) -> Result<RepairScan, AppError> {
         .map_err(|error| AppError::Internal(error.to_string()))
 }
 
-async fn migrate_home(home: PathBuf, target_provider: String) -> Result<RepairResult, AppError> {
-    tokio::task::spawn_blocking(move || provider_sync::migrate(&home, &target_provider))
+async fn repair_home(home: PathBuf, target_provider: String) -> Result<RepairResult, AppError> {
+    tokio::task::spawn_blocking(move || provider_sync::repair(&home, &target_provider))
         .await
         .map_err(|error| AppError::Internal(error.to_string()))?
 }
@@ -327,11 +246,13 @@ fn sync_active_openai_credential(store: &Store, home: &std::path::Path) -> Resul
     let Some(record_id) = record_id else {
         return Ok(());
     };
-    let Some(credential) = codex::read_official_account(home)? else {
-        return Ok(());
+    let credential = match codex::read_official_account(home) {
+        Ok(Some(credential)) => credential,
+        Ok(None) | Err(AppError::InvalidConfig(_)) => return Ok(()),
+        Err(error) => return Err(error),
     };
     let saved = store.official_account(&record_id)?;
-    if saved.account_id == credential.tokens.account_id {
+    if saved.account_id == credential.tokens.account_id && saved.credential != credential {
         store.sync_official_credential(&record_id, &credential, saved.expires_at)?;
     }
     Ok(())
@@ -340,99 +261,64 @@ fn sync_active_openai_credential(store: &Store, home: &std::path::Path) -> Resul
 async fn sync_active_codex_configuration(
     store: &Store,
     manager: &ConfigManager,
-    proxy: &ProxyManager,
 ) -> Result<(), AppError> {
-    let (home_setting, active, route) = store.read(|state| {
-        (
-            state.codex.home.clone(),
-            state.active.clone(),
-            state.route.clone(),
-        )
-    })?;
+    let (home_setting, active) =
+        store.read(|state| (state.codex.home.clone(), state.active.clone()))?;
     let home = codex::home(&home_setting);
     match active.kind {
         ActiveKind::Official => {
             sync_active_openai_credential(store, &home)?;
-            proxy.stop().await;
+            let account_id = active.account_id.as_deref().ok_or_else(|| {
+                AppError::InvalidConfig("当前 OpenAI 登录信息不完整，请重新登录。".into())
+            })?;
+            let account = store.official_account(account_id)?;
+            codex::activate_official_account(&home, &account.credential)?;
             return Ok(());
         }
-        ActiveKind::None => {
-            proxy.stop().await;
-            return Ok(());
-        }
+        ActiveKind::None => return Ok(()),
         ActiveKind::Provider => {}
     }
 
-    let provider_id = active
-        .provider_id
-        .as_deref()
-        .ok_or_else(|| AppError::InvalidConfig("当前 Provider 状态不完整".into()))?;
+    let provider_id = active.provider_id.as_deref().ok_or_else(|| {
+        AppError::InvalidConfig("当前第三方 API 服务信息不完整，请重新选择。".into())
+    })?;
     let account_id = active
         .account_id
         .as_deref()
-        .ok_or_else(|| AppError::InvalidConfig("当前 Provider 账号状态不完整".into()))?;
+        .ok_or_else(|| AppError::InvalidConfig("当前 API Key 信息不完整，请重新选择。".into()))?;
     let mut provider = store.provider(provider_id)?;
     let mut account = store.account(account_id)?;
     provider.normalize_and_validate()?;
     account.normalize_and_validate()?;
     if !provider.enabled || account.provider_id.as_deref() != Some(provider_id) {
-        return Err(AppError::InvalidConfig("当前 Provider 或账号不可用".into()));
+        return Err(AppError::InvalidConfig(
+            "当前第三方 API 服务或 API Key 已不可用，请重新选择。".into(),
+        ));
     }
 
-    if route.enabled {
-        proxy.prepare(&provider, &account, &route).await?;
-    }
-    if let Err(error) =
-        rebuild_model_catalog(provider.clone(), home.clone(), store.root().to_path_buf()).await
-    {
-        if route.enabled {
-            proxy.abort_pending().await;
-        }
-        return Err(error);
-    }
-    let prepared = (|| {
-        let model = provider
-            .models
-            .first()
-            .ok_or_else(|| AppError::InvalidConfig("Provider 没有模型".into()))?;
-        let preview = manager.preview_custom(&home, store.root(), model, &route, false)?;
-        manager.apply(&preview.operation_id)
-    })();
-    if let Err(error) = prepared {
-        if route.enabled {
-            proxy.abort_pending().await;
-        }
-        return Err(error);
-    }
-
-    if route.enabled {
-        proxy.commit().await
-    } else {
-        proxy.stop().await;
-        Ok(())
-    }
+    let preview = manager.preview_custom(&home, &provider, &account)?;
+    manager.apply(&preview.operation_id)
 }
 
 async fn activate_openai_record(
     store: &Store,
-    proxy: &ProxyManager,
+    manager: &ConfigManager,
     account: &StoredOfficialAccount,
 ) -> Result<RepairResult, AppError> {
     let home = codex::home(&store.codex_home_setting()?);
-    let migrate_sessions =
-        scan_home(home.clone()).await?.current_provider == codex::MANAGED_PROVIDER_ID;
+    let repair_sessions = provider_sync::configured_provider(&home) == codex::MANAGED_PROVIDER_ID;
     codex::activate_official_account(&home, &account.credential)?;
-    store.activate_official_account(&account.id)?;
-    store.clear_managed_codex_fields()?;
-    let repair = if migrate_sessions {
-        migrate_home(home, "openai".into()).await?
+    if let Err(error) = store.activate_official_account(&account.id) {
+        return Err(compensate_activation_failure(store, manager, error).await);
+    }
+    let repair = if repair_sessions {
+        repair_home(home, "openai".into()).await?
     } else {
         RepairResult {
             target_provider: "openai".into(),
             ..RepairResult::default()
         }
     };
-    proxy.stop().await;
     Ok(repair)
 }
 
@@ -440,121 +326,47 @@ async fn activate_openai_record(
 async fn activate_provider(
     store: State<'_, Store>,
     manager: State<'_, ConfigManager>,
-    proxy: State<'_, ProxyManager>,
+    activation: State<'_, ActivationLock>,
     id: String,
     account_id: String,
 ) -> Result<RepairResult, AppError> {
-    let _guard = proxy.activation_guard().await;
-    let mut provider = store.provider(&id)?;
-    let mut account = store.account(&account_id)?;
-    provider.normalize_and_validate()?;
-    account.normalize_and_validate()?;
-    if !provider.enabled || account.provider_id.as_deref() != Some(id.as_str()) {
-        return Err(AppError::InvalidConfig("Provider 或账号不可用".into()));
-    }
-    let settings = store.route_settings()?;
-    if !settings.enabled {
-        return Err(AppError::InvalidConfig("请先启用本地代理".into()));
-    }
-    let home = codex::home(&store.codex_home_setting()?);
-    sync_active_openai_credential(&store, &home)?;
-    proxy.prepare(&provider, &account, &settings).await?;
-    let (scan, _) = match tokio::try_join!(
-        scan_home(home.clone()),
-        rebuild_model_catalog(provider.clone(), home.clone(), store.root().to_path_buf())
-    ) {
-        Ok(result) => result,
-        Err(error) => {
-            proxy.abort_pending().await;
-            return Err(error);
-        }
-    };
-    let migrate_sessions = scan.current_provider != codex::MANAGED_PROVIDER_ID;
-    let prepared = (|| {
-        let model = provider
-            .models
-            .first()
-            .ok_or_else(|| AppError::InvalidConfig("Provider 没有模型".into()))?;
-        let preview = manager.preview_custom(&home, store.root(), model, &settings, false)?;
-        manager.apply(&preview.operation_id)?;
-        store.activate(&id, &account_id)
-    })();
-    if let Err(error) = prepared {
-        proxy.abort_pending().await;
-        return Err(error);
-    }
-    let migration = if migrate_sessions {
-        match migrate_home(home, codex::MANAGED_PROVIDER_ID.into()).await {
-            Ok(migration) => migration,
-            Err(error) => {
-                proxy.abort_pending().await;
-                return Err(error);
-            }
-        }
-    } else {
-        RepairResult {
-            target_provider: codex::MANAGED_PROVIDER_ID.into(),
-            ..RepairResult::default()
-        }
-    };
-    proxy.commit().await?;
-    Ok(migration)
-}
-
-#[tauri::command]
-async fn activate_upstream(
-    store: State<'_, Store>,
-    manager: State<'_, ConfigManager>,
-    proxy: State<'_, ProxyManager>,
-    id: String,
-    account_id: String,
-) -> Result<(), AppError> {
-    let _guard = proxy.activation_guard().await;
+    let _guard = activation.0.lock().await;
     let mut provider = store.provider(&id)?;
     let mut account = store.account(&account_id)?;
     provider.normalize_and_validate()?;
     account.normalize_and_validate()?;
     if !provider.enabled || account.provider_id.as_deref() != Some(id.as_str()) {
         return Err(AppError::InvalidConfig(
-            "Provider 或账号不可用，或账号归属不匹配".into(),
+            "所选第三方 API 服务或 API Key 已不可用，请检查后重试。".into(),
         ));
-    }
-    let settings = store.route_settings()?;
-    if !settings.enabled {
-        return Err(AppError::InvalidConfig("请先启用本地代理".into()));
     }
     let home = codex::home(&store.codex_home_setting()?);
     sync_active_openai_credential(&store, &home)?;
-    proxy.prepare(&provider, &account, &settings).await?;
-    if let Err(error) =
-        rebuild_model_catalog(provider.clone(), home.clone(), store.root().to_path_buf()).await
-    {
-        proxy.abort_pending().await;
-        return Err(error);
+    let repair_sessions = provider_sync::configured_provider(&home) != codex::MANAGED_PROVIDER_ID;
+    let preview = manager.preview_custom(&home, &provider, &account)?;
+    manager.apply(&preview.operation_id)?;
+    if let Err(error) = store.activate(&id, &account_id) {
+        return Err(compensate_activation_failure(&store, &manager, error).await);
     }
-    let prepared = (|| {
-        let model = provider
-            .models
-            .first()
-            .ok_or_else(|| AppError::InvalidConfig("Provider 没有模型".into()))?;
-        let preview = manager.preview_custom(&home, store.root(), model, &settings, false)?;
-        manager.apply(&preview.operation_id)?;
-        store.activate(&id, &account_id)
-    })();
-    if let Err(error) = prepared {
-        proxy.abort_pending().await;
-        return Err(error);
-    }
-    proxy.commit().await
+    let repair = if repair_sessions {
+        repair_home(home, codex::MANAGED_PROVIDER_ID.into()).await?
+    } else {
+        RepairResult {
+            target_provider: codex::MANAGED_PROVIDER_ID.into(),
+            ..RepairResult::default()
+        }
+    };
+    Ok(repair)
 }
 
 #[tauri::command]
 async fn activate_official(
     store: State<'_, Store>,
     center: State<'_, AuthCenter>,
-    proxy: State<'_, ProxyManager>,
+    manager: State<'_, ConfigManager>,
+    activation: State<'_, ActivationLock>,
 ) -> Result<RepairResult, AppError> {
-    let _guard = proxy.activation_guard().await;
+    let _guard = activation.0.lock().await;
     let (home_setting, id) = store.read(|state| {
         let id = state
             .active
@@ -571,61 +383,26 @@ async fn activate_official(
         (state.codex.home.clone(), id)
     })?;
     sync_active_openai_credential(&store, &codex::home(&home_setting))?;
-    let id = id.ok_or_else(|| AppError::InvalidConfig("请先登录 OpenAI Account".into()))?;
+    let id =
+        id.ok_or_else(|| AppError::InvalidConfig("请先在“账号与服务”中登录 OpenAI。".into()))?;
     let refreshed = center
         .refresh_account(&store.official_account(&id)?)
         .await?;
     let saved = store.save_official_account(&refreshed)?;
-    activate_openai_record(&store, &proxy, &saved).await
+    activate_openai_record(&store, &manager, &saved).await
 }
 
-#[tauri::command]
-fn regenerate_compatibility_token(
-    store: State<Store>,
-    manager: State<ConfigManager>,
-) -> Result<ConfigPatchPreview, AppError> {
-    let (home_setting, route, provider_id) = store.read(|state| {
-        (
-            state.codex.home.clone(),
-            state.route.clone(),
-            state.active.provider_id.clone(),
-        )
-    })?;
-    let provider_id =
-        provider_id.ok_or_else(|| AppError::InvalidConfig("当前未启用第三方 Provider".into()))?;
-    let provider = store.provider(&provider_id)?;
-    let model = provider
-        .models
-        .first()
-        .ok_or_else(|| AppError::InvalidConfig("Provider 没有模型".into()))?;
-    manager.preview_custom(
-        &codex::home(&home_setting),
-        store.root(),
-        model,
-        &route,
-        true,
-    )
-}
-
-#[tauri::command]
-async fn regenerate_model_catalog(
-    store: State<'_, Store>,
-    provider_id: String,
-) -> Result<String, AppError> {
-    rebuild_model_catalog(
-        store.provider(&provider_id)?,
-        codex::home(&store.codex_home_setting()?),
-        store.root().to_path_buf(),
-    )
-    .await
-}
-
-#[tauri::command]
-fn inspect_codex_config(store: State<Store>) -> Result<ConfigInspection, AppError> {
-    Ok(codex::inspect(
-        &codex::home(&store.codex_home_setting()?),
-        store.root(),
-    ))
+async fn compensate_activation_failure(
+    store: &Store,
+    manager: &ConfigManager,
+    error: AppError,
+) -> AppError {
+    match sync_active_codex_configuration(store, manager).await {
+        Ok(()) => error,
+        Err(rollback) => AppError::Internal(format!(
+            "{error}；原来的 Codex 连接也未能恢复，请重新选择账号或服务：{rollback}"
+        )),
+    }
 }
 
 #[tauri::command]
@@ -641,7 +418,7 @@ async fn repair_codex_data(
 ) -> Result<RepairResult, AppError> {
     let home = codex::home(&store.codex_home_setting()?);
     let index = index.inner().clone();
-    let result = migrate_home(home, target_provider).await;
+    let result = repair_home(home, target_provider).await;
     index.invalidate();
     result
 }
@@ -723,41 +500,6 @@ fn session_page(
 }
 
 #[tauri::command]
-async fn get_route_console(
-    store: State<'_, Store>,
-    proxy: State<'_, ProxyManager>,
-    page: Option<usize>,
-    page_size: Option<usize>,
-) -> Result<RouteConsoleSnapshot, AppError> {
-    Ok(proxy
-        .console(
-            store.route_settings()?,
-            page.unwrap_or(1),
-            page_size.unwrap_or(25),
-        )
-        .await)
-}
-
-#[tauri::command]
-async fn save_route_settings(
-    store: State<'_, Store>,
-    manager: State<'_, ConfigManager>,
-    proxy: State<'_, ProxyManager>,
-    mut settings: RouteSettings,
-) -> Result<(), AppError> {
-    let _guard = proxy.activation_guard().await;
-    settings.normalize();
-    store.save_route_settings(settings)?;
-    sync_active_codex_configuration(&store, &manager, &proxy).await
-}
-
-#[tauri::command]
-async fn clear_route_logs(proxy: State<'_, ProxyManager>) -> Result<(), AppError> {
-    proxy.clear_logs().await;
-    Ok(())
-}
-
-#[tauri::command]
 async fn get_dashboard(
     store: State<'_, Store>,
     index: State<'_, SessionIndex>,
@@ -787,7 +529,7 @@ async fn get_dashboard(
                                 .find(|account| account.id == id)
                         })
                         .map(|account| format!("OpenAI · {}", account.name))
-                        .unwrap_or_else(|| "OpenAI 官方模式".into())
+                        .unwrap_or_else(|| "OpenAI 官方账号".into())
                 })
             });
         (
@@ -799,10 +541,12 @@ async fn get_dashboard(
     let home = codex::home(&home_setting);
     let index = index.inner().clone();
     let scan_home = home.clone();
-    let (session_count, database_count) = tokio::task::spawn_blocking(move || {
-        let session_count = index.load(&scan_home).map_or(0, |sessions| sessions.len());
+    let (session_count, database_count, database_health) = tokio::task::spawn_blocking(move || {
         let database_count = provider_sync::database_paths(&scan_home).len();
-        (session_count, database_count)
+        match index.load(&scan_home) {
+            Ok(sessions) => (sessions.len(), database_count, "可以读取".into()),
+            Err(_) => (0, database_count, "读取失败".into()),
+        }
     })
     .await
     .map_err(|error| AppError::Internal(error.to_string()))?;
@@ -812,30 +556,25 @@ async fn get_dashboard(
         codex_home: home.display().to_string(),
         database_count,
         session_count,
-        database_health: "正常".into(),
+        database_health,
     })
 }
 
 fn settings_overview(store: &Store) -> Result<SettingsOverview, AppError> {
-    let (home_setting, active, route) = store.read(|state| {
-        (
-            state.codex.home.clone(),
-            state.active.clone(),
-            state.route.clone(),
-        )
-    })?;
+    let (home_setting, active) =
+        store.read(|state| (state.codex.home.clone(), state.active.clone()))?;
     let home = codex::home(&home_setting);
-    let inspection = codex::inspect(&home, store.root());
+    let inspection = codex::inspect(&home);
     let diagnostics = serde_json::json!({
         "dataDirectory": store.root(),
         "configFile": store.path(),
         "codex": &inspection,
         "active": active,
-        "route": route,
     });
     Ok(SettingsOverview {
         inspection,
         diagnostics,
+        can_preview_custom: matches!(active.kind, ActiveKind::Provider),
     })
 }
 
@@ -845,35 +584,56 @@ fn get_settings_overview(store: State<Store>) -> Result<SettingsOverview, AppErr
 }
 
 #[tauri::command]
-fn get_diagnostics(store: State<Store>) -> Result<serde_json::Value, AppError> {
-    Ok(settings_overview(&store)?.diagnostics)
+fn launch_codex(store: State<Store>) -> Result<(), AppError> {
+    let mut command = platform::codex_command();
+    let codex_home = codex::home(&store.codex_home_setting()?);
+    command.env("CODEX_HOME", &codex_home);
+    #[cfg(target_os = "macos")]
+    {
+        command.arg("app");
+        if let Some(home) = dirs::home_dir() {
+            command.current_dir(home);
+        }
+    }
+    command.spawn().map(|_| ()).map_err(|error| {
+        AppError::Internal(format!(
+            "无法启动 Codex，请确认 Codex 已安装并可从终端运行：{error}"
+        ))
+    })
 }
 
-#[tauri::command]
-fn launch_codex() -> Result<(), AppError> {
-    Command::new("codex")
-        .spawn()
-        .map(|_| ())
-        .map_err(|error| AppError::Internal(format!("无法启动 Codex：{error}")))
-}
-
-fn endpoint_url(base_url: &str, suffix: &str) -> String {
+fn models_endpoint(base_url: &str) -> String {
     let base = base_url.trim_end_matches('/');
     if base.rsplit('/').next().is_some_and(|part| {
         part.starts_with('v') && part[1..].chars().all(|value| value.is_ascii_digit())
     }) {
-        format!("{base}/{suffix}")
+        format!("{base}/models")
     } else {
-        format!("{base}/v1/{suffix}")
+        format!("{base}/v1/models")
     }
 }
 
-async fn start_configured_route(app: tauri::AppHandle) {
+fn custom_headers(
+    provider: &ProviderProfile,
+    account: &ProviderAccount,
+) -> Result<reqwest::header::HeaderMap, AppError> {
+    let mut headers = reqwest::header::HeaderMap::new();
+    for (name, value) in provider.headers.iter().chain(&account.headers) {
+        let name = reqwest::header::HeaderName::from_bytes(name.as_bytes())
+            .map_err(|_| AppError::InvalidConfig(format!("请求头名称无效：{name}")))?;
+        let value = reqwest::header::HeaderValue::from_str(value)
+            .map_err(|_| AppError::InvalidConfig("请求头内容包含无效字符。".into()))?;
+        headers.insert(name, value);
+    }
+    Ok(headers)
+}
+
+async fn sync_configured_provider(app: tauri::AppHandle) {
     let store = app.state::<Store>();
     let manager = app.state::<ConfigManager>();
-    let proxy = app.state::<ProxyManager>();
-    let _guard = proxy.activation_guard().await;
-    let _ = sync_active_codex_configuration(&store, &manager, &proxy).await;
+    let activation = app.state::<ActivationLock>();
+    let _guard = activation.0.lock().await;
+    let _ = sync_active_codex_configuration(&store, &manager).await;
 }
 
 fn show_main_window(app: &tauri::AppHandle) {
@@ -892,14 +652,15 @@ fn show_main_window(app: &tauri::AppHandle) {
 }
 
 pub fn run() {
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _, _| {
             show_main_window(app)
         }))
-        .manage(Store::new().expect("无法初始化 data/app.yaml"))
+        .manage(Store::new().expect("无法初始化应用数据"))
         .manage(AuthCenter::default())
         .manage(ConfigManager::default())
-        .manage(ProxyManager::default())
+        .manage(ActivationLock::default())
+        .manage(ApiClient::default())
         .manage(SessionIndex::default())
         .setup(|app| {
             let show =
@@ -934,7 +695,7 @@ pub fn run() {
                 })
                 .build(app)?;
             let handle = app.handle().clone();
-            tauri::async_runtime::spawn(start_configured_route(handle));
+            tauri::async_runtime::spawn(sync_configured_provider(handle));
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -945,41 +706,39 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             get_dashboard,
-            get_diagnostics,
             get_settings_overview,
             get_provider_overview,
-            list_providers,
             save_provider,
             delete_provider,
-            list_provider_accounts,
             save_provider_account,
             delete_provider_account,
-            list_openai_accounts,
             start_openai_device_auth,
             poll_openai_device_auth,
             activate_openai_account,
             delete_openai_account,
             open_openai_device_page,
-            fetch_provider_models,
             test_provider,
             preview_activation,
             apply_activation,
             activate_provider,
-            activate_upstream,
             activate_official,
-            regenerate_compatibility_token,
-            regenerate_model_catalog,
-            inspect_codex_config,
             scan_codex_data,
             repair_codex_data,
             list_sessions,
-            get_route_console,
-            save_route_settings,
-            clear_route_logs,
             launch_codex,
         ])
-        .run(tauri::generate_context!())
+        .build(tauri::generate_context!())
         .expect("Tauri 运行失败");
+    app.run(|app, event| match event {
+        #[cfg(target_os = "macos")]
+        tauri::RunEvent::Reopen {
+            has_visible_windows: false,
+            ..
+        } => show_main_window(app),
+        _ => {
+            let _ = app;
+        }
+    });
 }
 
 #[cfg(test)]
@@ -1036,15 +795,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn active_custom_configuration_syncs_all_codex_files() {
+    async fn active_custom_configuration_syncs_codex_credentials_and_provider() {
         let temp = tempfile::tempdir().unwrap();
         let home = temp.path().join("codex-home");
         fs::create_dir_all(&home).unwrap();
-        fs::write(
-            home.join("models_cache.json"),
-            r#"{"models":[{"slug":"template","display_name":"Template","base_instructions":"test","model_messages":{},"apply_patch_tool_type":"custom","shell_type":"shell","context_window":272000}]}"#,
-        )
-        .unwrap();
         let store = Store::open(temp.path().join("data")).unwrap();
         store
             .update(|state| {
@@ -1056,16 +810,9 @@ mod tests {
             .save_provider(ProviderProfile {
                 id: "provider".into(),
                 name: "Provider".into(),
-                protocol: ProviderProtocol::Responses,
                 base_url: "http://127.0.0.1:9/v1".into(),
-                models: vec!["model-v2".into()],
-                model_metadata: vec![],
-                model_aliases: Default::default(),
-                codex_chat_reasoning: None,
                 headers: Default::default(),
                 timeout_secs: 30,
-                context_window: None,
-                auto_compact_threshold: None,
                 enabled: true,
                 active: false,
                 active_account_id: None,
@@ -1087,31 +834,86 @@ mod tests {
             })
             .unwrap();
         store.activate(&provider.id, &account.id).unwrap();
-        store
-            .save_route_settings(RouteSettings {
-                enabled: false,
-                request_max_retries: 9,
-                stream_max_retries: 8,
-                ..RouteSettings::default()
-            })
-            .unwrap();
 
-        sync_active_codex_configuration(
-            &store,
-            &ConfigManager::default(),
-            &ProxyManager::default(),
-        )
-        .await
-        .unwrap();
+        sync_active_codex_configuration(&store, &ConfigManager::default())
+            .await
+            .unwrap();
 
         let config = fs::read_to_string(home.join("config.toml")).unwrap();
         let document = config.parse::<toml_edit::DocumentMut>().unwrap();
-        assert_eq!(document["model"].as_str(), Some("model-v2"));
         let custom = document["model_providers"]["custom"].as_table().unwrap();
-        assert_eq!(custom["request_max_retries"].as_integer(), Some(9));
-        assert_eq!(custom["stream_max_retries"].as_integer(), Some(8));
-        assert_eq!(fs::read(home.join("auth.json")).unwrap(), b"{}\n");
-        let catalog = fs::read_to_string(temp.path().join("data/model_catalog.json")).unwrap();
-        assert!(catalog.contains("model-v2"));
+        assert_eq!(custom["base_url"].as_str(), Some("http://127.0.0.1:9/v1"));
+        assert_eq!(custom["wire_api"].as_str(), Some("responses"));
+        assert_eq!(custom["requires_openai_auth"].as_bool(), Some(true));
+        assert!(custom.get("experimental_bearer_token").is_none());
+        let auth: serde_json::Value =
+            serde_json::from_slice(&fs::read(home.join("auth.json")).unwrap()).unwrap();
+        assert_eq!(auth.as_object().unwrap().len(), 1);
+        assert_eq!(auth["OPENAI_API_KEY"], "secret");
+    }
+
+    #[tokio::test]
+    async fn official_sync_repairs_drifted_custom_configuration() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex-home");
+        fs::create_dir_all(&home).unwrap();
+        let store = Store::open(temp.path().join("data")).unwrap();
+        store
+            .update(|state| {
+                state.codex.home = home.display().to_string();
+                Ok(())
+            })
+            .unwrap();
+        let credential = CodexAuthCredential {
+            auth_mode: "chatgpt".into(),
+            openai_api_key: None,
+            tokens: CodexAuthTokens {
+                id_token: "id-secret".into(),
+                access_token: "access-secret".into(),
+                refresh_token: "refresh-secret".into(),
+                account_id: "workspace".into(),
+            },
+            last_refresh: "2026-07-15T00:00:00Z".into(),
+        };
+        let saved = store
+            .save_official_account(&StoredOfficialAccount {
+                id: String::new(),
+                name: "OpenAI".into(),
+                account_id: "workspace".into(),
+                email: "person@example.test".into(),
+                credential: credential.clone(),
+                expires_at: None,
+                created_at: 0,
+                updated_at: 0,
+            })
+            .unwrap();
+        store.activate_official_account(&saved.id).unwrap();
+        fs::write(
+            home.join("config.toml"),
+            "model_provider = \"custom\"\n[model_providers.custom]\nwire_api = \"responses\"\nbase_url = \"https://wrong.example.test/v1\"\n",
+        )
+        .unwrap();
+        fs::write(
+            home.join("auth.json"),
+            r#"{"OPENAI_API_KEY":"wrong-secret"}"#,
+        )
+        .unwrap();
+
+        sync_active_codex_configuration(&store, &ConfigManager::default())
+            .await
+            .unwrap();
+
+        let config = fs::read_to_string(home.join("config.toml")).unwrap();
+        let document = config.parse::<toml_edit::DocumentMut>().unwrap();
+        assert!(document.get("model_provider").is_none());
+        assert!(
+            document
+                .get("model_providers")
+                .and_then(toml_edit::Item::as_table)
+                .is_none_or(|providers| providers.get("custom").is_none())
+        );
+        let repaired: CodexAuthCredential =
+            serde_json::from_slice(&fs::read(home.join("auth.json")).unwrap()).unwrap();
+        assert_eq!(repaired, credential);
     }
 }

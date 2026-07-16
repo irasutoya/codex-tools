@@ -3,7 +3,7 @@ name = "codex-tools"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-description = "Lightweight local Codex provider proxy and session migration tool"
+description = "OpenAI Responses provider manager and session repair tool for Codex"
 repository = "https://github.com/irasutoya/codex-tools"
 rust-version = "1.85"
 
@@ -20,12 +20,10 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 anyhow = "1"
-arc-swap = "1"
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 dirs = "6"
 futures-util = "0.3"
-rand = "0.9"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
@@ -35,7 +33,7 @@ sha2 = "0.10"
 tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-single-instance = "2"
 thiserror = "2"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 toml_edit = "0.22"
 uuid = { version = "1", features = ["v4", "serde"] }
 walkdir = "2"

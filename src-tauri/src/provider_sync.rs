@@ -50,15 +50,7 @@ pub fn scan(codex_home: &Path) -> RepairScan {
             Err(error) => warnings.push(format!("无法检查 {}：{error}", path.display())),
         }
     }
-    let current_provider = fs::read_to_string(codex_home.join("config.toml"))
-        .ok()
-        .and_then(|text| text.parse::<toml_edit::DocumentMut>().ok())
-        .and_then(|doc| {
-            doc.get("model_provider")
-                .and_then(toml_edit::Item::as_str)
-                .map(str::to_owned)
-        })
-        .unwrap_or_else(|| "openai".into());
+    let current_provider = configured_provider(codex_home);
     providers
         .entry(current_provider.clone())
         .or_default()
@@ -80,11 +72,23 @@ pub fn scan(codex_home: &Path) -> RepairScan {
     }
 }
 
-pub fn migrate(codex_home: &Path, target: &str) -> Result<RepairResult, AppError> {
+pub fn configured_provider(codex_home: &Path) -> String {
+    fs::read_to_string(codex_home.join("config.toml"))
+        .ok()
+        .and_then(|text| text.parse::<toml_edit::DocumentMut>().ok())
+        .and_then(|doc| {
+            doc.get("model_provider")
+                .and_then(toml_edit::Item::as_str)
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| "openai".into())
+}
+
+pub fn repair(codex_home: &Path, target: &str) -> Result<RepairResult, AppError> {
     let target = target.trim();
     if !matches!(target, "openai" | "custom") {
         return Err(AppError::InvalidConfig(
-            "会话迁移只允许 openai 与 custom 互切".into(),
+            "只能在 OpenAI 官方账号与第三方 API 之间更新会话归属。".into(),
         ));
     }
     let rollouts = rollout_files(codex_home);
@@ -95,7 +99,7 @@ pub fn migrate(codex_home: &Path, target: &str) -> Result<RepairResult, AppError
     };
 
     for path in rollouts {
-        match migrate_rollout(&path, target) {
+        match repair_rollout(&path, target) {
             Ok((changed, metas)) => {
                 result.session_meta_updated += metas;
                 if changed {
@@ -112,7 +116,7 @@ pub fn migrate(codex_home: &Path, target: &str) -> Result<RepairResult, AppError
     }
 
     for path in database_paths(codex_home) {
-        match migrate_database(&path, target) {
+        match repair_database(&path, target) {
             Ok(rows) => result.rows_updated += rows,
             Err(error) => result.warnings.push(format!("{}：{error}", path.display())),
         }
@@ -184,9 +188,9 @@ pub fn rollout_files(codex_home: &Path) -> Vec<PathBuf> {
 
 pub fn database_paths(codex_home: &Path) -> Vec<PathBuf> {
     let mut output = vec![];
-    let legacy = codex_home.join("state_5.sqlite");
-    if legacy.is_file() {
-        output.push(legacy);
+    let root_database = codex_home.join("state_5.sqlite");
+    if root_database.is_file() {
+        output.push(root_database);
     }
     collect_databases(&codex_home.join("sqlite"), &mut output);
     if let Some(path) = std::env::var_os("CODEX_SQLITE_HOME") {
@@ -216,7 +220,7 @@ fn collect_databases(path: &Path, output: &mut Vec<PathBuf>) {
     }
 }
 
-fn migrate_rollout(path: &Path, target: &str) -> anyhow::Result<(bool, usize)> {
+fn repair_rollout(path: &Path, target: &str) -> anyhow::Result<(bool, usize)> {
     let original_bytes = fs::read(path)?;
     let original = std::str::from_utf8(&original_bytes)?;
     let mut changed = false;
@@ -255,12 +259,12 @@ fn migrate_rollout(path: &Path, target: &str) -> anyhow::Result<(bool, usize)> {
         }
     }
     if changed && !atomic_write_if_unchanged(path, &original_bytes, output.as_bytes())? {
-        anyhow::bail!("会话文件在迁移期间发生变化，已保留 Codex 的并发写入，请重试");
+        anyhow::bail!("Codex 正在更新这个会话，文件已保持原样。请关闭该会话后重试");
     }
     Ok((changed, meta_count))
 }
 
-fn migrate_database(path: &Path, target: &str) -> anyhow::Result<usize> {
+fn repair_database(path: &Path, target: &str) -> anyhow::Result<usize> {
     let mut db = Connection::open(path)?;
     let Some((table, _, columns)) = session_table(&db)? else {
         return Ok(0);
@@ -286,7 +290,7 @@ fn inspect_database(path: &Path) -> anyhow::Result<Option<(String, u64, Vec<Stri
         return Ok(None);
     };
     if !columns.contains("model_provider") {
-        anyhow::bail!("会话表缺少 model_provider 字段");
+        anyhow::bail!("会话数据库格式不受支持，无法更新归属信息");
     }
     let count = db.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
         row.get(0)
@@ -353,7 +357,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn migration_unifies_all_provider_metadata_without_app_state_files() {
+    fn repair_unifies_all_provider_metadata_without_app_state_files() {
         let temp = tempfile::tempdir().unwrap();
         let home = temp.path().join("codex");
         let data = temp.path().join("data");
@@ -361,11 +365,11 @@ mod tests {
         let rollout = home.join("sessions/2026/rollout.jsonl");
         let before = format!(
             "{}\n{}\n",
-            serde_json::json!({"type":"session_meta","payload":{"id":"one","model_provider":"legacy-provider","cwd":"C:/keep"}}),
+            serde_json::json!({"type":"session_meta","payload":{"id":"one","model_provider":"other-provider","cwd":"C:/keep"}}),
             serde_json::json!({"type":"event_msg","payload":{"type":"user_message","message":"unchanged"}})
         );
         fs::write(&rollout, before).unwrap();
-        let result = migrate(&home, "custom").unwrap();
+        let result = repair(&home, "custom").unwrap();
         assert_eq!(result.session_meta_updated, 1);
         let after = fs::read_to_string(rollout).unwrap();
         assert!(after.contains("\"model_provider\":\"custom\""));
@@ -375,7 +379,7 @@ mod tests {
     }
 
     #[test]
-    fn migration_preserves_already_matching_metadata_byte_for_byte() {
+    fn repair_preserves_already_matching_metadata_byte_for_byte() {
         let temp = tempfile::tempdir().unwrap();
         let rollout = temp.path().join("rollout.jsonl");
         let unchanged = r#"{ "type": "session_meta", "payload": { "id": "two", "model_provider": "custom", "future": true } }"#;
@@ -384,12 +388,12 @@ mod tests {
             serde_json::json!({"type":"session_meta","payload":{"id":"one","model_provider":"openai"}})
         );
         fs::write(&rollout, &original).unwrap();
-        let (changed, count) = migrate_rollout(&rollout, "custom").unwrap();
+        let (changed, count) = repair_rollout(&rollout, "custom").unwrap();
 
         assert!(changed);
         assert_eq!(count, 1);
-        let migrated = fs::read_to_string(rollout).unwrap();
-        assert!(migrated.ends_with(&format!("{unchanged}\n")));
+        let repaired = fs::read_to_string(rollout).unwrap();
+        assert!(repaired.ends_with(&format!("{unchanged}\n")));
     }
 
     #[test]
@@ -397,9 +401,9 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let db = temp.path().join("state.sqlite");
         let connection = Connection::open(&db).unwrap();
-        connection.execute_batch("CREATE TABLE threads(id TEXT PRIMARY KEY, model_provider TEXT, title TEXT); INSERT INTO threads VALUES('one','legacy-provider','keep'); INSERT INTO threads VALUES('two','custom','same'); INSERT INTO threads VALUES('three',NULL,'missing');").unwrap();
+        connection.execute_batch("CREATE TABLE threads(id TEXT PRIMARY KEY, model_provider TEXT, title TEXT); INSERT INTO threads VALUES('one','other-provider','keep'); INSERT INTO threads VALUES('two','custom','same'); INSERT INTO threads VALUES('three',NULL,'missing');").unwrap();
         drop(connection);
-        assert_eq!(migrate_database(&db, "custom").unwrap(), 2);
+        assert_eq!(repair_database(&db, "custom").unwrap(), 2);
         let connection = Connection::open(db).unwrap();
         let providers = connection
             .prepare("SELECT model_provider FROM threads ORDER BY id")
@@ -418,7 +422,7 @@ mod tests {
     }
 
     #[test]
-    fn migration_toggles_all_metadata_between_managed_providers() {
+    fn repair_toggles_all_metadata_between_managed_providers() {
         let temp = tempfile::tempdir().unwrap();
         let home = temp.path().join("codex");
         fs::create_dir_all(home.join("sessions")).unwrap();
@@ -427,12 +431,12 @@ mod tests {
             &rollout,
             format!(
                 "{}\n",
-                serde_json::json!({"type":"session_meta","payload":{"id":"one","model_provider":"legacy-provider"}})
+                serde_json::json!({"type":"session_meta","payload":{"id":"one","model_provider":"other-provider"}})
             ),
         )
         .unwrap();
 
-        let to_custom = migrate(&home, "custom").unwrap();
+        let to_custom = repair(&home, "custom").unwrap();
         assert_eq!(to_custom.session_meta_updated, 1);
         assert!(
             fs::read_to_string(&rollout)
@@ -440,7 +444,7 @@ mod tests {
                 .contains("\"model_provider\":\"custom\"")
         );
 
-        let to_openai = migrate(&home, "openai").unwrap();
+        let to_openai = repair(&home, "openai").unwrap();
         assert_eq!(to_openai.session_meta_updated, 1);
         assert!(
             fs::read_to_string(rollout)
@@ -450,9 +454,9 @@ mod tests {
     }
 
     #[test]
-    fn migration_rejects_unmanaged_provider_targets() {
+    fn repair_rejects_unmanaged_provider_targets() {
         let temp = tempfile::tempdir().unwrap();
-        let error = migrate(temp.path(), "third-party").unwrap_err();
-        assert!(error.to_string().contains("只允许 openai 与 custom"));
+        let error = repair(temp.path(), "third-party").unwrap_err();
+        assert!(error.to_string().contains("只能在 OpenAI"));
     }
 }

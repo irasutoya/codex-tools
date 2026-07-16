@@ -6,11 +6,13 @@ import {
   RefreshCw,
   Server,
   ShieldCheck,
+  TriangleAlert,
 } from "lucide-react"
 import { toast } from "sonner"
 
 import { MetricCard } from "@/components/metric-card"
 import { PageLoading } from "@/components/page-loading"
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import {
@@ -30,19 +32,29 @@ export default function DashboardPage() {
   const [data, setData] = useState<Dashboard>()
   const [launching, setLaunching] = useState(false)
   const [refreshing, setRefreshing] = useState(false)
-  const load = useCallback(async () => setData(await call("get_dashboard")), [])
+  const [error, setError] = useState<string>()
+  const load = useCallback(async () => {
+    try {
+      setData(await call("get_dashboard"))
+      setError(undefined)
+    } catch (reason) {
+      setError(String(reason))
+      throw reason
+    }
+  }, [])
 
   useEffect(() => {
-    void call<Dashboard>("get_dashboard")
-      .then(setData)
-      .catch((error) => toast.error(String(error)))
-  }, [])
+    const timeout = window.setTimeout(() => {
+      void load().catch(() => undefined)
+    }, 0)
+    return () => window.clearTimeout(timeout)
+  }, [load])
 
   const launchCodex = async () => {
     setLaunching(true)
     try {
       await call("launch_codex")
-      toast.success("已启动 Codex")
+      toast.success("Codex 已启动")
     } catch (error) {
       toast.error(String(error))
     } finally {
@@ -54,7 +66,7 @@ export default function DashboardPage() {
     setRefreshing(true)
     try {
       await load()
-      toast.success("状态已刷新")
+      toast.success("已获取最新状态")
     } catch (error) {
       toast.error(String(error))
     } finally {
@@ -62,64 +74,97 @@ export default function DashboardPage() {
     }
   }
 
-  if (!data) return <PageLoading />
+  if (!data) {
+    if (!error) return <PageLoading />
+    return (
+      <Alert variant="destructive">
+        <TriangleAlert />
+        <AlertTitle>暂时无法获取 Codex 状态</AlertTitle>
+        <AlertDescription className="flex flex-wrap items-center gap-3">
+          <span>{error}</span>
+          <Button
+            size="sm"
+            variant="outline"
+            disabled={refreshing}
+            onClick={() => void refresh()}
+          >
+            {refreshing ? (
+              <Spinner data-icon="inline-start" />
+            ) : (
+              <RefreshCw data-icon="inline-start" />
+            )}
+            重试
+          </Button>
+        </AlertDescription>
+      </Alert>
+    )
+  }
 
   const metrics = [
     {
-      label: "供应商",
+      label: "API 服务",
       value: data.providerCount,
       icon: Server,
-      detail: data.activeProvider ?? "尚未激活",
+      detail: "已保存的第三方服务",
     },
     {
-      label: "会话",
+      label: "历史会话",
       value: data.sessionCount,
       icon: Activity,
-      detail: "本地会话索引",
+      detail: "在本机找到的记录",
     },
     {
-      label: "会话数据库",
+      label: "数据文件",
       value: data.databaseCount,
       icon: Database,
-      detail: "已发现的数据源",
+      detail: "Codex 使用的数据库",
     },
     {
-      label: "数据库状态",
+      label: "数据状态",
       value: data.databaseHealth,
       icon: ShieldCheck,
-      detail: "SQLite 健康检查",
+      detail: "历史会话是否可读取",
     },
   ]
   const busy = launching || refreshing
 
   return (
-    <div className="flex flex-col gap-5">
-      <Card>
+    <div className="flex flex-col gap-6">
+      {error && (
+        <Alert variant="destructive">
+          <TriangleAlert />
+          <AlertTitle>未能获取最新状态</AlertTitle>
+          <AlertDescription>{error}</AlertDescription>
+        </Alert>
+      )}
+      <Card className="border-transparent bg-[var(--md-sys-color-secondary-container)] text-[var(--md-sys-color-on-secondary-container)]">
         <CardHeader>
-          <CardTitle>运行状态</CardTitle>
-          <CardDescription>本机 Codex 与当前上游的运行概况</CardDescription>
+          <CardTitle>当前连接</CardTitle>
+          <CardDescription className="text-current/70">
+            Codex 当前使用的账号或 API 服务
+          </CardDescription>
           <CardAction>
             <Badge variant={data.activeProvider ? "default" : "secondary"}>
-              {data.activeProvider ?? "尚未激活"}
+              {data.activeProvider ?? "尚未选择"}
             </Badge>
           </CardAction>
         </CardHeader>
         <CardContent>
           <div className="flex min-w-0 flex-col gap-1">
-            <span className="text-xs text-muted-foreground">Codex Home</span>
+            <span className="text-xs text-current/70">Codex 配置目录</span>
             <code className="truncate" title={data.codexHome}>
               {data.codexHome}
             </code>
           </div>
         </CardContent>
-        <CardFooter className="flex-wrap gap-2">
+        <CardFooter className="flex-wrap gap-2 bg-transparent">
           <Button disabled={busy} onClick={() => void launchCodex()}>
             {launching ? (
               <Spinner data-icon="inline-start" />
             ) : (
               <Play data-icon="inline-start" />
             )}
-            {launching ? "正在启动..." : "启动 Codex"}
+            {launching ? "正在启动…" : "打开 Codex"}
           </Button>
           <Button
             variant="outline"
@@ -131,11 +176,11 @@ export default function DashboardPage() {
             ) : (
               <RefreshCw data-icon="inline-start" />
             )}
-            {refreshing ? "正在刷新..." : "刷新"}
+            {refreshing ? "正在刷新…" : "刷新状态"}
           </Button>
         </CardFooter>
       </Card>
-      <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+      <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
         {metrics.map((metric) => (
           <MetricCard key={metric.label} {...metric} />
         ))}

@@ -2,7 +2,7 @@
   "name": "codex-tools",
   "private": true,
   "version": "0.1.0",
-  "description": "Lightweight Tauri manager and local Responses proxy for Codex.",
+  "description": "管理 Codex 的 OpenAI 账号和第三方 Responses API 服务。",
   "author": "Codex Tools contributors",
   "license": "MIT",
   "repository": {
@@ -22,7 +22,9 @@
     "typecheck": "tsc -b",
     "test": "vitest run",
     "tauri": "tauri",
-    "dist:win": "tauri build"
+    "dist:win": "tauri build --bundles nsis",
+    "dist:mac": "tauri build --bundles app,dmg",
+    "dist:mac:universal": "tauri build --target universal-apple-darwin --bundles app,dmg"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.8.0",

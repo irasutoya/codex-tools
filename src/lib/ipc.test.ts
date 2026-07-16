@@ -13,16 +13,15 @@ describe("Tauri IPC wrapper", () => {
   beforeEach(() => mockedInvoke.mockReset())
 
   it("forwards command arguments without mutation", async () => {
-    mockedInvoke.mockResolvedValue({ running: true })
+    mockedInvoke.mockResolvedValue({ operationId: "preview-id" })
 
-    await expect(call("get_route_console", { page: 2 })).resolves.toEqual({
-      running: true,
+    await expect(call("preview_activation")).resolves.toEqual({
+      operationId: "preview-id",
     })
-    expect(mockedInvoke).toHaveBeenCalledWith("get_route_console", { page: 2 })
+    expect(mockedInvoke).toHaveBeenCalledWith("preview_activation", undefined)
   })
 
   it.each([
-    ["list_openai_accounts", undefined],
     ["start_openai_device_auth", undefined],
     ["poll_openai_device_auth", { operationId: "device-operation" }],
     ["activate_openai_account", { id: "account-id" }],

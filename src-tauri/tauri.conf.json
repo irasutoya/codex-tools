@@ -10,26 +10,37 @@
     "frontendDist": "../dist"
   },
   "app": {
-    "windows": [{
-      "label": "main",
-      "title": "Codex Tools",
-      "width": 1180,
-      "height": 760,
-      "minWidth": 900,
-      "minHeight": 600,
-      "visible": true
-    }],
+    "windows": [
+      {
+        "label": "main",
+        "title": "Codex Tools",
+        "width": 1180,
+        "height": 760,
+        "minWidth": 360,
+        "minHeight": 520,
+        "visible": true
+      }
+    ],
     "security": {
       "csp": "default-src 'self'; connect-src ipc: http://ipc.localhost; img-src 'self' asset: http://asset.localhost; style-src 'self' 'unsafe-inline'; font-src 'self' data:"
     }
   },
   "bundle": {
     "active": true,
-    "targets": ["nsis"],
+    "targets": "all",
     "category": "DeveloperTool",
-    "shortDescription": "Lightweight Codex local API proxy",
-    "longDescription": "Manage third-party API providers through a loopback-only Responses proxy without modifying Codex itself.",
-    "icon": ["../build/icon.ico"],
+    "shortDescription": "管理 Codex 的 OpenAI 账号和第三方 API 服务",
+    "longDescription": "登录 OpenAI 账号，或将兼容 Responses API 的服务地址和 API Key 直接配置到 Codex。",
+    "icon": [
+      "../build/32x32.png",
+      "../build/128x128.png",
+      "../build/128x128@2x.png",
+      "../build/icon.icns",
+      "../build/icon.ico"
+    ],
+    "macOS": {
+      "minimumSystemVersion": "11.0"
+    },
     "windows": {
       "nsis": {
         "installMode": "currentUser",

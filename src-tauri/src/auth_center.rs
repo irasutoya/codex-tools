@@ -10,7 +10,6 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use std::collections::HashMap;
-use std::process::Command;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
@@ -111,8 +110,12 @@ struct TokenIdentity {
 impl Default for AuthCenter {
     fn default() -> Self {
         let user_agent = codex_user_agent();
-        let client = build_oauth_client(&user_agent)
-            .map_err(|error| format!("OpenAI OAuth 客户端初始化失败：{}", error.without_url()));
+        let client = build_oauth_client(&user_agent).map_err(|error| {
+            format!(
+                "无法准备 OpenAI 登录，请重启应用后再试：{}",
+                error.without_url()
+            )
+        });
         Self {
             client,
             pending: Mutex::new(HashMap::new()),
@@ -130,12 +133,12 @@ impl AuthCenter {
             .send()
             .await
             .map_err(safe_network_error)?;
-        let response = require_success(response, "OpenAI 设备登录启动失败")?;
-        let payload: DeviceStartResponse = read_json_bounded(response, "设备登录启动").await?;
+        let response = require_success(response, "无法开始 OpenAI 登录")?;
+        let payload: DeviceStartResponse = read_json_bounded(response, "登录码").await?;
 
         if payload.device_auth_id.trim().is_empty() || payload.user_code.trim().is_empty() {
             return Err(AppError::InvalidConfig(
-                "OpenAI 设备登录响应缺少设备码".into(),
+                "OpenAI 没有返回有效的登录码，请重新开始登录。".into(),
             ));
         }
 
@@ -199,14 +202,14 @@ impl AuthCenter {
                 Ok(DevicePollResult::Expired)
             }
             PollStatus::Failed(status) => Err(AppError::InvalidConfig(format!(
-                "OpenAI 设备登录轮询失败（HTTP {status}）"
+                "无法确认 OpenAI 登录结果（HTTP {status}），请稍后重试。"
             ))),
             PollStatus::Complete => {
-                let code: DevicePollResponse = read_json_bounded(response, "设备登录轮询").await?;
+                let code: DevicePollResponse = read_json_bounded(response, "登录结果").await?;
                 if code.authorization_code.trim().is_empty() || code.code_verifier.trim().is_empty()
                 {
                     return Err(AppError::InvalidConfig(
-                        "OpenAI 设备登录响应缺少授权信息".into(),
+                        "OpenAI 返回的登录结果不完整，请重新登录。".into(),
                     ));
                 }
                 let tokens = self.exchange_code(&code).await?;
@@ -246,11 +249,11 @@ impl AuthCenter {
 
         if response.status() == StatusCode::UNAUTHORIZED {
             return Err(AppError::InvalidConfig(
-                "OpenAI 登录已失效，请重新登录".into(),
+                "OpenAI 登录已过期，请重新登录。".into(),
             ));
         }
-        let response = require_success(response, "OpenAI 登录刷新失败")?;
-        let refreshed: TokenResponse = read_json_bounded(response, "登录刷新").await?;
+        let response = require_success(response, "无法续期 OpenAI 登录")?;
+        let refreshed: TokenResponse = read_json_bounded(response, "登录续期结果").await?;
         let tokens = merge_refreshed_tokens(refreshed, account)?;
         account_from_tokens(tokens, Some(account))
     }
@@ -266,7 +269,7 @@ impl AuthCenter {
         let unix_now = chrono::Utc::now().timestamp();
         let mut pending = self.pending.lock().await;
         let Some(state) = pending.get_mut(operation_id) else {
-            return Err(AppError::StaleOperation);
+            return Ok(LocalPollState::Expired);
         };
         if state.is_expired(now, unix_now) {
             pending.remove(operation_id);
@@ -296,8 +299,8 @@ impl AuthCenter {
             .send()
             .await
             .map_err(safe_network_error)?;
-        let response = require_success(response, "OpenAI 登录令牌交换失败")?;
-        let response: TokenResponse = read_json_bounded(response, "登录令牌交换").await?;
+        let response = require_success(response, "无法完成 OpenAI 登录")?;
+        let response: TokenResponse = read_json_bounded(response, "登录结果").await?;
         complete_login_tokens(response)
     }
 }
@@ -347,7 +350,7 @@ fn merge_refreshed_tokens(
         .unwrap_or_else(|| previous.credential.tokens.refresh_token.clone());
     if id_token.is_empty() || access_token.is_empty() || refresh_token.is_empty() {
         return Err(AppError::InvalidConfig(
-            "OpenAI 登录刷新响应缺少令牌".into(),
+            "OpenAI 返回的登录续期信息不完整，请重新登录。".into(),
         ));
     }
     Ok(CompleteTokens {
@@ -359,7 +362,9 @@ fn merge_refreshed_tokens(
 }
 
 fn required_token(value: Option<String>, name: &str) -> Result<String, AppError> {
-    non_empty(value).ok_or_else(|| AppError::InvalidConfig(format!("OpenAI 登录响应缺少 {name}")))
+    non_empty(value).ok_or_else(|| {
+        AppError::InvalidConfig(format!("OpenAI 返回的登录信息缺少 {name}，请重新登录。"))
+    })
 }
 
 fn non_empty(value: Option<String>) -> Option<String> {
@@ -376,11 +381,13 @@ fn account_from_tokens(
         .account_id
         .or(access_claims.account_id)
         .or_else(|| previous.map(|account| account.account_id.clone()))
-        .ok_or_else(|| AppError::InvalidConfig("OpenAI 登录响应缺少账号标识".into()))?;
+        .ok_or_else(|| {
+            AppError::InvalidConfig("OpenAI 返回的登录信息缺少账号标识，请重新登录。".into())
+        })?;
 
     if previous.is_some_and(|account| account.account_id != account_id) {
         return Err(AppError::InvalidConfig(
-            "OpenAI 刷新令牌返回了其他账号，请重新登录".into(),
+            "OpenAI 返回了其他账号的登录信息，请重新登录。".into(),
         ));
     }
 
@@ -512,7 +519,9 @@ async fn read_json_bounded<T: DeserializeOwned>(
         .content_length()
         .is_some_and(|length| length > MAX_OAUTH_RESPONSE_BYTES as u64)
     {
-        return Err(AppError::InvalidConfig(format!("OpenAI {context}响应过大")));
+        return Err(AppError::InvalidConfig(format!(
+            "OpenAI 返回的{context}数据过大，请稍后重试。"
+        )));
     }
 
     let mut body = Vec::new();
@@ -520,23 +529,26 @@ async fn read_json_bounded<T: DeserializeOwned>(
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(safe_network_error)?;
         if body.len().saturating_add(chunk.len()) > MAX_OAUTH_RESPONSE_BYTES {
-            return Err(AppError::InvalidConfig(format!("OpenAI {context}响应过大")));
+            return Err(AppError::InvalidConfig(format!(
+                "OpenAI 返回的{context}数据过大，请稍后重试。"
+            )));
         }
         body.extend_from_slice(&chunk);
     }
-    serde_json::from_slice(&body)
-        .map_err(|_| AppError::InvalidConfig(format!("OpenAI {context}响应格式无效")))
+    serde_json::from_slice(&body).map_err(|_| {
+        AppError::InvalidConfig(format!("OpenAI 返回的{context}格式无法识别，请稍后重试。"))
+    })
 }
 
 fn safe_network_error(error: reqwest::Error) -> AppError {
     let kind = if error.is_timeout() {
-        "请求超时"
+        "登录请求超时，请检查网络后重试。"
     } else if error.is_connect() {
-        "无法连接到认证服务"
+        "无法连接 OpenAI 登录服务，请检查网络。"
     } else if error.is_body() || error.is_decode() {
-        "响应读取失败"
+        "无法读取 OpenAI 的登录结果，请重试。"
     } else {
-        "网络请求失败"
+        "登录请求失败，请检查网络后重试。"
     };
     AppError::Internal(format!("OpenAI OAuth {kind}"))
 }
@@ -547,16 +559,17 @@ fn codex_user_agent() -> String {
         .get_or_init(|| {
             build_codex_user_agent(
                 detected_codex_version(),
-                &windows_version(),
+                crate::platform::os_name(),
+                &crate::platform::os_version(),
                 std::env::consts::ARCH,
             )
         })
         .clone()
 }
 
-fn build_codex_user_agent(version: &str, os_version: &str, arch: &str) -> String {
+fn build_codex_user_agent(version: &str, os_name: &str, os_version: &str, arch: &str) -> String {
     format!(
-        "{CODEX_ORIGINATOR}/{version} (Windows {os_version}; {arch}) unknown ({CODEX_LOGIN_SUFFIX}; {version})"
+        "{CODEX_ORIGINATOR}/{version} ({os_name} {os_version}; {arch}) unknown ({CODEX_LOGIN_SUFFIX}; {version})"
     )
 }
 
@@ -568,26 +581,19 @@ fn detected_codex_version() -> &'static str {
 }
 
 fn detect_codex_version() -> Option<String> {
+    let mut command = crate::platform::codex_command();
+    command.arg("--version");
     #[cfg(windows)]
-    let programs = ["codex.exe"];
-    #[cfg(not(windows))]
-    let programs = ["codex"];
-
-    programs.into_iter().find_map(|program| {
-        let mut command = Command::new(program);
-        command.arg("--version");
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-            command.creation_flags(CREATE_NO_WINDOW);
-        }
-        let output = command.output().ok()?;
-        if !output.status.success() {
-            return None;
-        }
-        parse_codex_version(&String::from_utf8_lossy(&output.stdout))
-    })
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    let output = command.output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_codex_version(&String::from_utf8_lossy(&output.stdout))
 }
 
 fn parse_codex_version(output: &str) -> Option<String> {
@@ -606,47 +612,6 @@ fn parse_codex_version(output: &str) -> Option<String> {
         return None;
     }
     Some(version.to_owned())
-}
-
-#[cfg(windows)]
-fn windows_version() -> String {
-    #[repr(C)]
-    struct RtlOsVersionInfo {
-        size: u32,
-        major: u32,
-        minor: u32,
-        build: u32,
-        platform_id: u32,
-        service_pack: [u16; 128],
-    }
-
-    #[link(name = "ntdll")]
-    unsafe extern "system" {
-        fn RtlGetVersion(version_information: *mut RtlOsVersionInfo) -> i32;
-    }
-
-    let mut version = RtlOsVersionInfo {
-        size: std::mem::size_of::<RtlOsVersionInfo>() as u32,
-        major: 0,
-        minor: 0,
-        build: 0,
-        platform_id: 0,
-        service_pack: [0; 128],
-    };
-    // SAFETY: `version` has the documented RTL_OSVERSIONINFOW layout, its size
-    // field is initialized, and the pointer remains valid for the duration of
-    // the synchronous ntdll call.
-    let status = unsafe { RtlGetVersion(&mut version) };
-    if status >= 0 && version.major > 0 {
-        format!("{}.{}.{}", version.major, version.minor, version.build)
-    } else {
-        "unknown".into()
-    }
-}
-
-#[cfg(not(windows))]
-fn windows_version() -> String {
-    "unknown".into()
 }
 
 #[cfg(test)]
@@ -699,6 +664,15 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn missing_device_operation_is_terminally_expired() {
+        let center = AuthCenter::default();
+        assert!(matches!(
+            center.poll_snapshot("missing").await.unwrap(),
+            LocalPollState::Expired
+        ));
+    }
+
     #[test]
     fn interval_accepts_string_and_number_with_safe_bounds() {
         assert_eq!(parse_interval(Some(&json!(2))), 2);
@@ -711,8 +685,12 @@ mod tests {
     #[test]
     fn user_agent_matches_codex_cli_shape() {
         assert_eq!(
-            build_codex_user_agent("0.144.1", "10.0.26100", "x86_64"),
+            build_codex_user_agent("0.144.1", "Windows", "10.0.26100", "x86_64"),
             "codex_cli_rs/0.144.1 (Windows 10.0.26100; x86_64) unknown (codex_login; 0.144.1)"
+        );
+        assert_eq!(
+            build_codex_user_agent("0.144.1", "Mac OS", "15.5", "aarch64"),
+            "codex_cli_rs/0.144.1 (Mac OS 15.5; aarch64) unknown (codex_login; 0.144.1)"
         );
         assert_eq!(
             parse_codex_version("codex-cli 0.144.1\r\n"),
