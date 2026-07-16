@@ -1,5 +1,9 @@
 export type Page = "dashboard" | "providers" | "sessions" | "settings"
 
+export type PageProps = {
+  active: boolean
+}
+
 export type Provider = {
   id: string
   name: string
@@ -108,6 +112,14 @@ export type DeviceAuthPollResult =
       account: OfficialAccountView
       repair: RepairResult
     }
+
+export type ProviderTestResult = {
+  ok: boolean
+  status: number
+  endpoint: string
+  message: string
+  suggestV1: boolean
+}
 
 export type ConfigPatchPreview = {
   operationId: string

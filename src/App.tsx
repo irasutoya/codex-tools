@@ -1,25 +1,47 @@
-import { lazy, Suspense, useState } from "react"
+import { lazy, Suspense, useRef, useState } from "react"
 import {
-  CircleGauge,
-  Database,
+  Check,
+  FileCheck2,
+  KeyRound,
+  LayoutDashboard,
+  MessagesSquare,
   Monitor,
   Moon,
-  Server,
-  Settings,
+  ShieldCheck,
   Sun,
   type LucideIcon,
 } from "lucide-react"
+import { useTheme } from "next-themes"
 
 import { PageLoading } from "@/components/page-loading"
-import { useTheme } from "@/components/theme-provider"
 import { Button } from "@/components/ui/button"
-import { Toaster } from "@/components/ui/sonner"
 import {
-  Tooltip,
-  TooltipContent,
-  TooltipProvider,
-  TooltipTrigger,
-} from "@/components/ui/tooltip"
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuGroup,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu"
+import { Separator } from "@/components/ui/separator"
+import {
+  Sidebar,
+  SidebarContent,
+  SidebarFooter,
+  SidebarGroup,
+  SidebarGroupContent,
+  SidebarGroupLabel,
+  SidebarHeader,
+  SidebarInset,
+  SidebarMenu,
+  SidebarMenuButton,
+  SidebarMenuItem,
+  SidebarProvider,
+  SidebarRail,
+  SidebarTrigger,
+  useSidebar,
+} from "@/components/ui/sidebar"
+import { Toaster } from "@/components/ui/sonner"
+import { TooltipProvider } from "@/components/ui/tooltip"
 import type { Page } from "@/types"
 
 const pageLoaders = {
@@ -47,30 +69,31 @@ const navigation: NavigationItem[] = [
   {
     id: "dashboard",
     label: "概览",
-    description: "查看 Codex 当前使用的账号、服务和本机会话状态",
-    icon: CircleGauge,
+    description: "查看 Codex 当前使用的账号、服务和本机会话",
+    icon: LayoutDashboard,
   },
   {
     id: "providers",
     label: "账号与服务",
-    description: "登录 OpenAI，或添加兼容 Responses API 的第三方服务",
-    icon: Server,
+    description: "管理 OpenAI 账号和兼容 Responses API 的服务",
+    icon: KeyRound,
   },
   {
     id: "sessions",
     label: "历史会话",
-    description: "查看本机会话，并修复切换连接后的归属信息",
-    icon: Database,
+    description: "查看本机会话并更新连接归属",
+    icon: MessagesSquare,
   },
   {
     id: "settings",
-    label: "配置检查",
-    description: "检查 Codex 配置，预览写入内容并获取排查信息",
-    icon: Settings,
+    label: "配置",
+    description: "检查 Codex 配置并预览即将写入的修改",
+    icon: FileCheck2,
   },
 ]
 
 export default function App() {
+  const contentRef = useRef<HTMLElement>(null)
   const [page, setPage] = useState<Page>("dashboard")
   const [visitedPages, setVisitedPages] = useState<Set<Page>>(
     () => new Set(["dashboard"])
@@ -78,6 +101,7 @@ export default function App() {
   const currentNavigation = navigation.find((item) => item.id === page)!
 
   const navigate = (nextPage: Page) => {
+    contentRef.current?.scrollTo({ top: 0 })
     setVisitedPages((current) => {
       if (current.has(nextPage)) return current
       const next = new Set(current)
@@ -88,30 +112,33 @@ export default function App() {
   }
 
   return (
-    <TooltipProvider delay={500}>
-      <div className="md3-app-shell">
-        <NavigationDrawer page={page} onNavigate={navigate} />
-        <NavigationRail page={page} onNavigate={navigate} />
-
-        <div className="md3-main-area">
-          <header className="md3-top-app-bar">
-            <div className="md3-top-app-bar__identity">
-              <img src="/codex-tools.svg" alt="" className="md3-mobile-logo" />
-              <div className="min-w-0">
-                <h1 className="md3-page-title">{currentNavigation.label}</h1>
-                <p className="md3-page-description">
-                  {currentNavigation.description}
-                </p>
-              </div>
+    <TooltipProvider>
+      <SidebarProvider className="h-full overflow-hidden">
+        <AppSidebar page={page} onNavigate={navigate} />
+        <SidebarInset className="min-h-0 overflow-hidden">
+          <header className="flex h-16 shrink-0 items-center gap-3 border-b px-4 sm:px-6">
+            <SidebarTrigger
+              aria-label="展开或收起导航"
+              title="展开或收起导航"
+            />
+            <Separator orientation="vertical" className="h-4" />
+            <div className="min-w-0 flex-1">
+              <h1 className="truncate text-base font-medium">
+                {currentNavigation.label}
+              </h1>
+              <p className="hidden truncate text-sm text-muted-foreground sm:block">
+                {currentNavigation.description}
+              </p>
             </div>
-            <ThemeToggle />
+            <ThemeMenu />
           </header>
 
           <main
-            className="md3-content-scroll"
+            ref={contentRef}
+            className="min-h-0 flex-1 overflow-y-auto"
             aria-label={currentNavigation.label}
           >
-            <div className="md3-content-frame">
+            <div className="mx-auto flex w-full max-w-6xl flex-col p-4 sm:p-6 lg:p-8">
               {navigation
                 .filter((item) => visitedPages.has(item.id))
                 .map((item) => {
@@ -120,195 +147,142 @@ export default function App() {
                   return (
                     <section
                       key={item.id}
-                      className="md3-page-panel"
                       hidden={!active}
                       aria-hidden={!active}
                       aria-label={item.label}
                     >
                       <Suspense fallback={<PageLoading />}>
-                        <PageComponent />
+                        <PageComponent active={active} />
                       </Suspense>
                     </section>
                   )
                 })}
             </div>
           </main>
-        </div>
-
-        <BottomNavigation page={page} onNavigate={navigate} />
-      </div>
-      <Toaster richColors position="bottom-right" />
+        </SidebarInset>
+      </SidebarProvider>
+      <Toaster position="bottom-right" closeButton visibleToasts={4} />
     </TooltipProvider>
   )
 }
 
-function NavigationDrawer({
+function AppSidebar({
   page,
   onNavigate,
 }: {
   page: Page
   onNavigate: (page: Page) => void
 }) {
-  return (
-    <aside className="md3-nav-drawer" aria-label="主导航">
-      <div className="md3-brand">
-        <img src="/codex-tools.svg" alt="" className="md3-brand__logo" />
-        <div className="md3-brand__copy">
-          <div className="md3-brand__title">Codex Tools</div>
-          <div className="md3-brand__subtitle">账号与 Responses API 管理</div>
-        </div>
-      </div>
+  const { setOpenMobile } = useSidebar()
 
-      <nav className="md3-nav-list">
-        <div className="md3-nav-label">主要功能</div>
-        {navigation.map((item) => (
-          <NavigationButton
-            key={item.id}
-            item={item}
-            current={page === item.id}
-            className="md3-nav-item"
-            onNavigate={onNavigate}
-          />
-        ))}
-      </nav>
-
-      <div className="md3-drawer-footer">
-        <span>本地保存 · 直接连接 Codex</span>
-      </div>
-    </aside>
-  )
-}
-
-function NavigationRail({
-  page,
-  onNavigate,
-}: {
-  page: Page
-  onNavigate: (page: Page) => void
-}) {
-  return (
-    <aside className="md3-nav-rail" aria-label="主导航">
-      <img src="/codex-tools.svg" alt="Codex Tools" className="md3-rail-logo" />
-      <nav className="md3-rail-list">
-        {navigation.map((item) => (
-          <NavigationButton
-            key={item.id}
-            item={item}
-            current={page === item.id}
-            className="md3-rail-item"
-            onNavigate={onNavigate}
-            compact
-          />
-        ))}
-      </nav>
-      <ThemeToggle />
-    </aside>
-  )
-}
-
-function BottomNavigation({
-  page,
-  onNavigate,
-}: {
-  page: Page
-  onNavigate: (page: Page) => void
-}) {
-  return (
-    <nav className="md3-bottom-nav" aria-label="主导航">
-      {navigation.map((item) => (
-        <NavigationButton
-          key={item.id}
-          item={item}
-          current={page === item.id}
-          className="md3-bottom-item"
-          onNavigate={onNavigate}
-          compact
-        />
-      ))}
-    </nav>
-  )
-}
-
-function NavigationButton({
-  item,
-  current,
-  className,
-  onNavigate,
-  compact = false,
-}: {
-  item: NavigationItem
-  current: boolean
-  className: string
-  onNavigate: (page: Page) => void
-  compact?: boolean
-}) {
-  const Icon = item.icon
-
-  return (
-    <button
-      type="button"
-      className={className}
-      aria-current={current ? "page" : undefined}
-      aria-label={compact ? item.label : undefined}
-      onFocus={() => void pageLoaders[item.id]()}
-      onPointerEnter={() => void pageLoaders[item.id]()}
-      onClick={() => onNavigate(item.id)}
-    >
-      {compact ? (
-        <>
-          <span
-            className={
-              className === "md3-bottom-item"
-                ? "md3-bottom-indicator"
-                : "md3-rail-indicator"
-            }
-          >
-            <Icon aria-hidden="true" />
-          </span>
-          <span>{item.label}</span>
-        </>
-      ) : (
-        <>
-          <Icon aria-hidden="true" />
-          <span>{item.label}</span>
-        </>
-      )}
-    </button>
-  )
-}
-
-const themeOptions = {
-  system: { label: "跟随系统", icon: Monitor },
-  light: { label: "浅色", icon: Sun },
-  dark: { label: "深色", icon: Moon },
-} as const
-
-function ThemeToggle() {
-  const { theme, setTheme } = useTheme()
-  const option = themeOptions[theme]
-  const Icon = option.icon
-
-  const cycleTheme = () => {
-    setTheme(
-      theme === "system" ? "light" : theme === "light" ? "dark" : "system"
-    )
+  const handleNavigate = (nextPage: Page) => {
+    onNavigate(nextPage)
+    setOpenMobile(false)
   }
 
   return (
-    <Tooltip>
-      <TooltipTrigger
+    <Sidebar collapsible="icon">
+      <SidebarHeader>
+        <SidebarMenu>
+          <SidebarMenuItem>
+            <SidebarMenuButton size="lg" tooltip="Codex Tools">
+              <img
+                src="/codex-tools.svg"
+                alt=""
+                className="size-8 rounded-md"
+              />
+              <div className="grid min-w-0 flex-1 text-left leading-tight">
+                <span className="truncate font-medium">Codex Tools</span>
+                <span className="truncate text-xs text-muted-foreground">
+                  Codex 连接管理
+                </span>
+              </div>
+            </SidebarMenuButton>
+          </SidebarMenuItem>
+        </SidebarMenu>
+      </SidebarHeader>
+
+      <SidebarContent>
+        <SidebarGroup>
+          <SidebarGroupLabel>导航</SidebarGroupLabel>
+          <SidebarGroupContent>
+            <SidebarMenu>
+              {navigation.map((item) => {
+                const Icon = item.icon
+                return (
+                  <SidebarMenuItem key={item.id}>
+                    <SidebarMenuButton
+                      isActive={page === item.id}
+                      tooltip={item.label}
+                      aria-current={page === item.id ? "page" : undefined}
+                      onFocus={() => void pageLoaders[item.id]()}
+                      onPointerEnter={() => void pageLoaders[item.id]()}
+                      onClick={() => handleNavigate(item.id)}
+                    >
+                      <Icon />
+                      <span>{item.label}</span>
+                    </SidebarMenuButton>
+                  </SidebarMenuItem>
+                )
+              })}
+            </SidebarMenu>
+          </SidebarGroupContent>
+        </SidebarGroup>
+      </SidebarContent>
+
+      <SidebarFooter>
+        <div className="flex items-center gap-2 px-2 py-1 text-xs text-muted-foreground group-data-[collapsible=icon]:hidden">
+          <ShieldCheck className="size-4 shrink-0" aria-hidden="true" />
+          <span>账号和密钥仅保存在本机</span>
+        </div>
+      </SidebarFooter>
+      <SidebarRail aria-label="展开或收起导航" title="展开或收起导航" />
+    </Sidebar>
+  )
+}
+
+const themeOptions = [
+  { id: "system", label: "跟随系统", icon: Monitor },
+  { id: "light", label: "浅色", icon: Sun },
+  { id: "dark", label: "深色", icon: Moon },
+] as const
+
+function ThemeMenu() {
+  const { theme = "system", setTheme } = useTheme()
+  const current = themeOptions.find((option) => option.id === theme)
+  const CurrentIcon = current?.icon ?? Monitor
+
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger
         render={
           <Button
             variant="ghost"
             size="icon"
-            aria-label={`切换界面主题，当前为${option.label}`}
-            onClick={cycleTheme}
+            aria-label={`界面主题：${current?.label ?? "跟随系统"}`}
+            title="选择界面主题"
           />
         }
       >
-        <Icon />
-      </TooltipTrigger>
-      <TooltipContent side="bottom">界面主题：{option.label}</TooltipContent>
-    </Tooltip>
+        <CurrentIcon />
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end" className="w-40">
+        <DropdownMenuGroup>
+          {themeOptions.map((option) => {
+            const Icon = option.icon
+            return (
+              <DropdownMenuItem
+                key={option.id}
+                onClick={() => setTheme(option.id)}
+              >
+                <Icon />
+                <span>{option.label}</span>
+                {theme === option.id && <Check className="ml-auto" />}
+              </DropdownMenuItem>
+            )
+          })}
+        </DropdownMenuGroup>
+      </DropdownMenuContent>
+    </DropdownMenu>
   )
 }

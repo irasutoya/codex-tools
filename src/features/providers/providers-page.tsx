@@ -1,22 +1,23 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import {
+  Activity,
+  ArrowRightLeft,
   Boxes,
   Copy,
   ExternalLink,
   KeyRound,
   LogIn,
+  MoreHorizontal,
   Pencil,
   Plus,
   RefreshCw,
   Save,
   Trash2,
   TriangleAlert,
-  UserPlus,
   UserRound,
-  Zap,
 } from "lucide-react"
-import { toast } from "sonner"
 
+import { ErrorDetails } from "@/components/error-details"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { PageLoading } from "@/components/page-loading"
 import { Badge } from "@/components/ui/badge"
@@ -48,6 +49,13 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog"
 import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuGroup,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu"
+import {
   Empty,
   EmptyContent,
   EmptyDescription,
@@ -57,9 +65,11 @@ import {
 } from "@/components/ui/empty"
 import {
   Field,
+  FieldContent,
   FieldDescription,
   FieldGroup,
   FieldLabel,
+  FieldTitle,
 } from "@/components/ui/field"
 import { Input } from "@/components/ui/input"
 import {
@@ -73,19 +83,21 @@ import {
 } from "@/components/ui/item"
 import { Spinner } from "@/components/ui/spinner"
 import { Switch } from "@/components/ui/switch"
+import { notify } from "@/lib/feedback"
 import { call } from "@/lib/ipc"
+import { notifyRepairWarnings } from "@/lib/repair-feedback"
+import { epochMilliseconds } from "@/lib/time"
 import {
   emptyAccount,
   emptyProvider,
   type Account,
   type DeviceAuthorization,
-  type DeviceAuthPollResult,
   type OfficialAccountView,
+  type PageProps,
   type Provider,
-  type ProviderOverview,
 } from "@/types"
 
-export default function ProvidersPage() {
+export default function ProvidersPage({ active }: PageProps) {
   const [providers, setProviders] = useState<Provider[]>([])
   const [accounts, setAccounts] = useState<Account[]>([])
   const [officialAccounts, setOfficialAccounts] = useState<
@@ -125,7 +137,7 @@ export default function ProvidersPage() {
   }, [accounts])
   const load = useCallback(async () => {
     try {
-      const overview = await call<ProviderOverview>("get_provider_overview")
+      const overview = await call("get_provider_overview")
       setProviders(overview.providers)
       setAccounts(overview.accounts)
       setOfficialAccounts(overview.officialAccounts)
@@ -137,11 +149,12 @@ export default function ProvidersPage() {
     }
   }, [])
   useEffect(() => {
+    if (!active) return
     const timeout = window.setTimeout(() => {
       void load().catch(() => undefined)
     }, 0)
     return () => window.clearTimeout(timeout)
-  }, [load])
+  }, [active, load])
 
   useEffect(() => {
     if (!deviceAuthorization) return
@@ -152,15 +165,15 @@ export default function ProvidersPage() {
 
     const scheduleNextPoll = () => {
       const remainingMs =
-        timestampMilliseconds(authorization.expiresAt) - Date.now()
+        epochMilliseconds(authorization.expiresAt) - Date.now()
       if (remainingMs <= 0) {
         setDeviceAuthorization(undefined)
-        toast.error("登录码已过期，请重新开始登录")
+        notify.error("登录码已过期", "请重新生成登录码后继续登录。")
         return
       }
       timer = window.setTimeout(
         () => {
-          void call<DeviceAuthPollResult>("poll_openai_device_auth", {
+          void call("poll_openai_device_auth", {
             operationId: authorization.operationId,
           })
             .then((result) => {
@@ -172,24 +185,23 @@ export default function ProvidersPage() {
               }
               setDeviceAuthorization(undefined)
               if (result.status === "expired") {
-                toast.error("登录码已过期，请重新开始登录")
+                notify.error("登录码已过期", "请重新生成登录码后继续登录。")
                 return
               }
-              toast.success(`已登录，Codex 现在使用 ${result.account.name}`)
-              if (result.repair.warnings.length) {
-                toast.warning(
-                  `账号已切换，但有 ${result.repair.warnings.length} 个历史会话需要检查`
-                )
-              }
-              void load().catch((error) => toast.error(String(error)))
+              notify.success(
+                "OpenAI 登录成功",
+                `Codex 现在使用 ${result.account.name}。`
+              )
+              notifyRepairWarnings(result.repair)
+              void load().catch((error) =>
+                notify.error("账号列表刷新失败", error)
+              )
             })
             .catch((error) => {
               if (cancelled) return
               if (!pollErrorShown) {
                 pollErrorShown = true
-                toast.error(
-                  `暂时无法确认登录结果，将继续重试：${String(error)}`
-                )
+                notify.warning("正在重新确认登录结果", error)
               }
               scheduleNextPoll()
             })
@@ -205,15 +217,25 @@ export default function ProvidersPage() {
     }
   }, [deviceAuthorization, load])
 
-  const run = async (task: string, action: () => Promise<unknown>) => {
+  const run = async (
+    task: string,
+    action: () => Promise<unknown>,
+    refreshAfter = true
+  ) => {
     if (running.current) return
     running.current = true
     setPendingTask(task)
     try {
       await action()
-      await load()
+      if (refreshAfter) {
+        try {
+          await load()
+        } catch (error) {
+          notify.warning("操作已完成，但列表刷新失败", error)
+        }
+      }
     } catch (error) {
-      toast.error(String(error))
+      notify.error(taskFailureTitle(task), error)
     } finally {
       running.current = false
       setPendingTask(undefined)
@@ -221,402 +243,475 @@ export default function ProvidersPage() {
   }
 
   if (!overviewLoaded) {
-    if (!overviewError) return <PageLoading />
+    if (!overviewError) return <PageLoading label="正在读取账号和 API 服务" />
     return (
       <Alert variant="destructive">
         <TriangleAlert />
-        <AlertTitle>暂时无法读取账号和服务</AlertTitle>
-        <AlertDescription className="flex flex-wrap items-center gap-3">
-          <span>{overviewError}</span>
-          <Button
-            size="sm"
-            variant="outline"
-            onClick={() => {
-              setOverviewError(undefined)
-              void load().catch(() => undefined)
-            }}
+        <AlertTitle>无法读取账号和 API 服务</AlertTitle>
+        <AlertDescription>
+          <ErrorDetails
+            error={overviewError}
+            action={
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() => {
+                  setOverviewError(undefined)
+                  void load().catch(() => undefined)
+                }}
+              >
+                <RefreshCw data-icon="inline-start" />
+                重试
+              </Button>
+            }
           >
-            <RefreshCw data-icon="inline-start" />
-            重试
-          </Button>
+            请确认本应用可以访问应用数据目录。
+          </ErrorDetails>
         </AlertDescription>
       </Alert>
     )
   }
 
   return (
-    <div className="flex flex-col gap-8">
+    <div className="flex flex-col gap-6">
       {overviewError && (
         <Alert variant="destructive">
           <TriangleAlert />
-          <AlertTitle>未能获取最新的账号和服务</AlertTitle>
-          <AlertDescription className="flex flex-wrap items-center gap-3">
-            <span>{overviewError}</span>
-            <Button
-              size="sm"
-              variant="outline"
-              onClick={() => void load().catch(() => undefined)}
+          <AlertTitle>显示的是上次读取的账号和服务</AlertTitle>
+          <AlertDescription>
+            <ErrorDetails
+              error={overviewError}
+              action={
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={() => void load().catch(() => undefined)}
+                >
+                  <RefreshCw data-icon="inline-start" />
+                  刷新
+                </Button>
+              }
             >
-              <RefreshCw data-icon="inline-start" />
-              重试
-            </Button>
+              暂时无法获取最新列表，页面仍显示上次读取的结果。
+            </ErrorDetails>
           </AlertDescription>
         </Alert>
       )}
-      <Card>
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2">
-            OpenAI 账号
-            {officialAccounts.some((item) => item.active) && (
-              <Badge>使用中</Badge>
-            )}
-          </CardTitle>
-          <CardDescription>
-            在浏览器中完成 OpenAI 登录。切换账号时会保留其他 Codex 设置。
-          </CardDescription>
-          <CardAction className="max-sm:col-span-2 max-sm:row-start-auto max-sm:justify-self-start">
+      <section className="flex flex-col gap-4" aria-labelledby="openai-title">
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
+          <div className="flex flex-col gap-1">
+            <h2 id="openai-title" className="text-base font-medium">
+              OpenAI 官方账号
+            </h2>
+            <p className="text-sm text-muted-foreground">
+              通过浏览器安全登录，授权信息只保存在这台电脑。
+            </p>
+          </div>
+          {officialAccounts.length > 0 && (
             <Button
+              variant="secondary"
               disabled={busy || Boolean(deviceAuthorization)}
               onClick={() => setConfirmOpenAiLogin(true)}
             >
               <LogIn data-icon="inline-start" />
-              登录 OpenAI
+              添加账号
             </Button>
-          </CardAction>
-        </CardHeader>
-        <CardContent className="flex flex-col gap-4">
-          {deviceAuthorization && (
-            <div className="flex flex-col gap-3">
-              <Alert>
-                <KeyRound />
-                <AlertTitle className="flex flex-wrap items-center gap-2">
-                  <span>
-                    登录码：
-                    <code className="font-mono font-semibold">
-                      {deviceAuthorization.userCode}
-                    </code>
-                  </span>
-                  <Badge variant="outline">
-                    <Spinner data-icon="inline-start" />
-                    等待登录
-                  </Badge>
-                </AlertTitle>
-                <AlertDescription>
-                  打开 {deviceAuthorization.verificationUri}，输入上面的登录码。
-                  登录码有效期至{" "}
-                  {formatTimestamp(deviceAuthorization.expiresAt)}
-                  。完成后此处会自动更新。
-                </AlertDescription>
-              </Alert>
-              <div className="flex flex-wrap gap-2">
-                <Button
-                  size="sm"
-                  variant="outline"
-                  onClick={() =>
-                    void navigator.clipboard
-                      .writeText(deviceAuthorization.userCode)
-                      .then(() => toast.success("登录码已复制"))
-                      .catch((error) => toast.error(String(error)))
-                  }
-                >
-                  <Copy data-icon="inline-start" />
-                  复制登录码
-                </Button>
-                <Button
-                  size="sm"
-                  variant="outline"
-                  onClick={() =>
-                    void call("open_openai_device_page").catch((error) =>
-                      toast.error(String(error))
-                    )
-                  }
-                >
-                  <ExternalLink data-icon="inline-start" />
-                  打开登录页面
-                </Button>
-              </div>
-            </div>
           )}
-          {!officialAccounts.length ? (
+        </div>
+        <Card>
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2">
+              已登录账号
+              {officialAccounts.some((item) => item.active) && (
+                <Badge>使用中</Badge>
+              )}
+            </CardTitle>
+            <CardDescription>
+              Codex 一次使用一个账号，可随时切换。
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="flex flex-col gap-4">
+            {deviceAuthorization && (
+              <div className="flex flex-col gap-3">
+                <Alert>
+                  <LogIn />
+                  <AlertTitle className="flex flex-wrap items-center gap-2">
+                    <span>
+                      登录码：
+                      <code className="font-mono font-semibold">
+                        {deviceAuthorization.userCode}
+                      </code>
+                    </span>
+                    <Badge variant="outline">
+                      <Spinner data-icon="inline-start" />
+                      等待登录
+                    </Badge>
+                  </AlertTitle>
+                  <AlertDescription>
+                    在打开的 OpenAI
+                    页面输入此代码。完成后会自动刷新；代码有效期至
+                    {formatTimestamp(deviceAuthorization.expiresAt)}。
+                  </AlertDescription>
+                </Alert>
+                <div className="flex flex-wrap gap-2">
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={() =>
+                      void navigator.clipboard
+                        .writeText(deviceAuthorization.userCode)
+                        .then(() => notify.success("登录码已复制"))
+                        .catch((error) => notify.error("无法复制登录码", error))
+                    }
+                  >
+                    <Copy data-icon="inline-start" />
+                    复制
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={() =>
+                      void call("open_openai_device_page").catch((error) =>
+                        notify.error("无法打开 OpenAI 登录页面", error)
+                      )
+                    }
+                  >
+                    <ExternalLink data-icon="inline-start" />
+                    打开 OpenAI
+                  </Button>
+                </div>
+              </div>
+            )}
+            {!officialAccounts.length ? (
+              <Empty>
+                <EmptyHeader>
+                  <EmptyMedia variant="icon">
+                    <UserRound />
+                  </EmptyMedia>
+                  <EmptyTitle>尚未登录 OpenAI</EmptyTitle>
+                  <EmptyDescription>
+                    登录后即可使用官方服务，凭据仅保存在本机。
+                  </EmptyDescription>
+                </EmptyHeader>
+                <EmptyContent>
+                  <Button
+                    size="sm"
+                    disabled={busy || Boolean(deviceAuthorization)}
+                    onClick={() => setConfirmOpenAiLogin(true)}
+                  >
+                    <LogIn data-icon="inline-start" />
+                    登录 OpenAI
+                  </Button>
+                </EmptyContent>
+              </Empty>
+            ) : (
+              <ItemGroup className="gap-2">
+                {officialAccounts.map((item) => (
+                  <Item
+                    key={item.id}
+                    variant={item.active ? "muted" : "outline"}
+                    size="sm"
+                  >
+                    <ItemMedia variant="icon">
+                      <UserRound />
+                    </ItemMedia>
+                    <ItemContent className="min-w-0">
+                      <ItemTitle>
+                        {item.name}
+                        {item.active && <Badge>使用中</Badge>}
+                      </ItemTitle>
+                      <ItemDescription className="truncate">
+                        {item.email || item.accountId}
+                      </ItemDescription>
+                      <ItemDescription>
+                        {item.expiresAt
+                          ? `有效至 ${formatTimestamp(item.expiresAt)}，到期前自动续期`
+                          : "有效期由 OpenAI 自动管理"}
+                      </ItemDescription>
+                    </ItemContent>
+                    <ItemActions className="ml-auto">
+                      <Button
+                        size="sm"
+                        variant="secondary"
+                        disabled={busy || item.active}
+                        onClick={() =>
+                          setPendingOfficialAction({
+                            kind: "activate",
+                            account: item,
+                          })
+                        }
+                      >
+                        <ArrowRightLeft data-icon="inline-start" />
+                        使用此账号
+                      </Button>
+                      <Button
+                        size="icon-sm"
+                        variant="ghost"
+                        disabled={busy || item.active}
+                        aria-label={`删除已保存的 OpenAI 账号 ${item.name}`}
+                        title="删除已保存的账号"
+                        onClick={() =>
+                          setPendingOfficialAction({
+                            kind: "delete",
+                            account: item,
+                          })
+                        }
+                      >
+                        <Trash2 />
+                      </Button>
+                    </ItemActions>
+                  </Item>
+                ))}
+              </ItemGroup>
+            )}
+          </CardContent>
+        </Card>
+      </section>
+      <section
+        className="flex flex-col gap-4"
+        aria-labelledby="custom-api-title"
+      >
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
+          <div className="flex flex-col gap-1">
+            <h2 id="custom-api-title" className="text-base font-medium">
+              第三方 API
+            </h2>
+            <p className="text-sm text-muted-foreground">
+              连接兼容 Responses API 的服务；请求由 Codex 直接发送。
+            </p>
+          </div>
+          <Button onClick={() => setDraft(emptyProvider())}>
+            <Plus data-icon="inline-start" />
+            添加服务
+          </Button>
+        </div>
+        <div className="grid gap-4">
+          {!providers.length && (
             <Empty>
               <EmptyHeader>
                 <EmptyMedia variant="icon">
-                  <UserRound />
+                  <Boxes />
                 </EmptyMedia>
-                <EmptyTitle>还没有登录 OpenAI</EmptyTitle>
+                <EmptyTitle>尚未添加第三方 API</EmptyTitle>
                 <EmptyDescription>
-                  登录信息只保存在本机，并直接供 Codex 使用。
+                  添加兼容 OpenAI Responses API 的服务即可开始使用。
                 </EmptyDescription>
               </EmptyHeader>
               <EmptyContent>
-                <Button
-                  size="sm"
-                  disabled={busy || Boolean(deviceAuthorization)}
-                  onClick={() => setConfirmOpenAiLogin(true)}
-                >
-                  <LogIn data-icon="inline-start" />
-                  登录 OpenAI
+                <Button size="sm" onClick={() => setDraft(emptyProvider())}>
+                  <Plus data-icon="inline-start" />
+                  添加服务
                 </Button>
               </EmptyContent>
             </Empty>
-          ) : (
-            <ItemGroup className="gap-2">
-              {officialAccounts.map((item) => (
-                <Item
-                  key={item.id}
-                  variant={item.active ? "muted" : "outline"}
-                  size="sm"
-                >
-                  <ItemMedia variant="icon">
-                    <UserRound />
-                  </ItemMedia>
-                  <ItemContent className="min-w-0">
-                    <ItemTitle>
-                      {item.name}
-                      {item.active && <Badge>使用中</Badge>}
-                    </ItemTitle>
-                    <ItemDescription className="truncate">
-                      {item.email || item.accountId}
-                    </ItemDescription>
-                    <ItemDescription>
-                      {item.expiresAt
-                        ? `当前登录有效至 ${formatTimestamp(item.expiresAt)}，到期前会自动续期`
-                        : "登录有效期由 OpenAI 自动管理"}
-                    </ItemDescription>
-                  </ItemContent>
-                  <ItemActions className="ml-auto">
-                    <Button
-                      size="sm"
-                      disabled={busy || item.active}
-                      onClick={() =>
-                        setPendingOfficialAction({
-                          kind: "activate",
-                          account: item,
-                        })
-                      }
-                    >
-                      <Zap data-icon="inline-start" />
-                      使用此账号
-                    </Button>
-                    <Button
-                      size="icon-sm"
-                      variant="ghost"
-                      disabled={busy || item.active}
-                      aria-label={`删除已保存的 OpenAI 账号 ${item.name}`}
-                      title="删除已保存的账号"
-                      onClick={() =>
-                        setPendingOfficialAction({
-                          kind: "delete",
-                          account: item,
-                        })
-                      }
-                    >
-                      <Trash2 />
-                    </Button>
-                  </ItemActions>
-                </Item>
-              ))}
-            </ItemGroup>
           )}
-        </CardContent>
-      </Card>
-      <div className="md3-section-heading">
-        <div>
-          <h2>第三方 API 服务</h2>
-          <p>服务地址和 API Key 会直接交给 Codex，本应用不会转发请求。</p>
-        </div>
-        <Button onClick={() => setDraft(emptyProvider())}>
-          <Plus data-icon="inline-start" />
-          添加服务
-        </Button>
-      </div>
-      <div className="grid gap-5">
-        {!providers.length && (
-          <Empty>
-            <EmptyHeader>
-              <EmptyMedia variant="icon">
-                <Boxes />
-              </EmptyMedia>
-              <EmptyTitle>还没有添加第三方 API 服务</EmptyTitle>
-              <EmptyDescription>
-                可添加任何兼容 OpenAI Responses API 的服务。
-              </EmptyDescription>
-            </EmptyHeader>
-            <EmptyContent>
-              <Button size="sm" onClick={() => setDraft(emptyProvider())}>
-                <Plus data-icon="inline-start" />
-                添加服务
-              </Button>
-            </EmptyContent>
-          </Empty>
-        )}
-        {providers.map((provider) => {
-          const linked = accountsByProvider.get(provider.id) ?? []
-          return (
-            <Card key={provider.id} size="sm">
-              <CardHeader>
-                <CardTitle className="flex items-center gap-2">
-                  {provider.name}
-                  {provider.active && <Badge>使用中</Badge>}
-                  {!provider.enabled && (
-                    <Badge variant="secondary">不可用</Badge>
-                  )}
-                </CardTitle>
-                <CardDescription className="truncate">
-                  OpenAI Responses · {provider.baseUrl}
-                </CardDescription>
-                <CardDescription className="truncate">
-                  Codex 将直接从此服务读取可用模型。
-                </CardDescription>
-                <CardAction className="flex gap-1 max-sm:col-span-2 max-sm:row-start-auto max-sm:justify-self-end">
-                  <Button
-                    size="icon-sm"
-                    variant="outline"
-                    aria-label={`编辑服务 ${provider.name}`}
-                    title="编辑服务"
-                    onClick={() => setDraft(provider)}
-                  >
-                    <Pencil />
-                  </Button>
-                  <Button
-                    size="icon-sm"
-                    variant="outline"
-                    aria-label={`为 ${provider.name} 添加 API Key`}
-                    title="添加 API Key"
-                    onClick={() => setAccount(emptyAccount(provider.id))}
-                  >
-                    <UserPlus />
-                  </Button>
-                  <Button
-                    size="icon-sm"
-                    variant="ghost"
-                    disabled={provider.active || busy}
-                    aria-label={`删除服务 ${provider.name}`}
-                    title="删除服务"
-                    onClick={() =>
-                      setPendingDelete({
-                        kind: "provider",
-                        id: provider.id,
-                        name: provider.name,
-                      })
-                    }
-                  >
-                    <Trash2 />
-                  </Button>
-                </CardAction>
-              </CardHeader>
-              <CardContent className="flex flex-col gap-3">
-                {!linked.length ? (
-                  <Empty className="py-4">
-                    <EmptyHeader>
-                      <EmptyTitle>还没有添加 API Key</EmptyTitle>
-                      <EmptyDescription>
-                        保存 API Key 后即可测试连接或切换使用。
-                      </EmptyDescription>
-                    </EmptyHeader>
-                    <EmptyContent>
-                      <Button
-                        size="sm"
-                        variant="outline"
-                        onClick={() => setAccount(emptyAccount(provider.id))}
-                      >
-                        <KeyRound data-icon="inline-start" />
-                        添加 API Key
-                      </Button>
-                    </EmptyContent>
-                  </Empty>
-                ) : (
-                  <ItemGroup className="gap-2">
-                    {linked.map((item) => (
-                      <Item
-                        key={item.id}
-                        variant={item.active ? "muted" : "outline"}
-                        size="sm"
-                      >
-                        <ItemMedia variant="icon">
-                          <KeyRound />
-                        </ItemMedia>
-                        <ItemContent>
-                          <ItemTitle>
-                            {item.name}
-                            {item.active && <Badge>使用中</Badge>}
-                          </ItemTitle>
-                          <ItemDescription>
-                            API Key 已保存在本机；使用此服务时会同步给 Codex。
-                          </ItemDescription>
-                        </ItemContent>
-                        <ItemActions className="ml-auto">
-                          <Button
-                            size="sm"
-                            variant="outline"
-                            disabled={busy}
-                            onClick={() =>
-                              void run(`account:test:${item.id}`, async () => {
-                                const result = await call<{
-                                  ok: boolean
-                                  message: string
-                                }>("test_provider", {
-                                  id: provider.id,
-                                  accountId: item.id,
-                                })
-                                if (result.ok) toast.success(result.message)
-                                else toast.error(result.message)
-                              })
-                            }
-                          >
-                            {pendingTask === `account:test:${item.id}` && (
-                              <Spinner data-icon="inline-start" />
-                            )}
-                            {pendingTask === `account:test:${item.id}`
-                              ? "测试中…"
-                              : "测试连接"}
-                          </Button>
-                          <Button
-                            size="sm"
-                            disabled={busy || item.active}
-                            title="让 Codex 使用此 API 地址和 API Key"
-                            onClick={() => {
-                              setPendingActivation({
-                                providerId: provider.id,
-                                accountId: item.id,
-                              })
-                            }}
-                          >
-                            {pendingTask === `account:activate:${item.id}` ? (
-                              <Spinner data-icon="inline-start" />
-                            ) : (
-                              <Zap data-icon="inline-start" />
-                            )}
-                            {pendingTask === `account:activate:${item.id}`
-                              ? "切换中…"
-                              : "使用"}
-                          </Button>
+          {providers.map((provider) => {
+            const linked = accountsByProvider.get(provider.id) ?? []
+            return (
+              <Card key={provider.id} size="sm">
+                <CardHeader>
+                  <CardTitle className="flex items-center gap-2">
+                    {provider.name}
+                    {provider.active && <Badge>使用中</Badge>}
+                    {!provider.enabled && (
+                      <Badge variant="secondary">不可用</Badge>
+                    )}
+                  </CardTitle>
+                  <CardDescription className="flex min-w-0 flex-col gap-1">
+                    <span className="truncate" title={provider.baseUrl}>
+                      {provider.baseUrl}
+                    </span>
+                    <span>Responses API · 模型列表由 Codex 读取</span>
+                  </CardDescription>
+                  <CardAction>
+                    <DropdownMenu>
+                      <DropdownMenuTrigger
+                        render={
                           <Button
                             size="icon-sm"
                             variant="ghost"
-                            disabled={item.active || busy}
-                            aria-label={`删除 API Key ${item.name}`}
-                            title="删除 API Key"
+                            aria-label={`${provider.name} 的更多操作`}
+                            title="更多操作"
+                          />
+                        }
+                      >
+                        <MoreHorizontal />
+                      </DropdownMenuTrigger>
+                      <DropdownMenuContent align="end" className="w-44">
+                        <DropdownMenuGroup>
+                          <DropdownMenuItem onClick={() => setDraft(provider)}>
+                            <Pencil />
+                            编辑服务
+                          </DropdownMenuItem>
+                          <DropdownMenuItem
+                            onClick={() =>
+                              setAccount(emptyAccount(provider.id))
+                            }
+                          >
+                            <KeyRound />
+                            添加 API Key
+                          </DropdownMenuItem>
+                          <DropdownMenuItem
+                            variant="destructive"
+                            disabled={provider.active || busy}
                             onClick={() =>
                               setPendingDelete({
-                                kind: "account",
-                                id: item.id,
-                                name: item.name,
+                                kind: "provider",
+                                id: provider.id,
+                                name: provider.name,
                               })
                             }
                           >
                             <Trash2 />
-                          </Button>
-                        </ItemActions>
-                      </Item>
-                    ))}
-                  </ItemGroup>
-                )}
-              </CardContent>
-            </Card>
-          )
-        })}
-      </div>
+                            删除服务
+                          </DropdownMenuItem>
+                        </DropdownMenuGroup>
+                      </DropdownMenuContent>
+                    </DropdownMenu>
+                  </CardAction>
+                </CardHeader>
+                <CardContent className="flex flex-col gap-3">
+                  {!linked.length ? (
+                    <Empty className="min-h-40 py-6">
+                      <EmptyHeader>
+                        <EmptyTitle>尚未添加 API Key</EmptyTitle>
+                        <EmptyDescription>
+                          添加后即可测试连接并使用此服务。
+                        </EmptyDescription>
+                      </EmptyHeader>
+                      <EmptyContent>
+                        <Button
+                          size="sm"
+                          variant="secondary"
+                          onClick={() => setAccount(emptyAccount(provider.id))}
+                        >
+                          <KeyRound data-icon="inline-start" />
+                          添加 API Key
+                        </Button>
+                      </EmptyContent>
+                    </Empty>
+                  ) : (
+                    <ItemGroup className="gap-2">
+                      {linked.map((item) => (
+                        <Item
+                          key={item.id}
+                          variant={item.active ? "muted" : "outline"}
+                          size="sm"
+                        >
+                          <ItemMedia variant="icon">
+                            <KeyRound />
+                          </ItemMedia>
+                          <ItemContent>
+                            <ItemTitle>
+                              {item.name}
+                              {item.active && <Badge>使用中</Badge>}
+                            </ItemTitle>
+                            <ItemDescription>
+                              仅保存在本机，启用此服务时写入 Codex。
+                            </ItemDescription>
+                          </ItemContent>
+                          <ItemActions className="ml-auto">
+                            <Button
+                              size="sm"
+                              variant="secondary"
+                              disabled={busy || item.active}
+                              title="让 Codex 使用此 API 地址和 API Key"
+                              onClick={() => {
+                                setPendingActivation({
+                                  providerId: provider.id,
+                                  accountId: item.id,
+                                })
+                              }}
+                            >
+                              {pendingTask === `account:activate:${item.id}` ? (
+                                <Spinner data-icon="inline-start" />
+                              ) : (
+                                <ArrowRightLeft data-icon="inline-start" />
+                              )}
+                              {pendingTask === `account:activate:${item.id}`
+                                ? "切换中…"
+                                : "使用"}
+                            </Button>
+                            <DropdownMenu>
+                              <DropdownMenuTrigger
+                                render={
+                                  <Button
+                                    size="icon-sm"
+                                    variant="ghost"
+                                    aria-label={`${item.name} 的更多操作`}
+                                    title="更多操作"
+                                  />
+                                }
+                              >
+                                <MoreHorizontal />
+                              </DropdownMenuTrigger>
+                              <DropdownMenuContent align="end" className="w-40">
+                                <DropdownMenuGroup>
+                                  <DropdownMenuItem
+                                    disabled={busy}
+                                    onClick={() =>
+                                      void run(
+                                        `account:test:${item.id}`,
+                                        async () => {
+                                          const result = await call(
+                                            "test_provider",
+                                            {
+                                              id: provider.id,
+                                              accountId: item.id,
+                                            }
+                                          )
+                                          const detail = result.suggestV1
+                                            ? `${result.message} 请确认 API 地址以 /v1 结尾。`
+                                            : result.message
+                                          if (result.ok) {
+                                            notify.success(
+                                              "连接测试成功",
+                                              detail
+                                            )
+                                          } else {
+                                            notify.error("连接测试失败", detail)
+                                          }
+                                        },
+                                        false
+                                      )
+                                    }
+                                  >
+                                    {pendingTask ===
+                                    `account:test:${item.id}` ? (
+                                      <Spinner />
+                                    ) : (
+                                      <Activity />
+                                    )}
+                                    测试连接
+                                  </DropdownMenuItem>
+                                  <DropdownMenuItem
+                                    variant="destructive"
+                                    disabled={item.active || busy}
+                                    onClick={() =>
+                                      setPendingDelete({
+                                        kind: "account",
+                                        id: item.id,
+                                        name: item.name,
+                                      })
+                                    }
+                                  >
+                                    <Trash2 />
+                                    删除 API Key
+                                  </DropdownMenuItem>
+                                </DropdownMenuGroup>
+                              </DropdownMenuContent>
+                            </DropdownMenu>
+                          </ItemActions>
+                        </Item>
+                      ))}
+                    </ItemGroup>
+                  )}
+                </CardContent>
+              </Card>
+            )
+          })}
+        </div>
+      </section>
       {draft && (
         <ProviderEditor
           value={draft}
@@ -625,10 +720,10 @@ export default function ProvidersPage() {
           onCancel={() => setDraft(undefined)}
           onSave={(provider) =>
             void run("provider:save", async () => {
-              await call<Provider>("save_provider", {
+              await call("save_provider", {
                 provider,
               })
-              toast.success("第三方 API 服务已保存")
+              notify.success("API 服务已保存")
               setDraft(undefined)
             })
           }
@@ -644,7 +739,7 @@ export default function ProvidersPage() {
             void run("account:save", async () => {
               await call("save_provider_account", { account })
               setAccount(undefined)
-              toast.success("API Key 已保存")
+              notify.success("API Key 已保存")
             })
           }
         />
@@ -655,10 +750,10 @@ export default function ProvidersPage() {
       >
         <AlertDialogContent>
           <AlertDialogHeader>
-            <AlertDialogTitle>登录 OpenAI 并立即使用？</AlertDialogTitle>
+            <AlertDialogTitle>登录并切换到 OpenAI？</AlertDialogTitle>
             <AlertDialogDescription>
-              授权完成后，Codex 会自动切换到新登录的账号。已保存的第三方 API
-              服务不会删除，其他 Codex 设置也会保留。
+              登录成功后，Codex 会立即使用新账号。第三方 API
+              和其他设置不会删除。
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
@@ -668,11 +763,12 @@ export default function ProvidersPage() {
               onClick={() => {
                 setConfirmOpenAiLogin(false)
                 void run("openai:login", async () => {
-                  const authorization = await call<DeviceAuthorization>(
-                    "start_openai_device_auth"
-                  )
+                  const authorization = await call("start_openai_device_auth")
                   setDeviceAuthorization(authorization)
-                  toast.info("登录码已生成，请在 OpenAI 页面完成登录")
+                  notify.info(
+                    "登录码已生成",
+                    "请在打开的 OpenAI 页面完成登录，本页会自动更新。"
+                  )
                 })
               }}
             >
@@ -689,11 +785,10 @@ export default function ProvidersPage() {
       >
         <AlertDialogContent>
           <AlertDialogHeader>
-            <AlertDialogTitle>改用这个第三方 API？</AlertDialogTitle>
+            <AlertDialogTitle>切换到此 API 服务？</AlertDialogTitle>
             <AlertDialogDescription>
-              Codex 将直接使用该服务的 API 地址和已保存的 API
-              Key，并自行读取服务 提供的模型列表。OpenAI
-              登录账号仍会保存在本应用中，之后可以随时切回。
+              Codex 将使用此服务的地址和密钥，并自动读取模型列表。OpenAI
+              账号仍会保留。
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
@@ -707,11 +802,12 @@ export default function ProvidersPage() {
                 void run(
                   `account:activate:${activation.accountId}`,
                   async () => {
-                    await call("activate_provider", {
+                    const repair = await call("activate_provider", {
                       id: activation.providerId,
                       accountId: activation.accountId,
                     })
-                    toast.success("Codex 已切换到所选第三方 API 服务")
+                    notify.success("Codex 已切换到所选 API 服务")
+                    notifyRepairWarnings(repair)
                   }
                 )
               }}
@@ -732,12 +828,12 @@ export default function ProvidersPage() {
             <AlertDialogTitle>
               {pendingOfficialAction?.kind === "delete"
                 ? "删除已保存的 OpenAI 账号？"
-                : "改用这个 OpenAI 账号？"}
+                : "切换到此 OpenAI 账号？"}
             </AlertDialogTitle>
             <AlertDialogDescription>
               {pendingOfficialAction?.kind === "delete"
                 ? `只会删除本机保存的“${pendingOfficialAction.account.name}”登录信息，不会删除 OpenAI 云端账号。`
-                : `Codex 将改用“${pendingOfficialAction?.account.name ?? ""}”登录。第三方 API 服务仍会保留，之后可以随时切回。`}
+                : `Codex 将使用“${pendingOfficialAction?.account.name ?? ""}”。第三方 API 仍会保留。`}
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
@@ -760,13 +856,14 @@ export default function ProvidersPage() {
                       await call("delete_openai_account", {
                         id: pending.account.id,
                       })
-                      toast.success("已删除本机保存的 OpenAI 账号")
+                      notify.success("OpenAI 账号已从本机删除")
                       return
                     }
-                    await call("activate_openai_account", {
+                    const repair = await call("activate_openai_account", {
                       id: pending.account.id,
                     })
-                    toast.success("Codex 已切换到所选 OpenAI 账号")
+                    notify.success("Codex 已切换到所选 OpenAI 账号")
+                    notifyRepairWarnings(repair)
                   }
                 )
               }}
@@ -790,10 +887,10 @@ export default function ProvidersPage() {
               删除{pendingDelete?.kind === "provider" ? "服务" : "API Key"}？
             </AlertDialogTitle>
             <AlertDialogDescription>
-              将删除本机保存的“{pendingDelete?.name ?? ""}”。
+              将从本机删除“{pendingDelete?.name ?? ""}”。
               {pendingDelete?.kind === "provider"
-                ? "该服务下保存的所有 API Key 也会一并删除。正在使用的服务不能删除。"
-                : "这不会撤销服务商网站上的 API Key。"}
+                ? "该服务下的所有 API Key 也会一并删除。"
+                : "服务商网站上的 API Key 不会被撤销。"}
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
@@ -812,7 +909,7 @@ export default function ProvidersPage() {
                       : "delete_provider_account",
                     { id: pending.id }
                   )
-                  toast.success(
+                  notify.success(
                     pending.kind === "provider"
                       ? "第三方 API 服务已删除"
                       : "API Key 已删除"
@@ -829,17 +926,26 @@ export default function ProvidersPage() {
   )
 }
 
+function taskFailureTitle(task: string) {
+  if (task.startsWith("account:test:")) return "连接测试失败"
+  if (task === "provider:save") return "API 服务保存失败"
+  if (task === "account:save") return "API Key 保存失败"
+  if (task === "openai:login") return "无法开始 OpenAI 登录"
+  if (task.startsWith("account:activate:")) return "无法切换 API 服务"
+  if (task.startsWith("openai:activate:")) return "无法切换 OpenAI 账号"
+  if (task.startsWith("openai:delete:")) return "OpenAI 账号删除失败"
+  if (task.startsWith("delete:provider:")) return "API 服务删除失败"
+  if (task.startsWith("delete:account:")) return "API Key 删除失败"
+  return "操作未完成"
+}
+
 function formatTimestamp(value: number) {
-  const date = new Date(timestampMilliseconds(value))
+  const date = new Date(epochMilliseconds(value))
   if (Number.isNaN(date.getTime())) return "时间未知"
   return new Intl.DateTimeFormat("zh-CN", {
     dateStyle: "medium",
     timeStyle: "short",
   }).format(date)
-}
-
-function timestampMilliseconds(value: number) {
-  return value < 10_000_000_000 ? value * 1000 : value
 }
 
 function ProviderEditor({
@@ -864,13 +970,13 @@ function ProviderEditor({
         if (!open && !busy) onCancel()
       }}
     >
-      <DialogContent className="sm:max-w-xl">
+      <DialogContent>
         <DialogHeader>
           <DialogTitle>
             {value.id ? "编辑 API 服务" : "添加 API 服务"}
           </DialogTitle>
           <DialogDescription>
-            填写服务商提供的 OpenAI Responses API 地址。保存后再添加 API Key。
+            填写服务名称和 Responses API 地址。保存后再添加 API Key。
           </DialogDescription>
         </DialogHeader>
         <FieldGroup>
@@ -879,6 +985,7 @@ function ProviderEditor({
             <Input
               id="provider-name"
               autoFocus
+              required
               placeholder="例如：公司 API"
               value={value.name}
               onChange={(event) =>
@@ -890,22 +997,31 @@ function ProviderEditor({
             <FieldLabel htmlFor="provider-base-url">API 地址</FieldLabel>
             <Input
               id="provider-base-url"
+              type="url"
+              required
+              placeholder="https://api.example.com/v1"
               value={value.baseUrl}
               onChange={(event) =>
                 onChange({ ...value, baseUrl: event.target.value })
               }
             />
             <FieldDescription>
-              通常以 /v1 结尾，例如 https://api.example.com/v1。
+              填写服务商提供的 API 根地址，通常以 /v1 结尾。
             </FieldDescription>
           </Field>
           <Field orientation="horizontal">
+            <FieldContent>
+              <FieldTitle>启用此服务</FieldTitle>
+              <FieldDescription>
+                关闭后仍会保留配置，但不能切换使用。
+              </FieldDescription>
+            </FieldContent>
             <Switch
               id="provider-enabled"
+              aria-label="启用此服务"
               checked={value.enabled}
               onCheckedChange={(enabled) => onChange({ ...value, enabled })}
             />
-            <FieldLabel htmlFor="provider-enabled">允许使用此服务</FieldLabel>
           </Field>
         </FieldGroup>
         <DialogFooter>
@@ -913,7 +1029,7 @@ function ProviderEditor({
             取消
           </Button>
           <Button
-            disabled={busy || !value.name || !value.baseUrl}
+            disabled={busy || !value.name.trim() || !value.baseUrl.trim()}
             onClick={() => onSave(value)}
           >
             {pendingTask === "provider:save" ? (
@@ -953,7 +1069,7 @@ function AccountEditor({
         <DialogHeader>
           <DialogTitle>添加 API Key</DialogTitle>
           <DialogDescription>
-            为这个服务保存一个 API Key。可以保存多个，方便在不同账号间切换。
+            可以为同一服务保存多个密钥，并随时切换。
           </DialogDescription>
         </DialogHeader>
         <FieldGroup>
@@ -962,6 +1078,7 @@ function AccountEditor({
             <Input
               id="account-name"
               autoFocus
+              required
               placeholder="例如：个人密钥"
               value={value.name}
               onChange={(event) =>
@@ -973,16 +1090,17 @@ function AccountEditor({
             <FieldLabel htmlFor="account-api-key">API Key</FieldLabel>
             <Input
               id="account-api-key"
+              required
               type="password"
               autoComplete="off"
+              placeholder="sk-…"
               value={value.apiKey ?? ""}
               onChange={(event) =>
                 onChange({ ...value, apiKey: event.target.value })
               }
             />
             <FieldDescription>
-              API Key 会保存在当前系统账号的应用数据中，并在使用此服务时同步给
-              Codex。
+              仅保存在本机；启用服务后写入 Codex 的 auth.json。
             </FieldDescription>
           </Field>
         </FieldGroup>
@@ -990,7 +1108,10 @@ function AccountEditor({
           <Button variant="outline" disabled={pending} onClick={onCancel}>
             取消
           </Button>
-          <Button disabled={pending || !value.apiKey} onClick={onSave}>
+          <Button
+            disabled={pending || !value.name.trim() || !value.apiKey?.trim()}
+            onClick={onSave}
+          >
             {pending ? (
               <Spinner data-icon="inline-start" />
             ) : (

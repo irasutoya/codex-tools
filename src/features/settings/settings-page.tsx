@@ -1,13 +1,15 @@
 import { useCallback, useEffect, useState } from "react"
 import {
   Check,
-  FileDiff,
-  ShieldCheck,
+  Copy,
+  Eye,
+  Info,
+  LogIn,
+  RefreshCw,
   TriangleAlert,
-  Undo2,
 } from "lucide-react"
-import { toast } from "sonner"
 
+import { ErrorDetails } from "@/components/error-details"
 import { PageLoading } from "@/components/page-loading"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import {
@@ -40,16 +42,20 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog"
 import { Field, FieldDescription, FieldLabel } from "@/components/ui/field"
+import {
+  Item,
+  ItemContent,
+  ItemDescription,
+  ItemTitle,
+} from "@/components/ui/item"
 import { Spinner } from "@/components/ui/spinner"
 import { Textarea } from "@/components/ui/textarea"
+import { notify } from "@/lib/feedback"
 import { call } from "@/lib/ipc"
-import type {
-  ConfigInspection,
-  ConfigPatchPreview,
-  SettingsOverview,
-} from "@/types"
+import { notifyRepairWarnings } from "@/lib/repair-feedback"
+import type { ConfigInspection, ConfigPatchPreview, PageProps } from "@/types"
 
-export default function SettingsPage() {
+export default function SettingsPage({ active }: PageProps) {
   const [inspection, setInspection] = useState<ConfigInspection>()
   const [diagnostics, setDiagnostics] = useState<Record<string, unknown>>()
   const [canPreviewCustom, setCanPreviewCustom] = useState(false)
@@ -59,36 +65,60 @@ export default function SettingsPage() {
   const [previewing, setPreviewing] = useState(false)
   const [applyingPreview, setApplyingPreview] = useState(false)
   const [switchingOfficial, setSwitchingOfficial] = useState(false)
+
   const load = useCallback(async () => {
-    const overview = await call<SettingsOverview>("get_settings_overview")
+    const overview = await call("get_settings_overview")
     setInspection(overview.inspection)
     setDiagnostics(overview.diagnostics)
     setCanPreviewCustom(overview.canPreviewCustom)
     setError(undefined)
   }, [])
+
   useEffect(() => {
+    if (!active) return
     const timeout = window.setTimeout(() => {
       void load().catch((reason) => setError(String(reason)))
     }, 0)
     return () => window.clearTimeout(timeout)
-  }, [load])
+  }, [active, load])
+
   if (error) {
     return (
       <Alert variant="destructive">
-        <AlertTitle>暂时无法检查 Codex 配置</AlertTitle>
-        <AlertDescription>{error}</AlertDescription>
+        <TriangleAlert />
+        <AlertTitle>无法检查 Codex 配置</AlertTitle>
+        <AlertDescription>
+          <ErrorDetails
+            error={error}
+            action={
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => {
+                  setError(undefined)
+                  void load().catch((reason) => setError(String(reason)))
+                }}
+              >
+                <RefreshCw data-icon="inline-start" />
+                重试
+              </Button>
+            }
+          >
+            请确认本应用可以访问 Codex 配置目录。
+          </ErrorDetails>
+        </AlertDescription>
       </Alert>
     )
   }
-  if (!inspection) return <PageLoading />
+
+  if (!inspection) return <PageLoading label="正在检查 Codex 配置" />
 
   const createPreview = async () => {
     setPreviewing(true)
     try {
-      const next = await call<ConfigPatchPreview>("preview_activation")
-      setPreview(next)
+      setPreview(await call("preview_activation"))
     } catch (reason) {
-      toast.error(String(reason))
+      notify.error("无法生成配置预览", reason)
     } finally {
       setPreviewing(false)
     }
@@ -100,10 +130,14 @@ export default function SettingsPage() {
     try {
       await call("apply_activation", { operationId: preview.operationId })
       setPreview(undefined)
-      toast.success("Codex 配置已更新")
-      await load()
+      notify.success("Codex 配置已更新")
+      try {
+        await load()
+      } catch (reason) {
+        notify.warning("配置已写入，但状态刷新失败", reason)
+      }
     } catch (reason) {
-      toast.error(String(reason))
+      notify.error("无法写入 Codex 配置", reason)
     } finally {
       setApplyingPreview(false)
     }
@@ -113,133 +147,164 @@ export default function SettingsPage() {
     setConfirmOfficial(false)
     setSwitchingOfficial(true)
     try {
-      await call("activate_official")
-      await load()
-      toast.success("Codex 已切换到 OpenAI")
+      const repair = await call("activate_official")
+      notify.success("Codex 已切换到 OpenAI")
+      notifyRepairWarnings(repair)
+      try {
+        await load()
+      } catch (reason) {
+        notify.warning("连接已切换，但状态刷新失败", reason)
+      }
     } catch (reason) {
-      toast.error(String(reason))
+      notify.error("无法切换到 OpenAI", reason)
     } finally {
       setSwitchingOfficial(false)
     }
   }
 
+  const copyDiagnostics = () => {
+    void navigator.clipboard
+      .writeText(JSON.stringify(diagnostics ?? {}, null, 2))
+      .then(() => notify.success("诊断信息已复制"))
+      .catch((reason) => notify.error("无法复制诊断信息", reason))
+  }
+
   const busy = previewing || applyingPreview || switchingOfficial
+  const connectionLabel =
+    inspection.activeProvider === "custom"
+      ? "第三方 API"
+      : inspection.activeProvider === "openai"
+        ? "OpenAI 官方账号"
+        : "OpenAI 默认设置"
 
   return (
     <div className="flex flex-col gap-6">
       <Alert>
-        <ShieldCheck />
-        <AlertTitle>只更新连接所需的设置</AlertTitle>
+        <Info />
+        <AlertTitle>只修改连接所需字段</AlertTitle>
         <AlertDescription>
-          切换账号或第三方 API 时，其他 Codex 设置会保持不变。登录信息和 API Key
-          会直接同步到 Codex 自己的凭据文件。
+          账号、API 地址和密钥之外的 Codex 设置不会改变。
         </AlertDescription>
       </Alert>
-      <Card>
-        <CardHeader>
-          <CardTitle>当前配置</CardTitle>
-          <CardDescription className="truncate" title={inspection.path}>
-            {inspection.path}
-          </CardDescription>
-          <CardAction>
-            <Badge variant={inspection.valid ? "default" : "destructive"}>
-              {inspection.valid ? "可以使用" : "需要处理"}
-            </Badge>
-          </CardAction>
-        </CardHeader>
-        <CardContent className="flex flex-col gap-4">
-          <dl>
-            <div className="flex min-w-0 flex-col gap-1">
-              <dt className="text-xs text-muted-foreground">当前连接方式</dt>
-              <dd className="truncate font-medium">
-                {inspection.activeProvider === "custom"
-                  ? "第三方 API"
-                  : inspection.activeProvider === "openai"
-                    ? "OpenAI 官方账号"
-                    : "OpenAI 默认设置"}
-              </dd>
-            </div>
-          </dl>
-          {inspection.warnings.length > 0 && (
-            <Alert variant="destructive">
-              <TriangleAlert />
-              <AlertTitle>发现需要处理的问题</AlertTitle>
-              <AlertDescription>
-                <ul className="flex list-disc flex-col gap-1 pl-4">
-                  {inspection.warnings.map((warning) => (
-                    <li key={warning}>{warning}</li>
-                  ))}
-                </ul>
-              </AlertDescription>
-            </Alert>
-          )}
-        </CardContent>
-        <CardFooter className="flex-wrap gap-2">
-          <Button
-            variant="outline"
-            disabled={busy || !canPreviewCustom}
-            title={
-              canPreviewCustom
-                ? undefined
-                : "请先在“账号与服务”中使用一个第三方 API"
-            }
-            onClick={() => void createPreview()}
-          >
-            {previewing ? (
-              <Spinner data-icon="inline-start" />
-            ) : (
-              <FileDiff data-icon="inline-start" />
-            )}
-            {previewing ? "正在准备预览…" : "预览第三方配置"}
-          </Button>
-          <Button
-            variant="outline"
-            disabled={busy}
-            onClick={() => setConfirmOfficial(true)}
-          >
-            {switchingOfficial ? (
-              <Spinner data-icon="inline-start" />
-            ) : (
-              <Undo2 data-icon="inline-start" />
-            )}
-            {switchingOfficial ? "正在切换…" : "切换到 OpenAI"}
-          </Button>
-        </CardFooter>
-      </Card>
-      <Card size="sm">
-        <CardHeader>
-          <CardTitle>故障排查信息</CardTitle>
-          <CardDescription>
-            可在反馈问题时使用；API Key 和自定义请求头已经隐藏。
-          </CardDescription>
-        </CardHeader>
-        <CardContent>
-          <pre
-            className="max-h-72 overflow-auto rounded-xl bg-[var(--md-sys-color-surface-container-highest)] p-4 text-xs leading-5"
-            tabIndex={0}
-          >
-            {JSON.stringify(diagnostics, null, 2)}
-          </pre>
-        </CardContent>
-      </Card>
+
+      <section className="flex flex-col gap-4" aria-labelledby="config-title">
+        <div className="flex flex-col gap-1">
+          <h2 id="config-title" className="text-base font-medium">
+            Codex 配置
+          </h2>
+          <p className="text-sm text-muted-foreground">
+            查看当前连接，并在写入前确认所有修改。
+          </p>
+        </div>
+
+        <div className="grid gap-4 xl:grid-cols-[minmax(0,3fr)_minmax(20rem,2fr)]">
+          <Card>
+            <CardHeader>
+              <CardTitle>当前配置</CardTitle>
+              <CardDescription className="truncate" title={inspection.path}>
+                {inspection.path}
+              </CardDescription>
+              <CardAction>
+                <Badge variant={inspection.valid ? "default" : "destructive"}>
+                  {inspection.valid ? "可以使用" : "需要处理"}
+                </Badge>
+              </CardAction>
+            </CardHeader>
+            <CardContent className="flex flex-col gap-4">
+              <Item variant="muted">
+                <ItemContent>
+                  <ItemTitle>当前连接</ItemTitle>
+                  <ItemDescription>{connectionLabel}</ItemDescription>
+                </ItemContent>
+              </Item>
+
+              {inspection.warnings.length > 0 && (
+                <Alert>
+                  <TriangleAlert />
+                  <AlertTitle>发现需要确认的配置</AlertTitle>
+                  <AlertDescription>
+                    <ul className="flex list-disc flex-col gap-1 pl-4">
+                      {inspection.warnings.map((warning) => (
+                        <li key={warning}>{warning}</li>
+                      ))}
+                    </ul>
+                  </AlertDescription>
+                </Alert>
+              )}
+            </CardContent>
+            <CardFooter className="flex-wrap gap-2">
+              <Button
+                variant="outline"
+                disabled={busy || !canPreviewCustom}
+                title={
+                  canPreviewCustom
+                    ? undefined
+                    : "请先在“账号与服务”中使用一个第三方 API"
+                }
+                onClick={() => void createPreview()}
+              >
+                {previewing ? (
+                  <Spinner data-icon="inline-start" />
+                ) : (
+                  <Eye data-icon="inline-start" />
+                )}
+                {previewing ? "正在准备…" : "预览修改"}
+              </Button>
+              <Button
+                variant="outline"
+                disabled={busy}
+                onClick={() => setConfirmOfficial(true)}
+              >
+                {switchingOfficial ? (
+                  <Spinner data-icon="inline-start" />
+                ) : (
+                  <LogIn data-icon="inline-start" />
+                )}
+                {switchingOfficial ? "正在切换…" : "使用 OpenAI"}
+              </Button>
+            </CardFooter>
+          </Card>
+
+          <Card size="sm">
+            <CardHeader>
+              <CardTitle>诊断信息</CardTitle>
+              <CardDescription>
+                反馈问题时可以复制；API Key 等敏感内容已经隐藏。
+              </CardDescription>
+            </CardHeader>
+            <CardContent>
+              <pre className="max-h-80 overflow-auto rounded-lg bg-muted p-3 text-xs whitespace-pre-wrap">
+                {JSON.stringify(diagnostics, null, 2)}
+              </pre>
+            </CardContent>
+            <CardFooter className="justify-end">
+              <Button size="sm" variant="outline" onClick={copyDiagnostics}>
+                <Copy data-icon="inline-start" />
+                复制诊断信息
+              </Button>
+            </CardFooter>
+          </Card>
+        </div>
+      </section>
+
       <Dialog
         open={Boolean(preview)}
         onOpenChange={(open) => {
           if (!open && !applyingPreview) setPreview(undefined)
         }}
       >
-        <DialogContent className="sm:max-w-2xl">
+        <DialogContent className="sm:max-w-3xl">
           <DialogHeader>
-            <DialogTitle>确认将要写入的配置</DialogTitle>
+            <DialogTitle>预览配置修改</DialogTitle>
             <DialogDescription>
               {preview
                 ? `${preview.changes.join("；") || "没有检测到字段变化"} · API Key ${preview.apiKeyMasked}`
-                : "检查即将交给 Codex 的第三方 API 配置。"}
+                : "检查即将写入 Codex 的第三方 API 配置。"}
             </DialogDescription>
           </DialogHeader>
           <Field>
             <FieldLabel htmlFor="config-preview">
-              将写入 config.toml 的内容
+              config.toml 修改预览
             </FieldLabel>
             <Textarea
               id="config-preview"
@@ -247,9 +312,7 @@ export default function SettingsPage() {
               readOnly
               value={preview?.rendered ?? ""}
             />
-            <FieldDescription>
-              此处只能查看。点击“写入配置”后才会修改 Codex。
-            </FieldDescription>
+            <FieldDescription>确认后才会写入配置文件。</FieldDescription>
           </Field>
           <DialogFooter>
             <Button
@@ -268,18 +331,19 @@ export default function SettingsPage() {
               ) : (
                 <Check data-icon="inline-start" />
               )}
-              {applyingPreview ? "正在写入…" : "写入配置"}
+              {applyingPreview ? "正在写入…" : "确认写入"}
             </Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
       <AlertDialog open={confirmOfficial} onOpenChange={setConfirmOfficial}>
         <AlertDialogContent>
           <AlertDialogHeader>
             <AlertDialogTitle>切换到 OpenAI 官方服务？</AlertDialogTitle>
             <AlertDialogDescription>
-              Codex 将使用当前保存的 OpenAI 账号。第三方 API 服务和其他 Codex
-              设置都会保留，之后可以随时切回。若尚未登录，请先前往“账号与服务”。
+              Codex 将使用当前保存的 OpenAI 账号。第三方 API
+              和其他配置会继续保留；如果尚未登录，请先前往“账号与服务”。
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>

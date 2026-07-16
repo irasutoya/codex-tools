@@ -18,6 +18,10 @@ use tauri::{Manager, State, WindowEvent};
 
 const TRAY_SHOW_ID: &str = "tray_show";
 const TRAY_EXIT_ID: &str = "tray_exit";
+const DEFAULT_WINDOW_WIDTH: f64 = 1180.0;
+const DEFAULT_WINDOW_HEIGHT: f64 = 760.0;
+const MIN_WINDOW_WIDTH: f64 = 360.0;
+const MIN_WINDOW_HEIGHT: f64 = 520.0;
 
 #[derive(Default)]
 struct ActivationLock(tokio::sync::Mutex<()>);
@@ -174,12 +178,14 @@ async fn test_provider(
     .map_err(|error| {
         AppError::InvalidConfig(format!("无法连接到服务，请检查网络和 API 地址：{error}"))
     })?;
-    let status = response.status().as_u16();
+    let status_code = response.status();
+    let status = status_code.as_u16();
+    let ok = provider_test_succeeded(status_code);
     Ok(ProviderTestResult {
-        ok: status < 400,
+        ok,
         status,
         endpoint,
-        message: if status < 400 {
+        message: if ok {
             "模型列表接口可以访问，Codex 可直接从此服务读取模型。".into()
         } else {
             format!("连接测试未通过（HTTP {status}），请检查 API 地址、API Key 和服务状态。")
@@ -613,6 +619,10 @@ fn models_endpoint(base_url: &str) -> String {
     }
 }
 
+fn provider_test_succeeded(status: reqwest::StatusCode) -> bool {
+    status.is_success()
+}
+
 fn custom_headers(
     provider: &ProviderProfile,
     account: &ProviderAccount,
@@ -646,8 +656,8 @@ fn show_main_window(app: &tauri::AppHandle) {
     let _ =
         tauri::WebviewWindowBuilder::new(app, "main", tauri::WebviewUrl::App("index.html".into()))
             .title("Codex Tools")
-            .inner_size(1180.0, 760.0)
-            .min_inner_size(900.0, 600.0)
+            .inner_size(DEFAULT_WINDOW_WIDTH, DEFAULT_WINDOW_HEIGHT)
+            .min_inner_size(MIN_WINDOW_WIDTH, MIN_WINDOW_HEIGHT)
             .build();
 }
 
@@ -745,6 +755,30 @@ pub fn run() {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn provider_test_only_accepts_success_responses() {
+        assert!(provider_test_succeeded(reqwest::StatusCode::OK));
+        assert!(provider_test_succeeded(reqwest::StatusCode::NO_CONTENT));
+        assert!(!provider_test_succeeded(reqwest::StatusCode::FOUND));
+        assert!(!provider_test_succeeded(reqwest::StatusCode::UNAUTHORIZED));
+    }
+
+    #[test]
+    fn model_endpoint_preserves_versioned_api_roots() {
+        assert_eq!(
+            models_endpoint("https://api.example.test/v1/"),
+            "https://api.example.test/v1/models"
+        );
+        assert_eq!(
+            models_endpoint("https://api.example.test/openai/v2"),
+            "https://api.example.test/openai/v2/models"
+        );
+        assert_eq!(
+            models_endpoint("https://api.example.test/openai"),
+            "https://api.example.test/openai/v1/models"
+        );
+    }
 
     #[test]
     fn session_pages_filter_without_changing_totals_or_page_boundaries() {

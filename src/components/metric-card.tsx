@@ -1,5 +1,4 @@
 import type { LucideIcon } from "lucide-react"
-import type { ReactNode } from "react"
 
 import {
   Card,
@@ -7,39 +6,33 @@ import {
   CardContent,
   CardDescription,
   CardHeader,
+  CardTitle,
 } from "@/components/ui/card"
 
 type MetricCardProps = {
   label: string
-  value: ReactNode
+  value: string | number
+  detail?: string
   icon: LucideIcon
-  detail?: ReactNode
 }
 
 export function MetricCard({
   label,
   value,
-  icon: Icon,
   detail,
+  icon: Icon,
 }: MetricCardProps) {
   return (
-    <Card
-      size="sm"
-      className="min-h-32 bg-[var(--md-sys-color-surface-container)]"
-    >
+    <Card size="sm" className="min-h-32">
       <CardHeader>
         <CardDescription>{label}</CardDescription>
-        <CardAction className="flex size-10 items-center justify-center rounded-full bg-[var(--md-sys-color-primary-container)] text-[var(--md-sys-color-on-primary-container)]">
-          <Icon className="size-5" />
+        <CardAction className="flex size-8 items-center justify-center rounded-lg bg-muted text-muted-foreground">
+          <Icon className="size-4" aria-hidden="true" />
         </CardAction>
       </CardHeader>
       <CardContent className="flex flex-col gap-1">
-        <div className="font-heading text-[2rem] leading-10 font-normal tracking-tight tabular-nums">
-          {value}
-        </div>
-        {detail && (
-          <div className="text-xs text-muted-foreground">{detail}</div>
-        )}
+        <CardTitle className="text-2xl tabular-nums">{value}</CardTitle>
+        {detail && <p className="text-xs text-muted-foreground">{detail}</p>}
       </CardContent>
     </Card>
   )
