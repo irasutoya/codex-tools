@@ -581,7 +581,7 @@ fn detected_codex_version() -> &'static str {
 }
 
 fn detect_codex_version() -> Option<String> {
-    let mut command = crate::platform::codex_command();
+    let mut command = crate::platform::codex_cli_command();
     command.arg("--version");
     #[cfg(windows)]
     {

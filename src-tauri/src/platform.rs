@@ -4,11 +4,11 @@ use std::{
     process::Command,
 };
 
-pub fn codex_command() -> Command {
-    Command::new(codex_executable())
+pub fn codex_cli_command() -> Command {
+    Command::new(codex_cli_executable())
 }
 
-fn codex_executable() -> OsString {
+fn codex_cli_executable() -> OsString {
     if let Some(configured) = std::env::var_os("CODEX_BIN")
         && !configured.is_empty()
     {
@@ -105,7 +105,14 @@ pub fn open_url(url: &str) -> std::io::Result<()> {
         command
     };
 
-    command.spawn().map(|_| ())
+    let status = command.status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!(
+            "系统无法打开链接（退出状态：{status}）"
+        )))
+    }
 }
 
 pub fn os_name() -> &'static str {

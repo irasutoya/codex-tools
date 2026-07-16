@@ -22,6 +22,7 @@ const DEFAULT_WINDOW_WIDTH: f64 = 1180.0;
 const DEFAULT_WINDOW_HEIGHT: f64 = 760.0;
 const MIN_WINDOW_WIDTH: f64 = 360.0;
 const MIN_WINDOW_HEIGHT: f64 = 520.0;
+const CODEX_APP_URI: &str = "codex://";
 
 #[derive(Default)]
 struct ActivationLock(tokio::sync::Mutex<()>);
@@ -590,20 +591,10 @@ fn get_settings_overview(store: State<Store>) -> Result<SettingsOverview, AppErr
 }
 
 #[tauri::command]
-fn launch_codex(store: State<Store>) -> Result<(), AppError> {
-    let mut command = platform::codex_command();
-    let codex_home = codex::home(&store.codex_home_setting()?);
-    command.env("CODEX_HOME", &codex_home);
-    #[cfg(target_os = "macos")]
-    {
-        command.arg("app");
-        if let Some(home) = dirs::home_dir() {
-            command.current_dir(home);
-        }
-    }
-    command.spawn().map(|_| ()).map_err(|error| {
+fn launch_codex() -> Result<(), AppError> {
+    platform::open_url(CODEX_APP_URI).map_err(|error| {
         AppError::Internal(format!(
-            "无法启动 Codex，请确认 Codex 已安装并可从终端运行：{error}"
+            "无法打开 Codex，请确认已安装 Codex 桌面应用：{error}"
         ))
     })
 }
