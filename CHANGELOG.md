@@ -6,6 +6,10 @@
 
 ### Changed
 
+- 重写面向发布的 README，补充下载安装、首次使用、数据安全、系统签名告警和开发说明。
+- 发布工作流现在校验项目版本与标签、从对应 Changelog 版本提取 Release notes，并为安装包生成 SHA-256 校验文件。
+- CI 和发布任务增加并发控制与超时限制，项目元数据补充运行时版本、主页和问题追踪入口。
+- 将只在构建阶段提供 Tailwind 样式和组件工具的 shadcn 包从运行时依赖移至开发依赖。
 - 桌面运行时全面迁移到 Tauri 2 + Rust，React/shadcn 只负责按页懒加载的界面。
 - 应用数据统一为平台数据目录中的 `app.yaml`，旧 `data/config.yaml` 不再读取，也不创建应用 SQLite。
 - 删除本地路由、协议转换与请求日志，只保留 OpenAI Responses Provider 管理；API 地址和请求头直接写入 Codex `config.toml`，API Key 写入 `auth.json`。
@@ -17,6 +21,7 @@
 
 ### Added
 
+- 贡献指南和维护者发布清单。
 - OpenAI Account 设备码登录、多账号保存与切换；登录请求使用 Codex CLI 风格的 `User-Agent`，OAuth 凭据不会返回 WebView。
 - macOS 11+ 运行与打包支持，包括系统浏览器登录、平台化 Codex CLI 发现、Application Support 数据目录、通用架构 DMG 和 macOS CI。
 

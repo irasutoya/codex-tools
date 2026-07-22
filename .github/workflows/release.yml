@@ -7,9 +7,14 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   build-windows:
     runs-on: windows-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -34,6 +39,7 @@ jobs:
 
   build-macos:
     runs-on: macos-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -61,15 +67,24 @@ jobs:
   release:
     needs: [build-windows, build-macos]
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
       - uses: actions/download-artifact@v4
         with:
           path: release-artifacts
           merge-multiple: true
+      - name: Generate checksums
+        working-directory: release-artifacts
+        run: sha256sum * > SHA256SUMS.txt
+      - name: Extract release notes
+        run: npm run release:notes -- --version "${GITHUB_REF_NAME#v}"
       - uses: softprops/action-gh-release@v2
         with:
           draft: true
           prerelease: true
           files: release-artifacts/*
-          body_path: CHANGELOG.md
+          body_path: release-notes.md

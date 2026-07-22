@@ -1,20 +1,63 @@
 # Codex Tools
 
-Codex Tools 是面向 macOS 11+ 与 Windows 10/11 的轻量 Tauri 2 + Rust 桌面工具。它只管理兼容 OpenAI Responses API 的 Provider，并把所选 API 地址和凭据直接写入 Codex 的 `custom` provider 配置。
+<p align="center">
+  <img src="public/codex-tools.svg" alt="Codex Tools" width="96" height="96" />
+</p>
 
-## 功能
+<p align="center">
+  在 Windows 和 macOS 上管理 Codex 的 OpenAI 账号与兼容 Responses API 的第三方服务。
+</p>
 
-- 管理兼容 OpenAI Responses API 的上游及多个 API 账号。
-- Codex 直接使用第三方 API 自己提供的模型列表，不生成或覆盖本地模型目录。
-- Codex 直接连接上游，本程序不启动 HTTP 监听器、不转发请求，也不转换其他协议。
-- 支持 OpenAI Account 设备码登录，并可在多个官方账号与第三方 API 之间切换。
-- 切换时使用 TOML 解析器更新或删除受管 Provider 字段；MCP、Skills、Hooks、沙箱、其他 Provider 及未知配置保持不变。
-- 第三方供应商切换时 Codex provider 始终为 `custom`；仅在 `openai` 与 `custom` 模式互切后，自动把全部已识别会话的 provider 元数据统一到新模式。
-- 直接读取 Codex JSONL/SQLite，不创建应用 SQLite，不保存聊天正文，不生成会话备份。
+<p align="center">
+  <a href="https://github.com/irasutoya/codex-tools/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/irasutoya/codex-tools/actions/workflows/ci.yml/badge.svg" /></a>
+  <a href="https://github.com/irasutoya/codex-tools/releases/latest"><img alt="GitHub Release" src="https://img.shields.io/github/v/release/irasutoya/codex-tools?display_name=tag&sort=semver" /></a>
+  <a href="LICENSE"><img alt="MIT License" src="https://img.shields.io/badge/license-MIT-blue.svg" /></a>
+</p>
 
-## Codex 配置
+Codex Tools 是一个轻量的 Tauri 2 + Rust 桌面应用。它直接更新 Codex
+配置，不启动本地代理、不转发请求，也不保存聊天正文。
 
-应用在现有 `config.toml` 上更新以下字段，`base_url` 是所选 Provider 的真实 API 地址：
+## 主要功能
+
+- 保存并切换多个 OpenAI Account，使用设备码完成授权。
+- 管理多个兼容 OpenAI Responses API 的 Provider 和 API 账号。
+- 只更新受管的 `custom` Provider 字段，保留 MCP、Skills、Hooks、沙箱及未知配置。
+- 在官方账号与第三方 API 之间切换时，同步已识别会话的 Provider 元数据。
+- 直接读取 Codex JSONL/SQLite；不创建应用数据库，不保存聊天正文。
+- 支持 Windows 10/11 和 macOS 11+，macOS 发布包同时支持 Apple Silicon 与 Intel。
+
+## 下载与安装
+
+从 [Releases](https://github.com/irasutoya/codex-tools/releases/latest)
+下载适合当前系统的安装包：
+
+| 平台    | 发布产物           | 系统要求                |
+| ------- | ------------------ | ----------------------- |
+| Windows | NSIS `.exe` 安装包 | Windows 10/11、WebView2 |
+| macOS   | 通用架构 `.dmg`    | macOS 11 或更高版本     |
+
+> [!IMPORTANT]
+> 当前自动构建的安装包尚未配置 Authenticode 或 Apple Developer ID
+> 签名。系统可能显示“未知发布者”或阻止打开。请先核对 Release 来源和
+> `SHA256SUMS.txt`；不确定时请从源码构建，不要关闭系统安全防护。
+
+Codex Tools 面向已经安装并使用 Codex 的用户。启动后应用会自动寻找 Codex
+配置目录和 CLI；也可以通过 `CODEX_HOME` 和 `CODEX_BIN` 环境变量指定位置。
+
+## 快速开始
+
+1. 启动 Codex Tools，先在设置页确认检测到的 Codex 路径。
+2. 选择“OpenAI Account”并按设备码提示登录，或添加兼容 Responses API
+   的 Provider、API 地址和 API Key。
+3. 测试第三方连接后，选择要使用的账号并确认配置预览。
+4. 应用切换，然后重新打开 Codex 使新配置生效。
+
+切换前建议退出正在运行的 Codex 实例。应用会检测预览后发生的并发修改，但仍应
+避免同时用其他工具编辑 `config.toml` 或 `auth.json`。
+
+## 配置行为
+
+第三方账号激活后，应用会把所选服务写入 Codex 配置：
 
 ```toml
 model_provider = "custom"
@@ -29,7 +72,7 @@ base_url = "https://api.example.com/v1"
 X-Custom-Header = "<可选请求头>"
 ```
 
-切换自定义账号时会清空并重写 `auth.json`，文件中只保留 `OPENAI_API_KEY`：
+对应的 `auth.json` 会被完整重建，只保留当前第三方凭据：
 
 ```json
 {
@@ -37,22 +80,23 @@ X-Custom-Header = "<可选请求头>"
 }
 ```
 
-第三方 API 需要提供 OpenAI 兼容的模型列表与 Responses 接口。Codex 会直接向 Provider 请求模型列表和 `/responses`，本应用只在“测试连接”时检查模型列表接口是否可访问，不读取或保存返回内容。
+切换回官方账号时，应用会删除根配置和现有 Profile 中受管的 `custom`
+Provider 字段，并写入所选 OpenAI Account 的完整凭据。配置通过 TOML
+语法树更新；其他 Provider、MCP、Skills、Hooks、沙箱及未知字段保持不变。
 
-## OpenAI Account 登录与切换
-
-应用使用与 Codex CLI 相同的 OpenAI 设备授权端点和 Codex CLI 风格的 `User-Agent` 发起登录。登录完成后，完整凭据只在 Rust 后端处理，并保存到 `data/app.yaml`；前端只会收到账号名称、邮箱、到期时间等脱敏元数据。
-
-两种认证模式严格互斥。`config.toml` 不会被整体清空，但 `auth.json` 每次都会按目标模式完整重写：
-
-- 切换到官方账号：删除根配置和 Profile 中的 `model_provider` 以及 `[model_providers.custom]`，再把所选账号的完整官方凭据写入 `~/.codex/auth.json`。
-- 切换到第三方 API：将根配置和已有 Profile 中的 `model_provider` 调整为 `custom`，写入 `[model_providers.custom]`，再将 `auth.json` 重写为仅含 `OPENAI_API_KEY` 的对象。
-
-程序会先完整解析 TOML，使用结构化语法树更新字段，避免文本删改误伤其他配置。应用不管理或清理 `model`、模型目录以及其他未知字段。第三方配置在预览和应用之间会校验 `config.toml` 和 `auth.json` 是否发生变化；提交时依次清空认证、原子写入配置，再写入目标认证，避免 API 地址与错误账号凭据短暂配对。文件内容没有变化时会跳过写盘。原有 `auth.json` 内容无需可解析，因为目标文件会被完整重建。
+第三方服务必须提供兼容 OpenAI 的模型列表与 Responses API。Codex 会直接连接
+该服务；Codex Tools 只在“测试连接”时检查模型列表接口，不读取或保存响应内容。
 
 ## 数据与安全
 
-Windows 便携式数据位于可执行文件同级 `data/`：
+凭据会按产品约定以明文保存在本机。请勿上传、同步或分享以下目录和文件：
+
+| 平台    | Codex Tools 数据位置                                                     |
+| ------- | ------------------------------------------------------------------------ |
+| Windows | 安装目录或可执行文件同级的 `data/app.yaml`                               |
+| macOS   | `~/Library/Application Support/io.github.irasutoya.codex-tools/app.yaml` |
+
+激活第三方账号后，API Key 还会写入 Codex 的 `auth.json`。Windows 便携目录结构如下：
 
 ```text
 Codex Tools.exe
@@ -60,41 +104,50 @@ data/
   app.yaml
 ```
 
-第三方 API Key 和 OpenAI Account OAuth 凭据按产品约定以明文保存在平台对应的 `app.yaml`，激活第三方账号后 API Key 还会以明文写入 Codex `auth.json`。请勿上传、同步或分享这些文件。应用只读取当前的 `app.yaml`，不会扫描、导入或删除其他应用数据文件；日志和前端诊断不包含 API Key 或 OAuth token。
+可以通过 `CODEX_TOOLS_DATA_DIR` 覆盖应用数据目录。macOS 默认将目录和配置文件
+权限分别限制为当前用户可访问的 `0700` 和 `0600`。日志和前端诊断不会包含 API
+Key 或 OAuth token。完整边界和漏洞报告方式见 [安全策略](SECURITY.md)。
 
-macOS 安装包的数据位于 `~/Library/Application Support/io.github.irasutoya.codex-tools/`，避免修改只读或已签名的 `.app`；目录与配置文件权限分别限制为当前用户可访问的 `0700` 和 `0600`。可在两个平台通过 `CODEX_TOOLS_DATA_DIR` 覆盖数据目录；macOS 图形应用找不到 Codex CLI 时，还会检查 Homebrew、用户级安装以及 Codex/ChatGPT 应用内置的 CLI，也可通过 `CODEX_BIN` 显式指定。
+## 本地开发
 
-## 开发
-
-需要 Node.js 24、Rust 1.85+，以及当前平台的 Tauri 构建依赖。Windows 需要 WebView2 和 NSIS；macOS 需要 Xcode Command Line Tools。
+需要 Node.js 24、Rust 1.85+ 以及当前平台的
+[Tauri 2 构建依赖](https://v2.tauri.app/start/prerequisites/)。Windows 构建还需要
+WebView2 和 NSIS，macOS 构建需要 Xcode Command Line Tools。
 
 ```shell
+git clone https://github.com/irasutoya/codex-tools.git
+cd codex-tools
 npm ci
 npm run dev
 ```
 
-质量检查：
+提交前运行完整检查：
 
 ```shell
 npm run check
+cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
+cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --locked -- -D warnings
 cargo test --manifest-path src-tauri/Cargo.toml --locked
 ```
 
-Windows 安装包：
-
-```powershell
-npm run dist:win
-```
-
-输出位于 `src-tauri/target/release/bundle/nsis/`。
-
-macOS 原生安装包：
+本地打包：
 
 ```shell
+# Windows：输出到 src-tauri/target/release/bundle/nsis/
+npm run dist:win
+
+# macOS：输出到 src-tauri/target/release/bundle/dmg/
 npm run dist:mac
 ```
 
-输出位于 `src-tauri/target/release/bundle/dmg/`。发布流程使用 `npm run dist:mac:universal` 同时包含 Apple Silicon 与 Intel 架构；本地执行前需安装 `aarch64-apple-darwin` 和 `x86_64-apple-darwin` Rust targets。
+发布流程、版本同步和标签要求见 [发布指南](docs/RELEASING.md)。参与开发前请阅读
+[贡献指南](CONTRIBUTING.md)。
+
+## 项目状态
+
+项目仍处于早期预览阶段。升级前请阅读 [更新日志](CHANGELOG.md)，并在
+[Issues](https://github.com/irasutoya/codex-tools/issues) 中报告可复现的问题。提交问题时
+请移除 API Key、OAuth token、`auth.json`、`data/app.yaml` 和会话正文。
 
 ## 许可证
 

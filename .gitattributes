@@ -6,6 +6,7 @@
 *.js text eol=lf
 *.json text eol=lf
 *.md text eol=lf
+*.mjs text eol=lf
 *.rs text eol=lf
 *.svg text eol=lf
 *.toml text eol=lf
@@ -14,6 +15,9 @@
 *.xml text eol=lf
 *.yml text eol=lf
 *.yaml text eol=lf
+.gitattributes text eol=lf
+.gitignore text eol=lf
+.prettierignore text eol=lf
 
 # Native Windows command files require CRLF.
 *.bat text eol=crlf

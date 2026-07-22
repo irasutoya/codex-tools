@@ -4,9 +4,17 @@
 
 项目处于早期预览阶段，仅最新版本接收安全修复。
 
+| Version        | Supported |
+| -------------- | --------- |
+| Latest release | Yes       |
+| Older releases | No        |
+
 ## Reporting a vulnerability
 
-请通过 GitHub 仓库的私密漏洞报告功能提交问题。不要在公开 Issue 中附带 API Key、`auth.json`、`data/app.yaml` 或 Codex 会话数据。
+请通过 GitHub 仓库的
+[私密漏洞报告功能](https://github.com/irasutoya/codex-tools/security/advisories/new)
+提交问题。不要在公开 Issue 中附带 API Key、`auth.json`、`data/app.yaml` 或
+Codex 会话数据。
 
 ## Security boundaries
 
