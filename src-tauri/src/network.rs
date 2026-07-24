@@ -86,6 +86,7 @@ fn normalize_proxy_url(value: &str) -> Option<String> {
     reqwest::Url::parse(&normalized).ok().map(|_| normalized)
 }
 
+#[cfg(any(windows, test))]
 fn parse_proxy_server(value: &str) -> SystemProxy {
     let mut settings = SystemProxy::default();
     for part in value
