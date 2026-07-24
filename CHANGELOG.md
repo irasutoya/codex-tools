@@ -4,6 +4,18 @@
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-07-24
+
+### Added
+
+- OpenAI 设备码登录、Token 刷新和第三方 Provider 连通性测试现在遵循 Windows 与 macOS 系统代理；显式设置的 `HTTP_PROXY`、`HTTPS_PROXY` 或 `ALL_PROXY` 环境变量仍然优先。
+- 系统代理例外列表会同步应用于后端网络请求，局域网、本机地址和用户配置的直连域名不会被错误转发。
+
+### Changed
+
+- OAuth 与 Provider 测试复用统一的网络客户端配置，并共享连接超时、连接池和 TCP keepalive 策略，减少重复配置及网络行为差异。
+- Windows 系统代理支持按 HTTP/HTTPS 分协议配置，macOS 支持从 System Configuration 读取代理端点与例外列表。
+
 ## [0.1.0] - 2026-07-22
 
 ### Added
@@ -28,5 +40,6 @@
 - 上游密钥和自定义请求头改为 Rust 后端只写、前端脱敏；会话扫描增加大小及并发边界。
 - 删除应用配置版本迁移、废弃协议兼容分支、旧模型字段清理和未使用 IPC；相同配置不再重复写盘，账号切换前不再扫描全部会话。
 
-[Unreleased]: https://github.com/irasutoya/codex-tools/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/irasutoya/codex-tools/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/irasutoya/codex-tools/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/irasutoya/codex-tools/releases/tag/v0.1.0

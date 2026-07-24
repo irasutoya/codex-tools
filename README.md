@@ -20,6 +20,7 @@ Codex Tools 是一个轻量的 Tauri 2 + Rust 桌面应用。它直接更新 Cod
 ## 主要功能
 
 - 保存并切换多个 OpenAI Account，使用设备码完成授权。
+- OpenAI 登录、Token 刷新和服务测试自动遵循 Windows/macOS 系统代理，并保留环境变量代理优先级。
 - 管理多个兼容 OpenAI Responses API 的 Provider 和 API 账号。
 - 只更新受管的 `custom` Provider 字段，保留 MCP、Skills、Hooks、沙箱及未知配置。
 - 在官方账号与第三方 API 之间切换时，同步已识别会话的 Provider 元数据。

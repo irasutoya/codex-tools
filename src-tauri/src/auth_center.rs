@@ -317,7 +317,7 @@ fn build_oauth_client(user_agent: &str) -> Result<reqwest::Client, reqwest::Erro
     if let Ok(value) = HeaderValue::from_str(user_agent) {
         headers.insert(USER_AGENT, value);
     }
-    reqwest::Client::builder()
+    crate::network::client_builder()?
         .default_headers(headers)
         .redirect(reqwest::redirect::Policy::none())
         .https_only(true)

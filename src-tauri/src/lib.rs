@@ -1,6 +1,7 @@
 mod auth_center;
 mod codex;
 mod models;
+mod network;
 mod platform;
 mod provider_sync;
 mod session_index;
@@ -32,8 +33,14 @@ struct ApiClient(reqwest::Client);
 impl Default for ApiClient {
     fn default() -> Self {
         Self(
-            reqwest::Client::builder()
+            network::client_builder()
+                .expect("无法读取系统代理设置")
                 .redirect(reqwest::redirect::Policy::none())
+                .connect_timeout(std::time::Duration::from_secs(30))
+                .timeout(std::time::Duration::from_secs(60))
+                .pool_max_idle_per_host(4)
+                .pool_idle_timeout(std::time::Duration::from_secs(90))
+                .tcp_keepalive(std::time::Duration::from_secs(60))
                 .build()
                 .expect("无法初始化 HTTP 客户端"),
         )
