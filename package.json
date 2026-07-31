@@ -1,7 +1,7 @@
 {
   "name": "codex-tools",
   "private": true,
-  "version": "0.3.3",
+  "version": "0.3.4",
   "description": "管理 Codex 的 OpenAI 账号和第三方 Responses API 服务。",
   "author": "Codex Tools contributors",
   "license": "MIT",
@@ -34,7 +34,9 @@
     "tauri": "tauri",
     "dist:win": "tauri build --target x86_64-pc-windows-msvc --bundles nsis",
     "dist:mac:arm64": "tauri build --target aarch64-apple-darwin --bundles app,dmg",
-    "dist:mac:x64": "tauri build --target x86_64-apple-darwin --bundles app,dmg"
+    "dist:mac:x64": "tauri build --target x86_64-apple-darwin --bundles app,dmg",
+    "verify:mac:arm64": "codesign --verify --deep --strict --verbose=4 'src-tauri/target/aarch64-apple-darwin/release/bundle/macos/Codex Tools.app'",
+    "verify:mac:x64": "codesign --verify --deep --strict --verbose=4 'src-tauri/target/x86_64-apple-darwin/release/bundle/macos/Codex Tools.app'"
   },
   "dependencies": {
     "@base-ui/react": "^1.6.0",

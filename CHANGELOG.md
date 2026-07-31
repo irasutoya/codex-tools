@@ -4,6 +4,17 @@
 
 ## [Unreleased]
 
+## [0.3.4] - 2026-07-31
+
+### Changed
+
+- macOS 安装说明按 Apple Silicon 与 Intel 分开，并补充未公证应用的一次性安全确认方法。
+
+### Fixed
+
+- macOS `.app` 现在由 Tauri 对整个应用包执行 ad-hoc 签名，不再只保留 Mach-O 链接器签名，避免 Gatekeeper 将有效下载误判为“应用已损坏”。
+- CI 和 Release 在上传 DMG 前强制运行 `codesign --verify --deep --strict`；签名结构无效时发布流程会直接失败。
+
 ## [0.3.3] - 2026-07-31
 
 ### Changed
@@ -90,7 +101,8 @@
 - 上游密钥和自定义请求头改为 Rust 后端只写、前端脱敏；会话扫描增加大小及并发边界。
 - 删除应用配置版本迁移、废弃协议兼容分支、旧模型字段清理和未使用 IPC；相同配置不再重复写盘，账号切换前不再扫描全部会话。
 
-[Unreleased]: https://github.com/irasutoya/codex-tools/compare/v0.3.3...HEAD
+[Unreleased]: https://github.com/irasutoya/codex-tools/compare/v0.3.4...HEAD
+[0.3.4]: https://github.com/irasutoya/codex-tools/compare/v0.3.3...v0.3.4
 [0.3.3]: https://github.com/irasutoya/codex-tools/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/irasutoya/codex-tools/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/irasutoya/codex-tools/compare/v0.3.0...v0.3.1

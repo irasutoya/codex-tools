@@ -25,7 +25,8 @@ cargo test --manifest-path src-tauri/Cargo.toml --locked
 ```
 
 如有对应平台环境，再运行 `npm run dist:win`、`npm run dist:mac:arm64` 或
-`npm run dist:mac:x64`，并实际启动对应架构的产物。
+`npm run dist:mac:x64`，并实际启动对应架构的产物。macOS 构建后还必须运行对应的
+`npm run verify:mac:arm64` 或 `npm run verify:mac:x64`；严格签名校验失败时不得上传。
 
 ## 3. 创建发布
 
@@ -40,6 +41,7 @@ git push origin vX.Y.Z
 arm64 和 macOS x64 安装包，生成 `SHA256SUMS.txt`，并创建草稿预发布。检查以下项目后再手动发布草稿：
 
 - Windows x64 `.exe`、macOS arm64 `.dmg` 和 macOS x64 `.dmg` 均已上传。
+- 两个 macOS 应用包均已通过 `codesign --verify --deep --strict`。
 - `SHA256SUMS.txt` 包含所有安装包且哈希可复算。
 - Release notes 与 `CHANGELOG.md` 对应版本一致。
 - 在干净机器或虚拟机中完成基本安装、启动、账号切换和卸载检查。

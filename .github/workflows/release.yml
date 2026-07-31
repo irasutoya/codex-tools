@@ -50,10 +50,12 @@ jobs:
             runner: macos-latest
             target: aarch64-apple-darwin
             script: dist:mac:arm64
+            verify_script: verify:mac:arm64
           - arch: x64
             runner: macos-15-intel
             target: x86_64-apple-darwin
             script: dist:mac:x64
+            verify_script: verify:mac:x64
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     steps:
@@ -74,6 +76,8 @@ jobs:
       - run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --locked -- -D warnings
       - run: cargo test --manifest-path src-tauri/Cargo.toml --locked
       - run: npm run ${{ matrix.script }}
+      - name: Verify macOS bundle signature
+        run: npm run ${{ matrix.verify_script }}
       - uses: actions/upload-artifact@v4
         with:
           name: macos-${{ matrix.arch }}-installer

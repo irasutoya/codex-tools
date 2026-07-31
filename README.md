@@ -32,15 +32,27 @@ Codex Tools 是一个轻量的 Tauri 2 + Rust 桌面应用。它直接更新 Cod
 从 [Releases](https://github.com/irasutoya/codex-tools/releases/latest)
 下载适合当前系统的安装包：
 
-| 平台    | 发布产物           | 系统要求                |
-| ------- | ------------------ | ----------------------- |
-| Windows | NSIS `.exe` 安装包 | Windows 10/11、WebView2 |
-| macOS   | 通用架构 `.dmg`    | macOS 11 或更高版本     |
+| 平台                | 发布产物                | 系统要求                |
+| ------------------- | ----------------------- | ----------------------- |
+| Windows x64         | `_x64-setup.exe` 安装包 | Windows 10/11、WebView2 |
+| macOS Apple Silicon | `_aarch64.dmg` 磁盘映像 | macOS 11 或更高版本     |
+| macOS Intel         | `_x64.dmg` 磁盘映像     | macOS 11 或更高版本     |
 
 > [!IMPORTANT]
 > 当前自动构建的安装包尚未配置 Authenticode 或 Apple Developer ID
 > 签名。系统可能显示“未知发布者”或阻止打开。请先核对 Release 来源和
 > `SHA256SUMS.txt`；不确定时请从源码构建，不要关闭系统安全防护。
+
+macOS 用户将应用拖入“应用程序”后，如果首次启动被 Gatekeeper 阻止，请打开
+“系统设置 → 隐私与安全性”，确认来源后选择“仍要打开”。如果已经核对
+`SHA256SUMS.txt`，但系统仍将应用误报为“已损坏”，可以只移除 Codex Tools 的
+下载隔离标记，然后重新打开：
+
+```shell
+xattr -dr com.apple.quarantine "/Applications/Codex Tools.app"
+```
+
+此命令只处理指定应用，不会关闭 macOS 的全局安全检查。
 
 Codex Tools 面向已经安装并使用 Codex 的用户。启动后应用会自动寻找 Codex
 配置目录和 CLI；也可以通过 `CODEX_HOME` 和 `CODEX_BIN` 环境变量指定位置。
