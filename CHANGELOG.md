@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-07-31
+
 ### Added
 
 - Codex 账号页新增独立的反代号登录入口，支持导入 `at-...`、`accessToken`、`refresh_token` 或账号 JSON，原始 JSON 不会落盘。
@@ -46,6 +48,7 @@
 - 上游密钥和自定义请求头改为 Rust 后端只写、前端脱敏；会话扫描增加大小及并发边界。
 - 删除应用配置版本迁移、废弃协议兼容分支、旧模型字段清理和未使用 IPC；相同配置不再重复写盘，账号切换前不再扫描全部会话。
 
-[Unreleased]: https://github.com/irasutoya/codex-tools/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/irasutoya/codex-tools/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/irasutoya/codex-tools/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/irasutoya/codex-tools/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/irasutoya/codex-tools/releases/tag/v0.1.0
