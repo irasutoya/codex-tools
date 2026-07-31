@@ -63,6 +63,7 @@ import {
 } from "@/components/ui/table"
 import { call } from "@/lib/ipc"
 import { notify } from "@/lib/feedback"
+import { notifyRepairWarnings } from "@/lib/repair-feedback"
 import { epochMilliseconds } from "@/lib/time"
 import type { PageProps, PageResult, RepairScan, Session } from "@/types"
 
@@ -78,7 +79,7 @@ function oppositeProvider(provider: string): ManagedProvider {
 }
 
 function providerLabel(provider: string) {
-  if (provider === "openai") return "OpenAI 官方账号"
+  if (provider === "openai") return "OpenAI 账号"
   if (provider === "custom") return "第三方 API"
   return provider || "未识别"
 }
@@ -160,7 +161,7 @@ export default function SessionsPage({ active }: PageProps) {
     setRefreshing(true)
     void refreshAll()
       .then(() => notify.success("会话列表已刷新"))
-      .catch((reason) => notify.error("会话列表刷新失败", reason))
+      .catch((reason) => notify.error("无法刷新会话列表", reason))
       .finally(() => setRefreshing(false))
   }
 
@@ -215,19 +216,17 @@ export default function SessionsPage({ active }: PageProps) {
       })
       notify.success(
         "会话归属已更新",
-        `修改了 ${result.filesModified} 个文件和 ${result.rowsUpdated} 条数据库记录。`
+        `修改了 ${result.filesModified} 个会话文件中的 ${result.sessionMetaUpdated} 条连接标记，以及 ${result.rowsUpdated} 条数据库记录。`
       )
-      result.warnings.forEach((warning) =>
-        notify.warning("部分会话未能更新", warning)
-      )
+      notifyRepairWarnings(result, "会话归属更新已完成")
       setRepairTarget(oppositeProvider(result.targetProvider))
       try {
         await refreshAll()
       } catch (reason) {
-        notify.warning("归属已更新，但列表刷新失败", reason)
+        notify.warning("会话归属已更新，但无法读取最新列表", reason)
       }
     } catch (reason) {
-      notify.error("会话归属更新失败", reason)
+      notify.error("无法更新会话归属", reason)
     } finally {
       setBusy(false)
     }
@@ -258,7 +257,7 @@ export default function SessionsPage({ active }: PageProps) {
             label="连接归属"
             value={scan.sessionMetaCount}
             icon={ScanSearch}
-            detail={`当前标记为 ${providerLabel(scan.currentProvider)}`}
+            detail={`配置当前使用 ${providerLabel(scan.currentProvider)}`}
           />
           <MetricCard
             label="会话文件"
@@ -275,11 +274,24 @@ export default function SessionsPage({ active }: PageProps) {
         </div>
       </section>
 
+      {scan.warnings.length > 0 && (
+        <Alert>
+          <TriangleAlert />
+          <AlertTitle>部分会话数据未能检查</AlertTitle>
+          <AlertDescription>
+            <ErrorDetails error={scan.warnings.join("\n")}>
+              已完成其余数据的扫描，共有 {scan.warnings.length}
+              项警告。展开详情可查看首批原因。
+            </ErrorDetails>
+          </AlertDescription>
+        </Alert>
+      )}
+
       <Card size="sm">
         <CardHeader>
           <CardTitle>更新会话归属</CardTitle>
           <CardDescription>
-            切换连接后，将已有会话标记为当前账号或 API 服务。
+            将已有会话的连接标记统一更新为 OpenAI 或第三方 API。
           </CardDescription>
           <CardAction>
             <Badge variant="outline">目标：{providerLabel(target)}</Badge>
@@ -290,7 +302,8 @@ export default function SessionsPage({ active }: PageProps) {
             <Info />
             <AlertTitle>只更新归属信息</AlertTitle>
             <AlertDescription>
-              不会改动或上传对话内容。正在使用的会话会自动跳过，可稍后重试。
+              只修改本机元数据中的连接标记，不读取或上传对话正文。若文件同时被
+              Codex 修改，程序会保留原文件并报告警告。
             </AlertDescription>
           </Alert>
           <ItemGroup className="grid gap-2 sm:grid-cols-2">
@@ -335,7 +348,7 @@ export default function SessionsPage({ active }: PageProps) {
         <CardHeader>
           <CardTitle>会话记录</CardTitle>
           <CardDescription>
-            仅查看 Codex 保存在本机的会话，不会复制或上传。
+            列表来自本机 Codex 会话文件和已识别的数据库，不会上传。
           </CardDescription>
           <CardAction>
             <Button
@@ -367,7 +380,10 @@ export default function SessionsPage({ active }: PageProps) {
               <TableBody>
                 {sessions.items.map((session) => (
                   <TableRow key={session.identity}>
-                    <TableCell className="max-w-80 truncate font-medium">
+                    <TableCell
+                      className="max-w-80 truncate font-medium"
+                      title={session.title || session.id}
+                    >
                       {session.title || session.id}
                     </TableCell>
                     <TableCell>
@@ -375,7 +391,10 @@ export default function SessionsPage({ active }: PageProps) {
                         {providerLabel(session.provider)}
                       </Badge>
                     </TableCell>
-                    <TableCell className="hidden max-w-64 truncate lg:table-cell">
+                    <TableCell
+                      className="hidden max-w-64 truncate lg:table-cell"
+                      title={session.cwd}
+                    >
                       {session.cwd}
                     </TableCell>
                     <TableCell className="whitespace-nowrap tabular-nums">
@@ -400,7 +419,7 @@ export default function SessionsPage({ active }: PageProps) {
           )}
         </CardContent>
         {sessions.total > 0 && (
-          <CardFooter className="justify-between gap-3">
+          <CardFooter className="flex-wrap justify-between gap-3">
             <div
               className="flex items-center gap-2 text-xs text-muted-foreground"
               aria-live="polite"
@@ -452,7 +471,8 @@ export default function SessionsPage({ active }: PageProps) {
               将会话归属更新为{providerLabel(target)}？
             </AlertDialogTitle>
             <AlertDialogDescription>
-              不会改动或上传对话内容。Codex 正在使用的会话会保持原样。
+              程序只修改本机会话的连接标记。若 Codex
+              同时写入某个会话文件，该文件会保持原样并在完成后报告。
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>

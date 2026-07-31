@@ -2,9 +2,15 @@ import { Clock3, Gauge } from "lucide-react"
 
 import { Badge } from "@/components/ui/badge"
 import { epochMilliseconds } from "@/lib/time"
+import { cn } from "@/lib/utils"
 import type { AccountQuota } from "@/types"
 
 import { quotaRows, quotaStatusText } from "./quota-format"
+
+const quotaTimestampFormatter = new Intl.DateTimeFormat("zh-CN", {
+  dateStyle: "short",
+  timeStyle: "short",
+})
 
 export function QuotaStatusView({
   quota,
@@ -20,7 +26,7 @@ export function QuotaStatusView({
     <div className="flex min-w-0 flex-col gap-2">
       <div className="flex flex-wrap items-center gap-2">
         <span className="flex items-center gap-1.5 text-xs font-medium">
-          <Gauge className="size-3.5" />
+          <Gauge className="size-3.5" aria-hidden="true" />
           额度
         </span>
         <Badge variant={successful ? "default" : "secondary"}>
@@ -28,7 +34,7 @@ export function QuotaStatusView({
         </Badge>
         {quota?.fetchedAt && (
           <span className="flex items-center gap-1 text-xs text-muted-foreground">
-            <Clock3 className="size-3" />
+            <Clock3 className="size-3" aria-hidden="true" />
             {formatTimestamp(quota.fetchedAt)}
           </span>
         )}
@@ -41,11 +47,10 @@ export function QuotaStatusView({
             </p>
           )}
           <div
-            className={
-              compact
-                ? "grid gap-2 sm:grid-cols-2"
-                : "grid gap-2 md:grid-cols-2"
-            }
+            className={cn(
+              "grid gap-2",
+              compact ? "sm:grid-cols-2" : "md:grid-cols-2"
+            )}
           >
             {rows.map((row) => (
               <div
@@ -71,7 +76,9 @@ export function QuotaStatusView({
         </>
       )}
       {quota?.error && !successful && (
-        <p className="text-xs text-muted-foreground">{quota.error}</p>
+        <p className="max-h-20 overflow-auto text-xs break-all text-muted-foreground">
+          {quota.error}
+        </p>
       )}
     </div>
   )
@@ -80,8 +87,5 @@ export function QuotaStatusView({
 function formatTimestamp(value: number) {
   const date = new Date(epochMilliseconds(value))
   if (Number.isNaN(date.getTime())) return "时间未知"
-  return new Intl.DateTimeFormat("zh-CN", {
-    dateStyle: "short",
-    timeStyle: "short",
-  }).format(date)
+  return quotaTimestampFormatter.format(date)
 }

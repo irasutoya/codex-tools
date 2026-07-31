@@ -18,7 +18,7 @@ export function ErrorDetails({
         <summary className="cursor-pointer text-xs font-medium">
           查看错误详情
         </summary>
-        <p className="mt-2 font-mono text-xs break-words">
+        <p className="mt-2 max-h-40 overflow-auto font-mono text-xs break-all whitespace-pre-wrap">
           {formatError(error)}
         </p>
       </details>

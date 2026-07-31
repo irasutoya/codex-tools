@@ -130,7 +130,7 @@ fn parse_quota_payload(payload: &Value, now: i64) -> Result<QuotaData, String> {
     let rate_limit = payload
         .get("rate_limit")
         .or_else(|| payload.get("data").and_then(|data| data.get("rate_limit")))
-        .ok_or_else(|| "OpenAI 官方额度响应中没有 5H/7D 窗口".to_string())?;
+        .ok_or_else(|| "OpenAI 额度响应中没有 5H/7D 窗口".to_string())?;
     let primary = rate_limit
         .get("primary_window")
         .filter(|window| !window.is_null())
@@ -142,7 +142,7 @@ fn parse_quota_payload(payload: &Value, now: i64) -> Result<QuotaData, String> {
         .map(|window| parse_window(window, now))
         .transpose()?;
     if primary.is_none() && secondary.is_none() {
-        return Err("OpenAI 官方额度响应中没有可用的 5H/7D 窗口".into());
+        return Err("OpenAI 额度响应中没有可用的 5H/7D 窗口".into());
     }
     Ok(QuotaData::Windowed { primary, secondary })
 }

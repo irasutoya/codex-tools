@@ -16,6 +16,8 @@ use std::{
 use toml_edit::{DocumentMut, Item, Table, Value, value};
 
 pub const MANAGED_PROVIDER_ID: &str = "custom";
+const MAX_CODEX_CONFIG_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_CODEX_AUTH_BYTES: u64 = 4 * 1024 * 1024;
 
 #[derive(Clone)]
 struct PendingPatch {
@@ -254,7 +256,18 @@ fn is_personal_access_token_credential(credential: &CodexAuthCredential) -> bool
 
 pub fn inspect(codex_home: &Path) -> ConfigInspection {
     let path = codex_home.join("config.toml");
-    let text = fs::read_to_string(&path).unwrap_or_default();
+    let text = match read_optional(&path) {
+        Ok(text) => text,
+        Err(error) => {
+            return ConfigInspection {
+                path: path.display().to_string(),
+                valid: false,
+                active_provider: None,
+                managed_provider_present: false,
+                warnings: vec![error.to_string()],
+            };
+        }
+    };
     match text.parse::<DocumentMut>() {
         Ok(document) => {
             let custom = document
@@ -468,18 +481,49 @@ fn render_auth_object(
 }
 
 fn read_optional(path: &Path) -> Result<String, AppError> {
+    reject_oversized_file(
+        path,
+        MAX_CODEX_CONFIG_BYTES,
+        "Codex 配置文件超过 2 MB，程序已停止读取以避免占用过多内存。",
+    )?;
     match fs::read_to_string(path) {
-        Ok(value) => Ok(value),
+        Ok(value) if value.len() as u64 <= MAX_CODEX_CONFIG_BYTES => Ok(value),
+        Ok(_) => Err(AppError::InvalidConfig(
+            "Codex 配置文件超过 2 MB，程序已停止读取以避免占用过多内存。".into(),
+        )),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
-        Err(error) => Err(error.into()),
+        Err(error) => Err(AppError::Internal(format!(
+            "无法读取 Codex 配置文件，请检查文件权限：{error}"
+        ))),
     }
 }
 
 fn read_optional_bytes(path: &Path) -> Result<Vec<u8>, AppError> {
+    reject_oversized_file(
+        path,
+        MAX_CODEX_AUTH_BYTES,
+        "Codex 登录文件超过 4 MB，程序已停止读取以避免占用过多内存。",
+    )?;
     match fs::read(path) {
-        Ok(value) => Ok(value),
+        Ok(value) if value.len() as u64 <= MAX_CODEX_AUTH_BYTES => Ok(value),
+        Ok(_) => Err(AppError::InvalidConfig(
+            "Codex 登录文件超过 4 MB，程序已停止读取以避免占用过多内存。".into(),
+        )),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
-        Err(error) => Err(error.into()),
+        Err(error) => Err(AppError::Internal(format!(
+            "无法读取 Codex 登录文件，请检查文件权限：{error}"
+        ))),
+    }
+}
+
+fn reject_oversized_file(path: &Path, limit: u64, message: &'static str) -> Result<(), AppError> {
+    match fs::metadata(path) {
+        Ok(metadata) if metadata.len() > limit => Err(AppError::InvalidConfig(message.into())),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(AppError::Internal(format!(
+            "无法检查 Codex 文件大小，请检查文件权限：{error}"
+        ))),
     }
 }
 
@@ -564,6 +608,26 @@ fn managed_custom_preview(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inspection_rejects_oversized_config_files() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(
+            temp.path().join("config.toml"),
+            vec![b'x'; MAX_CODEX_CONFIG_BYTES as usize + 1],
+        )
+        .unwrap();
+
+        let inspection = inspect(temp.path());
+
+        assert!(!inspection.valid);
+        assert!(
+            inspection
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("超过 2 MB"))
+        );
+    }
 
     fn prepare_home(home: &Path) {
         fs::create_dir_all(home).unwrap();

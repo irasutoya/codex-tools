@@ -100,6 +100,16 @@ import {
 
 import { QuotaStatusView } from "./quota-status"
 
+const MAX_DISPLAY_NAME_LENGTH = 100
+const MAX_API_URL_LENGTH = 2_048
+const MAX_API_KEY_LENGTH = 65_536
+const MAX_ACCOUNT_ID_LENGTH = 512
+const MAX_COOKIE_CREDENTIAL_LENGTH = 262_144
+const accountTimestampFormatter = new Intl.DateTimeFormat("zh-CN", {
+  dateStyle: "medium",
+  timeStyle: "short",
+})
+
 export default function ProvidersPage({ active }: PageProps) {
   const [providers, setProviders] = useState<Provider[]>([])
   const [accounts, setAccounts] = useState<Account[]>([])
@@ -205,7 +215,7 @@ export default function ProvidersPage({ active }: PageProps) {
                 )
                 .finally(() =>
                   load().catch((error) =>
-                    notify.error("账号列表刷新失败", error)
+                    notify.warning("登录已完成，但无法读取最新账号列表", error)
                   )
                 )
             })
@@ -213,7 +223,7 @@ export default function ProvidersPage({ active }: PageProps) {
               if (cancelled) return
               if (!pollErrorShown) {
                 pollErrorShown = true
-                notify.warning("正在重新确认登录结果", error)
+                notify.warning("暂时无法确认登录结果，程序将自动重试", error)
               }
               scheduleNextPoll()
             })
@@ -243,7 +253,7 @@ export default function ProvidersPage({ active }: PageProps) {
         try {
           await load()
         } catch (error) {
-          notify.warning("操作已完成，但列表刷新失败", error)
+          notify.warning("操作已完成，但无法读取最新列表", error)
         }
       }
     } catch (error) {
@@ -316,7 +326,8 @@ export default function ProvidersPage({ active }: PageProps) {
               Codex 账号
             </h2>
             <p className="text-sm text-muted-foreground">
-              正常号与反代号统一管理，5H/7D 均从 OpenAI 官方查询。
+              网页登录账号与 Cookie 账号统一管理；5H/7D 额度以 OpenAI
+              接口实际返回为准。
             </p>
           </div>
           <div className="flex flex-wrap gap-2">
@@ -331,8 +342,10 @@ export default function ProvidersPage({ active }: PageProps) {
                       (result) => result.quota.status === "success"
                     ).length
                     notify.success(
-                      "官方额度刷新完成",
-                      `${succeeded}/${results.length} 个账号查询成功。`
+                      "账号额度刷新完成",
+                      succeeded === results.length
+                        ? `${results.length} 个账号均查询成功。`
+                        : `${succeeded}/${results.length} 个账号查询成功；其余账号请查看各自状态。`
                     )
                   })
                 }
@@ -351,7 +364,7 @@ export default function ProvidersPage({ active }: PageProps) {
               onClick={() => setProxyLoginOpen(true)}
             >
               <KeyRound data-icon="inline-start" />
-              登录反代号
+              导入 Cookie
             </Button>
             <Button
               disabled={busy || Boolean(deviceAuthorization)}
@@ -434,7 +447,7 @@ export default function ProvidersPage({ active }: PageProps) {
                   </EmptyMedia>
                   <EmptyTitle>尚未添加 Codex 账号</EmptyTitle>
                   <EmptyDescription>
-                    可通过 OpenAI 网页登录正常号，或导入反代号。
+                    可通过 OpenAI 网页登录，也可粘贴 Cookie 凭据导入账号。
                   </EmptyDescription>
                 </EmptyHeader>
                 <EmptyContent className="flex flex-wrap gap-2">
@@ -445,7 +458,7 @@ export default function ProvidersPage({ active }: PageProps) {
                     onClick={() => setProxyLoginOpen(true)}
                   >
                     <KeyRound data-icon="inline-start" />
-                    登录反代号
+                    导入 Cookie
                   </Button>
                   <Button
                     size="sm"
@@ -477,7 +490,7 @@ export default function ProvidersPage({ active }: PageProps) {
                         {item.name}
                         <Badge variant="outline">
                           {item.source === "proxy_import"
-                            ? "反代号"
+                            ? "Cookie"
                             : "网页登录"}
                         </Badge>
                         {item.active && <Badge>使用中</Badge>}
@@ -493,7 +506,7 @@ export default function ProvidersPage({ active }: PageProps) {
                                 : ""
                             }`
                           : item.source === "proxy_import"
-                            ? "有效期由反代 Token 决定"
+                            ? "有效期取决于 Cookie 中的访问凭据"
                             : "有效期由 OpenAI 自动管理"}
                       </ItemDescription>
                       <QuotaStatusView quota={item.quota} compact />
@@ -503,8 +516,8 @@ export default function ProvidersPage({ active }: PageProps) {
                         size="icon-sm"
                         variant="ghost"
                         disabled={busy}
-                        aria-label={`刷新 ${item.name} 的官方额度`}
-                        title="刷新官方额度"
+                        aria-label={`刷新 ${item.name} 的 OpenAI 额度`}
+                        title="刷新 OpenAI 额度"
                         onClick={() =>
                           void run(`official:quota:${item.id}`, async () => {
                             const quota = await call(
@@ -512,10 +525,10 @@ export default function ProvidersPage({ active }: PageProps) {
                               { accountId: item.id }
                             )
                             if (quota.status === "success") {
-                              notify.success("官方额度已更新")
+                              notify.success("OpenAI 额度已更新")
                             } else {
                               notify.warning(
-                                "官方额度未更新",
+                                "OpenAI 额度未更新",
                                 quota.error ?? "OpenAI 暂未返回额度。"
                               )
                             }
@@ -523,9 +536,9 @@ export default function ProvidersPage({ active }: PageProps) {
                         }
                       >
                         {pendingTask === `official:quota:${item.id}` ? (
-                          <Spinner />
+                          <Spinner data-icon="inline-start" />
                         ) : (
-                          <RefreshCw />
+                          <RefreshCw data-icon="inline-start" />
                         )}
                       </Button>
                       <Button
@@ -555,7 +568,7 @@ export default function ProvidersPage({ active }: PageProps) {
                           })
                         }
                       >
-                        <Trash2 />
+                        <Trash2 data-icon="inline-start" />
                       </Button>
                     </ItemActions>
                   </Item>
@@ -575,7 +588,8 @@ export default function ProvidersPage({ active }: PageProps) {
               第三方 API
             </h2>
             <p className="text-sm text-muted-foreground">
-              连接兼容 Responses API 的服务；请求由 Codex 直接发送。
+              管理兼容 OpenAI Responses API 的服务。请求由 Codex
+              直接发送，不经过本应用转发。
             </p>
           </div>
           <Button onClick={() => setDraft(emptyProvider())}>
@@ -592,7 +606,7 @@ export default function ProvidersPage({ active }: PageProps) {
                 </EmptyMedia>
                 <EmptyTitle>尚未添加第三方 API</EmptyTitle>
                 <EmptyDescription>
-                  添加兼容 OpenAI Responses API 的服务即可开始使用。
+                  先添加服务地址，再添加 API Key 并测试连接。
                 </EmptyDescription>
               </EmptyHeader>
               <EmptyContent>
@@ -619,7 +633,7 @@ export default function ProvidersPage({ active }: PageProps) {
                     <span className="truncate" title={provider.baseUrl}>
                       {provider.baseUrl}
                     </span>
-                    <span>Responses API · 模型列表由 Codex 读取</span>
+                    <span>Responses API · 模型列表由 Codex 请求</span>
                   </CardDescription>
                   <CardAction>
                     <DropdownMenu>
@@ -633,7 +647,7 @@ export default function ProvidersPage({ active }: PageProps) {
                           />
                         }
                       >
-                        <MoreHorizontal />
+                        <MoreHorizontal data-icon="inline-start" />
                       </DropdownMenuTrigger>
                       <DropdownMenuContent align="end" className="w-44">
                         <DropdownMenuGroup>
@@ -674,7 +688,7 @@ export default function ProvidersPage({ active }: PageProps) {
                       <EmptyHeader>
                         <EmptyTitle>尚未添加 API Key</EmptyTitle>
                         <EmptyDescription>
-                          添加后即可测试连接并使用此服务。
+                          添加后可测试连接；切换后 Codex 才会使用此密钥。
                         </EmptyDescription>
                       </EmptyHeader>
                       <EmptyContent>
@@ -705,7 +719,7 @@ export default function ProvidersPage({ active }: PageProps) {
                               {item.active && <Badge>使用中</Badge>}
                             </ItemTitle>
                             <ItemDescription>
-                              API Key 仅保存在本机，启用时写入 Codex。
+                              API Key 保存在本机，切换到此服务时写入 Codex。
                             </ItemDescription>
                           </ItemContent>
                           <ItemActions className="ml-auto">
@@ -741,7 +755,7 @@ export default function ProvidersPage({ active }: PageProps) {
                                   />
                                 }
                               >
-                                <MoreHorizontal />
+                                <MoreHorizontal data-icon="inline-start" />
                               </DropdownMenuTrigger>
                               <DropdownMenuContent align="end" className="w-40">
                                 <DropdownMenuGroup>
@@ -767,7 +781,10 @@ export default function ProvidersPage({ active }: PageProps) {
                                               detail
                                             )
                                           } else {
-                                            notify.error("连接测试失败", detail)
+                                            notify.error(
+                                              "连接测试未通过",
+                                              detail
+                                            )
                                           }
                                         },
                                         false
@@ -854,19 +871,19 @@ export default function ProvidersPage({ active }: PageProps) {
                 content,
               })
               setProxyLoginOpen(false)
-              notify.success("反代号已登录", imported.name)
+              notify.success("Cookie 账号已导入", imported.name)
               try {
                 const quota = await call("refresh_official_account_quota", {
                   accountId: imported.id,
                 })
                 if (quota.status !== "success") {
                   notify.warning(
-                    "反代号已保存，但额度暂未更新",
+                    "Cookie 账号已保存，但额度暂未更新",
                     quota.error ?? "OpenAI 暂未返回额度。"
                   )
                 }
               } catch (error) {
-                notify.warning("反代号已保存，但额度暂未更新", error)
+                notify.warning("Cookie 账号已保存，但额度暂未更新", error)
               }
             })
           }
@@ -880,8 +897,8 @@ export default function ProvidersPage({ active }: PageProps) {
           <AlertDialogHeader>
             <AlertDialogTitle>登录并切换到 OpenAI？</AlertDialogTitle>
             <AlertDialogDescription>
-              登录成功后，Codex 会立即使用新账号。第三方 API
-              和其他设置不会删除。
+              登录完成后，Codex 会切换到新账号。已保存的第三方 API 服务和其他
+              Codex 设置会保留。
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
@@ -915,8 +932,8 @@ export default function ProvidersPage({ active }: PageProps) {
           <AlertDialogHeader>
             <AlertDialogTitle>切换到此 API 服务？</AlertDialogTitle>
             <AlertDialogDescription>
-              Codex 将使用此服务的地址和密钥，并自动读取模型列表。OpenAI
-              账号仍会保留。
+              Codex 将使用此服务的地址和 API Key，并直接请求 Responses API
+              和模型列表。已保存的 OpenAI 账号会保留。
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
@@ -1055,27 +1072,24 @@ export default function ProvidersPage({ active }: PageProps) {
 }
 
 function taskFailureTitle(task: string) {
-  if (task.startsWith("account:test:")) return "连接测试失败"
-  if (task === "provider:save") return "API 服务保存失败"
-  if (task === "account:save") return "API Key 保存失败"
-  if (task === "proxy:login") return "反代号登录失败"
-  if (task.startsWith("official:quota:")) return "官方额度刷新失败"
+  if (task.startsWith("account:test:")) return "无法完成连接测试"
+  if (task === "provider:save") return "无法保存 API 服务"
+  if (task === "account:save") return "无法保存 API Key"
+  if (task === "proxy:login") return "无法导入 Cookie 账号"
+  if (task.startsWith("official:quota:")) return "无法刷新 OpenAI 额度"
   if (task === "openai:login") return "无法开始 OpenAI 登录"
   if (task.startsWith("account:activate:")) return "无法切换 API 服务"
   if (task.startsWith("openai:activate:")) return "无法切换 OpenAI 账号"
-  if (task.startsWith("openai:delete:")) return "OpenAI 账号删除失败"
-  if (task.startsWith("delete:provider:")) return "API 服务删除失败"
-  if (task.startsWith("delete:account:")) return "API Key 删除失败"
+  if (task.startsWith("openai:delete:")) return "无法删除 OpenAI 账号"
+  if (task.startsWith("delete:provider:")) return "无法删除 API 服务"
+  if (task.startsWith("delete:account:")) return "无法删除 API Key"
   return "操作未完成"
 }
 
 function formatTimestamp(value: number) {
   const date = new Date(epochMilliseconds(value))
   if (Number.isNaN(date.getTime())) return "时间未知"
-  return new Intl.DateTimeFormat("zh-CN", {
-    dateStyle: "medium",
-    timeStyle: "short",
-  }).format(date)
+  return accountTimestampFormatter.format(date)
 }
 
 function ProviderEditor({
@@ -1100,7 +1114,7 @@ function ProviderEditor({
         if (!open && !busy) onCancel()
       }}
     >
-      <DialogContent>
+      <DialogContent className="sm:max-w-md">
         <DialogHeader>
           <DialogTitle>
             {value.id ? "编辑 API 服务" : "添加 API 服务"}
@@ -1110,25 +1124,30 @@ function ProviderEditor({
           </DialogDescription>
         </DialogHeader>
         <FieldGroup>
-          <Field>
+          <Field data-disabled={busy}>
             <FieldLabel htmlFor="provider-name">服务名称</FieldLabel>
             <Input
               id="provider-name"
               autoFocus
+              disabled={busy}
               required
+              maxLength={MAX_DISPLAY_NAME_LENGTH}
               placeholder="例如：公司 API"
               value={value.name}
               onChange={(event) =>
                 onChange({ ...value, name: event.target.value })
               }
             />
+            <FieldDescription>最多 100 个字符。</FieldDescription>
           </Field>
-          <Field>
+          <Field data-disabled={busy}>
             <FieldLabel htmlFor="provider-base-url">API 地址</FieldLabel>
             <Input
               id="provider-base-url"
               type="url"
+              disabled={busy}
               required
+              maxLength={MAX_API_URL_LENGTH}
               placeholder="https://api.example.com/v1"
               value={value.baseUrl}
               onChange={(event) =>
@@ -1136,10 +1155,10 @@ function ProviderEditor({
               }
             />
             <FieldDescription>
-              填写服务商提供的 API 根地址，通常以 /v1 结尾。
+              最多 2,048 个字符。填写服务商提供的 API 根地址，通常以 /v1 结尾。
             </FieldDescription>
           </Field>
-          <Field orientation="horizontal">
+          <Field orientation="horizontal" data-disabled={busy}>
             <FieldContent>
               <FieldTitle>启用此服务</FieldTitle>
               <FieldDescription>
@@ -1149,6 +1168,7 @@ function ProviderEditor({
             <Switch
               id="provider-enabled"
               aria-label="启用此服务"
+              disabled={busy}
               checked={value.enabled}
               onCheckedChange={(enabled) => onChange({ ...value, enabled })}
             />
@@ -1195,7 +1215,7 @@ function AccountEditor({
         if (!open && !pending) onCancel()
       }}
     >
-      <DialogContent>
+      <DialogContent className="sm:max-w-md">
         <DialogHeader>
           <DialogTitle>添加 API Key</DialogTitle>
           <DialogDescription>
@@ -1203,26 +1223,31 @@ function AccountEditor({
           </DialogDescription>
         </DialogHeader>
         <FieldGroup>
-          <Field>
+          <Field data-disabled={pending}>
             <FieldLabel htmlFor="account-name">密钥名称</FieldLabel>
             <Input
               id="account-name"
               autoFocus
+              disabled={pending}
               required
+              maxLength={MAX_DISPLAY_NAME_LENGTH}
               placeholder="例如：个人密钥"
               value={value.name}
               onChange={(event) =>
                 onChange({ ...value, name: event.target.value })
               }
             />
+            <FieldDescription>最多 100 个字符。</FieldDescription>
           </Field>
-          <Field>
+          <Field data-disabled={pending}>
             <FieldLabel htmlFor="account-api-key">API Key</FieldLabel>
             <Input
               id="account-api-key"
               required
+              disabled={pending}
               type="password"
               autoComplete="off"
+              maxLength={MAX_API_KEY_LENGTH}
               placeholder="sk-…"
               value={value.apiKey ?? ""}
               onChange={(event) =>
@@ -1234,7 +1259,8 @@ function AccountEditor({
               }
             />
             <FieldDescription>
-              仅保存在本机；启用服务后写入 Codex 的 auth.json。
+              最多 65,536 个字符。密钥保存在本机；切换到此服务时写入 Codex 的
+              auth.json。
             </FieldDescription>
           </Field>
         </FieldGroup>
@@ -1274,7 +1300,8 @@ function ProxyLoginDialog({
 }) {
   const [name, setName] = useState("")
   const [accountId, setAccountId] = useState("")
-  const [content, setContent] = useState("")
+  const [hasContent, setHasContent] = useState(false)
+  const contentRef = useRef<HTMLTextAreaElement>(null)
 
   return (
     <Dialog
@@ -1283,53 +1310,66 @@ function ProxyLoginDialog({
         if (!open && !pending) onCancel()
       }}
     >
-      <DialogContent>
+      <DialogContent className="sm:max-w-lg">
         <DialogHeader>
-          <DialogTitle>登录反代号</DialogTitle>
+          <DialogTitle>导入 Cookie 账号</DialogTitle>
           <DialogDescription>
-            粘贴反代提供的 Token 或账号 JSON。登录后会从 OpenAI 官方查询 5H/7D。
+            粘贴 Cookie Token 或单账号 JSON。这里不会读取浏览器
+            Cookie；导入后会尝试向 OpenAI 查询 5H/7D 额度。
           </DialogDescription>
         </DialogHeader>
         <FieldGroup>
-          <Field>
+          <Field data-disabled={pending}>
             <FieldLabel htmlFor="proxy-account-name">账号名称</FieldLabel>
             <Input
               id="proxy-account-name"
               autoFocus
-              placeholder="可选，例如：日常反代号"
+              disabled={pending}
+              maxLength={MAX_DISPLAY_NAME_LENGTH}
+              placeholder="可选，例如：工作 Cookie 账号"
               value={name}
               onChange={(event) => setName(event.target.value)}
             />
           </Field>
-          <Field>
+          <Field data-disabled={pending}>
             <FieldLabel htmlFor="proxy-account-id">
               ChatGPT Account ID
             </FieldLabel>
             <Input
               id="proxy-account-id"
               autoComplete="off"
+              disabled={pending}
+              maxLength={MAX_ACCOUNT_ID_LENGTH}
               placeholder="可选；团队号查询额度时可能需要"
               value={accountId}
               onChange={(event) => setAccountId(event.target.value)}
             />
             <FieldDescription>
-              个人号通常留空；账号 JSON 已包含 accountId 时也可留空。
+              最多 512 个字符。个人账号通常留空；单账号 JSON 已包含 accountId
+              时也可留空。
             </FieldDescription>
           </Field>
-          <Field>
+          <Field data-disabled={pending}>
             <FieldLabel htmlFor="proxy-account-content">
-              Token / 账号 JSON
+              Cookie Token / 单账号 JSON
             </FieldLabel>
             <Textarea
+              ref={contentRef}
               id="proxy-account-content"
-              className="min-h-36 font-mono text-xs"
+              className="field-sizing-fixed h-40 max-h-40 min-h-40 max-w-full resize-none overflow-x-hidden overflow-y-auto font-mono text-xs break-all"
               autoComplete="off"
-              placeholder='粘贴 at-…、accessToken，或包含 "access_token" / "refresh_token" 的 JSON'
-              value={content}
-              onChange={(event) => setContent(event.target.value)}
+              disabled={pending}
+              spellCheck={false}
+              wrap="soft"
+              maxLength={MAX_COOKIE_CREDENTIAL_LENGTH}
+              placeholder='粘贴 at-…、accessToken，或包含 "access_token" / "refresh_token" 的单账号 JSON'
+              onInput={(event) =>
+                setHasContent(/\S/.test(event.currentTarget.value))
+              }
             />
             <FieldDescription>
-              原始 JSON 不会保存；程序只提取登录所需字段，凭据仅保存在本机。
+              最多 262,144 个字符。原始 JSON
+              不会保存；程序只提取登录所需字段，并将凭据写入本机应用数据文件。
             </FieldDescription>
           </Field>
         </FieldGroup>
@@ -1338,21 +1378,23 @@ function ProxyLoginDialog({
             取消
           </Button>
           <Button
-            disabled={pending || !content.trim()}
-            onClick={() =>
+            disabled={pending || !hasContent}
+            onClick={() => {
+              const content = contentRef.current?.value ?? ""
+              if (!content.trim()) return
               onLogin(
                 name.trim() || undefined,
                 accountId.trim() || undefined,
                 content
               )
-            }
+            }}
           >
             {pending ? (
               <Spinner data-icon="inline-start" />
             ) : (
               <LogIn data-icon="inline-start" />
             )}
-            {pending ? "正在登录…" : "登录反代号"}
+            {pending ? "正在导入…" : "导入并登录"}
           </Button>
         </DialogFooter>
       </DialogContent>

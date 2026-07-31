@@ -11,6 +11,7 @@ mod storage;
 
 use auth_center::{AuthCenter, DevicePollResult};
 use codex::ConfigManager;
+use futures_util::{StreamExt, stream};
 use models::*;
 use session_index::SessionIndex;
 use std::{borrow::Cow, path::PathBuf};
@@ -26,6 +27,8 @@ const DEFAULT_WINDOW_HEIGHT: f64 = 760.0;
 const MIN_WINDOW_WIDTH: f64 = 360.0;
 const MIN_WINDOW_HEIGHT: f64 = 520.0;
 const CODEX_APP_URI: &str = "codex://";
+const MAX_SESSION_QUERY_CHARS: usize = 256;
+const QUOTA_REFRESH_CONCURRENCY: usize = 4;
 
 #[derive(Default)]
 struct ActivationLock(tokio::sync::Mutex<()>);
@@ -183,14 +186,18 @@ async fn refresh_all_official_quotas_in_store(
             .map(|account| account.id.clone())
             .collect::<Vec<_>>()
     })?;
-    let mut results = Vec::with_capacity(account_ids.len());
-    for account_id in account_ids {
-        results.push(QuotaRefreshResult {
+    let requests = account_ids.into_iter().map(|account_id| async move {
+        Ok::<_, AppError>(QuotaRefreshResult {
             quota: refresh_official_quota(store, center, client, &account_id).await?,
             account_id,
-        });
-    }
-    Ok(results)
+        })
+    });
+    stream::iter(requests)
+        .buffered(QUOTA_REFRESH_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect()
 }
 
 #[tauri::command]
@@ -553,6 +560,11 @@ async fn list_sessions(
         index.invalidate();
     }
     let query = query.unwrap_or_default();
+    if query.chars().count() > MAX_SESSION_QUERY_CHARS {
+        return Err(AppError::InvalidConfig(
+            "会话搜索内容不能超过 256 个字符。".into(),
+        ));
+    }
     let page = page.unwrap_or(1).max(1);
     let page_size = page_size.unwrap_or(25).clamp(1, 100);
     tokio::task::spawn_blocking(move || session_page(&index, &home, &query, page, page_size))
@@ -649,7 +661,7 @@ async fn get_dashboard(
                                 .find(|account| account.id == id)
                         })
                         .map(|account| format!("OpenAI · {}", account.name))
-                        .unwrap_or_else(|| "OpenAI 官方账号".into())
+                        .unwrap_or_else(|| "OpenAI 账号".into())
                 })
             });
         let active_account = active_stored_provider.and_then(|provider| {

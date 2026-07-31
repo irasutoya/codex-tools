@@ -6,6 +6,12 @@ use std::{
     sync::{RwLock, RwLockReadGuard},
 };
 
+const MAX_APP_DATA_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_SAVED_PROVIDERS: usize = 500;
+const MAX_ACCOUNTS_PER_PROVIDER: usize = 500;
+const MAX_SAVED_OPENAI_ACCOUNTS: usize = 500;
+const MAX_EMAIL_CHARS: usize = 320;
+
 pub struct Store {
     root: PathBuf,
     path: PathBuf,
@@ -23,7 +29,17 @@ impl Store {
         secure_directory(&root)?;
         let path = root.join("app.yaml");
         let state = if path.exists() {
+            if fs::metadata(&path)?.len() > MAX_APP_DATA_BYTES {
+                anyhow::bail!(
+                    "应用数据文件超过 16 MB，程序已停止读取以避免占用过多内存。请备份并检查 app.yaml"
+                );
+            }
             let text = fs::read_to_string(&path)?;
+            if text.len() as u64 > MAX_APP_DATA_BYTES {
+                anyhow::bail!(
+                    "应用数据文件超过 16 MB，程序已停止读取以避免占用过多内存。请备份并检查 app.yaml"
+                );
+            }
             serde_yaml::from_str::<AppConfig>(&text).map_err(|error| {
                 anyhow::anyhow!("应用数据文件损坏，无法读取已保存的账号和服务：{error}")
             })?
@@ -128,6 +144,7 @@ impl Store {
                 .find(|value| value.profile.id == provider.id)
                 .map(|value| value.profile.headers.clone())
         };
+        let is_new = existing_headers.is_none();
         if let Some(existing_headers) = existing_headers {
             preserve_redacted_headers(&mut provider.headers, &existing_headers);
         }
@@ -156,6 +173,11 @@ impl Store {
                 };
                 existing.profile.active_account_id = active_account_id;
             } else {
+                if is_new && state.providers.len() >= MAX_SAVED_PROVIDERS {
+                    return Err(AppError::InvalidConfig(
+                        "最多可保存 500 个第三方 API 服务，请先删除不再使用的服务。".into(),
+                    ));
+                }
                 state.providers.push(StoredProvider {
                     profile: provider.clone(),
                     accounts: vec![],
@@ -258,6 +280,7 @@ impl Store {
                     .map(|account| (provider.profile.id.clone(), account))
             })
         };
+        let is_new = existing.is_none();
         if let Some((existing_provider_id, existing)) = existing {
             if account.provider_id.as_deref() != Some(existing_provider_id.as_str()) {
                 return Err(AppError::InvalidConfig(
@@ -310,6 +333,12 @@ impl Store {
             {
                 *existing = account.clone();
             } else {
+                if is_new && provider.accounts.len() >= MAX_ACCOUNTS_PER_PROVIDER {
+                    return Err(AppError::InvalidConfig(
+                        "每个第三方 API 服务最多可保存 500 个 API Key，请先删除不再使用的密钥。"
+                            .into(),
+                    ));
+                }
                 provider.accounts.push(account.clone());
             }
             Ok(())
@@ -439,6 +468,11 @@ impl Store {
             if incoming.created_at == 0 {
                 incoming.created_at = now;
             }
+            if state.official_accounts.len() >= MAX_SAVED_OPENAI_ACCOUNTS {
+                return Err(AppError::InvalidConfig(
+                    "最多可保存 500 个 OpenAI 账号，请先删除不再使用的账号。".into(),
+                ));
+            }
             incoming.updated_at = now;
             state.official_accounts.push(incoming.clone());
             Ok(incoming)
@@ -456,7 +490,7 @@ impl Store {
                 .iter_mut()
                 .find(|account| account.id == id)
                 .ok_or_else(|| {
-                    AppError::InvalidConfig("Codex 账号不存在，可能已被删除。".into())
+                    AppError::InvalidConfig("OpenAI 账号不存在，可能已被删除。".into())
                 })?;
             account.quota = quota.clone();
             Ok(quota)
@@ -549,6 +583,21 @@ fn normalize_official_account(account: &mut StoredOfficialAccount) -> Result<(),
             "OpenAI 登录信息缺少账号标识，请重新登录。".into(),
         ));
     }
+    ensure_char_limit(
+        &account.name,
+        MAX_DISPLAY_NAME_CHARS,
+        "账号名称不能超过 100 个字符。",
+    )?;
+    ensure_char_limit(
+        &account.account_id,
+        MAX_ACCOUNT_ID_CHARS,
+        "OpenAI 账号标识不能超过 512 个字符。",
+    )?;
+    ensure_char_limit(
+        &account.email,
+        MAX_EMAIL_CHARS,
+        "账号邮箱不能超过 320 个字符。",
+    )?;
     validate_official_credential(&account.credential)?;
     if account.account_id != account.credential.tokens.account_id {
         return Err(AppError::InvalidConfig(
@@ -573,6 +622,22 @@ fn validate_official_credential(credential: &CodexAuthCredential) -> Result<(), 
             "OpenAI 登录信息不完整，请重新登录。".into(),
         ));
     }
+    for token in [
+        tokens.id_token.as_str(),
+        tokens.access_token.as_str(),
+        tokens.refresh_token.as_str(),
+    ] {
+        ensure_char_limit(
+            token,
+            MAX_CREDENTIAL_CHARS,
+            "OpenAI 登录凭据过长，请重新登录或导入有效的 Cookie。",
+        )?;
+    }
+    ensure_char_limit(
+        &tokens.account_id,
+        MAX_ACCOUNT_ID_CHARS,
+        "OpenAI 账号标识不能超过 512 个字符。",
+    )?;
     Ok(())
 }
 
@@ -746,6 +811,18 @@ fn replace_file(source: &Path, target: &Path) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_oversized_app_data_before_parsing() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("app.yaml");
+        let file = fs::File::create(&path).unwrap();
+        file.set_len(MAX_APP_DATA_BYTES + 1).unwrap();
+
+        let error = Store::open(temp.path().to_path_buf()).err().unwrap();
+
+        assert!(error.to_string().contains("超过 16 MB"));
+    }
 
     fn official_account(account_id: &str, suffix: &str) -> StoredOfficialAccount {
         StoredOfficialAccount {

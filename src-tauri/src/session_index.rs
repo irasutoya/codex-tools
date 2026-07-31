@@ -3,13 +3,18 @@ use serde_json::Value;
 use std::{
     collections::HashMap,
     fs,
-    io::BufRead,
+    io::{BufRead, Read},
     path::{Path, PathBuf},
     sync::{Arc, RwLock},
     time::{Duration, Instant, SystemTime},
 };
 
 const CACHE_RECHECK_INTERVAL: Duration = Duration::from_secs(1);
+const MAX_ROLLOUT_INDEX_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_ROLLOUT_LINE_BYTES: usize = 256 * 1024;
+const MAX_SESSION_ID_CHARS: usize = 512;
+const MAX_SESSION_PROVIDER_CHARS: usize = 128;
+const MAX_SESSION_PATH_CHARS: usize = 4_096;
 
 #[derive(Clone, Default)]
 pub struct SessionIndex {
@@ -116,7 +121,13 @@ fn rebuild_from_paths(
     rollout_paths: &[PathBuf],
 ) -> anyhow::Result<Vec<SessionSummary>> {
     let mut sessions = HashMap::<String, SessionSummary>::new();
-    for session in provider_sync::list_database_sessions_from_paths(database_paths)? {
+    for mut session in provider_sync::list_database_sessions_from_paths(database_paths)? {
+        session.id = truncate_text(&session.id, MAX_SESSION_ID_CHARS);
+        session.title = truncate_text(&session.title, 512);
+        session.provider = truncate_text(&session.provider, MAX_SESSION_PROVIDER_CHARS);
+        session.original_provider =
+            truncate_text(&session.original_provider, MAX_SESSION_PROVIDER_CHARS);
+        session.cwd = truncate_text(&session.cwd, MAX_SESSION_PATH_CHARS);
         sessions.insert(session.id.clone(), session);
     }
     for path in rollout_paths {
@@ -126,8 +137,14 @@ fn rebuild_from_paths(
         let mut metadata = None;
         let mut title = String::new();
         let mut has_user_event = false;
-        for line in std::io::BufReader::new(file).lines() {
+        for line in std::io::BufReader::new(file)
+            .take(MAX_ROLLOUT_INDEX_BYTES)
+            .lines()
+        {
             let Ok(line) = line else { break };
+            if line.len() > MAX_ROLLOUT_LINE_BYTES {
+                continue;
+            }
             let Ok(record) = serde_json::from_str::<Value>(&line) else {
                 continue;
             };
@@ -161,14 +178,17 @@ fn rebuild_from_paths(
         if metadata.pointer("/source/subagent").is_some() {
             continue;
         }
-        let Some(id) = metadata.get("id").and_then(Value::as_str) else {
+        let Some(raw_id) = metadata.get("id").and_then(Value::as_str) else {
             continue;
         };
-        let provider = metadata
-            .get("model_provider")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_owned();
+        let id = truncate_text(raw_id, MAX_SESSION_ID_CHARS);
+        let provider = truncate_text(
+            metadata
+                .get("model_provider")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+            MAX_SESSION_PROVIDER_CHARS,
+        );
         let updated_at = fs::metadata(path)
             .ok()
             .and_then(|value| value.modified().ok())
@@ -177,7 +197,7 @@ fn rebuild_from_paths(
             .unwrap_or_default();
         let rollout = path.display().to_string();
         sessions
-            .entry(id.to_owned())
+            .entry(id.clone())
             .and_modify(|session| {
                 session.provider = provider.clone();
                 session.original_provider = provider.clone();
@@ -190,15 +210,18 @@ fn rebuild_from_paths(
             })
             .or_insert(SessionSummary {
                 identity: format!("rollout:{rollout}"),
-                id: id.to_owned(),
+                id,
                 title,
                 provider: provider.clone(),
-                cwd: metadata
-                    .get("cwd")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .trim_start_matches(r"\\?\")
-                    .replace('\\', "/"),
+                cwd: truncate_text(
+                    &metadata
+                        .get("cwd")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .trim_start_matches(r"\\?\")
+                        .replace('\\', "/"),
+                    MAX_SESSION_PATH_CHARS,
+                ),
                 archived: path
                     .components()
                     .any(|part| part.as_os_str() == "archived_sessions"),
@@ -212,6 +235,10 @@ fn rebuild_from_paths(
     let mut output = sessions.into_values().collect::<Vec<_>>();
     output.sort_by_key(|session| std::cmp::Reverse(session.updated_at));
     Ok(output)
+}
+
+fn truncate_text(value: &str, max_chars: usize) -> String {
+    value.chars().take(max_chars).collect()
 }
 
 #[cfg(test)]
@@ -320,5 +347,29 @@ mod tests {
         let updated = index.load(temp.path()).unwrap();
         assert_eq!(updated.len(), 2);
         assert!(!Arc::ptr_eq(&first, &updated));
+    }
+
+    #[test]
+    fn oversized_rollout_lines_do_not_block_later_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let sessions = temp.path().join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let rollout = sessions.join("rollout.jsonl");
+        let mut content = "x".repeat(MAX_ROLLOUT_LINE_BYTES + 1);
+        content.push('\n');
+        content.push_str(
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"safe\",\"model_provider\":\"openai\"}}\n",
+        );
+        content.push_str(
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"kept\"}}\n",
+        );
+        fs::write(&rollout, content).unwrap();
+
+        let index = SessionIndex::default();
+        let indexed = index.load(temp.path()).unwrap();
+
+        assert_eq!(indexed.len(), 1);
+        assert_eq!(indexed[0].id, "safe");
+        assert_eq!(indexed[0].title, "kept");
     }
 }

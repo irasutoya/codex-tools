@@ -1,6 +1,7 @@
 use crate::models::{
-    AppError, CodexAuthCredential, CodexAuthTokens, OfficialAccountSource,
-    OpenAiDeviceAuthorization, ProviderAccountQuota, StoredOfficialAccount,
+    AppError, CodexAuthCredential, CodexAuthTokens, MAX_ACCOUNT_ID_CHARS, MAX_CREDENTIAL_CHARS,
+    MAX_DISPLAY_NAME_CHARS, OfficialAccountSource, OpenAiDeviceAuthorization, ProviderAccountQuota,
+    StoredOfficialAccount, ensure_char_limit,
 };
 use crate::proxy_import::ImportedProxyCredential;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -240,7 +241,7 @@ impl AuthCenter {
                 .is_some_and(|expires_at| expires_at <= chrono::Utc::now().timestamp())
             {
                 return Err(AppError::InvalidConfig(
-                    "反代号的 accessToken 已过期，请重新导入。".into(),
+                    "Cookie 账号的 accessToken 已过期，请重新导入。".into(),
                 ));
             }
             return Ok(account.clone());
@@ -276,9 +277,37 @@ impl AuthCenter {
         imported: ImportedProxyCredential,
         requested_name: Option<String>,
     ) -> Result<StoredOfficialAccount, AppError> {
+        if let Some(name) = requested_name.as_deref() {
+            ensure_char_limit(
+                name.trim(),
+                MAX_DISPLAY_NAME_CHARS,
+                "账号名称不能超过 100 个字符。",
+            )?;
+        }
+        if let Some(account_id) = imported.account_id.as_deref() {
+            ensure_char_limit(
+                account_id.trim(),
+                MAX_ACCOUNT_ID_CHARS,
+                "OpenAI 账号标识不能超过 512 个字符。",
+            )?;
+        }
+        for token in [
+            imported.access_token.as_deref(),
+            imported.id_token.as_deref(),
+            imported.refresh_token.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            ensure_char_limit(
+                token,
+                MAX_CREDENTIAL_CHARS,
+                "Cookie 中的单项登录凭据过长，请导入有效的账号数据。",
+            )?;
+        }
         if imported.access_token.is_none() {
             let refresh_token = imported.refresh_token.clone().ok_or_else(|| {
-                AppError::InvalidConfig("反代账号缺少 accessToken 或 refresh_token。".into())
+                AppError::InvalidConfig("Cookie 凭据缺少 accessToken 或 refresh_token。".into())
             })?;
             let response = self
                 .client()?
@@ -291,8 +320,8 @@ impl AuthCenter {
                 .send()
                 .await
                 .map_err(safe_network_error)?;
-            let response = require_success(response, "无法使用反代 refresh_token 登录")?;
-            let refreshed: TokenResponse = read_json_bounded(response, "反代登录结果").await?;
+            let response = require_success(response, "无法使用 Cookie 中的 refresh_token 登录")?;
+            let refreshed: TokenResponse = read_json_bounded(response, "Cookie 登录结果").await?;
             let refreshed_import = ImportedProxyCredential {
                 access_token: Some(required_token(refreshed.access_token, "access_token")?),
                 id_token: non_empty(refreshed.id_token),
@@ -470,7 +499,7 @@ fn account_from_tokens(
     Ok(StoredOfficialAccount {
         id: previous.map_or_else(String::new, |account| account.id.clone()),
         name: if email.is_empty() {
-            previous.map_or_else(|| "OpenAI 官方账号".into(), |account| account.name.clone())
+            previous.map_or_else(|| "OpenAI 账号".into(), |account| account.name.clone())
         } else {
             email.clone()
         },
@@ -496,7 +525,7 @@ fn account_from_imported_tokens(
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| AppError::InvalidConfig("反代账号缺少 accessToken。".into()))?
+        .ok_or_else(|| AppError::InvalidConfig("Cookie 凭据缺少 accessToken。".into()))?
         .to_owned();
     let id_token = imported.id_token.clone().unwrap_or_default();
     let id_claims = token_identity(&id_token).unwrap_or_default();
@@ -557,7 +586,7 @@ fn apply_imported_profile(
         .map(str::to_owned)
         .or_else(|| imported.suggested_name.clone())
         .or_else(|| (!account.email.is_empty()).then(|| account.email.clone()))
-        .unwrap_or_else(|| "反代号".into());
+        .unwrap_or_else(|| "Cookie 账号".into());
 }
 
 fn token_local_identity(token: &str) -> String {
@@ -684,9 +713,9 @@ fn safe_network_error(error: reqwest::Error) -> AppError {
     } else if error.is_body() || error.is_decode() {
         "无法读取 OpenAI 的登录结果，请重试。"
     } else {
-        "登录请求失败，请检查网络后重试。"
+        "OpenAI 登录请求未完成，请检查网络后重试。"
     };
-    AppError::Internal(format!("OpenAI OAuth {kind}"))
+    AppError::Internal(kind.into())
 }
 
 fn codex_user_agent() -> String {
@@ -877,14 +906,14 @@ mod tests {
                 refresh_token: None,
                 account_id: None,
                 email: Some("proxy@example.test".into()),
-                suggested_name: Some("日常反代号".into()),
+                suggested_name: Some("日常 Cookie 账号".into()),
             },
             None,
         )
         .unwrap();
 
         assert_eq!(account.source, OfficialAccountSource::ProxyImport);
-        assert_eq!(account.name, "日常反代号");
+        assert_eq!(account.name, "日常 Cookie 账号");
         assert_eq!(account.email, "proxy@example.test");
         assert!(account.account_id.starts_with("proxy-"));
         assert_eq!(account.credential.tokens.access_token, "at-proxy-secret");

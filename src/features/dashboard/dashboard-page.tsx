@@ -69,7 +69,7 @@ export default function DashboardPage({ active }: PageProps) {
     setLaunching(true)
     try {
       await call("launch_codex")
-      notify.success("Codex 已打开")
+      notify.success("已发送打开 Codex 的请求")
     } catch (reason) {
       notify.error("无法打开 Codex", reason)
     } finally {
@@ -137,7 +137,7 @@ export default function DashboardPage({ active }: PageProps) {
               </Button>
             }
           >
-            请确认 Codex 已安装，并允许本应用访问配置目录。
+            请检查 Codex 配置目录是否存在，并确认本应用有读取权限。
           </ErrorDetails>
         </AlertDescription>
       </Alert>
@@ -161,13 +161,13 @@ export default function DashboardPage({ active }: PageProps) {
       label: "会话数据库",
       value: data.databaseCount,
       icon: FileText,
-      detail: "Codex 本地数据文件",
+      detail: "找到的 Codex 数据库文件",
     },
     {
       label: "数据状态",
       value: data.databaseHealth,
       icon: ShieldCheck,
-      detail: "会话数据是否可读取",
+      detail: "本机会话索引结果",
     },
   ]
   const busy = launching || refreshing || quotaRefreshing
@@ -190,10 +190,14 @@ export default function DashboardPage({ active }: PageProps) {
         <CardHeader>
           <CardTitle>当前连接</CardTitle>
           <CardDescription>
-            Codex 正在使用的账号或第三方 API 服务。
+            根据本机 Codex 配置识别出的当前账号或第三方 API 服务。
           </CardDescription>
           <CardAction>
-            <Badge variant={data.activeProvider ? "default" : "secondary"}>
+            <Badge
+              className="max-w-48 truncate"
+              title={data.activeProvider}
+              variant={data.activeProvider ? "default" : "secondary"}
+            >
               {data.activeProvider ?? "尚未选择"}
             </Badge>
           </CardAction>
@@ -279,7 +283,7 @@ export default function DashboardPage({ active }: PageProps) {
             本机状态
           </h2>
           <p className="text-sm text-muted-foreground">
-            账号、服务和本地会话的当前概况。
+            数据来自本机保存的配置、账号和会话文件。
           </p>
         </div>
         <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">

@@ -269,7 +269,7 @@ function SidebarTrigger({
       }}
       {...props}
     >
-      <PanelLeftIcon />
+      <PanelLeftIcon data-icon="inline-start" />
       <span className="sr-only">展开或收起导航</span>
     </Button>
   )
