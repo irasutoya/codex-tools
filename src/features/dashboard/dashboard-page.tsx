@@ -13,6 +13,7 @@ import {
 
 import { ErrorDetails } from "@/components/error-details"
 import { MetricCard } from "@/components/metric-card"
+import { SectionHeader } from "@/components/page-header"
 import { PageLoading } from "@/components/page-loading"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Badge } from "@/components/ui/badge"
@@ -30,7 +31,9 @@ import {
   Item,
   ItemContent,
   ItemDescription,
+  ItemGroup,
   ItemMedia,
+  ItemSeparator,
   ItemTitle,
 } from "@/components/ui/item"
 import { Spinner } from "@/components/ui/spinner"
@@ -173,7 +176,7 @@ export default function DashboardPage({ active }: PageProps) {
   const busy = launching || refreshing || quotaRefreshing
 
   return (
-    <div className="flex flex-col gap-6">
+    <div className="flex flex-col gap-8">
       {error && (
         <Alert variant="destructive">
           <TriangleAlert />
@@ -190,7 +193,7 @@ export default function DashboardPage({ active }: PageProps) {
         <CardHeader>
           <CardTitle>当前连接</CardTitle>
           <CardDescription>
-            根据本机 Codex 配置识别出的当前账号或第三方 API 服务。
+            Codex 下一次请求会使用这里显示的账号或 API 服务。
           </CardDescription>
           <CardAction>
             <Badge
@@ -202,39 +205,44 @@ export default function DashboardPage({ active }: PageProps) {
             </Badge>
           </CardAction>
         </CardHeader>
-        <CardContent className="flex flex-col gap-3">
-          {data.activeAccount && (
-            <Item variant="muted">
+        <CardContent>
+          <ItemGroup className="gap-0">
+            {data.activeAccount && (
+              <>
+                <Item>
+                  <ItemMedia variant="icon">
+                    <KeyRound />
+                  </ItemMedia>
+                  <ItemContent className="min-w-0">
+                    <ItemTitle>{data.activeAccount}</ItemTitle>
+                    <ItemDescription>
+                      {data.activeKind === "official"
+                        ? "OpenAI 账号"
+                        : "第三方 API Key"}
+                    </ItemDescription>
+                    {data.activeKind === "official" && (
+                      <QuotaStatusView quota={data.activeQuota} />
+                    )}
+                  </ItemContent>
+                </Item>
+                <ItemSeparator />
+              </>
+            )}
+            <Item>
               <ItemMedia variant="icon">
-                <KeyRound />
+                <FolderCog />
               </ItemMedia>
               <ItemContent className="min-w-0">
-                <ItemTitle>{data.activeAccount}</ItemTitle>
-                <ItemDescription>
-                  {data.activeKind === "official"
-                    ? "当前 Codex 账号"
-                    : "当前 API Key"}
+                <ItemTitle>配置目录</ItemTitle>
+                <ItemDescription
+                  className="truncate font-mono"
+                  title={data.codexHome}
+                >
+                  {data.codexHome}
                 </ItemDescription>
-                {data.activeKind === "official" && (
-                  <QuotaStatusView quota={data.activeQuota} />
-                )}
               </ItemContent>
             </Item>
-          )}
-          <Item variant="muted">
-            <ItemMedia variant="icon">
-              <FolderCog />
-            </ItemMedia>
-            <ItemContent className="min-w-0">
-              <ItemTitle>Codex 配置目录</ItemTitle>
-              <ItemDescription
-                className="truncate font-mono"
-                title={data.codexHome}
-              >
-                {data.codexHome}
-              </ItemDescription>
-            </ItemContent>
-          </Item>
+          </ItemGroup>
         </CardContent>
         <CardFooter className="flex-wrap gap-2">
           <Button disabled={busy} onClick={() => void launchCodex()}>
@@ -275,18 +283,15 @@ export default function DashboardPage({ active }: PageProps) {
       </Card>
 
       <section
-        className="flex flex-col gap-4"
+        className="flex flex-col gap-3"
         aria-labelledby="local-status-title"
       >
-        <div className="flex flex-col gap-1">
-          <h2 id="local-status-title" className="text-base font-medium">
-            本机状态
-          </h2>
-          <p className="text-sm text-muted-foreground">
-            数据来自本机保存的配置、账号和会话文件。
-          </p>
-        </div>
-        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+        <SectionHeader
+          id="local-status-title"
+          title="本机状态"
+          description="这些统计来自当前设备上的 Codex 配置和会话文件。"
+        />
+        <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
           {metrics.map((metric) => (
             <MetricCard key={metric.label} {...metric} />
           ))}

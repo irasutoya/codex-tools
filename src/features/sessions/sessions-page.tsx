@@ -14,6 +14,7 @@ import {
 
 import { ErrorDetails } from "@/components/error-details"
 import { MetricCard } from "@/components/metric-card"
+import { SectionHeader } from "@/components/page-header"
 import { PageLoading } from "@/components/page-loading"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import {
@@ -233,20 +234,32 @@ export default function SessionsPage({ active }: PageProps) {
   }
 
   return (
-    <div className="flex flex-col gap-6">
+    <div className="flex flex-col gap-8">
       <section
-        className="flex flex-col gap-4"
+        className="flex flex-col gap-3"
         aria-labelledby="session-status-title"
       >
-        <div className="flex flex-col gap-1">
-          <h2 id="session-status-title" className="text-base font-medium">
-            本机会话
-          </h2>
-          <p className="text-sm text-muted-foreground">
-            Codex 保存在当前配置目录中的会话数据。
-          </p>
-        </div>
-        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+        <SectionHeader
+          id="session-status-title"
+          title="本机会话"
+          description="仅统计当前 Codex 配置目录中的会话文件和数据库。"
+          actions={
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={controlsDisabled}
+              onClick={refresh}
+            >
+              {refreshing ? (
+                <Spinner data-icon="inline-start" aria-hidden="true" />
+              ) : (
+                <RefreshCw data-icon="inline-start" />
+              )}
+              {refreshing ? "刷新中…" : "刷新"}
+            </Button>
+          }
+        />
+        <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
           <MetricCard
             label="会话总数"
             value={sessions.total}
@@ -287,7 +300,7 @@ export default function SessionsPage({ active }: PageProps) {
         </Alert>
       )}
 
-      <Card size="sm">
+      <Card>
         <CardHeader>
           <CardTitle>更新会话归属</CardTitle>
           <CardDescription>
@@ -350,23 +363,8 @@ export default function SessionsPage({ active }: PageProps) {
           <CardDescription>
             列表来自本机 Codex 会话文件和已识别的数据库，不会上传。
           </CardDescription>
-          <CardAction>
-            <Button
-              size="sm"
-              variant="outline"
-              disabled={controlsDisabled}
-              onClick={refresh}
-            >
-              {refreshing ? (
-                <Spinner data-icon="inline-start" aria-hidden="true" />
-              ) : (
-                <RefreshCw data-icon="inline-start" />
-              )}
-              {refreshing ? "刷新中…" : "刷新"}
-            </Button>
-          </CardAction>
         </CardHeader>
-        <CardContent className="min-w-0">
+        <CardContent className="min-w-0 overflow-x-auto">
           {sessions.items.length ? (
             <Table>
               <TableHeader>

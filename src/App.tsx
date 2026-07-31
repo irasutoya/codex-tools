@@ -1,4 +1,4 @@
-import { lazy, Suspense, useRef, useState } from "react"
+import { lazy, Suspense, useRef, useState, type CSSProperties } from "react"
 import {
   Check,
   FileCheck2,
@@ -13,6 +13,7 @@ import {
 } from "lucide-react"
 import { useTheme } from "next-themes"
 
+import { PageHeader } from "@/components/page-header"
 import { PageLoading } from "@/components/page-loading"
 import { Button } from "@/components/ui/button"
 import {
@@ -69,25 +70,25 @@ const navigation: NavigationItem[] = [
   {
     id: "dashboard",
     label: "概览",
-    description: "查看 Codex 当前连接和本机会话状态",
+    description: "查看当前连接、账号额度和本机会话状态",
     icon: LayoutDashboard,
   },
   {
     id: "providers",
     label: "账号与服务",
-    description: "管理 OpenAI 账号和兼容 Responses API 的服务",
+    description: "管理 OpenAI 账号与兼容 Responses API 的第三方服务",
     icon: KeyRound,
   },
   {
     id: "sessions",
     label: "历史会话",
-    description: "查看本机会话，并按需更新连接标记",
+    description: "查看本机会话，并仅在需要时更新连接归属",
     icon: MessagesSquare,
   },
   {
     id: "settings",
     label: "配置",
-    description: "检查 Codex 配置，并在写入前预览修改",
+    description: "检查本机 Codex 配置，并在写入前预览变更",
     icon: FileCheck2,
   },
 ]
@@ -111,25 +112,25 @@ export default function App() {
     setPage(nextPage)
   }
 
+  const CurrentPageIcon = currentNavigation.icon
+
   return (
     <TooltipProvider>
-      <SidebarProvider className="h-full overflow-hidden">
+      <SidebarProvider
+        className="h-full overflow-hidden"
+        style={{ "--sidebar-width": "14rem" } as CSSProperties}
+      >
         <AppSidebar page={page} onNavigate={navigate} />
         <SidebarInset className="min-h-0 overflow-hidden">
-          <header className="flex h-16 shrink-0 items-center gap-3 border-b px-4 sm:px-6">
+          <header className="flex h-12 shrink-0 items-center gap-2 border-b px-3 sm:px-4">
             <SidebarTrigger
               aria-label="展开或收起导航"
               title="展开或收起导航"
             />
             <Separator orientation="vertical" className="h-4" />
-            <div className="min-w-0 flex-1">
-              <h1 className="truncate text-base font-medium">
-                {currentNavigation.label}
-              </h1>
-              <p className="hidden truncate text-sm text-muted-foreground sm:block">
-                {currentNavigation.description}
-              </p>
-            </div>
+            <span className="min-w-0 flex-1 truncate text-sm font-medium md:text-muted-foreground">
+              {currentNavigation.label}
+            </span>
             <ThemeMenu />
           </header>
 
@@ -138,7 +139,12 @@ export default function App() {
             className="min-h-0 flex-1 overflow-y-auto"
             aria-label={currentNavigation.label}
           >
-            <div className="mx-auto flex w-full max-w-6xl flex-col p-4 sm:p-6 lg:p-8">
+            <div className="mx-auto flex w-full max-w-7xl flex-col gap-7 px-4 py-6 sm:px-6 sm:py-8 lg:px-8">
+              <PageHeader
+                title={currentNavigation.label}
+                description={currentNavigation.description}
+                icon={CurrentPageIcon}
+              />
               {navigation
                 .filter((item) => visitedPages.has(item.id))
                 .map((item) => {
@@ -181,30 +187,26 @@ function AppSidebar({
   }
 
   return (
-    <Sidebar collapsible="icon">
-      <SidebarHeader>
-        <SidebarMenu>
-          <SidebarMenuItem>
-            <SidebarMenuButton size="lg" tooltip="Codex Tools">
-              <img
-                src="/codex-tools.svg"
-                alt=""
-                className="size-8 rounded-md"
-              />
-              <div className="grid min-w-0 flex-1 text-left leading-tight">
-                <span className="truncate font-medium">Codex Tools</span>
-                <span className="truncate text-xs text-muted-foreground">
-                  Codex 连接管理
-                </span>
-              </div>
-            </SidebarMenuButton>
-          </SidebarMenuItem>
-        </SidebarMenu>
+    <Sidebar variant="inset" collapsible="icon">
+      <SidebarHeader className="pt-3">
+        <div className="flex h-10 items-center gap-2 px-2 group-data-[collapsible=icon]:justify-center group-data-[collapsible=icon]:px-0">
+          <img
+            src="/codex-tools.svg"
+            alt=""
+            className="size-7 shrink-0 rounded-md"
+          />
+          <div className="min-w-0 group-data-[collapsible=icon]:hidden">
+            <div className="truncate text-sm font-semibold">Codex Tools</div>
+            <div className="truncate text-xs text-muted-foreground">
+              本机连接管理
+            </div>
+          </div>
+        </div>
       </SidebarHeader>
 
       <SidebarContent>
         <SidebarGroup>
-          <SidebarGroupLabel>导航</SidebarGroupLabel>
+          <SidebarGroupLabel>工作台</SidebarGroupLabel>
           <SidebarGroupContent>
             <SidebarMenu>
               {navigation.map((item) => {
@@ -231,9 +233,11 @@ function AppSidebar({
       </SidebarContent>
 
       <SidebarFooter>
-        <div className="flex items-center gap-2 px-2 py-1 text-xs text-muted-foreground group-data-[collapsible=icon]:hidden">
-          <ShieldCheck className="size-4 shrink-0" aria-hidden="true" />
-          <span>账号凭据和 API Key 存储在本机</span>
+        <div className="flex items-start gap-2 rounded-lg bg-sidebar-accent/60 px-2 py-2.5 text-xs leading-relaxed text-muted-foreground group-data-[collapsible=icon]:justify-center group-data-[collapsible=icon]:bg-transparent group-data-[collapsible=icon]:px-0">
+          <ShieldCheck className="mt-0.5 size-4 shrink-0" aria-hidden="true" />
+          <span className="group-data-[collapsible=icon]:hidden">
+            凭据仅保存在这台设备上
+          </span>
         </div>
       </SidebarFooter>
       <SidebarRail aria-label="展开或收起导航" title="展开或收起导航" />

@@ -10,6 +10,7 @@ import {
 } from "lucide-react"
 
 import { ErrorDetails } from "@/components/error-details"
+import { SectionHeader } from "@/components/page-header"
 import { PageLoading } from "@/components/page-loading"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import {
@@ -187,7 +188,7 @@ export default function SettingsPage({ active }: PageProps) {
         : "OpenAI 默认设置"
 
   return (
-    <div className="flex flex-col gap-6">
+    <div className="flex flex-col gap-8">
       <Alert>
         <Info />
         <AlertTitle>只修改连接所需字段</AlertTitle>
@@ -197,17 +198,14 @@ export default function SettingsPage({ active }: PageProps) {
         </AlertDescription>
       </Alert>
 
-      <section className="flex flex-col gap-4" aria-labelledby="config-title">
-        <div className="flex flex-col gap-1">
-          <h2 id="config-title" className="text-base font-medium">
-            Codex 配置
-          </h2>
-          <p className="text-sm text-muted-foreground">
-            查看本机配置状态，并在写入前确认由本应用管理的字段。
-          </p>
-        </div>
+      <section className="flex flex-col gap-3" aria-labelledby="config-title">
+        <SectionHeader
+          id="config-title"
+          title="配置文件"
+          description="检查当前连接，并在写入前预览本应用负责的字段。"
+        />
 
-        <div className="grid gap-4 xl:grid-cols-[minmax(0,3fr)_minmax(20rem,2fr)]">
+        <div className="grid items-start gap-3 lg:grid-cols-[minmax(0,3fr)_minmax(18rem,2fr)]">
           <Card>
             <CardHeader>
               <CardTitle>当前配置</CardTitle>
@@ -221,7 +219,7 @@ export default function SettingsPage({ active }: PageProps) {
               </CardAction>
             </CardHeader>
             <CardContent className="flex flex-col gap-4">
-              <Item variant="muted">
+              <Item>
                 <ItemContent>
                   <ItemTitle>当前连接</ItemTitle>
                   <ItemDescription>{connectionLabel}</ItemDescription>
@@ -275,7 +273,7 @@ export default function SettingsPage({ active }: PageProps) {
             </CardFooter>
           </Card>
 
-          <Card size="sm">
+          <Card>
             <CardHeader>
               <CardTitle>诊断信息</CardTitle>
               <CardDescription>
@@ -283,7 +281,7 @@ export default function SettingsPage({ active }: PageProps) {
               </CardDescription>
             </CardHeader>
             <CardContent>
-              <pre className="max-h-80 overflow-auto rounded-lg bg-muted p-3 text-xs whitespace-pre-wrap">
+              <pre className="max-h-72 overflow-auto rounded-lg bg-muted/70 p-3 text-xs leading-relaxed whitespace-pre-wrap">
                 {diagnosticsText}
               </pre>
             </CardContent>

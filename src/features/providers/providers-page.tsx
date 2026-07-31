@@ -3,6 +3,7 @@ import {
   Activity,
   ArrowRightLeft,
   Boxes,
+  Check,
   Copy,
   ExternalLink,
   KeyRound,
@@ -18,6 +19,7 @@ import {
 } from "lucide-react"
 
 import { ErrorDetails } from "@/components/error-details"
+import { SectionHeader } from "@/components/page-header"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { PageLoading } from "@/components/page-loading"
 import { Badge } from "@/components/ui/badge"
@@ -295,7 +297,7 @@ export default function ProvidersPage({ active }: PageProps) {
   }
 
   return (
-    <div className="flex flex-col gap-6">
+    <div className="flex flex-col gap-8">
       {overviewError && (
         <Alert variant="destructive">
           <TriangleAlert />
@@ -319,182 +321,174 @@ export default function ProvidersPage({ active }: PageProps) {
           </AlertDescription>
         </Alert>
       )}
-      <section className="flex flex-col gap-4" aria-labelledby="openai-title">
-        <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
-          <div className="flex flex-col gap-1">
-            <h2 id="openai-title" className="text-base font-medium">
-              Codex 账号
-            </h2>
-            <p className="text-sm text-muted-foreground">
-              网页登录账号与 Cookie 账号统一管理；5H/7D 额度以 OpenAI
-              接口实际返回为准。
-            </p>
-          </div>
-          <div className="flex flex-wrap gap-2">
-            {officialAccounts.length > 0 && (
+      <section className="flex flex-col gap-3" aria-labelledby="openai-title">
+        <SectionHeader
+          id="openai-title"
+          title="OpenAI 账号"
+          description="统一管理网页登录和 Cookie 账号；额度只显示 OpenAI 接口实际返回的结果。"
+          actions={
+            <>
+              {officialAccounts.length > 0 && (
+                <Button
+                  size="sm"
+                  variant="outline"
+                  disabled={busy}
+                  onClick={() =>
+                    void run("official:quota:all", async () => {
+                      const results = await call("refresh_all_official_quotas")
+                      const succeeded = results.filter(
+                        (result) => result.quota.status === "success"
+                      ).length
+                      notify.success(
+                        "账号额度刷新完成",
+                        succeeded === results.length
+                          ? `${results.length} 个账号均查询成功。`
+                          : `${succeeded}/${results.length} 个账号查询成功；其余账号请查看各自状态。`
+                      )
+                    })
+                  }
+                >
+                  {pendingTask === "official:quota:all" ? (
+                    <Spinner data-icon="inline-start" />
+                  ) : (
+                    <RefreshCw data-icon="inline-start" />
+                  )}
+                  刷新全部额度
+                </Button>
+              )}
               <Button
+                size="sm"
                 variant="outline"
                 disabled={busy}
-                onClick={() =>
-                  void run("official:quota:all", async () => {
-                    const results = await call("refresh_all_official_quotas")
-                    const succeeded = results.filter(
-                      (result) => result.quota.status === "success"
-                    ).length
-                    notify.success(
-                      "账号额度刷新完成",
-                      succeeded === results.length
-                        ? `${results.length} 个账号均查询成功。`
-                        : `${succeeded}/${results.length} 个账号查询成功；其余账号请查看各自状态。`
-                    )
-                  })
-                }
+                onClick={() => setProxyLoginOpen(true)}
               >
-                {pendingTask === "official:quota:all" ? (
-                  <Spinner data-icon="inline-start" />
-                ) : (
-                  <RefreshCw data-icon="inline-start" />
-                )}
-                刷新全部额度
+                <KeyRound data-icon="inline-start" />
+                导入 Cookie
               </Button>
-            )}
-            <Button
-              variant="outline"
-              disabled={busy}
-              onClick={() => setProxyLoginOpen(true)}
-            >
-              <KeyRound data-icon="inline-start" />
-              导入 Cookie
-            </Button>
-            <Button
-              disabled={busy || Boolean(deviceAuthorization)}
-              onClick={() => setConfirmOpenAiLogin(true)}
-            >
-              <LogIn data-icon="inline-start" />
-              网页登录
-            </Button>
-          </div>
-        </div>
-        <Card>
-          <CardHeader>
-            <CardTitle className="flex items-center gap-2">
-              已保存账号
-              {officialAccounts.some((item) => item.active) && (
-                <Badge>使用中</Badge>
-              )}
-            </CardTitle>
-            <CardDescription>
-              Codex 一次使用一个账号，可随时切换。
-            </CardDescription>
-          </CardHeader>
-          <CardContent className="flex flex-col gap-4">
-            {deviceAuthorization && (
-              <div className="flex flex-col gap-3">
-                <Alert>
-                  <LogIn />
-                  <AlertTitle className="flex flex-wrap items-center gap-2">
-                    <span>
-                      登录码：
-                      <code className="font-mono font-semibold">
-                        {deviceAuthorization.userCode}
-                      </code>
-                    </span>
-                    <Badge variant="outline">
-                      <Spinner data-icon="inline-start" />
-                      等待登录
-                    </Badge>
-                  </AlertTitle>
-                  <AlertDescription>
-                    在打开的 OpenAI
-                    页面输入此代码。完成后会自动刷新；代码有效期至
-                    {formatTimestamp(deviceAuthorization.expiresAt)}。
-                  </AlertDescription>
-                </Alert>
-                <div className="flex flex-wrap gap-2">
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    onClick={() =>
-                      void navigator.clipboard
-                        .writeText(deviceAuthorization.userCode)
-                        .then(() => notify.success("登录码已复制"))
-                        .catch((error) => notify.error("无法复制登录码", error))
-                    }
-                  >
-                    <Copy data-icon="inline-start" />
-                    复制
-                  </Button>
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    onClick={() =>
-                      void call("open_openai_device_page").catch((error) =>
-                        notify.error("无法打开 OpenAI 登录页面", error)
-                      )
-                    }
-                  >
-                    <ExternalLink data-icon="inline-start" />
-                    打开 OpenAI
-                  </Button>
-                </div>
+              <Button
+                size="sm"
+                disabled={busy || Boolean(deviceAuthorization)}
+                onClick={() => setConfirmOpenAiLogin(true)}
+              >
+                <LogIn data-icon="inline-start" />
+                网页登录
+              </Button>
+            </>
+          }
+        />
+        <div className="flex flex-col gap-3">
+          {deviceAuthorization && (
+            <Alert>
+              <LogIn />
+              <AlertTitle className="flex flex-wrap items-center gap-2">
+                <span>
+                  登录码：
+                  <code className="font-mono font-semibold">
+                    {deviceAuthorization.userCode}
+                  </code>
+                </span>
+                <Badge variant="outline">
+                  <Spinner data-icon="inline-start" />
+                  等待登录
+                </Badge>
+              </AlertTitle>
+              <AlertDescription>
+                在打开的 OpenAI 页面输入此代码。完成后会自动刷新；代码有效期至
+                {formatTimestamp(deviceAuthorization.expiresAt)}。
+              </AlertDescription>
+              <div className="mt-3 flex flex-wrap gap-2">
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={() =>
+                    void navigator.clipboard
+                      .writeText(deviceAuthorization.userCode)
+                      .then(() => notify.success("登录码已复制"))
+                      .catch((error) => notify.error("无法复制登录码", error))
+                  }
+                >
+                  <Copy data-icon="inline-start" />
+                  复制
+                </Button>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={() =>
+                    void call("open_openai_device_page").catch((error) =>
+                      notify.error("无法打开 OpenAI 登录页面", error)
+                    )
+                  }
+                >
+                  <ExternalLink data-icon="inline-start" />
+                  打开 OpenAI
+                </Button>
               </div>
-            )}
-            {!officialAccounts.length ? (
-              <Empty>
-                <EmptyHeader>
-                  <EmptyMedia variant="icon">
-                    <KeyRound />
-                  </EmptyMedia>
-                  <EmptyTitle>尚未添加 Codex 账号</EmptyTitle>
-                  <EmptyDescription>
-                    可通过 OpenAI 网页登录，也可粘贴 Cookie 凭据导入账号。
-                  </EmptyDescription>
-                </EmptyHeader>
-                <EmptyContent className="flex flex-wrap gap-2">
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    disabled={busy}
-                    onClick={() => setProxyLoginOpen(true)}
-                  >
-                    <KeyRound data-icon="inline-start" />
-                    导入 Cookie
-                  </Button>
-                  <Button
-                    size="sm"
-                    disabled={busy || Boolean(deviceAuthorization)}
-                    onClick={() => setConfirmOpenAiLogin(true)}
-                  >
-                    <LogIn data-icon="inline-start" />
-                    网页登录
-                  </Button>
-                </EmptyContent>
-              </Empty>
-            ) : (
-              <ItemGroup className="gap-2">
-                {officialAccounts.map((item) => (
-                  <Item
-                    key={item.id}
-                    variant={item.active ? "muted" : "outline"}
-                    size="sm"
-                  >
-                    <ItemMedia variant="icon">
-                      {item.source === "proxy_import" ? (
-                        <KeyRound />
-                      ) : (
-                        <UserRound />
-                      )}
-                    </ItemMedia>
-                    <ItemContent className="min-w-0">
-                      <ItemTitle>
-                        {item.name}
-                        <Badge variant="outline">
-                          {item.source === "proxy_import"
-                            ? "Cookie"
-                            : "网页登录"}
+            </Alert>
+          )}
+          {!officialAccounts.length ? (
+            <Card>
+              <CardContent>
+                <Empty className="min-h-48">
+                  <EmptyHeader>
+                    <EmptyMedia variant="icon">
+                      <KeyRound />
+                    </EmptyMedia>
+                    <EmptyTitle>尚未添加 OpenAI 账号</EmptyTitle>
+                    <EmptyDescription>
+                      通过 OpenAI 网页登录，或粘贴 Cookie 凭据导入账号。
+                    </EmptyDescription>
+                  </EmptyHeader>
+                  <EmptyContent className="flex flex-wrap gap-2">
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      disabled={busy}
+                      onClick={() => setProxyLoginOpen(true)}
+                    >
+                      <KeyRound data-icon="inline-start" />
+                      导入 Cookie
+                    </Button>
+                    <Button
+                      size="sm"
+                      disabled={busy || Boolean(deviceAuthorization)}
+                      onClick={() => setConfirmOpenAiLogin(true)}
+                    >
+                      <LogIn data-icon="inline-start" />
+                      网页登录
+                    </Button>
+                  </EmptyContent>
+                </Empty>
+              </CardContent>
+            </Card>
+          ) : (
+            <ItemGroup className="gap-3">
+              {officialAccounts.map((item) => (
+                <Item
+                  key={item.id}
+                  variant={item.active ? "muted" : "outline"}
+                  className="items-start gap-4 p-4"
+                >
+                  <ItemMedia variant="icon">
+                    {item.source === "proxy_import" ? (
+                      <KeyRound />
+                    ) : (
+                      <UserRound />
+                    )}
+                  </ItemMedia>
+                  <ItemContent className="min-w-0 gap-2">
+                    <div className="flex min-w-0 flex-wrap items-center gap-2">
+                      <ItemTitle className="max-w-full">{item.name}</ItemTitle>
+                      <Badge variant="outline">
+                        {item.source === "proxy_import" ? "Cookie" : "网页登录"}
+                      </Badge>
+                      {item.active && (
+                        <Badge variant="secondary">
+                          <Check data-icon="inline-start" />
+                          使用中
                         </Badge>
-                        {item.active && <Badge>使用中</Badge>}
-                      </ItemTitle>
+                      )}
+                    </div>
+                    <div className="flex min-w-0 flex-col gap-0.5">
                       <ItemDescription className="truncate">
                         {item.email || item.accountId}
                       </ItemDescription>
@@ -509,97 +503,109 @@ export default function ProvidersPage({ active }: PageProps) {
                             ? "有效期取决于 Cookie 中的访问凭据"
                             : "有效期由 OpenAI 自动管理"}
                       </ItemDescription>
-                      <QuotaStatusView quota={item.quota} compact />
-                    </ItemContent>
-                    <ItemActions className="ml-auto">
-                      <Button
-                        size="icon-sm"
-                        variant="ghost"
-                        disabled={busy}
-                        aria-label={`刷新 ${item.name} 的 OpenAI 额度`}
-                        title="刷新 OpenAI 额度"
-                        onClick={() =>
-                          void run(`official:quota:${item.id}`, async () => {
-                            const quota = await call(
-                              "refresh_official_account_quota",
-                              { accountId: item.id }
-                            )
-                            if (quota.status === "success") {
-                              notify.success("OpenAI 额度已更新")
-                            } else {
-                              notify.warning(
-                                "OpenAI 额度未更新",
-                                quota.error ?? "OpenAI 暂未返回额度。"
+                    </div>
+                    <QuotaStatusView quota={item.quota} compact />
+                  </ItemContent>
+                  <ItemActions className="w-full justify-start sm:ml-auto sm:w-auto sm:justify-end sm:self-start">
+                    <Button
+                      size="sm"
+                      variant={item.active ? "outline" : "secondary"}
+                      disabled={busy || item.active}
+                      onClick={() =>
+                        setPendingOfficialAction({
+                          kind: "activate",
+                          account: item,
+                        })
+                      }
+                    >
+                      <ArrowRightLeft data-icon="inline-start" />
+                      {item.active ? "正在使用" : "切换"}
+                    </Button>
+                    <DropdownMenu>
+                      <DropdownMenuTrigger
+                        render={
+                          <Button
+                            size="icon-sm"
+                            variant="ghost"
+                            disabled={busy}
+                            aria-label={`${item.name} 的更多操作`}
+                            title="更多操作"
+                          />
+                        }
+                      >
+                        <MoreHorizontal data-icon="inline-start" />
+                      </DropdownMenuTrigger>
+                      <DropdownMenuContent align="end" className="w-40">
+                        <DropdownMenuGroup>
+                          <DropdownMenuItem
+                            onClick={() =>
+                              void run(
+                                `official:quota:${item.id}`,
+                                async () => {
+                                  const quota = await call(
+                                    "refresh_official_account_quota",
+                                    { accountId: item.id }
+                                  )
+                                  if (quota.status === "success") {
+                                    notify.success("OpenAI 额度已更新")
+                                  } else {
+                                    notify.warning(
+                                      "OpenAI 额度未更新",
+                                      quota.error ?? "OpenAI 暂未返回额度。"
+                                    )
+                                  }
+                                }
                               )
                             }
-                          })
-                        }
-                      >
-                        {pendingTask === `official:quota:${item.id}` ? (
-                          <Spinner data-icon="inline-start" />
-                        ) : (
-                          <RefreshCw data-icon="inline-start" />
-                        )}
-                      </Button>
-                      <Button
-                        size="sm"
-                        variant="secondary"
-                        disabled={busy || item.active}
-                        onClick={() =>
-                          setPendingOfficialAction({
-                            kind: "activate",
-                            account: item,
-                          })
-                        }
-                      >
-                        <ArrowRightLeft data-icon="inline-start" />
-                        使用此账号
-                      </Button>
-                      <Button
-                        size="icon-sm"
-                        variant="ghost"
-                        disabled={busy || item.active}
-                        aria-label={`删除已保存的 OpenAI 账号 ${item.name}`}
-                        title="删除已保存的账号"
-                        onClick={() =>
-                          setPendingOfficialAction({
-                            kind: "delete",
-                            account: item,
-                          })
-                        }
-                      >
-                        <Trash2 data-icon="inline-start" />
-                      </Button>
-                    </ItemActions>
-                  </Item>
-                ))}
-              </ItemGroup>
-            )}
-          </CardContent>
-        </Card>
+                          >
+                            {pendingTask === `official:quota:${item.id}` ? (
+                              <Spinner />
+                            ) : (
+                              <RefreshCw />
+                            )}
+                            刷新额度
+                          </DropdownMenuItem>
+                          <DropdownMenuItem
+                            variant="destructive"
+                            disabled={item.active}
+                            onClick={() =>
+                              setPendingOfficialAction({
+                                kind: "delete",
+                                account: item,
+                              })
+                            }
+                          >
+                            <Trash2 />
+                            删除账号
+                          </DropdownMenuItem>
+                        </DropdownMenuGroup>
+                      </DropdownMenuContent>
+                    </DropdownMenu>
+                  </ItemActions>
+                </Item>
+              ))}
+            </ItemGroup>
+          )}
+        </div>
       </section>
       <section
-        className="flex flex-col gap-4"
+        className="flex flex-col gap-3"
         aria-labelledby="custom-api-title"
       >
-        <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
-          <div className="flex flex-col gap-1">
-            <h2 id="custom-api-title" className="text-base font-medium">
-              第三方 API
-            </h2>
-            <p className="text-sm text-muted-foreground">
-              管理兼容 OpenAI Responses API 的服务。请求由 Codex
-              直接发送，不经过本应用转发。
-            </p>
-          </div>
-          <Button onClick={() => setDraft(emptyProvider())}>
-            <Plus data-icon="inline-start" />
-            添加服务
-          </Button>
-        </div>
-        <div className="grid gap-4">
+        <SectionHeader
+          id="custom-api-title"
+          title="第三方 API"
+          description="管理兼容 OpenAI Responses API 的服务；请求由 Codex 直接发送，本应用不参与转发。"
+          actions={
+            <Button size="sm" onClick={() => setDraft(emptyProvider())}>
+              <Plus data-icon="inline-start" />
+              添加服务
+            </Button>
+          }
+        />
+        <div className="grid gap-3">
           {!providers.length && (
-            <Empty>
+            <Empty className="min-h-48 border">
               <EmptyHeader>
                 <EmptyMedia variant="icon">
                   <Boxes />
@@ -620,20 +626,25 @@ export default function ProvidersPage({ active }: PageProps) {
           {providers.map((provider) => {
             const linked = accountsByProvider.get(provider.id) ?? []
             return (
-              <Card key={provider.id} size="sm">
+              <Card key={provider.id}>
                 <CardHeader>
                   <CardTitle className="flex items-center gap-2">
                     {provider.name}
-                    {provider.active && <Badge>使用中</Badge>}
+                    {provider.active && (
+                      <Badge variant="secondary">
+                        <Check data-icon="inline-start" />
+                        使用中
+                      </Badge>
+                    )}
                     {!provider.enabled && (
                       <Badge variant="secondary">不可用</Badge>
                     )}
                   </CardTitle>
-                  <CardDescription className="flex min-w-0 flex-col gap-1">
+                  <CardDescription className="flex min-w-0 flex-col gap-0.5">
                     <span className="truncate" title={provider.baseUrl}>
                       {provider.baseUrl}
                     </span>
-                    <span>Responses API · 模型列表由 Codex 请求</span>
+                    <span>Responses API · 由 Codex 直接请求</span>
                   </CardDescription>
                   <CardAction>
                     <DropdownMenu>
@@ -708,7 +719,7 @@ export default function ProvidersPage({ active }: PageProps) {
                         <Item
                           key={item.id}
                           variant={item.active ? "muted" : "outline"}
-                          size="sm"
+                          className="items-start gap-3 p-3"
                         >
                           <ItemMedia variant="icon">
                             <KeyRound />
@@ -716,13 +727,18 @@ export default function ProvidersPage({ active }: PageProps) {
                           <ItemContent>
                             <ItemTitle>
                               {item.name}
-                              {item.active && <Badge>使用中</Badge>}
+                              {item.active && (
+                                <Badge variant="secondary">
+                                  <Check data-icon="inline-start" />
+                                  使用中
+                                </Badge>
+                              )}
                             </ItemTitle>
                             <ItemDescription>
                               API Key 保存在本机，切换到此服务时写入 Codex。
                             </ItemDescription>
                           </ItemContent>
-                          <ItemActions className="ml-auto">
+                          <ItemActions className="w-full justify-start sm:ml-auto sm:w-auto sm:justify-end">
                             <Button
                               size="sm"
                               variant="secondary"

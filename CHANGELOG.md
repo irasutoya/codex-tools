@@ -4,6 +4,19 @@
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-07-31
+
+### Changed
+
+- 按 shadcn `base-nova` 规范重构应用壳层与全部四个页面，改用 inset 侧栏、紧凑顶部栏、统一页面标题和一致的区块层级。
+- OpenAI 账号改为单层列表，保留切换操作并将刷新、删除收进上下文菜单；第三方 API、额度信息和活动状态采用相同的信息密度与反馈方式。
+- 概览、历史会话和配置页统一卡片、空状态、加载状态及响应式布局，减少嵌套容器和无效留白。
+
+### Fixed
+
+- 账号与 API Key 的操作区在窄窗口下会完整换行；会话表格可横向滚动，配置卡片不再被同列内容强制拉高。
+- Cookie 导入弹窗在 390 像素宽窗口和超长凭据下仍保持固定输入高度、内部滚动与可访问的底部操作区。
+
 ## [0.3.1] - 2026-07-31
 
 ### Changed
@@ -63,7 +76,8 @@
 - 上游密钥和自定义请求头改为 Rust 后端只写、前端脱敏；会话扫描增加大小及并发边界。
 - 删除应用配置版本迁移、废弃协议兼容分支、旧模型字段清理和未使用 IPC；相同配置不再重复写盘，账号切换前不再扫描全部会话。
 
-[Unreleased]: https://github.com/irasutoya/codex-tools/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/irasutoya/codex-tools/compare/v0.3.2...HEAD
+[0.3.2]: https://github.com/irasutoya/codex-tools/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/irasutoya/codex-tools/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/irasutoya/codex-tools/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/irasutoya/codex-tools/compare/v0.1.0...v0.2.0

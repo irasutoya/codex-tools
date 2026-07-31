@@ -1,4 +1,4 @@
-import { Clock3, Gauge } from "lucide-react"
+import { Clock3 } from "lucide-react"
 
 import { Badge } from "@/components/ui/badge"
 import { epochMilliseconds } from "@/lib/time"
@@ -23,19 +23,15 @@ export function QuotaStatusView({
   const successful = quota?.status === "success"
 
   return (
-    <div className="flex min-w-0 flex-col gap-2">
-      <div className="flex flex-wrap items-center gap-2">
-        <span className="flex items-center gap-1.5 text-xs font-medium">
-          <Gauge className="size-3.5" aria-hidden="true" />
-          额度
-        </span>
-        <Badge variant={successful ? "default" : "secondary"}>
+    <div className="flex min-w-0 flex-col gap-2.5">
+      <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+        <Badge variant={successful ? "secondary" : "outline"}>
           {quotaStatusText(quota)}
         </Badge>
         {quota?.fetchedAt && (
-          <span className="flex items-center gap-1 text-xs text-muted-foreground">
+          <span className="flex items-center gap-1">
             <Clock3 className="size-3" aria-hidden="true" />
-            {formatTimestamp(quota.fetchedAt)}
+            更新于 {formatTimestamp(quota.fetchedAt)}
           </span>
         )}
       </div>
@@ -55,12 +51,14 @@ export function QuotaStatusView({
             {rows.map((row) => (
               <div
                 key={row.label}
-                className="min-w-0 border-l-2 border-border pl-2"
+                className="min-w-0 rounded-lg bg-muted/60 px-3 py-2.5"
               >
                 <div className="text-xs text-muted-foreground">{row.label}</div>
-                <div className="truncate text-sm font-medium">{row.value}</div>
+                <div className="mt-0.5 truncate text-sm font-semibold tabular-nums">
+                  {row.value}
+                </div>
                 {(row.detail || row.resetAt) && (
-                  <div className="truncate text-xs text-muted-foreground">
+                  <div className="mt-0.5 truncate text-xs text-muted-foreground">
                     {[
                       row.detail,
                       row.resetAt &&

@@ -23,16 +23,20 @@ export function MetricCard({
   icon: Icon,
 }: MetricCardProps) {
   return (
-    <Card size="sm" className="min-h-32">
+    <Card size="sm" className="min-h-28">
       <CardHeader>
         <CardDescription>{label}</CardDescription>
-        <CardAction className="flex size-8 items-center justify-center rounded-lg bg-muted text-muted-foreground">
+        <CardAction className="text-muted-foreground">
           <Icon className="size-4" aria-hidden="true" />
         </CardAction>
       </CardHeader>
-      <CardContent className="flex flex-col gap-1">
-        <CardTitle className="text-2xl tabular-nums">{value}</CardTitle>
-        {detail && <p className="text-xs text-muted-foreground">{detail}</p>}
+      <CardContent className="flex flex-col gap-0.5">
+        <CardTitle className="text-xl tabular-nums">{value}</CardTitle>
+        {detail && (
+          <p className="line-clamp-2 text-xs leading-relaxed text-muted-foreground">
+            {detail}
+          </p>
+        )}
       </CardContent>
     </Card>
   )
