@@ -3,6 +3,7 @@ import {
   ExternalLink,
   FileText,
   FolderCog,
+  KeyRound,
   MessagesSquare,
   RefreshCw,
   Server,
@@ -37,10 +38,13 @@ import { notify } from "@/lib/feedback"
 import { call } from "@/lib/ipc"
 import type { Dashboard, PageProps } from "@/types"
 
+import { QuotaStatusView } from "../providers/quota-status"
+
 export default function DashboardPage({ active }: PageProps) {
   const [data, setData] = useState<Dashboard>()
   const [launching, setLaunching] = useState(false)
   const [refreshing, setRefreshing] = useState(false)
+  const [quotaRefreshing, setQuotaRefreshing] = useState(false)
   const [error, setError] = useState<string>()
 
   const load = useCallback(async () => {
@@ -82,6 +86,29 @@ export default function DashboardPage({ active }: PageProps) {
       notify.error("无法更新状态", reason)
     } finally {
       setRefreshing(false)
+    }
+  }
+
+  const refreshQuota = async () => {
+    if (!data?.activeAccountId) return
+    setQuotaRefreshing(true)
+    try {
+      const quota = await call("refresh_official_account_quota", {
+        accountId: data.activeAccountId,
+      })
+      await load()
+      if (quota.status === "success") {
+        notify.success("当前账号额度已更新")
+      } else {
+        notify.warning(
+          "当前账号额度未更新",
+          quota.error ?? "OpenAI 暂未返回额度。"
+        )
+      }
+    } catch (reason) {
+      notify.error("无法刷新当前账号额度", reason)
+    } finally {
+      setQuotaRefreshing(false)
     }
   }
 
@@ -143,7 +170,7 @@ export default function DashboardPage({ active }: PageProps) {
       detail: "会话数据是否可读取",
     },
   ]
-  const busy = launching || refreshing
+  const busy = launching || refreshing || quotaRefreshing
 
   return (
     <div className="flex flex-col gap-6">
@@ -171,7 +198,25 @@ export default function DashboardPage({ active }: PageProps) {
             </Badge>
           </CardAction>
         </CardHeader>
-        <CardContent>
+        <CardContent className="flex flex-col gap-3">
+          {data.activeAccount && (
+            <Item variant="muted">
+              <ItemMedia variant="icon">
+                <KeyRound />
+              </ItemMedia>
+              <ItemContent className="min-w-0">
+                <ItemTitle>{data.activeAccount}</ItemTitle>
+                <ItemDescription>
+                  {data.activeKind === "official"
+                    ? "当前 Codex 账号"
+                    : "当前 API Key"}
+                </ItemDescription>
+                {data.activeKind === "official" && (
+                  <QuotaStatusView quota={data.activeQuota} />
+                )}
+              </ItemContent>
+            </Item>
+          )}
           <Item variant="muted">
             <ItemMedia variant="icon">
               <FolderCog />
@@ -208,6 +253,20 @@ export default function DashboardPage({ active }: PageProps) {
             )}
             {refreshing ? "正在刷新…" : "刷新状态"}
           </Button>
+          {data.activeKind === "official" && data.activeAccountId && (
+            <Button
+              variant="outline"
+              disabled={busy}
+              onClick={() => void refreshQuota()}
+            >
+              {quotaRefreshing ? (
+                <Spinner data-icon="inline-start" />
+              ) : (
+                <RefreshCw data-icon="inline-start" />
+              )}
+              {quotaRefreshing ? "正在查询…" : "刷新当前额度"}
+            </Button>
+          )}
         </CardFooter>
       </Card>
 

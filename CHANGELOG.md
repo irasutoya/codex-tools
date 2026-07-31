@@ -4,6 +4,12 @@
 
 ## [Unreleased]
 
+### Added
+
+- Codex 账号页新增独立的反代号登录入口，支持导入 `at-...`、`accessToken`、`refresh_token` 或账号 JSON，原始 JSON 不会落盘。
+- 正常网页登录账号与反代号统一从 OpenAI 官方 `wham/usage` 查询并缓存 5H/7D 额度，支持单个、批量和 Dashboard 刷新。
+- 仅含 accessToken 的反代号使用 Codex 官方支持的 `personal_access_token` 登录格式；第三方 Responses API 继续只管理 API Key。
+
 ## [0.2.0] - 2026-07-24
 
 ### Added

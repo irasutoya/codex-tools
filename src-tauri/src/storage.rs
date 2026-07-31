@@ -445,6 +445,24 @@ impl Store {
         })
     }
 
+    pub fn save_official_account_quota(
+        &self,
+        id: &str,
+        quota: ProviderAccountQuota,
+    ) -> Result<ProviderAccountQuota, AppError> {
+        self.update(|state| {
+            let account = state
+                .official_accounts
+                .iter_mut()
+                .find(|account| account.id == id)
+                .ok_or_else(|| {
+                    AppError::InvalidConfig("Codex 账号不存在，可能已被删除。".into())
+                })?;
+            account.quota = quota.clone();
+            Ok(quota)
+        })
+    }
+
     pub fn sync_official_credential(
         &self,
         id: &str,
@@ -542,12 +560,14 @@ fn normalize_official_account(account: &mut StoredOfficialAccount) -> Result<(),
 
 fn validate_official_credential(credential: &CodexAuthCredential) -> Result<(), AppError> {
     let tokens = &credential.tokens;
+    let personal_access_token =
+        tokens.id_token.trim().is_empty() || tokens.refresh_token.trim().is_empty();
     if credential.auth_mode != "chatgpt"
         || credential.last_refresh.trim().is_empty()
-        || tokens.id_token.trim().is_empty()
         || tokens.access_token.trim().is_empty()
-        || tokens.refresh_token.trim().is_empty()
         || tokens.account_id.trim().is_empty()
+        || (!personal_access_token
+            && (tokens.id_token.trim().is_empty() || tokens.refresh_token.trim().is_empty()))
     {
         return Err(AppError::InvalidConfig(
             "OpenAI 登录信息不完整，请重新登录。".into(),
@@ -744,7 +764,9 @@ mod tests {
                 },
                 last_refresh: "2026-07-14T00:00:00Z".into(),
             },
+            source: OfficialAccountSource::OpenAiOauth,
             expires_at: Some(1_800_000_000),
+            quota: ProviderAccountQuota::default(),
             created_at: 0,
             updated_at: 0,
         }

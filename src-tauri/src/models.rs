@@ -107,6 +107,44 @@ pub enum AccountAuthKind {
     OfficialOauth,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum OfficialAccountSource {
+    #[default]
+    OpenAiOauth,
+    ProxyImport,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum QuotaStatus {
+    #[default]
+    Never,
+    Success,
+    Unsupported,
+    Unauthorized,
+    RateLimited,
+    Error,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderAccountQuota {
+    #[serde(default)]
+    pub status: QuotaStatus,
+    pub data: Option<QuotaData>,
+    pub fetched_at: Option<i64>,
+    pub last_attempt_at: Option<i64>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuotaRefreshResult {
+    pub account_id: String,
+    pub quota: ProviderAccountQuota,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderAccount {
@@ -155,7 +193,7 @@ pub struct StoredProvider {
     pub accounts: Vec<ProviderAccount>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ActiveKind {
     #[default]
@@ -220,7 +258,7 @@ impl fmt::Debug for CodexAuthCredential {
 
 /// Sensitive official-account record. It is serialized only as part of
 /// `app.yaml`; public commands must return [`OfficialAccountView`] instead.
-#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct StoredOfficialAccount {
     #[serde(default)]
@@ -229,7 +267,11 @@ pub struct StoredOfficialAccount {
     pub account_id: String,
     pub email: String,
     pub credential: CodexAuthCredential,
+    #[serde(default)]
+    pub source: OfficialAccountSource,
     pub expires_at: Option<i64>,
+    #[serde(default)]
+    pub quota: ProviderAccountQuota,
     #[serde(default)]
     pub created_at: i64,
     #[serde(default)]
@@ -252,14 +294,16 @@ impl fmt::Debug for StoredOfficialAccount {
     }
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct OfficialAccountView {
     pub id: String,
     pub name: String,
     pub account_id: String,
     pub email: String,
+    pub source: OfficialAccountSource,
     pub expires_at: Option<i64>,
+    pub quota: ProviderAccountQuota,
     pub created_at: i64,
     pub updated_at: i64,
     pub active: bool,
@@ -280,7 +324,9 @@ impl StoredOfficialAccount {
             name: self.name.clone(),
             account_id: self.account_id.clone(),
             email: self.email.clone(),
+            source: self.source,
             expires_at: self.expires_at,
+            quota: self.quota.clone(),
             created_at: self.created_at,
             updated_at: self.updated_at,
             active,
@@ -362,11 +408,37 @@ pub struct ProviderTestResult {
     pub suggest_v1: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct QuotaWindow {
+    pub used_percent: u8,
+    pub remaining_percent: u8,
+    pub window_seconds: Option<i64>,
+    pub reset_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(
+    tag = "kind",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
+pub enum QuotaData {
+    Windowed {
+        primary: Option<QuotaWindow>,
+        secondary: Option<QuotaWindow>,
+    },
+}
+
 #[derive(Debug, Serialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct Dashboard {
     pub provider_count: usize,
     pub active_provider: Option<String>,
+    pub active_kind: ActiveKind,
+    pub active_account_id: Option<String>,
+    pub active_account: Option<String>,
+    pub active_quota: Option<ProviderAccountQuota>,
     pub codex_home: String,
     pub database_count: usize,
     pub session_count: usize,
@@ -567,7 +639,9 @@ mod tests {
                 },
                 last_refresh: "2026-07-14T00:00:00Z".into(),
             },
+            source: OfficialAccountSource::OpenAiOauth,
             expires_at: Some(1_800_000_000),
+            quota: ProviderAccountQuota::default(),
             created_at: 1,
             updated_at: 2,
         }

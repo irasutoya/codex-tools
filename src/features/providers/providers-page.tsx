@@ -83,6 +83,7 @@ import {
 } from "@/components/ui/item"
 import { Spinner } from "@/components/ui/spinner"
 import { Switch } from "@/components/ui/switch"
+import { Textarea } from "@/components/ui/textarea"
 import { notify } from "@/lib/feedback"
 import { call } from "@/lib/ipc"
 import { notifyRepairWarnings } from "@/lib/repair-feedback"
@@ -96,6 +97,8 @@ import {
   type PageProps,
   type Provider,
 } from "@/types"
+
+import { QuotaStatusView } from "./quota-status"
 
 export default function ProvidersPage({ active }: PageProps) {
   const [providers, setProviders] = useState<Provider[]>([])
@@ -116,6 +119,7 @@ export default function ProvidersPage({ active }: PageProps) {
     account: OfficialAccountView
   }>()
   const [confirmOpenAiLogin, setConfirmOpenAiLogin] = useState(false)
+  const [proxyLoginOpen, setProxyLoginOpen] = useState(false)
   const [pendingTask, setPendingTask] = useState<string>()
   const [overviewLoaded, setOverviewLoaded] = useState(false)
   const [overviewError, setOverviewError] = useState<string>()
@@ -193,9 +197,17 @@ export default function ProvidersPage({ active }: PageProps) {
                 `Codex 现在使用 ${result.account.name}。`
               )
               notifyRepairWarnings(result.repair)
-              void load().catch((error) =>
-                notify.error("账号列表刷新失败", error)
-              )
+              void call("refresh_official_account_quota", {
+                accountId: result.account.id,
+              })
+                .catch((error) =>
+                  notify.warning("登录成功，但额度暂未更新", error)
+                )
+                .finally(() =>
+                  load().catch((error) =>
+                    notify.error("账号列表刷新失败", error)
+                  )
+                )
             })
             .catch((error) => {
               if (cancelled) return
@@ -301,27 +313,59 @@ export default function ProvidersPage({ active }: PageProps) {
         <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
           <div className="flex flex-col gap-1">
             <h2 id="openai-title" className="text-base font-medium">
-              OpenAI 官方账号
+              Codex 账号
             </h2>
             <p className="text-sm text-muted-foreground">
-              通过浏览器安全登录，授权信息只保存在这台电脑。
+              正常号与反代号统一管理，5H/7D 均从 OpenAI 官方查询。
             </p>
           </div>
-          {officialAccounts.length > 0 && (
+          <div className="flex flex-wrap gap-2">
+            {officialAccounts.length > 0 && (
+              <Button
+                variant="outline"
+                disabled={busy}
+                onClick={() =>
+                  void run("official:quota:all", async () => {
+                    const results = await call("refresh_all_official_quotas")
+                    const succeeded = results.filter(
+                      (result) => result.quota.status === "success"
+                    ).length
+                    notify.success(
+                      "官方额度刷新完成",
+                      `${succeeded}/${results.length} 个账号查询成功。`
+                    )
+                  })
+                }
+              >
+                {pendingTask === "official:quota:all" ? (
+                  <Spinner data-icon="inline-start" />
+                ) : (
+                  <RefreshCw data-icon="inline-start" />
+                )}
+                刷新全部额度
+              </Button>
+            )}
             <Button
-              variant="secondary"
+              variant="outline"
+              disabled={busy}
+              onClick={() => setProxyLoginOpen(true)}
+            >
+              <KeyRound data-icon="inline-start" />
+              登录反代号
+            </Button>
+            <Button
               disabled={busy || Boolean(deviceAuthorization)}
               onClick={() => setConfirmOpenAiLogin(true)}
             >
               <LogIn data-icon="inline-start" />
-              添加账号
+              网页登录
             </Button>
-          )}
+          </div>
         </div>
         <Card>
           <CardHeader>
             <CardTitle className="flex items-center gap-2">
-              已登录账号
+              已保存账号
               {officialAccounts.some((item) => item.active) && (
                 <Badge>使用中</Badge>
               )}
@@ -386,21 +430,30 @@ export default function ProvidersPage({ active }: PageProps) {
               <Empty>
                 <EmptyHeader>
                   <EmptyMedia variant="icon">
-                    <UserRound />
+                    <KeyRound />
                   </EmptyMedia>
-                  <EmptyTitle>尚未登录 OpenAI</EmptyTitle>
+                  <EmptyTitle>尚未添加 Codex 账号</EmptyTitle>
                   <EmptyDescription>
-                    登录后即可使用官方服务，凭据仅保存在本机。
+                    可通过 OpenAI 网页登录正常号，或导入反代号。
                   </EmptyDescription>
                 </EmptyHeader>
-                <EmptyContent>
+                <EmptyContent className="flex flex-wrap gap-2">
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    disabled={busy}
+                    onClick={() => setProxyLoginOpen(true)}
+                  >
+                    <KeyRound data-icon="inline-start" />
+                    登录反代号
+                  </Button>
                   <Button
                     size="sm"
                     disabled={busy || Boolean(deviceAuthorization)}
                     onClick={() => setConfirmOpenAiLogin(true)}
                   >
                     <LogIn data-icon="inline-start" />
-                    登录 OpenAI
+                    网页登录
                   </Button>
                 </EmptyContent>
               </Empty>
@@ -413,11 +466,20 @@ export default function ProvidersPage({ active }: PageProps) {
                     size="sm"
                   >
                     <ItemMedia variant="icon">
-                      <UserRound />
+                      {item.source === "proxy_import" ? (
+                        <KeyRound />
+                      ) : (
+                        <UserRound />
+                      )}
                     </ItemMedia>
                     <ItemContent className="min-w-0">
                       <ItemTitle>
                         {item.name}
+                        <Badge variant="outline">
+                          {item.source === "proxy_import"
+                            ? "反代号"
+                            : "网页登录"}
+                        </Badge>
                         {item.active && <Badge>使用中</Badge>}
                       </ItemTitle>
                       <ItemDescription className="truncate">
@@ -425,11 +487,47 @@ export default function ProvidersPage({ active }: PageProps) {
                       </ItemDescription>
                       <ItemDescription>
                         {item.expiresAt
-                          ? `有效至 ${formatTimestamp(item.expiresAt)}，到期前自动续期`
-                          : "有效期由 OpenAI 自动管理"}
+                          ? `有效至 ${formatTimestamp(item.expiresAt)}${
+                              item.source === "open_ai_oauth"
+                                ? "，到期前自动续期"
+                                : ""
+                            }`
+                          : item.source === "proxy_import"
+                            ? "有效期由反代 Token 决定"
+                            : "有效期由 OpenAI 自动管理"}
                       </ItemDescription>
+                      <QuotaStatusView quota={item.quota} compact />
                     </ItemContent>
                     <ItemActions className="ml-auto">
+                      <Button
+                        size="icon-sm"
+                        variant="ghost"
+                        disabled={busy}
+                        aria-label={`刷新 ${item.name} 的官方额度`}
+                        title="刷新官方额度"
+                        onClick={() =>
+                          void run(`official:quota:${item.id}`, async () => {
+                            const quota = await call(
+                              "refresh_official_account_quota",
+                              { accountId: item.id }
+                            )
+                            if (quota.status === "success") {
+                              notify.success("官方额度已更新")
+                            } else {
+                              notify.warning(
+                                "官方额度未更新",
+                                quota.error ?? "OpenAI 暂未返回额度。"
+                              )
+                            }
+                          })
+                        }
+                      >
+                        {pendingTask === `official:quota:${item.id}` ? (
+                          <Spinner />
+                        ) : (
+                          <RefreshCw />
+                        )}
+                      </Button>
                       <Button
                         size="sm"
                         variant="secondary"
@@ -607,7 +705,7 @@ export default function ProvidersPage({ active }: PageProps) {
                               {item.active && <Badge>使用中</Badge>}
                             </ItemTitle>
                             <ItemDescription>
-                              仅保存在本机，启用此服务时写入 Codex。
+                              API Key 仅保存在本机，启用时写入 Codex。
                             </ItemDescription>
                           </ItemContent>
                           <ItemActions className="ml-auto">
@@ -696,7 +794,7 @@ export default function ProvidersPage({ active }: PageProps) {
                                     }
                                   >
                                     <Trash2 />
-                                    删除 API Key
+                                    删除账号
                                   </DropdownMenuItem>
                                 </DropdownMenuGroup>
                               </DropdownMenuContent>
@@ -740,6 +838,36 @@ export default function ProvidersPage({ active }: PageProps) {
               await call("save_provider_account", { account })
               setAccount(undefined)
               notify.success("API Key 已保存")
+            })
+          }
+        />
+      )}
+      {proxyLoginOpen && (
+        <ProxyLoginDialog
+          pending={pendingTask === "proxy:login"}
+          onCancel={() => setProxyLoginOpen(false)}
+          onLogin={(name, accountId, content) =>
+            void run("proxy:login", async () => {
+              const imported = await call("import_proxy_account", {
+                name,
+                accountId,
+                content,
+              })
+              setProxyLoginOpen(false)
+              notify.success("反代号已登录", imported.name)
+              try {
+                const quota = await call("refresh_official_account_quota", {
+                  accountId: imported.id,
+                })
+                if (quota.status !== "success") {
+                  notify.warning(
+                    "反代号已保存，但额度暂未更新",
+                    quota.error ?? "OpenAI 暂未返回额度。"
+                  )
+                }
+              } catch (error) {
+                notify.warning("反代号已保存，但额度暂未更新", error)
+              }
             })
           }
         />
@@ -930,6 +1058,8 @@ function taskFailureTitle(task: string) {
   if (task.startsWith("account:test:")) return "连接测试失败"
   if (task === "provider:save") return "API 服务保存失败"
   if (task === "account:save") return "API Key 保存失败"
+  if (task === "proxy:login") return "反代号登录失败"
+  if (task.startsWith("official:quota:")) return "官方额度刷新失败"
   if (task === "openai:login") return "无法开始 OpenAI 登录"
   if (task.startsWith("account:activate:")) return "无法切换 API 服务"
   if (task.startsWith("openai:activate:")) return "无法切换 OpenAI 账号"
@@ -1069,7 +1199,7 @@ function AccountEditor({
         <DialogHeader>
           <DialogTitle>添加 API Key</DialogTitle>
           <DialogDescription>
-            可以为同一服务保存多个密钥，并随时切换。
+            可以为同一个第三方服务保存多个 API Key，并随时切换。
           </DialogDescription>
         </DialogHeader>
         <FieldGroup>
@@ -1096,7 +1226,11 @@ function AccountEditor({
               placeholder="sk-…"
               value={value.apiKey ?? ""}
               onChange={(event) =>
-                onChange({ ...value, apiKey: event.target.value })
+                onChange({
+                  ...value,
+                  apiKey: event.target.value,
+                  authKind: "api_key",
+                })
               }
             />
             <FieldDescription>
@@ -1118,6 +1252,107 @@ function AccountEditor({
               <Save data-icon="inline-start" />
             )}
             {pending ? "正在保存…" : "保存 API Key"}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
+function ProxyLoginDialog({
+  pending,
+  onCancel,
+  onLogin,
+}: {
+  pending: boolean
+  onCancel: () => void
+  onLogin: (
+    name: string | undefined,
+    accountId: string | undefined,
+    content: string
+  ) => void
+}) {
+  const [name, setName] = useState("")
+  const [accountId, setAccountId] = useState("")
+  const [content, setContent] = useState("")
+
+  return (
+    <Dialog
+      open
+      onOpenChange={(open) => {
+        if (!open && !pending) onCancel()
+      }}
+    >
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>登录反代号</DialogTitle>
+          <DialogDescription>
+            粘贴反代提供的 Token 或账号 JSON。登录后会从 OpenAI 官方查询 5H/7D。
+          </DialogDescription>
+        </DialogHeader>
+        <FieldGroup>
+          <Field>
+            <FieldLabel htmlFor="proxy-account-name">账号名称</FieldLabel>
+            <Input
+              id="proxy-account-name"
+              autoFocus
+              placeholder="可选，例如：日常反代号"
+              value={name}
+              onChange={(event) => setName(event.target.value)}
+            />
+          </Field>
+          <Field>
+            <FieldLabel htmlFor="proxy-account-id">
+              ChatGPT Account ID
+            </FieldLabel>
+            <Input
+              id="proxy-account-id"
+              autoComplete="off"
+              placeholder="可选；团队号查询额度时可能需要"
+              value={accountId}
+              onChange={(event) => setAccountId(event.target.value)}
+            />
+            <FieldDescription>
+              个人号通常留空；账号 JSON 已包含 accountId 时也可留空。
+            </FieldDescription>
+          </Field>
+          <Field>
+            <FieldLabel htmlFor="proxy-account-content">
+              Token / 账号 JSON
+            </FieldLabel>
+            <Textarea
+              id="proxy-account-content"
+              className="min-h-36 font-mono text-xs"
+              autoComplete="off"
+              placeholder='粘贴 at-…、accessToken，或包含 "access_token" / "refresh_token" 的 JSON'
+              value={content}
+              onChange={(event) => setContent(event.target.value)}
+            />
+            <FieldDescription>
+              原始 JSON 不会保存；程序只提取登录所需字段，凭据仅保存在本机。
+            </FieldDescription>
+          </Field>
+        </FieldGroup>
+        <DialogFooter>
+          <Button variant="outline" disabled={pending} onClick={onCancel}>
+            取消
+          </Button>
+          <Button
+            disabled={pending || !content.trim()}
+            onClick={() =>
+              onLogin(
+                name.trim() || undefined,
+                accountId.trim() || undefined,
+                content
+              )
+            }
+          >
+            {pending ? (
+              <Spinner data-icon="inline-start" />
+            ) : (
+              <LogIn data-icon="inline-start" />
+            )}
+            {pending ? "正在登录…" : "登录反代号"}
           </Button>
         </DialogFooter>
       </DialogContent>

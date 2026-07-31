@@ -169,8 +169,15 @@ pub fn activate_official_account(
     let mut document = parse_config_document(&read_optional(&config_path)?)?;
     clear_custom_provider_fields(&mut document)?;
 
-    let mut auth_rendered = serde_json::to_vec_pretty(credential)
-        .map_err(|error| AppError::Internal(error.to_string()))?;
+    let mut auth_rendered = if is_personal_access_token_credential(credential) {
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "OPENAI_API_KEY": null,
+            "personal_access_token": credential.tokens.access_token,
+        }))
+    } else {
+        serde_json::to_vec_pretty(credential)
+    }
+    .map_err(|error| AppError::Internal(error.to_string()))?;
     auth_rendered.push(b'\n');
 
     commit_codex_files(
@@ -191,25 +198,58 @@ pub fn read_official_account(codex_home: &Path) -> Result<Option<CodexAuthCreden
     if bytes.iter().all(u8::is_ascii_whitespace) || bytes == b"{}" || bytes == b"{}\n" {
         return Ok(None);
     }
-    let credential = serde_json::from_slice::<CodexAuthCredential>(&bytes).map_err(|_| {
-        AppError::InvalidConfig("Codex 的登录文件无法识别，将在切换账号时重新写入。".into())
-    })?;
+    let credential = match serde_json::from_slice::<CodexAuthCredential>(&bytes) {
+        Ok(credential) => credential,
+        Err(_) => {
+            let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| {
+                AppError::InvalidConfig("Codex 的登录文件无法识别，将在切换账号时重新写入。".into())
+            })?;
+            let personal_access_token = value
+                .get("personal_access_token")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    AppError::InvalidConfig(
+                        "Codex 的登录文件无法识别，将在切换账号时重新写入。".into(),
+                    )
+                })?;
+            CodexAuthCredential {
+                auth_mode: "chatgpt".into(),
+                openai_api_key: None,
+                tokens: crate::models::CodexAuthTokens {
+                    id_token: String::new(),
+                    access_token: personal_access_token.to_owned(),
+                    refresh_token: String::new(),
+                    account_id: String::new(),
+                },
+                last_refresh: String::new(),
+            }
+        }
+    };
     validate_official_credential(&credential)?;
     Ok(Some(credential))
 }
 
 fn validate_official_credential(credential: &CodexAuthCredential) -> Result<(), AppError> {
+    let personal_access_token = is_personal_access_token_credential(credential);
     if credential.auth_mode != "chatgpt"
-        || credential.tokens.id_token.trim().is_empty()
         || credential.tokens.access_token.trim().is_empty()
-        || credential.tokens.refresh_token.trim().is_empty()
-        || credential.tokens.account_id.trim().is_empty()
+        || (!personal_access_token
+            && (credential.tokens.id_token.trim().is_empty()
+                || credential.tokens.refresh_token.trim().is_empty()
+                || credential.tokens.account_id.trim().is_empty()))
     {
         return Err(AppError::InvalidConfig(
             "OpenAI 登录信息不完整，请重新登录。".into(),
         ));
     }
     Ok(())
+}
+
+fn is_personal_access_token_credential(credential: &CodexAuthCredential) -> bool {
+    credential.tokens.id_token.trim().is_empty()
+        || credential.tokens.refresh_token.trim().is_empty()
 }
 
 pub fn inspect(codex_home: &Path) -> ConfigInspection {
@@ -1021,6 +1061,39 @@ model_providers = "invalid"
 
         assert!(result.is_err());
         assert_eq!(auth, b"{}\n");
+    }
+
+    #[test]
+    fn personal_access_token_account_uses_codex_supported_auth_shape() {
+        let temp = tempfile::tempdir().unwrap();
+        prepare_home(temp.path());
+        let credential = CodexAuthCredential {
+            auth_mode: "chatgpt".into(),
+            openai_api_key: None,
+            tokens: crate::models::CodexAuthTokens {
+                id_token: String::new(),
+                access_token: "at-proxy-secret".into(),
+                refresh_token: String::new(),
+                account_id: "proxy-local-id".into(),
+            },
+            last_refresh: "2026-07-31T00:00:00Z".into(),
+        };
+
+        activate_official_account(temp.path(), &credential).unwrap();
+
+        let auth: serde_json::Value =
+            serde_json::from_slice(&fs::read(temp.path().join("auth.json")).unwrap()).unwrap();
+        assert_eq!(auth["OPENAI_API_KEY"], serde_json::Value::Null);
+        assert_eq!(auth["personal_access_token"], "at-proxy-secret");
+        assert!(auth.get("tokens").is_none());
+        assert_eq!(
+            read_official_account(temp.path())
+                .unwrap()
+                .unwrap()
+                .tokens
+                .access_token,
+            "at-proxy-secret"
+        );
     }
 
     #[test]

@@ -2,8 +2,10 @@ mod auth_center;
 mod codex;
 mod models;
 mod network;
+mod official_quota;
 mod platform;
 mod provider_sync;
+mod proxy_import;
 mod session_index;
 mod storage;
 
@@ -90,6 +92,105 @@ async fn save_provider_account(
 #[tauri::command]
 fn delete_provider_account(store: State<Store>, id: String) -> Result<(), AppError> {
     store.delete_account(&id)
+}
+
+#[tauri::command]
+async fn import_proxy_account(
+    store: State<'_, Store>,
+    center: State<'_, AuthCenter>,
+    name: Option<String>,
+    account_id: Option<String>,
+    content: String,
+) -> Result<OfficialAccountView, AppError> {
+    let mut imported =
+        proxy_import::parse_proxy_credential(&content).map_err(AppError::InvalidConfig)?;
+    if let Some(account_id) = account_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        imported.account_id = Some(account_id.to_owned());
+    }
+    let account = center.import_proxy_account(imported, name).await?;
+    let saved = store.save_official_account(&account)?;
+    store.official_account_view(&saved.id)
+}
+
+async fn refresh_official_quota(
+    store: &Store,
+    center: &AuthCenter,
+    client: &ApiClient,
+    account_id: &str,
+) -> Result<ProviderAccountQuota, AppError> {
+    let stored = store.official_account(account_id)?;
+    let now = chrono::Utc::now().timestamp();
+    let mut snapshot = stored.quota.clone();
+    snapshot.last_attempt_at = Some(now);
+    let account = match center.refresh_account(&stored).await {
+        Ok(account) => store.save_official_account(&account)?,
+        Err(error) => {
+            snapshot.status = match error {
+                AppError::InvalidConfig(_) => QuotaStatus::Unauthorized,
+                AppError::StaleOperation | AppError::Internal(_) => QuotaStatus::Error,
+            };
+            snapshot.error = Some(error.to_string());
+            return store.save_official_account_quota(account_id, snapshot);
+        }
+    };
+    match official_quota::fetch_quota(&client.0, &account).await {
+        Ok(data) => {
+            snapshot.status = QuotaStatus::Success;
+            snapshot.data = Some(data);
+            snapshot.fetched_at = Some(now);
+            snapshot.error = None;
+        }
+        Err(error) => {
+            snapshot.status = error.status;
+            snapshot.error = Some(error.message);
+        }
+    }
+    store.save_official_account_quota(account_id, snapshot)
+}
+
+#[tauri::command]
+async fn refresh_official_account_quota(
+    store: State<'_, Store>,
+    center: State<'_, AuthCenter>,
+    client: State<'_, ApiClient>,
+    account_id: String,
+) -> Result<ProviderAccountQuota, AppError> {
+    refresh_official_quota(&store, &center, &client, &account_id).await
+}
+
+#[tauri::command]
+async fn refresh_all_official_quotas(
+    store: State<'_, Store>,
+    center: State<'_, AuthCenter>,
+    client: State<'_, ApiClient>,
+) -> Result<Vec<QuotaRefreshResult>, AppError> {
+    refresh_all_official_quotas_in_store(&store, &center, &client).await
+}
+
+async fn refresh_all_official_quotas_in_store(
+    store: &Store,
+    center: &AuthCenter,
+    client: &ApiClient,
+) -> Result<Vec<QuotaRefreshResult>, AppError> {
+    let account_ids = store.read(|state| {
+        state
+            .official_accounts
+            .iter()
+            .map(|account| account.id.clone())
+            .collect::<Vec<_>>()
+    })?;
+    let mut results = Vec::with_capacity(account_ids.len());
+    for account_id in account_ids {
+        results.push(QuotaRefreshResult {
+            quota: refresh_official_quota(store, center, client, &account_id).await?,
+            account_id,
+        });
+    }
+    Ok(results)
 }
 
 #[tauri::command]
@@ -518,17 +619,22 @@ async fn get_dashboard(
     store: State<'_, Store>,
     index: State<'_, SessionIndex>,
 ) -> Result<Dashboard, AppError> {
-    let (home_setting, provider_count, active_provider) = store.read(|state| {
-        let active_provider = state
-            .active
-            .provider_id
-            .as_deref()
-            .and_then(|id| {
-                state
-                    .providers
-                    .iter()
-                    .find(|provider| provider.profile.id == id)
-            })
+    let (
+        home_setting,
+        provider_count,
+        active_provider,
+        active_kind,
+        active_account_id,
+        active_account,
+        active_quota,
+    ) = store.read(|state| {
+        let active_stored_provider = state.active.provider_id.as_deref().and_then(|id| {
+            state
+                .providers
+                .iter()
+                .find(|provider| provider.profile.id == id)
+        });
+        let active_provider = active_stored_provider
             .map(|provider| provider.profile.name.clone())
             .or_else(|| {
                 matches!(state.active.kind, ActiveKind::Official).then(|| {
@@ -546,10 +652,35 @@ async fn get_dashboard(
                         .unwrap_or_else(|| "OpenAI 官方账号".into())
                 })
             });
+        let active_account = active_stored_provider.and_then(|provider| {
+            state
+                .active
+                .account_id
+                .as_deref()
+                .and_then(|id| provider.accounts.iter().find(|account| account.id == id))
+        });
+        let active_official_account = matches!(state.active.kind, ActiveKind::Official)
+            .then(|| {
+                state.active.account_id.as_deref().and_then(|id| {
+                    state
+                        .official_accounts
+                        .iter()
+                        .find(|account| account.id == id)
+                })
+            })
+            .flatten();
         (
             state.codex.home.clone(),
             state.providers.len(),
             active_provider,
+            state.active.kind,
+            active_account
+                .map(|account| account.id.clone())
+                .or_else(|| active_official_account.map(|account| account.id.clone())),
+            active_account
+                .map(|account| account.name.clone())
+                .or_else(|| active_official_account.map(|account| account.name.clone())),
+            active_official_account.map(|account| account.quota.clone()),
         )
     })?;
     let home = codex::home(&home_setting);
@@ -567,6 +698,10 @@ async fn get_dashboard(
     Ok(Dashboard {
         provider_count,
         active_provider,
+        active_kind,
+        active_account_id,
+        active_account,
+        active_quota,
         codex_home: home.display().to_string(),
         database_count,
         session_count,
@@ -720,12 +855,15 @@ pub fn run() {
             delete_provider,
             save_provider_account,
             delete_provider_account,
+            import_proxy_account,
             start_openai_device_auth,
             poll_openai_device_auth,
             activate_openai_account,
             delete_openai_account,
             open_openai_device_page,
             test_provider,
+            refresh_official_account_quota,
+            refresh_all_official_quotas,
             preview_activation,
             apply_activation,
             activate_provider,
@@ -775,6 +913,58 @@ mod tests {
         assert_eq!(
             models_endpoint("https://api.example.test/openai"),
             "https://api.example.test/openai/v1/models"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_all_official_quotas_continues_after_expired_proxy_accounts() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path().join("data")).unwrap();
+        for account_id in ["first", "second"] {
+            store
+                .save_official_account(&StoredOfficialAccount {
+                    id: String::new(),
+                    name: account_id.into(),
+                    account_id: account_id.into(),
+                    email: String::new(),
+                    credential: CodexAuthCredential {
+                        auth_mode: "chatgpt".into(),
+                        openai_api_key: None,
+                        tokens: CodexAuthTokens {
+                            id_token: String::new(),
+                            access_token: format!("{account_id}-access"),
+                            refresh_token: String::new(),
+                            account_id: account_id.into(),
+                        },
+                        last_refresh: "2026-07-31T00:00:00Z".into(),
+                    },
+                    source: OfficialAccountSource::ProxyImport,
+                    expires_at: Some(1),
+                    quota: ProviderAccountQuota::default(),
+                    created_at: 0,
+                    updated_at: 0,
+                })
+                .unwrap();
+        }
+
+        let results = refresh_all_official_quotas_in_store(
+            &store,
+            &AuthCenter::default(),
+            &ApiClient::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(results.len(), 2);
+        assert!(
+            results
+                .iter()
+                .all(|result| result.quota.status == QuotaStatus::Unauthorized)
+        );
+        assert!(
+            results
+                .iter()
+                .all(|result| result.quota.last_attempt_at.is_some())
         );
     }
 
@@ -914,7 +1104,9 @@ mod tests {
                 account_id: "workspace".into(),
                 email: "person@example.test".into(),
                 credential: credential.clone(),
+                source: OfficialAccountSource::OpenAiOauth,
                 expires_at: None,
+                quota: ProviderAccountQuota::default(),
                 created_at: 0,
                 updated_at: 0,
             })

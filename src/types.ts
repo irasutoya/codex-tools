@@ -32,10 +32,48 @@ export type Account = {
 export type Dashboard = {
   providerCount: number
   activeProvider?: string
+  activeKind: "none" | "provider" | "official"
+  activeAccountId?: string
+  activeAccount?: string
+  activeQuota?: AccountQuota
   codexHome: string
   databaseCount: number
   sessionCount: number
   databaseHealth: string
+}
+
+export type QuotaStatus =
+  | "never"
+  | "success"
+  | "unsupported"
+  | "unauthorized"
+  | "rate_limited"
+  | "error"
+
+export type QuotaWindow = {
+  usedPercent: number
+  remainingPercent: number
+  windowSeconds?: number
+  resetAt?: number
+}
+
+export type QuotaData = {
+  kind: "windowed"
+  primary?: QuotaWindow
+  secondary?: QuotaWindow
+}
+
+export type AccountQuota = {
+  status: QuotaStatus
+  data?: QuotaData
+  fetchedAt?: number
+  lastAttemptAt?: number
+  error?: string
+}
+
+export type QuotaRefreshResult = {
+  accountId: string
+  quota: AccountQuota
 }
 
 export type Session = {
@@ -84,7 +122,9 @@ export type OfficialAccountView = {
   name: string
   accountId: string
   email: string
+  source: "open_ai_oauth" | "proxy_import"
   expiresAt?: number
+  quota: AccountQuota
   active: boolean
   createdAt: number
   updatedAt: number

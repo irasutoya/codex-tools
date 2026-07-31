@@ -2,14 +2,17 @@ import { invoke } from "@tauri-apps/api/core"
 
 import type {
   Account,
+  AccountQuota,
   ConfigPatchPreview,
   Dashboard,
   DeviceAuthorization,
   DeviceAuthPollResult,
+  OfficialAccountView,
   PageResult,
   Provider,
   ProviderOverview,
   ProviderTestResult,
+  QuotaRefreshResult,
   RepairResult,
   RepairScan,
   Session,
@@ -29,6 +32,10 @@ type CommandMap = {
   delete_provider: CommandSpec<{ id: string }, void>
   save_provider_account: CommandSpec<{ account: Account }, Account>
   delete_provider_account: CommandSpec<{ id: string }, void>
+  import_proxy_account: CommandSpec<
+    { name?: string; accountId?: string; content: string },
+    OfficialAccountView
+  >
   start_openai_device_auth: CommandSpec<undefined, DeviceAuthorization>
   poll_openai_device_auth: CommandSpec<
     { operationId: string },
@@ -41,6 +48,11 @@ type CommandMap = {
     { id: string; accountId: string },
     ProviderTestResult
   >
+  refresh_official_account_quota: CommandSpec<
+    { accountId: string },
+    AccountQuota
+  >
+  refresh_all_official_quotas: CommandSpec<undefined, QuotaRefreshResult[]>
   preview_activation: CommandSpec<
     { providerId?: string } | undefined,
     ConfigPatchPreview

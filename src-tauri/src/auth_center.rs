@@ -1,7 +1,8 @@
 use crate::models::{
-    AppError, CodexAuthCredential, CodexAuthTokens, OpenAiDeviceAuthorization,
-    StoredOfficialAccount,
+    AppError, CodexAuthCredential, CodexAuthTokens, OfficialAccountSource,
+    OpenAiDeviceAuthorization, ProviderAccountQuota, StoredOfficialAccount,
 };
+use crate::proxy_import::ImportedProxyCredential;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use futures_util::StreamExt;
 use reqwest::StatusCode;
@@ -9,6 +10,7 @@ use reqwest::header::{HeaderMap, HeaderValue, USER_AGENT};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -232,6 +234,17 @@ impl AuthCenter {
         }) {
             return Ok(account.clone());
         }
+        if account.credential.tokens.refresh_token.trim().is_empty() {
+            if account
+                .expires_at
+                .is_some_and(|expires_at| expires_at <= chrono::Utc::now().timestamp())
+            {
+                return Err(AppError::InvalidConfig(
+                    "反代号的 accessToken 已过期，请重新导入。".into(),
+                ));
+            }
+            return Ok(account.clone());
+        }
         // Refresh tokens can rotate and are single-use. Serializing refreshes prevents
         // two activations from consuming the same token concurrently.
         let _guard = self.refresh_lock.lock().await;
@@ -256,6 +269,43 @@ impl AuthCenter {
         let refreshed: TokenResponse = read_json_bounded(response, "登录续期结果").await?;
         let tokens = merge_refreshed_tokens(refreshed, account)?;
         account_from_tokens(tokens, Some(account))
+    }
+
+    pub async fn import_proxy_account(
+        &self,
+        imported: ImportedProxyCredential,
+        requested_name: Option<String>,
+    ) -> Result<StoredOfficialAccount, AppError> {
+        if imported.access_token.is_none() {
+            let refresh_token = imported.refresh_token.clone().ok_or_else(|| {
+                AppError::InvalidConfig("反代账号缺少 accessToken 或 refresh_token。".into())
+            })?;
+            let response = self
+                .client()?
+                .post(TOKEN_URL)
+                .json(&json!({
+                    "client_id": CODEX_CLIENT_ID,
+                    "grant_type": "refresh_token",
+                    "refresh_token": refresh_token,
+                }))
+                .send()
+                .await
+                .map_err(safe_network_error)?;
+            let response = require_success(response, "无法使用反代 refresh_token 登录")?;
+            let refreshed: TokenResponse = read_json_bounded(response, "反代登录结果").await?;
+            let refreshed_import = ImportedProxyCredential {
+                access_token: Some(required_token(refreshed.access_token, "access_token")?),
+                id_token: non_empty(refreshed.id_token),
+                refresh_token: non_empty(refreshed.refresh_token)
+                    .or_else(|| imported.refresh_token.clone()),
+                account_id: imported.account_id,
+                email: imported.email,
+                suggested_name: imported.suggested_name,
+            };
+            return account_from_imported_tokens(refreshed_import, requested_name);
+        }
+
+        account_from_imported_tokens(imported, requested_name)
     }
 
     fn client(&self) -> Result<&reqwest::Client, AppError> {
@@ -427,10 +477,96 @@ fn account_from_tokens(
         account_id,
         email,
         credential,
+        source: previous.map_or(OfficialAccountSource::OpenAiOauth, |account| account.source),
         expires_at,
+        quota: previous.map_or_else(ProviderAccountQuota::default, |account| {
+            account.quota.clone()
+        }),
         created_at: previous.map_or(now_timestamp, |account| account.created_at),
         updated_at: now_timestamp,
     })
+}
+
+fn account_from_imported_tokens(
+    imported: ImportedProxyCredential,
+    requested_name: Option<String>,
+) -> Result<StoredOfficialAccount, AppError> {
+    let access_token = imported
+        .access_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| AppError::InvalidConfig("反代账号缺少 accessToken。".into()))?
+        .to_owned();
+    let id_token = imported.id_token.clone().unwrap_or_default();
+    let id_claims = token_identity(&id_token).unwrap_or_default();
+    let access_claims = token_identity(&access_token).unwrap_or_default();
+    let account_id = imported
+        .account_id
+        .clone()
+        .or(id_claims.account_id)
+        .or(access_claims.account_id)
+        .unwrap_or_else(|| token_local_identity(&access_token));
+    let email = imported
+        .email
+        .clone()
+        .or(id_claims.email)
+        .or(access_claims.email)
+        .unwrap_or_default();
+    let now = chrono::Utc::now();
+    let now_timestamp = now.timestamp();
+    let expires_at = access_claims.expires_at.or(id_claims.expires_at);
+    let mut account = StoredOfficialAccount {
+        id: String::new(),
+        name: String::new(),
+        account_id: account_id.clone(),
+        email,
+        credential: CodexAuthCredential {
+            auth_mode: "chatgpt".into(),
+            openai_api_key: None,
+            tokens: CodexAuthTokens {
+                id_token,
+                access_token,
+                refresh_token: imported.refresh_token.clone().unwrap_or_default(),
+                account_id,
+            },
+            last_refresh: now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        },
+        source: OfficialAccountSource::ProxyImport,
+        expires_at,
+        quota: ProviderAccountQuota::default(),
+        created_at: now_timestamp,
+        updated_at: now_timestamp,
+    };
+    apply_imported_profile(&mut account, &imported, requested_name);
+    Ok(account)
+}
+
+fn apply_imported_profile(
+    account: &mut StoredOfficialAccount,
+    imported: &ImportedProxyCredential,
+    requested_name: Option<String>,
+) {
+    if account.email.is_empty() {
+        account.email = imported.email.clone().unwrap_or_default();
+    }
+    account.name = requested_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .or_else(|| imported.suggested_name.clone())
+        .or_else(|| (!account.email.is_empty()).then(|| account.email.clone()))
+        .unwrap_or_else(|| "反代号".into());
+}
+
+fn token_local_identity(token: &str) -> String {
+    let digest = Sha256::digest(token.as_bytes());
+    let suffix = digest[..12]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("proxy-{suffix}")
 }
 
 fn token_identity(token: &str) -> Option<TokenIdentity> {
@@ -717,7 +853,9 @@ mod tests {
                 },
                 last_refresh: "2026-01-01T00:00:00Z".into(),
             },
+            source: OfficialAccountSource::OpenAiOauth,
             expires_at: None,
+            quota: ProviderAccountQuota::default(),
             created_at: 1,
             updated_at: 1,
         };
@@ -728,5 +866,28 @@ mod tests {
             expires_in: Some(3600),
         };
         assert!(account_from_tokens(tokens, Some(&previous)).is_err());
+    }
+
+    #[test]
+    fn imported_personal_access_token_is_marked_as_proxy_account() {
+        let account = account_from_imported_tokens(
+            ImportedProxyCredential {
+                access_token: Some("at-proxy-secret".into()),
+                id_token: None,
+                refresh_token: None,
+                account_id: None,
+                email: Some("proxy@example.test".into()),
+                suggested_name: Some("日常反代号".into()),
+            },
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(account.source, OfficialAccountSource::ProxyImport);
+        assert_eq!(account.name, "日常反代号");
+        assert_eq!(account.email, "proxy@example.test");
+        assert!(account.account_id.starts_with("proxy-"));
+        assert_eq!(account.credential.tokens.access_token, "at-proxy-secret");
+        assert!(account.credential.tokens.refresh_token.is_empty());
     }
 }
