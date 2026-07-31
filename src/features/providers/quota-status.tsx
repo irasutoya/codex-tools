@@ -1,6 +1,14 @@
 import { Clock3 } from "lucide-react"
 
 import { Badge } from "@/components/ui/badge"
+import {
+  Item,
+  ItemActions,
+  ItemContent,
+  ItemDescription,
+  ItemGroup,
+  ItemTitle,
+} from "@/components/ui/item"
 import { epochMilliseconds } from "@/lib/time"
 import { cn } from "@/lib/utils"
 import type { AccountQuota } from "@/types"
@@ -12,20 +20,14 @@ const quotaTimestampFormatter = new Intl.DateTimeFormat("zh-CN", {
   timeStyle: "short",
 })
 
-export function QuotaStatusView({
-  quota,
-  compact = false,
-}: {
-  quota?: AccountQuota
-  compact?: boolean
-}) {
+export function QuotaStatusView({ quota }: { quota?: AccountQuota }) {
   const rows = quotaRows(quota)
   const successful = quota?.status === "success"
 
   return (
     <div className="flex min-w-0 flex-col gap-2.5">
       <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
-        <Badge variant={successful ? "secondary" : "outline"}>
+        <Badge variant={successful ? "default" : "outline"}>
           {quotaStatusText(quota)}
         </Badge>
         {quota?.fetchedAt && (
@@ -42,35 +44,38 @@ export function QuotaStatusView({
               以下为上次成功查询结果
             </p>
           )}
-          <div
+          <ItemGroup
             className={cn(
               "grid gap-2",
-              compact ? "sm:grid-cols-2" : "md:grid-cols-2"
+              rows.length > 1 ? "grid-cols-2" : "grid-cols-1"
             )}
           >
             {rows.map((row) => (
-              <div
-                key={row.label}
-                className="min-w-0 rounded-lg bg-muted/60 px-3 py-2.5"
-              >
-                <div className="text-xs text-muted-foreground">{row.label}</div>
-                <div className="mt-0.5 truncate text-sm font-semibold tabular-nums">
-                  {row.value}
-                </div>
+              <Item key={row.label} variant="muted" size="sm">
+                <ItemContent className="gap-0.5">
+                  <ItemDescription className="line-clamp-none text-xs">
+                    {row.label}
+                  </ItemDescription>
+                  <ItemTitle className="text-base tabular-nums">
+                    {row.value}
+                  </ItemTitle>
+                </ItemContent>
                 {(row.detail || row.resetAt) && (
-                  <div className="mt-0.5 truncate text-xs text-muted-foreground">
-                    {[
-                      row.detail,
-                      row.resetAt &&
-                        `重置/到期 ${formatTimestamp(row.resetAt)}`,
-                    ]
-                      .filter(Boolean)
-                      .join(" · ")}
-                  </div>
+                  <ItemActions className="ml-auto max-w-[65%]">
+                    <ItemDescription className="text-right text-xs tabular-nums">
+                      {[
+                        row.detail,
+                        row.resetAt &&
+                          `重置/到期 ${formatTimestamp(row.resetAt)}`,
+                      ]
+                        .filter(Boolean)
+                        .join(" · ")}
+                    </ItemDescription>
+                  </ItemActions>
                 )}
-              </div>
+              </Item>
             ))}
-          </div>
+          </ItemGroup>
         </>
       )}
       {quota?.error && !successful && (

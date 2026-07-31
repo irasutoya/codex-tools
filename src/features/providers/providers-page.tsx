@@ -297,7 +297,7 @@ export default function ProvidersPage({ active }: PageProps) {
   }
 
   return (
-    <div className="flex flex-col gap-8">
+    <div className="flex flex-col gap-6">
       {overviewError && (
         <Alert variant="destructive">
           <TriangleAlert />
@@ -321,7 +321,7 @@ export default function ProvidersPage({ active }: PageProps) {
           </AlertDescription>
         </Alert>
       )}
-      <section className="flex flex-col gap-3" aria-labelledby="openai-title">
+      <section className="flex flex-col gap-4" aria-labelledby="openai-title">
         <SectionHeader
           id="openai-title"
           title="OpenAI 账号"
@@ -478,15 +478,9 @@ export default function ProvidersPage({ active }: PageProps) {
                   <ItemContent className="min-w-0 gap-2">
                     <div className="flex min-w-0 flex-wrap items-center gap-2">
                       <ItemTitle className="max-w-full">{item.name}</ItemTitle>
-                      <Badge variant="outline">
+                      <Badge variant="secondary">
                         {item.source === "proxy_import" ? "Cookie" : "网页登录"}
                       </Badge>
-                      {item.active && (
-                        <Badge variant="secondary">
-                          <Check data-icon="inline-start" />
-                          使用中
-                        </Badge>
-                      )}
                     </div>
                     <div className="flex min-w-0 flex-col gap-0.5">
                       <ItemDescription className="truncate">
@@ -504,23 +498,30 @@ export default function ProvidersPage({ active }: PageProps) {
                             : "有效期由 OpenAI 自动管理"}
                       </ItemDescription>
                     </div>
-                    <QuotaStatusView quota={item.quota} compact />
+                    <QuotaStatusView quota={item.quota} />
                   </ItemContent>
-                  <ItemActions className="w-full justify-start sm:ml-auto sm:w-auto sm:justify-end sm:self-start">
-                    <Button
-                      size="sm"
-                      variant={item.active ? "outline" : "secondary"}
-                      disabled={busy || item.active}
-                      onClick={() =>
-                        setPendingOfficialAction({
-                          kind: "activate",
-                          account: item,
-                        })
-                      }
-                    >
-                      <ArrowRightLeft data-icon="inline-start" />
-                      {item.active ? "正在使用" : "切换"}
-                    </Button>
+                  <ItemActions className="ml-auto w-auto justify-end self-start">
+                    {item.active ? (
+                      <Badge variant="default">
+                        <Check data-icon="inline-start" />
+                        当前账号
+                      </Badge>
+                    ) : (
+                      <Button
+                        size="sm"
+                        variant="secondary"
+                        disabled={busy}
+                        onClick={() =>
+                          setPendingOfficialAction({
+                            kind: "activate",
+                            account: item,
+                          })
+                        }
+                      >
+                        <ArrowRightLeft data-icon="inline-start" />
+                        切换
+                      </Button>
+                    )}
                     <DropdownMenu>
                       <DropdownMenuTrigger
                         render={
@@ -589,7 +590,7 @@ export default function ProvidersPage({ active }: PageProps) {
         </div>
       </section>
       <section
-        className="flex flex-col gap-3"
+        className="flex flex-col gap-4"
         aria-labelledby="custom-api-title"
       >
         <SectionHeader
@@ -631,13 +632,13 @@ export default function ProvidersPage({ active }: PageProps) {
                   <CardTitle className="flex items-center gap-2">
                     {provider.name}
                     {provider.active && (
-                      <Badge variant="secondary">
+                      <Badge variant="default">
                         <Check data-icon="inline-start" />
                         使用中
                       </Badge>
                     )}
                     {!provider.enabled && (
-                      <Badge variant="secondary">不可用</Badge>
+                      <Badge variant="outline">不可用</Badge>
                     )}
                   </CardTitle>
                   <CardDescription className="flex min-w-0 flex-col gap-0.5">
@@ -728,7 +729,7 @@ export default function ProvidersPage({ active }: PageProps) {
                             <ItemTitle>
                               {item.name}
                               {item.active && (
-                                <Badge variant="secondary">
+                                <Badge variant="default">
                                   <Check data-icon="inline-start" />
                                   使用中
                                 </Badge>
@@ -738,28 +739,31 @@ export default function ProvidersPage({ active }: PageProps) {
                               API Key 保存在本机，切换到此服务时写入 Codex。
                             </ItemDescription>
                           </ItemContent>
-                          <ItemActions className="w-full justify-start sm:ml-auto sm:w-auto sm:justify-end">
-                            <Button
-                              size="sm"
-                              variant="secondary"
-                              disabled={busy || item.active}
-                              title="让 Codex 使用此 API 地址和 API Key"
-                              onClick={() => {
-                                setPendingActivation({
-                                  providerId: provider.id,
-                                  accountId: item.id,
-                                })
-                              }}
-                            >
-                              {pendingTask === `account:activate:${item.id}` ? (
-                                <Spinner data-icon="inline-start" />
-                              ) : (
-                                <ArrowRightLeft data-icon="inline-start" />
-                              )}
-                              {pendingTask === `account:activate:${item.id}`
-                                ? "切换中…"
-                                : "使用"}
-                            </Button>
+                          <ItemActions className="ml-auto w-auto justify-end">
+                            {!item.active && (
+                              <Button
+                                size="sm"
+                                variant="secondary"
+                                disabled={busy}
+                                title="让 Codex 使用此 API 地址和 API Key"
+                                onClick={() => {
+                                  setPendingActivation({
+                                    providerId: provider.id,
+                                    accountId: item.id,
+                                  })
+                                }}
+                              >
+                                {pendingTask ===
+                                `account:activate:${item.id}` ? (
+                                  <Spinner data-icon="inline-start" />
+                                ) : (
+                                  <ArrowRightLeft data-icon="inline-start" />
+                                )}
+                                {pendingTask === `account:activate:${item.id}`
+                                  ? "切换中…"
+                                  : "使用"}
+                              </Button>
+                            )}
                             <DropdownMenu>
                               <DropdownMenuTrigger
                                 render={

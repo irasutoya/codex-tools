@@ -234,9 +234,9 @@ export default function SessionsPage({ active }: PageProps) {
   }
 
   return (
-    <div className="flex flex-col gap-8">
+    <div className="flex flex-col gap-6">
       <section
-        className="flex flex-col gap-3"
+        className="flex flex-col gap-4"
         aria-labelledby="session-status-title"
       >
         <SectionHeader

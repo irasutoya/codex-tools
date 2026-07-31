@@ -15,9 +15,9 @@ export function PageHeader({
   actions,
 }: PageHeaderProps) {
   return (
-    <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
+    <div className="flex items-start justify-between gap-6">
       <div className="flex min-w-0 items-start gap-3">
-        <div className="flex size-9 shrink-0 items-center justify-center rounded-lg bg-muted text-muted-foreground">
+        <div className="flex size-10 shrink-0 items-center justify-center rounded-xl bg-secondary text-secondary-foreground ring-1 ring-border">
           <Icon className="size-4" aria-hidden="true" />
         </div>
         <div className="min-w-0">
@@ -30,7 +30,7 @@ export function PageHeader({
         </div>
       </div>
       {actions && (
-        <div className="flex shrink-0 flex-wrap items-center gap-2 sm:justify-end">
+        <div className="flex shrink-0 flex-wrap items-center justify-end gap-2">
           {actions}
         </div>
       )}
@@ -52,7 +52,7 @@ export function SectionHeader({
   id,
 }: SectionHeaderProps) {
   return (
-    <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
+    <div className="flex items-end justify-between gap-6">
       <div className="min-w-0">
         <h2 id={id} className="font-heading text-base font-medium">
           {title}
@@ -64,7 +64,7 @@ export function SectionHeader({
         )}
       </div>
       {actions && (
-        <div className="flex shrink-0 flex-wrap items-center gap-2 sm:justify-end">
+        <div className="flex shrink-0 flex-wrap items-center justify-end gap-2">
           {actions}
         </div>
       )}

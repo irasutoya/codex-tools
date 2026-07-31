@@ -134,11 +134,14 @@ cargo test --manifest-path src-tauri/Cargo.toml --locked
 本地打包：
 
 ```shell
-# Windows：输出到 src-tauri/target/release/bundle/nsis/
+# Windows x64：输出到 src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/
 npm run dist:win
 
-# macOS：输出到 src-tauri/target/release/bundle/dmg/
-npm run dist:mac
+# macOS Apple Silicon：输出到 src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/
+npm run dist:mac:arm64
+
+# macOS Intel：输出到 src-tauri/target/x86_64-apple-darwin/release/bundle/dmg/
+npm run dist:mac:x64
 ```
 
 发布流程、版本同步和标签要求见 [发布指南](docs/RELEASING.md)。参与开发前请阅读

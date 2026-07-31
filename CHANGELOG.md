@@ -4,6 +4,20 @@
 
 ## [Unreleased]
 
+## [0.3.3] - 2026-07-31
+
+### Changed
+
+- 移除侧栏折叠入口和快捷操作，窗口最小尺寸固定为默认的 1180×760；界面只按完整桌面布局组织，不再为窄窗口压缩核心信息。
+- 统一四个页面的内容宽度、间距、卡片边界、侧栏选中态和语义色对比度，并将主题入口收进页面标题区。
+- 发布产物按架构拆分：macOS 分别构建 arm64 与 x64 DMG，Windows 仅构建 x64 NSIS 安装包；CI 同步覆盖这三个明确的平台目标。
+
+### Fixed
+
+- 移除左上角折叠按钮及竖向分隔线；当前账号不再显示低对比度的禁用按钮，改为明确的高对比状态标签。
+- 额度状态重新按 shadcn Item 组合排版：单周期占满可用宽度，双周期等宽展示，避免只有一个周期时留下大块空白。
+- 根布局改为使用 WebView 的实际可视高度，默认窗口下侧栏页脚、分页栏和最后一张卡片不再被 macOS 标题栏挤出画面。
+
 ## [0.3.2] - 2026-07-31
 
 ### Changed
@@ -76,7 +90,8 @@
 - 上游密钥和自定义请求头改为 Rust 后端只写、前端脱敏；会话扫描增加大小及并发边界。
 - 删除应用配置版本迁移、废弃协议兼容分支、旧模型字段清理和未使用 IPC；相同配置不再重复写盘，账号切换前不再扫描全部会话。
 
-[Unreleased]: https://github.com/irasutoya/codex-tools/compare/v0.3.2...HEAD
+[Unreleased]: https://github.com/irasutoya/codex-tools/compare/v0.3.3...HEAD
+[0.3.3]: https://github.com/irasutoya/codex-tools/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/irasutoya/codex-tools/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/irasutoya/codex-tools/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/irasutoya/codex-tools/compare/v0.2.0...v0.3.0

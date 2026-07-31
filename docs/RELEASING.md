@@ -1,6 +1,6 @@
 # Release guide
 
-此清单用于维护者发布 Windows NSIS 安装包和 macOS 通用架构 DMG。
+此清单用于维护者发布 Windows x64 NSIS 安装包，以及独立的 macOS arm64 和 x64 DMG。
 
 ## 1. 准备版本
 
@@ -24,7 +24,8 @@ cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --locked -- -D w
 cargo test --manifest-path src-tauri/Cargo.toml --locked
 ```
 
-如有对应平台环境，再运行 `npm run dist:win` 或 `npm run dist:mac` 并实际启动产物。
+如有对应平台环境，再运行 `npm run dist:win`、`npm run dist:mac:arm64` 或
+`npm run dist:mac:x64`，并实际启动对应架构的产物。
 
 ## 3. 创建发布
 
@@ -35,10 +36,10 @@ git tag -a vX.Y.Z -m "Codex Tools vX.Y.Z"
 git push origin vX.Y.Z
 ```
 
-标签会触发 Release workflow。工作流会再次校验版本，分别构建 Windows 和 macOS
-安装包，生成 `SHA256SUMS.txt`，并创建草稿预发布。检查以下项目后再手动发布草稿：
+标签会触发 Release workflow。工作流会再次校验版本，分别构建 Windows x64、macOS
+arm64 和 macOS x64 安装包，生成 `SHA256SUMS.txt`，并创建草稿预发布。检查以下项目后再手动发布草稿：
 
-- Windows `.exe` 和 macOS `.dmg` 均已上传。
+- Windows x64 `.exe`、macOS arm64 `.dmg` 和 macOS x64 `.dmg` 均已上传。
 - `SHA256SUMS.txt` 包含所有安装包且哈希可复算。
 - Release notes 与 `CHANGELOG.md` 对应版本一致。
 - 在干净机器或虚拟机中完成基本安装、启动、账号切换和卸载检查。

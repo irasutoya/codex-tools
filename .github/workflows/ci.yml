@@ -14,11 +14,27 @@ concurrency:
 
 jobs:
   validate:
+    name: Validate (${{ matrix.platform }}-${{ matrix.arch }})
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
+        include:
+          - platform: windows
+            arch: x64
+            runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            script: dist:win
+          - platform: macos
+            arch: arm64
+            runner: macos-latest
+            target: aarch64-apple-darwin
+            script: dist:mac:arm64
+          - platform: macos
+            arch: x64
+            runner: macos-15-intel
+            target: x86_64-apple-darwin
+            script: dist:mac:x64
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
@@ -27,6 +43,8 @@ jobs:
           node-version: 24
           cache: npm
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
@@ -35,7 +53,4 @@ jobs:
       - run: cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
       - run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --locked -- -D warnings
       - run: cargo test --manifest-path src-tauri/Cargo.toml --locked
-      - if: runner.os == 'Windows'
-        run: npm run dist:win
-      - if: runner.os == 'macOS'
-        run: npm run dist:mac
+      - run: npm run ${{ matrix.script }}

@@ -23,7 +23,6 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
-import { Separator } from "@/components/ui/separator"
 import {
   Sidebar,
   SidebarContent,
@@ -37,9 +36,6 @@ import {
   SidebarMenuButton,
   SidebarMenuItem,
   SidebarProvider,
-  SidebarRail,
-  SidebarTrigger,
-  useSidebar,
 } from "@/components/ui/sidebar"
 import { Toaster } from "@/components/ui/sonner"
 import { TooltipProvider } from "@/components/ui/tooltip"
@@ -118,32 +114,21 @@ export default function App() {
     <TooltipProvider>
       <SidebarProvider
         className="h-full overflow-hidden"
-        style={{ "--sidebar-width": "14rem" } as CSSProperties}
+        style={{ "--sidebar-width": "14.5rem" } as CSSProperties}
       >
         <AppSidebar page={page} onNavigate={navigate} />
         <SidebarInset className="min-h-0 overflow-hidden">
-          <header className="flex h-12 shrink-0 items-center gap-2 border-b px-3 sm:px-4">
-            <SidebarTrigger
-              aria-label="展开或收起导航"
-              title="展开或收起导航"
-            />
-            <Separator orientation="vertical" className="h-4" />
-            <span className="min-w-0 flex-1 truncate text-sm font-medium md:text-muted-foreground">
-              {currentNavigation.label}
-            </span>
-            <ThemeMenu />
-          </header>
-
           <main
             ref={contentRef}
             className="min-h-0 flex-1 overflow-y-auto"
             aria-label={currentNavigation.label}
           >
-            <div className="mx-auto flex w-full max-w-7xl flex-col gap-7 px-4 py-6 sm:px-6 sm:py-8 lg:px-8">
+            <div className="mx-auto flex w-full max-w-6xl flex-col gap-6 px-8 py-7">
               <PageHeader
                 title={currentNavigation.label}
                 description={currentNavigation.description}
                 icon={CurrentPageIcon}
+                actions={<ThemeMenu />}
               />
               {navigation
                 .filter((item) => visitedPages.has(item.id))
@@ -179,24 +164,17 @@ function AppSidebar({
   page: Page
   onNavigate: (page: Page) => void
 }) {
-  const { setOpenMobile } = useSidebar()
-
-  const handleNavigate = (nextPage: Page) => {
-    onNavigate(nextPage)
-    setOpenMobile(false)
-  }
-
   return (
-    <Sidebar variant="inset" collapsible="icon">
-      <SidebarHeader className="pt-3">
-        <div className="flex h-10 items-center gap-2 px-2 group-data-[collapsible=icon]:justify-center group-data-[collapsible=icon]:px-0">
+    <Sidebar collapsible="none" className="border-r border-sidebar-border">
+      <SidebarHeader className="px-3 pt-5">
+        <div className="flex h-12 items-center gap-3 px-2">
           <img
             src="/codex-tools.svg"
             alt=""
-            className="size-7 shrink-0 rounded-md"
+            className="size-8 shrink-0 rounded-lg"
           />
-          <div className="min-w-0 group-data-[collapsible=icon]:hidden">
-            <div className="truncate text-sm font-semibold">Codex Tools</div>
+          <div className="min-w-0">
+            <div className="truncate text-base font-semibold">Codex Tools</div>
             <div className="truncate text-xs text-muted-foreground">
               本机连接管理
             </div>
@@ -204,8 +182,8 @@ function AppSidebar({
         </div>
       </SidebarHeader>
 
-      <SidebarContent>
-        <SidebarGroup>
+      <SidebarContent className="px-1">
+        <SidebarGroup className="pt-4">
           <SidebarGroupLabel>工作台</SidebarGroupLabel>
           <SidebarGroupContent>
             <SidebarMenu>
@@ -219,7 +197,7 @@ function AppSidebar({
                       aria-current={page === item.id ? "page" : undefined}
                       onFocus={() => void pageLoaders[item.id]()}
                       onPointerEnter={() => void pageLoaders[item.id]()}
-                      onClick={() => handleNavigate(item.id)}
+                      onClick={() => onNavigate(item.id)}
                     >
                       <Icon aria-hidden="true" />
                       <span>{item.label}</span>
@@ -233,14 +211,11 @@ function AppSidebar({
       </SidebarContent>
 
       <SidebarFooter>
-        <div className="flex items-start gap-2 rounded-lg bg-sidebar-accent/60 px-2 py-2.5 text-xs leading-relaxed text-muted-foreground group-data-[collapsible=icon]:justify-center group-data-[collapsible=icon]:bg-transparent group-data-[collapsible=icon]:px-0">
+        <div className="flex items-start gap-2 rounded-lg bg-sidebar-accent px-3 py-3 text-xs leading-relaxed text-muted-foreground">
           <ShieldCheck className="mt-0.5 size-4 shrink-0" aria-hidden="true" />
-          <span className="group-data-[collapsible=icon]:hidden">
-            凭据仅保存在这台设备上
-          </span>
+          <span>凭据仅保存在这台设备上</span>
         </div>
       </SidebarFooter>
-      <SidebarRail aria-label="展开或收起导航" title="展开或收起导航" />
     </Sidebar>
   )
 }
@@ -261,7 +236,7 @@ function ThemeMenu() {
       <DropdownMenuTrigger
         render={
           <Button
-            variant="ghost"
+            variant="outline"
             size="icon"
             aria-label={`界面主题：${current?.label ?? "跟随系统"}`}
             title="选择界面主题"

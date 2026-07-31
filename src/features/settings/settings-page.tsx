@@ -188,7 +188,7 @@ export default function SettingsPage({ active }: PageProps) {
         : "OpenAI 默认设置"
 
   return (
-    <div className="flex flex-col gap-8">
+    <div className="flex flex-col gap-6">
       <Alert>
         <Info />
         <AlertTitle>只修改连接所需字段</AlertTitle>
@@ -198,7 +198,7 @@ export default function SettingsPage({ active }: PageProps) {
         </AlertDescription>
       </Alert>
 
-      <section className="flex flex-col gap-3" aria-labelledby="config-title">
+      <section className="flex flex-col gap-4" aria-labelledby="config-title">
         <SectionHeader
           id="config-title"
           title="配置文件"

@@ -176,7 +176,7 @@ export default function DashboardPage({ active }: PageProps) {
   const busy = launching || refreshing || quotaRefreshing
 
   return (
-    <div className="flex flex-col gap-8">
+    <div className="flex flex-col gap-6">
       {error && (
         <Alert variant="destructive">
           <TriangleAlert />
@@ -283,7 +283,7 @@ export default function DashboardPage({ active }: PageProps) {
       </Card>
 
       <section
-        className="flex flex-col gap-3"
+        className="flex flex-col gap-4"
         aria-labelledby="local-status-title"
       >
         <SectionHeader
