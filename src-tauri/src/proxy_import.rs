@@ -1,5 +1,7 @@
 use serde_json::Value;
 
+const MAX_COOKIE_CREDENTIAL_LENGTH: usize = 262_144;
+
 pub struct ImportedProxyCredential {
     pub access_token: Option<String>,
     pub id_token: Option<String>,
@@ -12,16 +14,20 @@ pub struct ImportedProxyCredential {
 pub fn parse_proxy_credential(input: &str) -> Result<ImportedProxyCredential, String> {
     let input = input.trim();
     if input.is_empty() {
-        return Err("请粘贴反代 Token 或账号 JSON".into());
+        return Err("请粘贴 Cookie Token 或单账号 JSON。".into());
+    }
+
+    if input.chars().count() > MAX_COOKIE_CREDENTIAL_LENGTH {
+        return Err("Cookie 内容不能超过 262,144 个字符。".into());
     }
 
     if input.starts_with('[') {
-        return Err("一次只能导入一个反代号，请粘贴单个账号 JSON".into());
+        return Err("一次只能导入一个 Cookie 账号，请粘贴单账号 JSON。".into());
     }
 
     if input.starts_with('{') {
         let value: Value =
-            serde_json::from_str(input).map_err(|_| "账号 JSON 格式不正确".to_string())?;
+            serde_json::from_str(input).map_err(|_| "Cookie JSON 格式不正确。".to_string())?;
         let access_token = find_string(
             &value,
             &[
@@ -33,7 +39,7 @@ pub fn parse_proxy_credential(input: &str) -> Result<ImportedProxyCredential, St
         );
         let refresh_token = find_string(&value, &["refresh_token", "refreshToken"]);
         if access_token.is_none() && refresh_token.is_none() {
-            return Err("账号 JSON 中没有找到 accessToken 或 refresh_token".into());
+            return Err("Cookie JSON 中没有找到 accessToken 或 refresh_token。".into());
         }
         return Ok(ImportedProxyCredential {
             access_token,
@@ -93,7 +99,7 @@ mod tests {
             r#"{
                 "account": {
                     "email": "person@example.test",
-                    "name": "日常反代号",
+                    "name": "日常 Cookie 账号",
                     "accountId": "workspace-1"
                 },
                 "tokens": {
@@ -110,7 +116,7 @@ mod tests {
         assert_eq!(imported.refresh_token.as_deref(), Some("refresh-secret"));
         assert_eq!(imported.account_id.as_deref(), Some("workspace-1"));
         assert_eq!(imported.email.as_deref(), Some("person@example.test"));
-        assert_eq!(imported.suggested_name.as_deref(), Some("日常反代号"));
+        assert_eq!(imported.suggested_name.as_deref(), Some("日常 Cookie 账号"));
     }
 
     #[test]
@@ -140,6 +146,14 @@ mod tests {
         .err()
         .unwrap();
 
-        assert_eq!(error, "一次只能导入一个反代号，请粘贴单个账号 JSON");
+        assert_eq!(error, "一次只能导入一个 Cookie 账号，请粘贴单账号 JSON。");
+    }
+
+    #[test]
+    fn rejects_oversized_cookie_content_before_parsing() {
+        let input = "x".repeat(MAX_COOKIE_CREDENTIAL_LENGTH + 1);
+        let error = parse_proxy_credential(&input).err().unwrap();
+
+        assert_eq!(error, "Cookie 内容不能超过 262,144 个字符。");
     }
 }

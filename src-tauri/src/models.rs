@@ -2,6 +2,15 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
 
+pub(crate) const MAX_DISPLAY_NAME_CHARS: usize = 100;
+pub(crate) const MAX_ACCOUNT_ID_CHARS: usize = 512;
+pub(crate) const MAX_CREDENTIAL_CHARS: usize = 262_144;
+const MAX_API_URL_CHARS: usize = 2_048;
+const MAX_API_KEY_CHARS: usize = 65_536;
+const MAX_CUSTOM_HEADERS: usize = 64;
+const MAX_HEADER_NAME_CHARS: usize = 256;
+const MAX_HEADER_VALUE_CHARS: usize = 8_192;
+
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
     #[error("{0}")]
@@ -62,8 +71,21 @@ impl ProviderProfile {
                 "请填写服务名称和 API 地址。".into(),
             ));
         }
-        let url = reqwest::Url::parse(&self.base_url)
-            .map_err(|_| AppError::InvalidConfig("API 地址格式不正确。".into()))?;
+        ensure_char_limit(
+            &self.name,
+            MAX_DISPLAY_NAME_CHARS,
+            "服务名称不能超过 100 个字符。",
+        )?;
+        ensure_char_limit(
+            &self.base_url,
+            MAX_API_URL_CHARS,
+            "API 地址不能超过 2,048 个字符。",
+        )?;
+        let url = reqwest::Url::parse(&self.base_url).map_err(|_| {
+            AppError::InvalidConfig(
+                "API 地址格式不正确，请填写完整的 http:// 或 https:// 地址。".into(),
+            )
+        })?;
         if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
             return Err(AppError::InvalidConfig(
                 "API 地址必须以 http:// 或 https:// 开头。".into(),
@@ -173,6 +195,12 @@ impl ProviderAccount {
         if self.name.is_empty() || key.is_empty() {
             return Err(AppError::InvalidConfig("请填写密钥名称和 API Key。".into()));
         }
+        ensure_char_limit(
+            &self.name,
+            MAX_DISPLAY_NAME_CHARS,
+            "密钥名称不能超过 100 个字符。",
+        )?;
+        ensure_char_limit(key, MAX_API_KEY_CHARS, "API Key 不能超过 65,536 个字符。")?;
         self.api_key = Some(key.to_owned());
         validate_headers(&self.headers)
     }
@@ -540,11 +568,37 @@ pub struct SettingsOverview {
 }
 
 fn validate_headers(headers: &BTreeMap<String, String>) -> Result<(), AppError> {
+    if headers.len() > MAX_CUSTOM_HEADERS {
+        return Err(AppError::InvalidConfig(
+            "自定义请求头不能超过 64 项。".into(),
+        ));
+    }
     for (name, value) in headers {
+        ensure_char_limit(
+            name,
+            MAX_HEADER_NAME_CHARS,
+            "自定义请求头名称不能超过 256 个字符。",
+        )?;
+        ensure_char_limit(
+            value,
+            MAX_HEADER_VALUE_CHARS,
+            "单个自定义请求头的值不能超过 8,192 个字符。",
+        )?;
         reqwest::header::HeaderName::from_bytes(name.as_bytes())
-            .map_err(|_| AppError::InvalidConfig(format!("自定义请求头名称无效：{name}")))?;
+            .map_err(|_| AppError::InvalidConfig(format!("自定义请求头名称无效：{name}。")))?;
         reqwest::header::HeaderValue::from_str(value)
-            .map_err(|_| AppError::InvalidConfig(format!("自定义请求头的值无效：{name}")))?;
+            .map_err(|_| AppError::InvalidConfig(format!("自定义请求头的值无效：{name}。")))?;
+    }
+    Ok(())
+}
+
+pub(crate) fn ensure_char_limit(
+    value: &str,
+    limit: usize,
+    message: &'static str,
+) -> Result<(), AppError> {
+    if value.chars().count() > limit {
+        return Err(AppError::InvalidConfig(message.into()));
     }
     Ok(())
 }
@@ -620,6 +674,36 @@ mod tests {
                 .normalize_and_validate()
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn provider_and_api_key_inputs_have_size_limits() {
+        let mut provider = ProviderProfile {
+            id: String::new(),
+            name: "x".repeat(MAX_DISPLAY_NAME_CHARS + 1),
+            base_url: "https://example.test/v1".into(),
+            headers: BTreeMap::new(),
+            timeout_secs: 30,
+            enabled: true,
+            active: false,
+            active_account_id: None,
+            account_count: 0,
+        };
+        assert!(provider.normalize_and_validate().is_err());
+
+        let mut account = ProviderAccount {
+            id: String::new(),
+            provider_id: Some("provider".into()),
+            name: "key".into(),
+            auth_kind: AccountAuthKind::ApiKey,
+            api_key: Some("x".repeat(MAX_API_KEY_CHARS + 1)),
+            headers: BTreeMap::new(),
+            active: false,
+            email: None,
+            created_at: 0,
+            updated_at: 0,
+        };
+        assert!(account.normalize_and_validate().is_err());
     }
 
     fn official_account() -> StoredOfficialAccount {

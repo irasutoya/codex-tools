@@ -7,13 +7,19 @@ use serde_json::Value;
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
     fs,
-    io::BufRead,
+    io::{BufRead, Read},
     path::{Path, PathBuf},
 };
 use walkdir::WalkDir;
 
+const MAX_ROLLOUT_SCAN_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_REPAIR_ROLLOUT_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_REPAIR_WARNINGS: usize = 100;
+const MAX_WARNING_CHARS: usize = 1_000;
+
 pub fn scan(codex_home: &Path) -> RepairScan {
     let mut warnings = vec![];
+    let mut omitted_warnings = 0;
     let rollouts = rollout_files(codex_home);
     let mut providers = BTreeMap::<String, BTreeSet<String>>::new();
     let mut session_meta_count = 0;
@@ -27,7 +33,11 @@ pub fn scan(codex_home: &Path) -> RepairScan {
                     .insert("rollout".into());
             }
             Ok(None) => {}
-            Err(error) => warnings.push(format!("无法读取 {}：{error}", path.display())),
+            Err(error) => push_warning(
+                &mut warnings,
+                &mut omitted_warnings,
+                format!("无法读取 {}：{error}", path.display()),
+            ),
         }
     }
     let mut databases = vec![];
@@ -47,9 +57,14 @@ pub fn scan(codex_home: &Path) -> RepairScan {
                 });
             }
             Ok(None) => {}
-            Err(error) => warnings.push(format!("无法检查 {}：{error}", path.display())),
+            Err(error) => push_warning(
+                &mut warnings,
+                &mut omitted_warnings,
+                format!("无法检查 {}：{error}", path.display()),
+            ),
         }
     }
+    finish_warnings(&mut warnings, omitted_warnings);
     let current_provider = configured_provider(codex_home);
     providers
         .entry(current_provider.clone())
@@ -88,7 +103,7 @@ pub fn repair(codex_home: &Path, target: &str) -> Result<RepairResult, AppError>
     let target = target.trim();
     if !matches!(target, "openai" | "custom") {
         return Err(AppError::InvalidConfig(
-            "只能在 OpenAI 官方账号与第三方 API 之间更新会话归属。".into(),
+            "只能在 OpenAI 账号与第三方 API 之间更新会话归属。".into(),
         ));
     }
     let rollouts = rollout_files(codex_home);
@@ -97,6 +112,7 @@ pub fn repair(codex_home: &Path, target: &str) -> Result<RepairResult, AppError>
         files_scanned: rollouts.len(),
         ..RepairResult::default()
     };
+    let mut omitted_warnings = 0;
 
     for path in rollouts {
         match repair_rollout(&path, target) {
@@ -110,7 +126,11 @@ pub fn repair(codex_home: &Path, target: &str) -> Result<RepairResult, AppError>
             }
             Err(error) => {
                 result.files_failed += 1;
-                result.warnings.push(format!("{}：{error}", path.display()));
+                push_warning(
+                    &mut result.warnings,
+                    &mut omitted_warnings,
+                    format!("{}：{error}", path.display()),
+                );
             }
         }
     }
@@ -118,9 +138,14 @@ pub fn repair(codex_home: &Path, target: &str) -> Result<RepairResult, AppError>
     for path in database_paths(codex_home) {
         match repair_database(&path, target) {
             Ok(rows) => result.rows_updated += rows,
-            Err(error) => result.warnings.push(format!("{}：{error}", path.display())),
+            Err(error) => push_warning(
+                &mut result.warnings,
+                &mut omitted_warnings,
+                format!("{}：{error}", path.display()),
+            ),
         }
     }
+    finish_warnings(&mut result.warnings, omitted_warnings);
     Ok(result)
 }
 
@@ -221,6 +246,9 @@ fn collect_databases(path: &Path, output: &mut Vec<PathBuf>) {
 }
 
 fn repair_rollout(path: &Path, target: &str) -> anyhow::Result<(bool, usize)> {
+    if fs::metadata(path)?.len() > MAX_REPAIR_ROLLOUT_BYTES {
+        anyhow::bail!("会话文件超过 256 MB，已跳过以避免占用过多内存");
+    }
     let original_bytes = fs::read(path)?;
     let original = std::str::from_utf8(&original_bytes)?;
     let mut changed = false;
@@ -334,7 +362,11 @@ fn choose<'a>(columns: &HashSet<String>, names: &'a [&'a str], fallback: &'a str
 }
 
 fn rollout_provider(path: &Path) -> anyhow::Result<Option<String>> {
-    for line in std::io::BufReader::new(fs::File::open(path)?).lines() {
+    let file_size = fs::metadata(path)?.len();
+    for line in std::io::BufReader::new(fs::File::open(path)?)
+        .take(MAX_ROLLOUT_SCAN_BYTES)
+        .lines()
+    {
         let line = line?;
         let Ok(record) = serde_json::from_str::<Value>(&line) else {
             continue;
@@ -349,7 +381,24 @@ fn rollout_provider(path: &Path) -> anyhow::Result<Option<String>> {
             ));
         }
     }
+    if file_size > MAX_ROLLOUT_SCAN_BYTES {
+        anyhow::bail!("前 2 MB 内没有找到会话元数据，已停止继续扫描");
+    }
     Ok(None)
+}
+
+fn push_warning(warnings: &mut Vec<String>, omitted: &mut usize, warning: String) {
+    if warnings.len() < MAX_REPAIR_WARNINGS.saturating_sub(1) {
+        warnings.push(warning.chars().take(MAX_WARNING_CHARS).collect());
+    } else {
+        *omitted += 1;
+    }
+}
+
+fn finish_warnings(warnings: &mut Vec<String>, omitted: usize) {
+    if omitted > 0 {
+        warnings.push(format!("另有 {omitted} 项警告未显示。"));
+    }
 }
 
 #[cfg(test)]
@@ -458,5 +507,30 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let error = repair(temp.path(), "third-party").unwrap_err();
         assert!(error.to_string().contains("只能在 OpenAI"));
+    }
+
+    #[test]
+    fn repair_skips_oversized_rollout_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let rollout = temp.path().join("oversized.jsonl");
+        let file = fs::File::create(&rollout).unwrap();
+        file.set_len(MAX_REPAIR_ROLLOUT_BYTES + 1).unwrap();
+
+        let error = repair_rollout(&rollout, "custom").unwrap_err();
+
+        assert!(error.to_string().contains("超过 256 MB"));
+    }
+
+    #[test]
+    fn warning_lists_are_bounded_and_report_omissions() {
+        let mut warnings = Vec::new();
+        let mut omitted = 0;
+        for index in 0..150 {
+            push_warning(&mut warnings, &mut omitted, format!("warning-{index}"));
+        }
+        finish_warnings(&mut warnings, omitted);
+
+        assert_eq!(warnings.len(), MAX_REPAIR_WARNINGS);
+        assert_eq!(warnings.last().unwrap(), "另有 51 项警告未显示。");
     }
 }

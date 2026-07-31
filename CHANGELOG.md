@@ -4,6 +4,21 @@
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-07-31
+
+### Changed
+
+- 按项目的 shadcn `base-nova` 规范统一表单禁用态、按钮图标、组件组合和窄窗口换行行为；诊断信息与额度时间格式改为复用计算结果。
+- 全部页面统一操作结果、错误原因和后续建议的表达方式，账号页将“反代号”调整为“Cookie 账号”，并明确数据来源、写入范围和实际行为。
+- 批量额度查询最多同时发送 4 个请求，避免大量账号同时刷新时占满网络连接。
+
+### Fixed
+
+- Cookie JSON 输入区改为固定高度并限制最大输入长度，长内容在输入框内换行滚动，不再撑出应用窗口。
+- 所有弹窗、文本域和错误详情增加尺寸上限，异常长的名称、路径、响应或错误信息不会再撑破界面。
+- 服务、API 地址、API Key、账号、应用数据、Codex 配置和会话文件增加分层大小限制；超出安全范围时停止处理并显示明确原因。
+- Codex 配置读取失败不再显示为“可以读取”；会话扫描警告会聚合显示，超大会话行和文件会安全跳过。
+
 ## [0.3.0] - 2026-07-31
 
 ### Added
@@ -48,7 +63,8 @@
 - 上游密钥和自定义请求头改为 Rust 后端只写、前端脱敏；会话扫描增加大小及并发边界。
 - 删除应用配置版本迁移、废弃协议兼容分支、旧模型字段清理和未使用 IPC；相同配置不再重复写盘，账号切换前不再扫描全部会话。
 
-[Unreleased]: https://github.com/irasutoya/codex-tools/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/irasutoya/codex-tools/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/irasutoya/codex-tools/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/irasutoya/codex-tools/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/irasutoya/codex-tools/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/irasutoya/codex-tools/releases/tag/v0.1.0

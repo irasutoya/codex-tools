@@ -69,7 +69,7 @@ const navigation: NavigationItem[] = [
   {
     id: "dashboard",
     label: "概览",
-    description: "查看 Codex 当前使用的账号、服务和本机会话",
+    description: "查看 Codex 当前连接和本机会话状态",
     icon: LayoutDashboard,
   },
   {
@@ -81,13 +81,13 @@ const navigation: NavigationItem[] = [
   {
     id: "sessions",
     label: "历史会话",
-    description: "查看本机会话并更新连接归属",
+    description: "查看本机会话，并按需更新连接标记",
     icon: MessagesSquare,
   },
   {
     id: "settings",
     label: "配置",
-    description: "检查 Codex 配置并预览即将写入的修改",
+    description: "检查 Codex 配置，并在写入前预览修改",
     icon: FileCheck2,
   },
 ]
@@ -219,7 +219,7 @@ function AppSidebar({
                       onPointerEnter={() => void pageLoaders[item.id]()}
                       onClick={() => handleNavigate(item.id)}
                     >
-                      <Icon />
+                      <Icon aria-hidden="true" />
                       <span>{item.label}</span>
                     </SidebarMenuButton>
                   </SidebarMenuItem>
@@ -233,7 +233,7 @@ function AppSidebar({
       <SidebarFooter>
         <div className="flex items-center gap-2 px-2 py-1 text-xs text-muted-foreground group-data-[collapsible=icon]:hidden">
           <ShieldCheck className="size-4 shrink-0" aria-hidden="true" />
-          <span>账号和密钥仅保存在本机</span>
+          <span>账号凭据和 API Key 存储在本机</span>
         </div>
       </SidebarFooter>
       <SidebarRail aria-label="展开或收起导航" title="展开或收起导航" />
@@ -264,7 +264,7 @@ function ThemeMenu() {
           />
         }
       >
-        <CurrentIcon />
+        <CurrentIcon data-icon="inline-start" />
       </DropdownMenuTrigger>
       <DropdownMenuContent align="end" className="w-40">
         <DropdownMenuGroup>
@@ -275,9 +275,11 @@ function ThemeMenu() {
                 key={option.id}
                 onClick={() => setTheme(option.id)}
               >
-                <Icon />
+                <Icon aria-hidden="true" />
                 <span>{option.label}</span>
-                {theme === option.id && <Check className="ml-auto" />}
+                {theme === option.id && (
+                  <Check className="ml-auto" aria-hidden="true" />
+                )}
               </DropdownMenuItem>
             )
           })}

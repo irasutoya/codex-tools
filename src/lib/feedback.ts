@@ -1,14 +1,42 @@
 import { toast } from "sonner"
 
+const MAX_ERROR_DETAIL_LENGTH = 2_000
+
 function formatError(error: unknown) {
-  const message =
+  const raw =
     error instanceof Error
       ? error.message
       : typeof error === "string"
         ? error
-        : String(error)
+        : error === null || error === undefined
+          ? ""
+          : String(error)
+  const boundedRaw = raw.slice(0, MAX_ERROR_DETAIL_LENGTH + 1)
+  let sanitized = ""
+  for (const character of boundedRaw) {
+    const code = character.charCodeAt(0)
+    if (
+      code === 9 ||
+      code === 10 ||
+      code === 13 ||
+      (code >= 32 && code !== 127)
+    ) {
+      sanitized += character
+    }
+  }
+  const message = sanitized
+    .trim()
+    .replace(/^Error:\s*/i, "")
+    .trim()
 
-  return message.replace(/^Error:\s*/i, "").trim() || "没有返回更多错误信息"
+  if (!message) return "未提供错误详情。"
+  if (
+    raw.length <= MAX_ERROR_DETAIL_LENGTH &&
+    message.length <= MAX_ERROR_DETAIL_LENGTH
+  ) {
+    return message
+  }
+  return `${message.slice(0, MAX_ERROR_DETAIL_LENGTH)}…（错误详情已截断）`
 }
 
 function options(detail?: unknown) {

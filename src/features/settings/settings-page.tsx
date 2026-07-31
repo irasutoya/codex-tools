@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react"
+import { useCallback, useEffect, useMemo, useState } from "react"
 import {
   Check,
   Copy,
@@ -41,7 +41,12 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog"
-import { Field, FieldDescription, FieldLabel } from "@/components/ui/field"
+import {
+  Field,
+  FieldDescription,
+  FieldGroup,
+  FieldLabel,
+} from "@/components/ui/field"
 import {
   Item,
   ItemContent,
@@ -65,6 +70,10 @@ export default function SettingsPage({ active }: PageProps) {
   const [previewing, setPreviewing] = useState(false)
   const [applyingPreview, setApplyingPreview] = useState(false)
   const [switchingOfficial, setSwitchingOfficial] = useState(false)
+  const diagnosticsText = useMemo(
+    () => JSON.stringify(diagnostics ?? {}, null, 2),
+    [diagnostics]
+  )
 
   const load = useCallback(async () => {
     const overview = await call("get_settings_overview")
@@ -134,7 +143,7 @@ export default function SettingsPage({ active }: PageProps) {
       try {
         await load()
       } catch (reason) {
-        notify.warning("配置已写入，但状态刷新失败", reason)
+        notify.warning("配置已写入，但无法读取最新状态", reason)
       }
     } catch (reason) {
       notify.error("无法写入 Codex 配置", reason)
@@ -153,7 +162,7 @@ export default function SettingsPage({ active }: PageProps) {
       try {
         await load()
       } catch (reason) {
-        notify.warning("连接已切换，但状态刷新失败", reason)
+        notify.warning("连接已切换，但无法读取最新状态", reason)
       }
     } catch (reason) {
       notify.error("无法切换到 OpenAI", reason)
@@ -164,7 +173,7 @@ export default function SettingsPage({ active }: PageProps) {
 
   const copyDiagnostics = () => {
     void navigator.clipboard
-      .writeText(JSON.stringify(diagnostics ?? {}, null, 2))
+      .writeText(diagnosticsText)
       .then(() => notify.success("诊断信息已复制"))
       .catch((reason) => notify.error("无法复制诊断信息", reason))
   }
@@ -174,7 +183,7 @@ export default function SettingsPage({ active }: PageProps) {
     inspection.activeProvider === "custom"
       ? "第三方 API"
       : inspection.activeProvider === "openai"
-        ? "OpenAI 官方账号"
+        ? "OpenAI 账号"
         : "OpenAI 默认设置"
 
   return (
@@ -183,7 +192,8 @@ export default function SettingsPage({ active }: PageProps) {
         <Info />
         <AlertTitle>只修改连接所需字段</AlertTitle>
         <AlertDescription>
-          账号、API 地址和密钥之外的 Codex 设置不会改变。
+          本应用只管理账号、API 地址、认证信息和连接标记；其他 Codex
+          设置保持原样。
         </AlertDescription>
       </Alert>
 
@@ -193,7 +203,7 @@ export default function SettingsPage({ active }: PageProps) {
             Codex 配置
           </h2>
           <p className="text-sm text-muted-foreground">
-            查看当前连接，并在写入前确认所有修改。
+            查看本机配置状态，并在写入前确认由本应用管理的字段。
           </p>
         </div>
 
@@ -206,7 +216,7 @@ export default function SettingsPage({ active }: PageProps) {
               </CardDescription>
               <CardAction>
                 <Badge variant={inspection.valid ? "default" : "destructive"}>
-                  {inspection.valid ? "可以使用" : "需要处理"}
+                  {inspection.valid ? "可以读取" : "需要处理"}
                 </Badge>
               </CardAction>
             </CardHeader>
@@ -269,12 +279,12 @@ export default function SettingsPage({ active }: PageProps) {
             <CardHeader>
               <CardTitle>诊断信息</CardTitle>
               <CardDescription>
-                反馈问题时可以复制；API Key 等敏感内容已经隐藏。
+                可在反馈问题时复制；这里不包含已保存的 API Key 或登录凭据。
               </CardDescription>
             </CardHeader>
             <CardContent>
               <pre className="max-h-80 overflow-auto rounded-lg bg-muted p-3 text-xs whitespace-pre-wrap">
-                {JSON.stringify(diagnostics, null, 2)}
+                {diagnosticsText}
               </pre>
             </CardContent>
             <CardFooter className="justify-end">
@@ -293,7 +303,7 @@ export default function SettingsPage({ active }: PageProps) {
           if (!open && !applyingPreview) setPreview(undefined)
         }}
       >
-        <DialogContent className="sm:max-w-3xl">
+        <DialogContent className="overflow-hidden sm:max-w-3xl">
           <DialogHeader>
             <DialogTitle>预览配置修改</DialogTitle>
             <DialogDescription>
@@ -302,18 +312,20 @@ export default function SettingsPage({ active }: PageProps) {
                 : "检查即将写入 Codex 的第三方 API 配置。"}
             </DialogDescription>
           </DialogHeader>
-          <Field>
-            <FieldLabel htmlFor="config-preview">
-              config.toml 修改预览
-            </FieldLabel>
-            <Textarea
-              id="config-preview"
-              className="max-h-[60vh] min-h-72"
-              readOnly
-              value={preview?.rendered ?? ""}
-            />
-            <FieldDescription>确认后才会写入配置文件。</FieldDescription>
-          </Field>
+          <FieldGroup>
+            <Field>
+              <FieldLabel htmlFor="config-preview">
+                config.toml 修改预览
+              </FieldLabel>
+              <Textarea
+                id="config-preview"
+                className="field-sizing-fixed h-[min(24rem,50dvh)] min-h-40 resize-none overflow-auto font-mono text-xs"
+                readOnly
+                value={preview?.rendered ?? ""}
+              />
+              <FieldDescription>确认后才会写入配置文件。</FieldDescription>
+            </Field>
+          </FieldGroup>
           <DialogFooter>
             <Button
               variant="outline"
@@ -340,10 +352,10 @@ export default function SettingsPage({ active }: PageProps) {
       <AlertDialog open={confirmOfficial} onOpenChange={setConfirmOfficial}>
         <AlertDialogContent>
           <AlertDialogHeader>
-            <AlertDialogTitle>切换到 OpenAI 官方服务？</AlertDialogTitle>
+            <AlertDialogTitle>切换到 OpenAI 账号？</AlertDialogTitle>
             <AlertDialogDescription>
-              Codex 将使用当前保存的 OpenAI 账号。第三方 API
-              和其他配置会继续保留；如果尚未登录，请先前往“账号与服务”。
+              Codex 将使用最近使用或更新的 OpenAI 账号。已保存的第三方 API
+              服务和其他配置会保留；如果没有可用账号，请先前往“账号与服务”登录。
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
