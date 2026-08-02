@@ -1,9 +1,9 @@
 use crate::{
     models::{BillingMode, PricingMatchKind, PricingScopeKind},
+    official_pricing::OfficialPricingCatalog,
     usage_log::TokenUsage,
 };
 
-pub(crate) const OFFICIAL_PRICING_RULE_VERSION: i64 = 20260801;
 const OFFICIAL_PRICING_RULE_PREFIX: &str = "openai-official-standard";
 const OFFICIAL_PRICING_RULE_NAME: &str = "OpenAI 官方参考价";
 
@@ -89,73 +89,50 @@ pub(crate) enum PricingOutcome {
 pub(crate) fn price_for_source(
     source_kind: crate::models::UsageSourceKind,
     rules: &[PricingRuleRecord],
+    official_catalog: Option<&OfficialPricingCatalog>,
     usage: &TokenUsage,
     context: &PricingContext<'_>,
 ) -> PricingOutcome {
     if source_kind == crate::models::UsageSourceKind::Official {
-        return price_with_official_catalog(usage, context);
+        return price_with_official_catalog(official_catalog, usage, context);
     }
     price_with_rules(rules, usage, context)
 }
 
 pub(crate) fn price_with_official_catalog(
+    catalog: Option<&OfficialPricingCatalog>,
     usage: &TokenUsage,
     context: &PricingContext<'_>,
 ) -> PricingOutcome {
-    let normalized = normalize_model_name(context.model);
-    let Some((model_name, input, cached_read, cache_write, output)) = official_rates(&normalized)
-    else {
+    let Some(catalog) = catalog else {
         return PricingOutcome::Unpriced {
             rule_id: None,
-            reason: "官方价格目录暂未收录此模型。".into(),
+            reason: "官方实时价格目录尚未同步。".into(),
         };
     };
-    let rule_id = format!("{OFFICIAL_PRICING_RULE_PREFIX}:{model_name}");
-    let rule = PricingRuleRecord {
-        id: rule_id,
-        version: OFFICIAL_PRICING_RULE_VERSION,
-        active: true,
-        scope_kind: PricingScopeKind::GlobalModel,
-        provider_id: None,
-        account_id: None,
-        model_pattern: model_name.to_owned(),
-        match_kind: PricingMatchKind::Exact,
-        billing_mode: BillingMode::Token,
-        input_microusd_per_million: Some(input),
-        cached_read_microusd_per_million: Some(cached_read),
-        cache_write_microusd_per_million: Some(cache_write),
-        output_microusd_per_million: Some(output),
-        request_fee_microusd: None,
-        cache_write_included_in_input: true,
-        effective_from_ms: 0,
+    let Some(rate) = crate::official_pricing::resolve_model(catalog, context.model) else {
+        return PricingOutcome::Unpriced {
+            rule_id: None,
+            reason: "官方实时价格目录暂未收录此模型。".into(),
+        };
     };
-    calculate(&rule, usage, context)
+    let rule_id = format!("{OFFICIAL_PRICING_RULE_PREFIX}:{}", rate.model);
+    match crate::official_pricing::calculate(catalog, usage, context.model) {
+        Ok(cost_microusd) => PricingOutcome::Estimated {
+            cost_microusd,
+            rule_id,
+            version: catalog.version,
+        },
+        Err(reason) => PricingOutcome::Unpriced {
+            rule_id: Some(rule_id),
+            reason,
+        },
+    }
 }
 
 pub(crate) fn official_pricing_rule_name(id: &str) -> Option<String> {
     id.starts_with(OFFICIAL_PRICING_RULE_PREFIX)
         .then(|| OFFICIAL_PRICING_RULE_NAME.to_owned())
-}
-
-fn normalize_model_name(model: &str) -> String {
-    let normalized = model.trim().to_ascii_lowercase();
-    normalized
-        .strip_prefix("openai/")
-        .unwrap_or(&normalized)
-        .to_owned()
-}
-
-fn official_rates(model: &str) -> Option<(&'static str, i64, i64, i64, i64)> {
-    let model_name = ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]
-        .into_iter()
-        .find(|candidate| model == *candidate || model.starts_with(&format!("{candidate}-")))?;
-    let rates = match model_name {
-        "gpt-5.6-sol" => (5_000_000, 500_000, 6_250_000, 30_000_000),
-        "gpt-5.6-terra" => (2_500_000, 250_000, 3_125_000, 15_000_000),
-        "gpt-5.6-luna" => (1_000_000, 100_000, 1_250_000, 6_000_000),
-        _ => return None,
-    };
-    Some((model_name, rates.0, rates.1, rates.2, rates.3))
 }
 
 pub(crate) fn price_with_rules(
@@ -367,8 +344,16 @@ mod tests {
     };
 
     #[test]
-    fn prices_official_luna_with_the_builtin_openai_catalog() {
+    fn prices_official_luna_with_the_runtime_openai_catalog() {
+        let catalog = crate::official_pricing::build_catalog(
+            "# Pricing\n\n### Standard pricing data\n\n| Model | Short context input | Short context cached input | Short context cache writes | Short context output |\n| --- | --- | --- | --- | --- |\n| gpt-5.6-luna | $0.2 | $0.02 | $0.25 | $1.2 |",
+            202608020000,
+            None,
+            None,
+        )
+        .unwrap();
         let result = price_with_official_catalog(
+            Some(&catalog),
             &TokenUsage {
                 input_tokens: 2_690_000,
                 cached_input_tokens: 2_450_000,
@@ -388,9 +373,9 @@ mod tests {
         assert_eq!(
             result,
             PricingOutcome::Estimated {
-                cost_microusd: 514_400,
+                cost_microusd: 102_880,
                 rule_id: "openai-official-standard:gpt-5.6-luna".into(),
-                version: 20260801,
+                version: 202608020000,
             }
         );
     }
@@ -398,6 +383,7 @@ mod tests {
     #[test]
     fn unknown_official_models_are_not_assigned_a_guessed_price() {
         let result = price_with_official_catalog(
+            None,
             &TokenUsage {
                 input_tokens: 1,
                 cached_input_tokens: 0,

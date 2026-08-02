@@ -623,6 +623,19 @@ pub struct UsageOverview {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct OfficialPricingCatalogView {
+    pub status: String,
+    pub source_url: String,
+    pub version: Option<i64>,
+    pub content_sha256: Option<String>,
+    pub fetched_at_ms: Option<i64>,
+    pub etag: Option<String>,
+    pub model_count: usize,
+    pub models: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct UsageRefreshResult {
     pub files_scanned: usize,
     pub events_added: usize,

@@ -5,6 +5,7 @@ use crate::{
         UsageGroupBy, UsageOverview, UsageQuery, UsageRange, UsageRefreshResult, UsageRow,
         UsageSourceKind, UsageTotals, UsageWarning,
     },
+    official_pricing::OfficialPricingCatalog,
     pricing::{
         PricingContext, PricingOutcome, PricingRuleRecord, official_pricing_rule_name,
         parse_usd_microusd, price_for_source,
@@ -25,7 +26,7 @@ use std::{
 };
 use uuid::Uuid;
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 const MAX_ROLLOUT_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_METADATA_SCAN_BYTES: usize = 4 * 1024 * 1024;
 const MAX_RECORD_LINE_BYTES: usize = 8 * 1024 * 1024;
@@ -175,6 +176,7 @@ impl UsageLedger {
         rebuild_usage_for_parser_upgrade(&mut connection, collection_epoch)?;
 
         let activations = load_activations(&connection).map_err(AppError::from)?;
+        let official_catalog = load_official_catalog(&connection).map_err(AppError::from)?;
         let pricing_rules = load_pricing_rule_records(&connection).map_err(AppError::from)?;
 
         for path in paths {
@@ -186,6 +188,7 @@ impl UsageLedger {
                 collection_epoch,
                 &activations,
                 &pricing_rules,
+                official_catalog.as_ref(),
             ) {
                 Ok(file_result) => {
                     result.events_added += file_result.events_added;
@@ -468,6 +471,91 @@ impl UsageLedger {
             .collect())
     }
 
+    pub(crate) fn official_pricing_catalog(
+        &self,
+    ) -> Result<Option<OfficialPricingCatalog>, AppError> {
+        let connection = self.open_connection().map_err(AppError::from)?;
+        initialize_schema(&connection).map_err(AppError::from)?;
+        load_official_catalog(&connection).map_err(AppError::from)
+    }
+
+    pub(crate) fn save_official_pricing_catalog(
+        &self,
+        catalog: &OfficialPricingCatalog,
+        _now_utc_ms: i64,
+    ) -> Result<bool, AppError> {
+        let serialized = serde_json::to_string(catalog)
+            .map_err(|error| AppError::Internal(format!("序列化官方价格目录失败：{error}")))?;
+        let mut connection = self.open_connection().map_err(AppError::from)?;
+        initialize_schema(&connection).map_err(AppError::from)?;
+        let existing = connection
+            .query_row(
+                "SELECT version FROM official_pricing_catalogs
+                 WHERE content_sha256 = ?1 LIMIT 1",
+                params![catalog.content_sha256],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|error| AppError::Internal(format!("检查官方价格目录版本失败：{error}")))?;
+        if let Some(existing_version) = existing {
+            connection
+                .execute(
+                    "UPDATE official_pricing_catalogs SET active = 1 WHERE version = ?1",
+                    params![existing_version],
+                )
+                .map_err(|error| AppError::Internal(format!("激活官方价格目录失败：{error}")))?;
+            return Ok(false);
+        }
+        let transaction = connection
+            .transaction()
+            .map_err(|error| AppError::Internal(format!("开始保存官方价格目录失败：{error}")))?;
+        transaction
+            .execute("UPDATE official_pricing_catalogs SET active = 0", [])
+            .map_err(|error| AppError::Internal(format!("停用旧官方价格目录失败：{error}")))?;
+        transaction
+            .execute(
+                "INSERT INTO official_pricing_catalogs(
+                    version, content_sha256, source_url, etag, last_modified,
+                    fetched_at_ms, normalized_json, active
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1)",
+                params![
+                    catalog.version,
+                    catalog.content_sha256,
+                    catalog.source_url,
+                    catalog.etag,
+                    catalog.last_modified,
+                    catalog.fetched_at_ms,
+                    serialized,
+                ],
+            )
+            .map_err(|error| AppError::Internal(format!("写入官方价格目录失败：{error}")))?;
+        transaction
+            .execute(
+                "DELETE FROM official_pricing_catalogs
+                 WHERE version NOT IN (
+                   SELECT version FROM official_pricing_catalogs
+                   ORDER BY fetched_at_ms DESC LIMIT 3
+                 )",
+                [],
+            )
+            .map_err(|error| AppError::Internal(format!("清理旧官方价格目录失败：{error}")))?;
+        transaction
+            .commit()
+            .map_err(|error| AppError::Internal(format!("提交官方价格目录失败：{error}")))?;
+        Ok(true)
+    }
+
+    pub(crate) fn reprice_current_cycle(&self, now_utc_ms: i64) -> Result<RepriceResult, AppError> {
+        let connection = self.open_connection().map_err(AppError::from)?;
+        initialize_schema(&connection).map_err(AppError::from)?;
+        let start = read_collection_epoch(&connection)?.unwrap_or(now_utc_ms);
+        drop(connection);
+        self.reprice(UsageRange {
+            start_at_ms: start,
+            end_at_ms: now_utc_ms.saturating_add(1),
+        })
+    }
+
     pub(crate) fn save_pricing_rule(
         &self,
         input: SavePricingRule,
@@ -576,6 +664,7 @@ impl UsageLedger {
             .map(|epoch| range.start_at_ms.max(epoch))
             .unwrap_or(range.end_at_ms);
         let rules = load_pricing_rule_records(&connection).map_err(AppError::from)?;
+        let official_catalog = load_official_catalog(&connection).map_err(AppError::from)?;
         let mut statement = connection
             .prepare(
                 "SELECT event_id, occurred_at_ms, model, provider_id, account_id,
@@ -639,6 +728,7 @@ impl UsageLedger {
             let outcome = price_for_source(
                 event.source_kind,
                 &rules,
+                official_catalog.as_ref(),
                 &event.usage,
                 &PricingContext {
                     model: &event.model,
@@ -816,7 +906,19 @@ fn initialize_schema(connection: &Connection) -> anyhow::Result<()> {
                created_at_ms INTEGER NOT NULL,
                updated_at_ms INTEGER NOT NULL
              );
-             PRAGMA user_version = 3;
+             CREATE TABLE IF NOT EXISTS official_pricing_catalogs (
+               version INTEGER PRIMARY KEY,
+               content_sha256 TEXT NOT NULL UNIQUE,
+               source_url TEXT NOT NULL,
+               etag TEXT,
+               last_modified TEXT,
+               fetched_at_ms INTEGER NOT NULL,
+               normalized_json TEXT NOT NULL,
+               active INTEGER NOT NULL CHECK (active IN (0, 1))
+             );
+             CREATE INDEX IF NOT EXISTS official_pricing_catalog_active_idx
+               ON official_pricing_catalogs(active, fetched_at_ms DESC);
+             PRAGMA user_version = 4;
              COMMIT;",
         )?;
     }
@@ -840,6 +942,44 @@ fn initialize_schema(connection: &Connection) -> anyhow::Result<()> {
                ADD COLUMN usage_boundary_state INTEGER NOT NULL DEFAULT 0
                  CHECK (usage_boundary_state IN (0, 1, 2, 3));
              PRAGMA user_version = 3;
+             COMMIT;",
+        )?;
+    }
+    if version == 3 {
+        connection.execute_batch(
+            "BEGIN;
+             CREATE TABLE IF NOT EXISTS official_pricing_catalogs (
+               version INTEGER PRIMARY KEY,
+               content_sha256 TEXT NOT NULL UNIQUE,
+               source_url TEXT NOT NULL,
+               etag TEXT,
+               last_modified TEXT,
+               fetched_at_ms INTEGER NOT NULL,
+               normalized_json TEXT NOT NULL,
+               active INTEGER NOT NULL CHECK (active IN (0, 1))
+             );
+             CREATE INDEX IF NOT EXISTS official_pricing_catalog_active_idx
+               ON official_pricing_catalogs(active, fetched_at_ms DESC);
+             PRAGMA user_version = 4;
+             COMMIT;",
+        )?;
+    }
+    if version < SCHEMA_VERSION {
+        connection.execute_batch(
+            "BEGIN;
+             CREATE TABLE IF NOT EXISTS official_pricing_catalogs (
+               version INTEGER PRIMARY KEY,
+               content_sha256 TEXT NOT NULL UNIQUE,
+               source_url TEXT NOT NULL,
+               etag TEXT,
+               last_modified TEXT,
+               fetched_at_ms INTEGER NOT NULL,
+               normalized_json TEXT NOT NULL,
+               active INTEGER NOT NULL CHECK (active IN (0, 1))
+             );
+             CREATE INDEX IF NOT EXISTS official_pricing_catalog_active_idx
+               ON official_pricing_catalogs(active, fetched_at_ms DESC);
+             PRAGMA user_version = 4;
              COMMIT;",
         )?;
     }
@@ -1078,6 +1218,7 @@ fn refresh_file(
     collection_epoch: i64,
     activations: &[ActivationSnapshot],
     pricing_rules: &[PricingRuleRecord],
+    official_catalog: Option<&OfficialPricingCatalog>,
 ) -> Result<FileRefreshResult, String> {
     let metadata = fs::metadata(path).map_err(|error| format!("无法读取会话文件：{error}"))?;
     if metadata.len() > MAX_ROLLOUT_BYTES {
@@ -1216,6 +1357,7 @@ fn refresh_file(
             now_utc_ms,
             activations,
             pricing_rules,
+            official_catalog,
         )? {
             events_added += 1;
         }
@@ -1453,6 +1595,21 @@ fn load_pricing_rule_records(connection: &Connection) -> anyhow::Result<Vec<Pric
     })?;
     rows.collect::<rusqlite::Result<Vec<_>>>()
         .map_err(Into::into)
+}
+
+fn load_official_catalog(
+    connection: &Connection,
+) -> anyhow::Result<Option<OfficialPricingCatalog>> {
+    let json = connection
+        .query_row(
+            "SELECT normalized_json FROM official_pricing_catalogs
+             WHERE active = 1 ORDER BY fetched_at_ms DESC LIMIT 1",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    json.map(|value| serde_json::from_str(&value).map_err(Into::into))
+        .transpose()
 }
 
 fn load_pricing_rule_dtos(connection: &Connection) -> Result<Vec<PricingRule>, AppError> {
@@ -1710,6 +1867,7 @@ fn insert_event(
     created_at_ms: i64,
     activations: &[ActivationSnapshot],
     pricing_rules: &[PricingRuleRecord],
+    official_catalog: Option<&OfficialPricingCatalog>,
 ) -> Result<bool, String> {
     let event_id = event_id(rollout_id, event);
     let usage_quality = match (event.quality, event.model_provider.is_none()) {
@@ -1731,6 +1889,7 @@ fn insert_event(
                 Some(price_for_source(
                     value.source_kind,
                     pricing_rules,
+                    official_catalog,
                     &to_internal_usage(event),
                     &PricingContext {
                         model: &event.model,
@@ -1754,6 +1913,7 @@ fn insert_event(
                 price_for_source(
                     *source_kind,
                     pricing_rules,
+                    official_catalog,
                     &to_internal_usage(event),
                     &PricingContext {
                         model: &event.model,
@@ -2018,6 +2178,7 @@ fn u64_db(value: u64) -> Result<i64, String> {
 mod tests {
     use super::{ActivationSnapshot, UsageLedger};
     use crate::models::{ActivationRecord, UsageGroupBy, UsageQuery, UsageRange, UsageSourceKind};
+    use crate::official_pricing::build_catalog;
     use crate::usage_log::{ParsedUsageEvent, TokenUsage, UsageQuality};
     use chrono::DateTime;
     use std::{fs, path::Path};
@@ -2092,6 +2253,19 @@ mod tests {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, text).unwrap();
         path
+    }
+
+    fn save_test_catalog(ledger: &UsageLedger) {
+        let catalog = build_catalog(
+            "# Pricing\n\n### Standard pricing data\n\n| Model | Short context input | Short context cached input | Short context cache writes | Short context output |\n| --- | --- | --- | --- | --- |\n| gpt-5.6-sol | $1 | $1 | $1 | $1 |",
+            20260801,
+            None,
+            None,
+        )
+        .unwrap();
+        ledger
+            .save_official_pricing_catalog(&catalog, 20260801)
+            .unwrap();
     }
 
     #[test]
@@ -2187,6 +2361,7 @@ mod tests {
         let old_log = format!("{}{}", rollout_prefix(), rollout_event());
         write_rollout(&home, &old_log);
         let ledger = UsageLedger::open(&temp.path().join("app")).unwrap();
+        save_test_catalog(&ledger);
 
         let refreshed = ledger.refresh(&home, 1_754_121_000_000).unwrap();
         let overview = query(&ledger);
@@ -2215,6 +2390,7 @@ mod tests {
         let home = temp.path().join("codex");
         write_rollout(&home, rollout_prefix());
         let ledger = UsageLedger::open(&temp.path().join("app")).unwrap();
+        save_test_catalog(&ledger);
 
         assert_eq!(
             ledger
@@ -2556,11 +2732,12 @@ mod tests {
     }
 
     #[test]
-    fn attributes_official_usage_and_uses_the_builtin_price_catalog() {
+    fn attributes_official_usage_and_uses_the_runtime_price_catalog() {
         let temp = tempfile::tempdir().unwrap();
         let home = temp.path().join("codex");
         write_rollout(&home, rollout_prefix());
         let ledger = UsageLedger::open(&temp.path().join("app")).unwrap();
+        save_test_catalog(&ledger);
         ledger.refresh(&home, 1_754_121_000_000).unwrap();
         append_new_usage(&home);
         ledger
@@ -2582,7 +2759,7 @@ mod tests {
             overview.rows[0].cost_status,
             crate::models::CostStatus::Estimated
         );
-        assert_eq!(overview.rows[0].estimated_cost_microusd, Some(653));
+        assert_eq!(overview.rows[0].estimated_cost_microusd, Some(108));
         assert_eq!(
             overview.rows[0].pricing_rule_name.as_deref(),
             Some("OpenAI 官方参考价")

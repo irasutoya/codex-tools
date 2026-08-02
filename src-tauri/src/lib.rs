@@ -3,6 +3,7 @@ mod codex;
 mod local_usage;
 mod models;
 mod network;
+mod official_pricing;
 mod official_quota;
 mod platform;
 mod pricing;
@@ -101,6 +102,109 @@ async fn refresh_usage(
     })
     .await
     .map_err(|error| AppError::Internal(error.to_string()))?
+}
+
+#[tauri::command]
+fn get_official_pricing_catalog(
+    ledger: State<UsageLedger>,
+) -> Result<OfficialPricingCatalogView, AppError> {
+    catalog_view(ledger.official_pricing_catalog()?)
+}
+
+#[tauri::command]
+async fn refresh_official_pricing_catalog(
+    client: State<'_, ApiClient>,
+    ledger: State<'_, UsageLedger>,
+) -> Result<OfficialPricingCatalogView, AppError> {
+    let cached = ledger.official_pricing_catalog()?;
+    let url = reqwest::Url::parse(official_pricing::SOURCE_URL)
+        .map_err(|error| AppError::Internal(format!("官方价格地址无效：{error}")))?;
+    if url.host_str() != Some("developers.openai.com") || url.scheme() != "https" {
+        return Err(AppError::Internal("官方价格地址域名校验失败。".into()));
+    }
+    let mut request = client.0.get(url).timeout(std::time::Duration::from_secs(8));
+    if let Some(cached) = cached.as_ref() {
+        if let Some(etag) = cached.etag.as_deref() {
+            request = request.header(reqwest::header::IF_NONE_MATCH, etag);
+        }
+        if let Some(last_modified) = cached.last_modified.as_deref() {
+            request = request.header(reqwest::header::IF_MODIFIED_SINCE, last_modified);
+        }
+    }
+    let response = request.send().await.map_err(|error| {
+        AppError::Internal(format!("获取官方价格失败，已保留上次缓存：{error}"))
+    })?;
+    if response.status() == reqwest::StatusCode::NOT_MODIFIED {
+        return catalog_view(cached);
+    }
+    if !response.status().is_success() {
+        return Err(AppError::Internal(format!(
+            "官方价格服务返回 HTTP {}，已保留上次缓存。",
+            response.status()
+        )));
+    }
+    if response
+        .content_length()
+        .is_some_and(|size| size as usize > official_pricing::MAX_DOCUMENT_BYTES)
+    {
+        return Err(AppError::Internal(
+            "官方价格文档超过 512KB 限制，已保留上次缓存。".into(),
+        ));
+    }
+    let etag = response
+        .headers()
+        .get(reqwest::header::ETAG)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let last_modified = response
+        .headers()
+        .get(reqwest::header::LAST_MODIFIED)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|error| AppError::Internal(format!("读取官方价格失败：{error}")))?;
+    if bytes.len() > official_pricing::MAX_DOCUMENT_BYTES {
+        return Err(AppError::Internal(
+            "官方价格文档超过 512KB 限制，已保留上次缓存。".into(),
+        ));
+    }
+    let document = String::from_utf8(bytes.to_vec())
+        .map_err(|_| AppError::Internal("官方价格文档不是 UTF-8。".into()))?;
+    let now = chrono::Utc::now().timestamp_millis();
+    let catalog = official_pricing::build_catalog(&document, now, etag, last_modified)
+        .map_err(AppError::Internal)?;
+    ledger.save_official_pricing_catalog(&catalog, now)?;
+    ledger.reprice_current_cycle(now)?;
+    catalog_view(Some(catalog))
+}
+
+fn catalog_view(
+    catalog: Option<official_pricing::OfficialPricingCatalog>,
+) -> Result<OfficialPricingCatalogView, AppError> {
+    Ok(match catalog {
+        Some(catalog) => OfficialPricingCatalogView {
+            status: "cached".into(),
+            source_url: catalog.source_url,
+            version: Some(catalog.version),
+            content_sha256: Some(catalog.content_sha256),
+            fetched_at_ms: Some(catalog.fetched_at_ms),
+            etag: catalog.etag,
+            model_count: catalog.models.len(),
+            models: catalog.models.keys().cloned().collect(),
+        },
+        None => OfficialPricingCatalogView {
+            status: "waiting".into(),
+            source_url: official_pricing::SOURCE_URL.into(),
+            version: None,
+            content_sha256: None,
+            fetched_at_ms: None,
+            etag: None,
+            model_count: 0,
+            models: Vec::new(),
+        },
+    })
 }
 
 #[tauri::command]
@@ -1139,6 +1243,8 @@ pub fn run() {
             get_provider_overview,
             get_usage_overview,
             refresh_usage,
+            get_official_pricing_catalog,
+            refresh_official_pricing_catalog,
             list_pricing_rules,
             save_pricing_rule,
             delete_pricing_rule,

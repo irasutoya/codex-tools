@@ -113,6 +113,17 @@ export type UsageOverview = {
   warnings: Array<{ path?: string; message: string }>
 }
 
+export type OfficialPricingCatalog = {
+  status: "waiting" | "cached"
+  sourceUrl: string
+  version?: number
+  contentSha256?: string
+  fetchedAtMs?: number
+  etag?: string
+  modelCount: number
+  models: string[]
+}
+
 export type UsageShareAccount = {
   key: string
   displayName: string

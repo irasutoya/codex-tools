@@ -70,6 +70,7 @@ import type {
   UsageGroupBy,
   UsageOverview,
   UsageRow,
+  OfficialPricingCatalog,
 } from "@/types"
 
 import { PricingRuleDialog } from "./pricing-rule-dialog"
@@ -108,6 +109,8 @@ export default function UsagePage({ active }: PageProps) {
   const [customEnd, setCustomEnd] = useState(() => getLocalDateInput())
   const [groupBy, setGroupBy] = useState<UsageGroupBy>("model")
   const [overview, setOverview] = useState<UsageOverview>()
+  const [officialCatalog, setOfficialCatalog] = useState<OfficialPricingCatalog>()
+  const [officialCatalogLoading, setOfficialCatalogLoading] = useState(false)
   const [rules, setRules] = useState<PricingRule[]>([])
   const [providers, setProviders] = useState<ProviderOverview>()
   const [pricingDraft, setPricingDraft] = useState<PricingRule>()
@@ -183,16 +186,31 @@ export default function UsagePage({ active }: PageProps) {
     }
   }, [])
 
+  const loadOfficialCatalog = useCallback(async (refresh = false) => {
+    setOfficialCatalogLoading(true)
+    try {
+      const result = refresh
+        ? await call("refresh_official_pricing_catalog")
+        : await call("get_official_pricing_catalog")
+      setOfficialCatalog(result)
+    } catch (reason) {
+      setPricingError(String(reason))
+    } finally {
+      setOfficialCatalogLoading(false)
+    }
+  }, [])
+
   useEffect(() => {
     if (!active || !customRangeValid) return
     const timeout = window.setTimeout(() => {
       void Promise.all([
         loadOverview().then(() => loadOverview(true, true)),
         loadRules(),
+        loadOfficialCatalog(true),
       ]).catch(() => undefined)
     }, 0)
     return () => window.clearTimeout(timeout)
-  }, [active, customRangeValid, loadOverview, loadRules])
+  }, [active, customRangeValid, loadOfficialCatalog, loadOverview, loadRules])
 
   useEffect(() => {
     if (!active || !customRangeValid) return
@@ -232,6 +250,7 @@ export default function UsagePage({ active }: PageProps) {
     try {
       await loadOverview(true)
       await loadRules()
+      await loadOfficialCatalog(true)
       notify.success("用量已刷新", "已重新扫描本机 Codex rollout 文件。")
     } catch (reason) {
       notify.error("无法刷新本机用量", reason)
@@ -420,6 +439,47 @@ export default function UsagePage({ active }: PageProps) {
           </AlertDescription>
         </Alert>
       )}
+
+      <Card>
+        <CardHeader className="gap-3 sm:flex-row sm:items-center sm:justify-between">
+          <div>
+            <CardTitle>OpenAI 官方实时价格</CardTitle>
+            <CardDescription>
+              价格从官方 Markdown 运行时同步，不写死模型；中转站价格规则完全独立。
+            </CardDescription>
+          </div>
+          <Button
+            size="sm"
+            variant="outline"
+            disabled={officialCatalogLoading}
+            onClick={() => void loadOfficialCatalog(true)}
+          >
+            {officialCatalogLoading ? <Spinner data-icon="inline-start" /> : <RefreshCw data-icon="inline-start" />}
+            {officialCatalogLoading ? "正在同步…" : "立即同步"}
+          </Button>
+        </CardHeader>
+        <CardContent className="flex flex-wrap items-center gap-3 text-sm">
+          <Badge variant={officialCatalog?.status === "cached" ? "secondary" : "outline"}>
+            {officialCatalog?.status === "cached" ? "已缓存" : "等待同步"}
+          </Badge>
+          <span className="text-muted-foreground">
+            {officialCatalog?.modelCount ?? 0} 个官方模型
+          </span>
+          {officialCatalog?.fetchedAtMs && (
+            <span className="text-muted-foreground">
+              最近同步：{formatDateTime(officialCatalog.fetchedAtMs)}
+            </span>
+          )}
+          <a
+            className="text-primary underline-offset-4 hover:underline"
+            href={officialCatalog?.sourceUrl ?? "https://developers.openai.com/api/docs/pricing.md"}
+            target="_blank"
+            rel="noreferrer"
+          >
+            查看官方来源
+          </a>
+        </CardContent>
+      </Card>
 
       <Card>
         <CardHeader className="gap-4 sm:flex-row sm:items-center sm:justify-between">
@@ -799,7 +859,7 @@ export default function UsagePage({ active }: PageProps) {
         <CardContent>
           <div className="mb-4 flex flex-col gap-1 rounded-lg border border-emerald-200 bg-emerald-50/60 p-3 text-sm dark:border-emerald-900 dark:bg-emerald-950/30">
             <div className="flex flex-wrap items-center gap-2">
-              <span className="font-medium">OpenAI 官方内置价格</span>
+              <span className="font-medium">OpenAI 官方实时价格</span>
               <Badge variant="outline">只读</Badge>
               <Badge variant="secondary">自动启用</Badge>
             </div>
