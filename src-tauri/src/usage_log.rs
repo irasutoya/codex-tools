@@ -31,12 +31,23 @@ pub(crate) struct ParsedUsageEvent {
     pub quality: UsageQuality,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum UsageBoundaryState {
+    #[default]
+    Regular,
+    AwaitingSubagentTaskStart,
+    AwaitingSubagentBoundaryMarker,
+    Started,
+}
+
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ParserState {
     pub rollout_id: Option<String>,
     pub model_provider: Option<String>,
     pub model: Option<String>,
     pub next_event_ordinal: u64,
+    pub usage_boundary: UsageBoundaryState,
+    pub boundary_marker_required: bool,
 }
 
 #[cfg(test)]
@@ -51,12 +62,17 @@ pub(crate) struct ParsedRollout {
 pub(crate) enum LineResult {
     Ignored,
     Event(ParsedUsageEvent),
+    SkippedInheritedUsage,
     Warning(String),
 }
 
 #[cfg(test)]
 pub(crate) fn parse_rollout_text(text: &str) -> ParsedRollout {
-    let mut state = ParserState::default();
+    let boundary_marker_required = text.lines().any(is_inter_agent_trigger_line);
+    let mut state = ParserState {
+        boundary_marker_required,
+        ..ParserState::default()
+    };
     let mut output = ParsedRollout::default();
 
     for segment in text.split_inclusive('\n') {
@@ -75,6 +91,7 @@ pub(crate) fn parse_rollout_text(text: &str) -> ParsedRollout {
         match parse_line(line.as_bytes(), &mut state) {
             Ok(LineResult::Ignored) => {}
             Ok(LineResult::Event(event)) => output.events.push(event),
+            Ok(LineResult::SkippedInheritedUsage) => {}
             Ok(LineResult::Warning(warning)) => output.warnings.push(warning),
             Err(error) if !complete_line => {
                 // A final line may still be being written by Codex. It is retried
@@ -112,6 +129,14 @@ pub(crate) fn parse_line(line: &[u8], state: &mut ParserState) -> Result<LineRes
             {
                 state.rollout_id = Some(id.to_owned());
             }
+            if payload
+                .and_then(|payload| payload.get("source"))
+                .and_then(|source| source.get("subagent"))
+                .and_then(|subagent| subagent.get("thread_spawn"))
+                .is_some()
+            {
+                state.usage_boundary = UsageBoundaryState::AwaitingSubagentTaskStart;
+            }
             if let Some(provider) = payload
                 .and_then(|payload| {
                     payload
@@ -123,6 +148,28 @@ pub(crate) fn parse_line(line: &[u8], state: &mut ParserState) -> Result<LineRes
                 .filter(|provider| !provider.is_empty())
             {
                 state.model_provider = Some(provider.to_owned());
+            }
+            Ok(LineResult::Ignored)
+        }
+        Some("event_msg") if payload_type == Some("task_started") => {
+            if state.usage_boundary == UsageBoundaryState::AwaitingSubagentTaskStart {
+                state.usage_boundary = if state.boundary_marker_required {
+                    UsageBoundaryState::AwaitingSubagentBoundaryMarker
+                } else {
+                    UsageBoundaryState::Started
+                };
+            }
+            Ok(LineResult::Ignored)
+        }
+        Some("inter_agent_communication_metadata")
+            if value
+                .get("payload")
+                .and_then(|payload| payload.get("trigger_turn"))
+                .and_then(Value::as_bool)
+                == Some(true) =>
+        {
+            if state.usage_boundary == UsageBoundaryState::AwaitingSubagentBoundaryMarker {
+                state.usage_boundary = UsageBoundaryState::Started;
             }
             Ok(LineResult::Ignored)
         }
@@ -181,6 +228,14 @@ pub(crate) fn parse_line(line: &[u8], state: &mut ParserState) -> Result<LineRes
         {
             let ordinal = state.next_event_ordinal;
             state.next_event_ordinal = state.next_event_ordinal.saturating_add(1);
+
+            if matches!(
+                state.usage_boundary,
+                UsageBoundaryState::AwaitingSubagentTaskStart
+                    | UsageBoundaryState::AwaitingSubagentBoundaryMarker
+            ) {
+                return Ok(LineResult::SkippedInheritedUsage);
+            }
 
             let timestamp = value
                 .get("timestamp")
@@ -283,6 +338,12 @@ fn parse_timestamp(value: &Value) -> Option<i64> {
 }
 
 #[cfg(test)]
+fn is_inter_agent_trigger_line(line: &str) -> bool {
+    line.contains(r#""type":"inter_agent_communication_metadata""#)
+        && line.contains(r#""trigger_turn":true"#)
+}
+
+#[cfg(test)]
 mod tests {
     use super::{TokenUsage, parse_rollout_text};
 
@@ -353,6 +414,75 @@ mod tests {
         assert_eq!(parsed.events.len(), 1);
         assert_eq!(parsed.events[0].model, "gpt-5.6-luna");
         assert_eq!(parsed.events[0].model_provider.as_deref(), Some("custom"));
+    }
+
+    #[test]
+    fn skips_inherited_subagent_usage_until_task_started() {
+        let text = concat!(
+            r#"{"type":"session_meta","payload":{"id":"subagent-rollout","model_provider":"openai","source":{"subagent":{"thread_spawn":{"parent_thread_id":"parent-rollout"}}}}}"#,
+            "\n",
+            r#"{"type":"turn_context","payload":{"model":"gpt-5.6-sol"}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100,"output_tokens":10,"total_tokens":110}}}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"thread_settings_applied","thread_settings":{"model":"gpt-5.6-luna","model_provider_id":"custom"}}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"task_started"}}"#,
+            "\n",
+            r#"{"type":"turn_context","payload":{"model":"gpt-5.6-luna"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-08-02T04:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":11,"output_tokens":4,"total_tokens":15}}}}"#,
+            "\n",
+        );
+
+        let parsed = parse_rollout_text(text);
+
+        assert_eq!(parsed.events.len(), 1);
+        assert_eq!(parsed.events[0].ordinal, 1);
+        assert_eq!(parsed.events[0].model, "gpt-5.6-luna");
+        assert_eq!(parsed.events[0].model_provider.as_deref(), Some("custom"));
+        assert_eq!(
+            parsed.state.usage_boundary,
+            super::UsageBoundaryState::Started
+        );
+    }
+
+    #[test]
+    fn skips_all_inherited_task_starts_until_inter_agent_boundary() {
+        let text = concat!(
+            r#"{"type":"session_meta","payload":{"id":"subagent-real-boundary","source":{"subagent":{"thread_spawn":{"parent_thread_id":"parent-rollout"}}}}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"task_started"}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100,"output_tokens":10,"total_tokens":110}}}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"task_started"}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":200,"output_tokens":20,"total_tokens":220}}}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"role":"developer"}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"task_started"}}"#,
+            "\n",
+            r#"{"type":"world_state","payload":{}}"#,
+            "\n",
+            r#"{"type":"turn_context","payload":{"model":"gpt-5.6-luna","model_provider":"custom"}}"#,
+            "\n",
+            r#"{"type":"inter_agent_communication_metadata","payload":{"trigger_turn":true}}"#,
+            "\n",
+            r#"{"type":"event_msg","timestamp":"2026-08-02T04:00:01Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":11,"output_tokens":4,"total_tokens":15}}}}"#,
+            "\n",
+        );
+
+        let parsed = parse_rollout_text(text);
+
+        assert_eq!(parsed.events.len(), 1);
+        assert_eq!(parsed.events[0].usage.total_tokens, 15);
+        assert_eq!(parsed.events[0].ordinal, 2);
+        assert_eq!(
+            parsed.state.usage_boundary,
+            super::UsageBoundaryState::Started
+        );
     }
 
     #[test]

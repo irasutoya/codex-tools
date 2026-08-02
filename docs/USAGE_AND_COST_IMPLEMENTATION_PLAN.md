@@ -7,6 +7,8 @@
 
 当前落地范围：后端日志解析、增量 SQLite 账本、账号激活时间线、USD 价格规则、Tauri IPC、用量与费用页、概览摘要、账号页今日用量摘要均已完成；软件更新后创建新的统计周期，更新前 Token 不回放、不入账、不展示；中转站价格采用服务+模型快速设置并默认重算当前范围；账号切换包含 pending/confirmed/cancelled 生命周期；数据库目录和文件权限已收紧。尚未提交 Git，等待用户运行 `npm run dev` 手动验证真实 Codex 日志。
 
+解析器维护补充：子任务 rollout 的 `session_meta.payload.source.subagent.thread_spawn` 表示文件前部可能包含父任务继承历史；继承段的 `token_count` 必须跳过，遇到 `event_msg.payload.type = task_started` 后才开始统计。解析器升级会重建当前统计周期，保留统计起点、激活历史和价格规则。无法绑定具体账号但能从日志确认 Provider 时，只保存官方/中转站来源，不猜账号；中转站账号未确认事件不参与自定义价格计算。
+
 手动测试前的 UI 示例截图：`output/playwright/token-cost-v034-ui.png`。示例使用脱敏模拟数据，不代表真实账单。
 
 ## 1. 目标

@@ -11,7 +11,7 @@ use crate::{
     },
     provider_sync,
     storage::{secure_directory, secure_file},
-    usage_log::{LineResult, ParsedUsageEvent, ParserState, parse_line},
+    usage_log::{LineResult, ParsedUsageEvent, ParserState, UsageBoundaryState, parse_line},
 };
 use chrono::Utc;
 use rusqlite::{Connection, OptionalExtension, Row, params};
@@ -25,7 +25,7 @@ use std::{
 };
 use uuid::Uuid;
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 3;
 const MAX_ROLLOUT_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_METADATA_SCAN_BYTES: usize = 4 * 1024 * 1024;
 const MAX_RECORD_LINE_BYTES: usize = 8 * 1024 * 1024;
@@ -35,7 +35,7 @@ const COLLECTION_MODE_METADATA_KEY: &str = "usage_collection_mode";
 const PARSER_VERSION_METADATA_KEY: &str = "usage_parser_version";
 const COLLECTION_MODE: &str = "after_update";
 const COLLECTION_VERSION: &str = env!("CARGO_PKG_VERSION");
-const PARSER_VERSION: &str = "2";
+const PARSER_VERSION: &str = "4";
 
 #[derive(Clone)]
 pub(crate) struct UsageLedger {
@@ -48,6 +48,14 @@ struct FileRefreshResult {
     events_skipped: usize,
     partial_lines: usize,
     warnings: Vec<UsageWarning>,
+}
+
+#[derive(Debug, Clone)]
+struct DiscoveredRollout {
+    rollout_id: String,
+    model_provider: Option<String>,
+    is_subagent: bool,
+    boundary_marker_required: bool,
 }
 
 struct RepriceEvent {
@@ -68,6 +76,8 @@ struct StoredCursor {
     next_event_ordinal: u64,
     last_model: Option<String>,
     last_model_provider: Option<String>,
+    usage_boundary_passed: bool,
+    usage_boundary: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -96,6 +106,7 @@ struct ActivationSnapshot {
     source_kind: UsageSourceKind,
     provider_id: Option<String>,
     account_id: Option<String>,
+    #[allow(dead_code)]
     model_provider: Option<String>,
     display_name_snapshot: String,
 }
@@ -103,7 +114,17 @@ struct ActivationSnapshot {
 enum ActivationResolution {
     Matched(ActivationSnapshot),
     Missing,
-    Conflict,
+}
+
+#[derive(Debug, Clone)]
+enum AttributionOutcome {
+    Confirmed(ActivationSnapshot),
+    SourceOnly {
+        source_kind: UsageSourceKind,
+        display_name: String,
+        allows_pricing: bool,
+    },
+    Unknown,
 }
 
 impl UsageLedger {
@@ -598,7 +619,11 @@ impl UsageLedger {
             unpriced_events: 0,
         };
         for event in events {
-            if event.source_kind == UsageSourceKind::Unattributed {
+            if event.source_kind == UsageSourceKind::Unattributed
+                || (event.source_kind == UsageSourceKind::Provider
+                    && event.provider_id.is_none()
+                    && event.account_id.is_none())
+            {
                 transaction
                     .execute(
                         "UPDATE usage_events SET cost_status = 'unattributed',
@@ -749,6 +774,10 @@ fn initialize_schema(connection: &Connection) -> anyhow::Result<()> {
                next_event_ordinal INTEGER NOT NULL,
                last_model TEXT,
                last_model_provider TEXT,
+               usage_boundary_passed INTEGER NOT NULL DEFAULT 1
+                 CHECK (usage_boundary_passed IN (0, 1)),
+               usage_boundary_state INTEGER NOT NULL DEFAULT 0
+                 CHECK (usage_boundary_state IN (0, 1, 2, 3)),
                file_length INTEGER NOT NULL,
                file_modified_at_ms INTEGER,
                updated_at_ms INTEGER NOT NULL
@@ -787,7 +816,30 @@ fn initialize_schema(connection: &Connection) -> anyhow::Result<()> {
                created_at_ms INTEGER NOT NULL,
                updated_at_ms INTEGER NOT NULL
              );
-             PRAGMA user_version = 1;
+             PRAGMA user_version = 3;
+             COMMIT;",
+        )?;
+    }
+    if version == 1 {
+        connection.execute_batch(
+            "BEGIN;
+             ALTER TABLE usage_cursors
+               ADD COLUMN usage_boundary_passed INTEGER NOT NULL DEFAULT 1
+                 CHECK (usage_boundary_passed IN (0, 1));
+             ALTER TABLE usage_cursors
+               ADD COLUMN usage_boundary_state INTEGER NOT NULL DEFAULT 0
+                 CHECK (usage_boundary_state IN (0, 1, 2, 3));
+             PRAGMA user_version = 3;
+             COMMIT;",
+        )?;
+    }
+    if version == 2 {
+        connection.execute_batch(
+            "BEGIN;
+             ALTER TABLE usage_cursors
+               ADD COLUMN usage_boundary_state INTEGER NOT NULL DEFAULT 0
+                 CHECK (usage_boundary_state IN (0, 1, 2, 3));
+             PRAGMA user_version = 3;
              COMMIT;",
         )?;
     }
@@ -886,11 +938,19 @@ fn initialize_collection_epoch(
         let Ok(metadata) = fs::metadata(path) else {
             continue;
         };
-        let Some((rollout_id, discovered_provider)) = discover_rollout(path)
+        let Some(discovered) = discover_rollout(path)
             .map_err(|error| AppError::Internal(format!("初始化本机用量文件游标失败：{error}")))?
         else {
             continue;
         };
+        let usage_boundary = if discovered.is_subagent {
+            rollout_boundary_state(path, discovered.boundary_marker_required).map_err(|error| {
+                AppError::Internal(format!("初始化本机用量子任务边界失败：{error}"))
+            })?
+        } else {
+            UsageBoundaryState::Regular
+        };
+        let rollout_id = discovered.rollout_id;
         let (next_event_ordinal, last_model, last_model_provider) = transaction
             .query_row(
                 "SELECT COALESCE(MAX(event_ordinal), -1) + 1, model, model_provider
@@ -909,18 +969,20 @@ fn initialize_collection_epoch(
             .execute(
                 "INSERT INTO usage_cursors(
                     rollout_id, last_path, byte_offset, next_event_ordinal,
-                    last_model, last_model_provider, file_length,
-                    file_modified_at_ms, updated_at_ms
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                    last_model, last_model_provider, usage_boundary_passed,
+                    usage_boundary_state, file_length, file_modified_at_ms, updated_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
                  ON CONFLICT(rollout_id) DO UPDATE SET
-                    last_path = excluded.last_path,
-                    byte_offset = excluded.byte_offset,
-                    next_event_ordinal = excluded.next_event_ordinal,
-                    last_model = excluded.last_model,
-                    last_model_provider = excluded.last_model_provider,
-                    file_length = excluded.file_length,
-                    file_modified_at_ms = excluded.file_modified_at_ms,
-                    updated_at_ms = excluded.updated_at_ms",
+                   last_path = excluded.last_path,
+                   byte_offset = excluded.byte_offset,
+                   next_event_ordinal = excluded.next_event_ordinal,
+                   last_model = excluded.last_model,
+                   last_model_provider = excluded.last_model_provider,
+                   usage_boundary_passed = excluded.usage_boundary_passed,
+                   usage_boundary_state = excluded.usage_boundary_state,
+                   file_length = excluded.file_length,
+                   file_modified_at_ms = excluded.file_modified_at_ms,
+                   updated_at_ms = excluded.updated_at_ms",
                 params![
                     rollout_id,
                     path.display().to_string(),
@@ -929,7 +991,9 @@ fn initialize_collection_epoch(
                     })?,
                     next_event_ordinal.max(0),
                     last_model,
-                    last_model_provider.or(discovered_provider),
+                    last_model_provider.or(discovered.model_provider),
+                    i64::from(usage_boundary_passed(usage_boundary)),
+                    usage_boundary_code(usage_boundary),
                     i64::try_from(metadata.len()).map_err(|_| {
                         AppError::Internal("会话文件大小超过数据库范围。".into())
                     })?,
@@ -1019,7 +1083,7 @@ fn refresh_file(
     if metadata.len() > MAX_ROLLOUT_BYTES {
         return Err("会话文件超过 256 MB，已跳过以避免占用过多内存。".into());
     }
-    let Some((rollout_id, discovered_provider)) = discover_rollout(path)? else {
+    let Some(discovered) = discover_rollout(path)? else {
         return Ok(FileRefreshResult {
             events_added: 0,
             events_skipped: 0,
@@ -1030,6 +1094,7 @@ fn refresh_file(
             }],
         });
     };
+    let rollout_id = discovered.rollout_id.clone();
 
     let cursor = load_cursor(connection, &rollout_id)?;
     let (offset, mut state) = match cursor {
@@ -1040,15 +1105,27 @@ fn refresh_file(
                 model_provider: cursor.last_model_provider,
                 model: cursor.last_model,
                 next_event_ordinal: cursor.next_event_ordinal,
+                usage_boundary: if discovered.is_subagent {
+                    usage_boundary_from_cursor(cursor.usage_boundary, cursor.usage_boundary_passed)
+                } else {
+                    UsageBoundaryState::Regular
+                },
+                boundary_marker_required: discovered.boundary_marker_required,
             },
         ),
         _ => (
             0,
             ParserState {
                 rollout_id: Some(rollout_id.clone()),
-                model_provider: discovered_provider,
+                model_provider: discovered.model_provider.clone(),
                 model: None,
                 next_event_ordinal: 0,
+                usage_boundary: if discovered.is_subagent {
+                    UsageBoundaryState::AwaitingSubagentTaskStart
+                } else {
+                    UsageBoundaryState::Regular
+                },
+                boundary_marker_required: discovered.boundary_marker_required,
             },
         ),
     };
@@ -1064,6 +1141,7 @@ fn refresh_file(
     let mut warnings = vec![];
     let mut partial_lines = 0;
     let mut events_skipped = 0;
+    let mut inherited_events_skipped = 0;
 
     loop {
         let mut line = Vec::new();
@@ -1096,6 +1174,10 @@ fn refresh_file(
         match parse_line(trimmed, &mut state) {
             Ok(LineResult::Event(event)) => events.push(event),
             Ok(LineResult::Ignored) => {}
+            Ok(LineResult::SkippedInheritedUsage) => {
+                events_skipped += 1;
+                inherited_events_skipped += 1;
+            }
             Ok(LineResult::Warning(message)) => {
                 events_skipped += 1;
                 warnings.push(UsageWarning {
@@ -1142,18 +1224,20 @@ fn refresh_file(
         .execute(
             "INSERT INTO usage_cursors(
                 rollout_id, last_path, byte_offset, next_event_ordinal,
-                last_model, last_model_provider, file_length,
-                file_modified_at_ms, updated_at_ms
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                last_model, last_model_provider, usage_boundary_passed,
+                usage_boundary_state, file_length, file_modified_at_ms, updated_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
              ON CONFLICT(rollout_id) DO UPDATE SET
-                last_path = excluded.last_path,
-                byte_offset = excluded.byte_offset,
-                next_event_ordinal = excluded.next_event_ordinal,
-                last_model = excluded.last_model,
-                last_model_provider = excluded.last_model_provider,
-                file_length = excluded.file_length,
-                file_modified_at_ms = excluded.file_modified_at_ms,
-                updated_at_ms = excluded.updated_at_ms",
+               last_path = excluded.last_path,
+               byte_offset = excluded.byte_offset,
+               next_event_ordinal = excluded.next_event_ordinal,
+               last_model = excluded.last_model,
+               last_model_provider = excluded.last_model_provider,
+               usage_boundary_passed = excluded.usage_boundary_passed,
+               usage_boundary_state = excluded.usage_boundary_state,
+               file_length = excluded.file_length,
+               file_modified_at_ms = excluded.file_modified_at_ms,
+               updated_at_ms = excluded.updated_at_ms",
             params![
                 rollout_id,
                 path.display().to_string(),
@@ -1162,6 +1246,8 @@ fn refresh_file(
                     .map_err(|_| "Token 事件序号超过数据库范围。")?,
                 state.model,
                 state.model_provider,
+                i64::from(usage_boundary_passed(state.usage_boundary)),
+                usage_boundary_code(state.usage_boundary),
                 i64::try_from(metadata.len()).map_err(|_| "会话文件大小超过数据库范围。")?,
                 file_modified_at_ms,
                 now_utc_ms,
@@ -1172,6 +1258,21 @@ fn refresh_file(
         .commit()
         .map_err(|error| format!("提交本机用量事务失败：{error}"))?;
 
+    if inherited_events_skipped > 0
+        && matches!(
+            state.usage_boundary,
+            UsageBoundaryState::AwaitingSubagentTaskStart
+                | UsageBoundaryState::AwaitingSubagentBoundaryMarker
+        )
+    {
+        warnings.push(UsageWarning {
+            path: Some(path.display().to_string()),
+            message:
+                "子任务日志尚未到达真实任务边界，已暂不统计继承历史 Token；后续刷新会继续处理。"
+                    .into(),
+        });
+    }
+
     Ok(FileRefreshResult {
         events_added,
         events_skipped,
@@ -1180,7 +1281,61 @@ fn refresh_file(
     })
 }
 
-fn discover_rollout(path: &Path) -> Result<Option<(String, Option<String>)>, String> {
+fn rollout_boundary_state(
+    path: &Path,
+    boundary_marker_required: bool,
+) -> Result<UsageBoundaryState, String> {
+    let file = File::open(path).map_err(|error| format!("无法打开会话文件：{error}"))?;
+    let mut reader = BufReader::new(file);
+    let mut state = ParserState {
+        usage_boundary: UsageBoundaryState::AwaitingSubagentTaskStart,
+        boundary_marker_required,
+        ..ParserState::default()
+    };
+    loop {
+        let mut line = Vec::new();
+        let bytes_read = reader
+            .read_until(b'\n', &mut line)
+            .map_err(|error| format!("读取子任务边界失败：{error}"))?;
+        if bytes_read == 0 {
+            return Ok(state.usage_boundary);
+        }
+        if line.len() > MAX_RECORD_LINE_BYTES {
+            continue;
+        }
+        let line = line.strip_suffix(b"\n").unwrap_or(&line);
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        let _ = parse_line(line, &mut state);
+    }
+}
+
+fn usage_boundary_code(value: UsageBoundaryState) -> i64 {
+    match value {
+        UsageBoundaryState::Regular => 0,
+        UsageBoundaryState::AwaitingSubagentTaskStart => 1,
+        UsageBoundaryState::AwaitingSubagentBoundaryMarker => 2,
+        UsageBoundaryState::Started => 3,
+    }
+}
+
+fn usage_boundary_from_cursor(code: i64, passed: bool) -> UsageBoundaryState {
+    match code {
+        1 => UsageBoundaryState::AwaitingSubagentTaskStart,
+        2 => UsageBoundaryState::AwaitingSubagentBoundaryMarker,
+        3 => UsageBoundaryState::Started,
+        _ if passed => UsageBoundaryState::Started,
+        _ => UsageBoundaryState::AwaitingSubagentTaskStart,
+    }
+}
+
+fn usage_boundary_passed(value: UsageBoundaryState) -> bool {
+    matches!(
+        value,
+        UsageBoundaryState::Regular | UsageBoundaryState::Started
+    )
+}
+
+fn discover_rollout(path: &Path) -> Result<Option<DiscoveredRollout>, String> {
     let file = File::open(path).map_err(|error| format!("无法打开会话文件：{error}"))?;
     let mut reader = BufReader::new(file);
     let mut state = ParserState::default();
@@ -1204,7 +1359,14 @@ fn discover_rollout(path: &Path) -> Result<Option<(String, Option<String>)>, Str
         let line = line.strip_suffix(b"\r").unwrap_or(line);
         if let Ok(LineResult::Ignored) = parse_line(line, &mut state) {
             if let Some(rollout_id) = state.rollout_id.clone() {
-                return Ok(Some((rollout_id, state.model_provider.clone())));
+                let is_subagent =
+                    state.usage_boundary == UsageBoundaryState::AwaitingSubagentTaskStart;
+                return Ok(Some(DiscoveredRollout {
+                    rollout_id,
+                    model_provider: state.model_provider.clone(),
+                    is_subagent,
+                    boundary_marker_required: is_subagent,
+                }));
             }
         }
     }
@@ -1215,7 +1377,7 @@ fn load_cursor(connection: &Connection, rollout_id: &str) -> Result<Option<Store
     connection
         .query_row(
             "SELECT last_path, byte_offset, next_event_ordinal, last_model,
-                    last_model_provider
+                    last_model_provider, usage_boundary_passed, usage_boundary_state
              FROM usage_cursors WHERE rollout_id = ?1",
             params![rollout_id],
             |row| {
@@ -1227,6 +1389,8 @@ fn load_cursor(connection: &Connection, rollout_id: &str) -> Result<Option<Store
                     next_event_ordinal,
                     last_model: row.get(3)?,
                     last_model_provider: row.get(4)?,
+                    usage_boundary_passed: row.get::<_, i64>(5)? != 0,
+                    usage_boundary: row.get(6)?,
                 })
             },
         )
@@ -1441,44 +1605,39 @@ fn resolve_activation(
     else {
         return ActivationResolution::Missing;
     };
-    match (
-        event.model_provider.as_deref(),
-        activation.model_provider.as_deref(),
-    ) {
-        (Some(event_provider), Some(active_provider))
-            if !providers_compatible(event_provider, active_provider) =>
-        {
-            return ActivationResolution::Conflict;
-        }
-        (Some(_), None) => return ActivationResolution::Conflict,
-        _ => {}
-    }
+    // The confirmed activation timeline is the authoritative account source.
+    // `model_provider` can be `custom` even when the active account is official
+    // (for example, custom model names used through the official session).
     ActivationResolution::Matched(activation.clone())
+}
+
+fn source_only_attribution(event: &ParsedUsageEvent) -> AttributionOutcome {
+    let Some(source_kind) = classify_model_provider(event.model_provider.as_deref()) else {
+        return AttributionOutcome::Unknown;
+    };
+    match source_kind {
+        UsageSourceKind::Official => AttributionOutcome::SourceOnly {
+            source_kind,
+            display_name: "官方 OpenAI（账号未确认）".into(),
+            allows_pricing: true,
+        },
+        UsageSourceKind::Provider => AttributionOutcome::SourceOnly {
+            source_kind,
+            display_name: "中转站（账号未确认）".into(),
+            allows_pricing: false,
+        },
+        UsageSourceKind::Unattributed => AttributionOutcome::Unknown,
+    }
 }
 
 fn resolve_attribution(
     activations: &[ActivationSnapshot],
     event: &ParsedUsageEvent,
-) -> Option<ActivationSnapshot> {
+) -> AttributionOutcome {
     match resolve_activation(activations, event) {
-        ActivationResolution::Matched(activation) => return Some(activation),
-        ActivationResolution::Conflict => return None,
-        ActivationResolution::Missing => {}
+        ActivationResolution::Matched(activation) => AttributionOutcome::Confirmed(activation),
+        ActivationResolution::Missing => source_only_attribution(event),
     }
-    let source_kind = classify_model_provider(event.model_provider.as_deref())?;
-    let source_name = match source_kind {
-        UsageSourceKind::Official => "官方 OpenAI（账号未确认）",
-        UsageSourceKind::Provider => "中转站（账号未确认）",
-        UsageSourceKind::Unattributed => return None,
-    };
-    Some(ActivationSnapshot {
-        effective_at_ms: event.occurred_at_ms,
-        source_kind,
-        provider_id: None,
-        account_id: None,
-        model_provider: event.model_provider.clone(),
-        display_name_snapshot: source_name.into(),
-    })
 }
 
 fn classify_model_provider(value: Option<&str>) -> Option<UsageSourceKind> {
@@ -1490,22 +1649,6 @@ fn classify_model_provider(value: Option<&str>) -> Option<UsageSourceKind> {
         "custom" | "proxy" | "relay" | "openrouter" => Some(UsageSourceKind::Provider),
         _ => None,
     }
-}
-
-fn providers_compatible(left: &str, right: &str) -> bool {
-    let left = left.trim().to_ascii_lowercase();
-    let right = right.trim().to_ascii_lowercase();
-    left == right
-        || matches!(
-            (
-                classify_model_provider(Some(&left)),
-                classify_model_provider(Some(&right))
-            ),
-            (
-                Some(UsageSourceKind::Official),
-                Some(UsageSourceKind::Official)
-            )
-        )
 }
 
 fn to_internal_usage(event: &ParsedUsageEvent) -> crate::usage_log::TokenUsage {
@@ -1576,33 +1719,53 @@ fn insert_event(
         (crate::usage_log::UsageQuality::CompatibleFallback, _) => "compatible_fallback",
     };
     let attribution = resolve_attribution(activations, event);
-    let source_kind = attribution
-        .as_ref()
-        .map(|value| source_kind_text(value.source_kind))
-        .unwrap_or("unattributed");
-    let provider_id = attribution
-        .as_ref()
-        .and_then(|value| value.provider_id.as_deref());
-    let account_id = attribution
-        .as_ref()
-        .and_then(|value| value.account_id.as_deref());
-    let source_name = attribution
-        .as_ref()
-        .map(|value| value.display_name_snapshot.as_str())
-        .unwrap_or("未归属");
-    let pricing = attribution.as_ref().map(|value| {
-        price_for_source(
-            value.source_kind,
-            pricing_rules,
-            &to_internal_usage(event),
-            &PricingContext {
-                model: &event.model,
+    let (source_kind, provider_id, account_id, source_name, pricing) = match &attribution {
+        AttributionOutcome::Confirmed(value) => {
+            let provider_id = value.provider_id.as_deref();
+            let account_id = value.account_id.as_deref();
+            (
+                source_kind_text(value.source_kind),
                 provider_id,
                 account_id,
-                effective_at_ms: event.occurred_at_ms,
-            },
-        )
-    });
+                value.display_name_snapshot.as_str(),
+                Some(price_for_source(
+                    value.source_kind,
+                    pricing_rules,
+                    &to_internal_usage(event),
+                    &PricingContext {
+                        model: &event.model,
+                        provider_id,
+                        account_id,
+                        effective_at_ms: event.occurred_at_ms,
+                    },
+                )),
+            )
+        }
+        AttributionOutcome::SourceOnly {
+            source_kind,
+            display_name,
+            allows_pricing,
+        } => (
+            source_kind_text(*source_kind),
+            None,
+            None,
+            display_name.as_str(),
+            (*allows_pricing).then(|| {
+                price_for_source(
+                    *source_kind,
+                    pricing_rules,
+                    &to_internal_usage(event),
+                    &PricingContext {
+                        model: &event.model,
+                        provider_id: None,
+                        account_id: None,
+                        effective_at_ms: event.occurred_at_ms,
+                    },
+                )
+            }),
+        ),
+        AttributionOutcome::Unknown => ("unattributed", None, None, "未归属", None),
+    };
     let (
         pricing_rule_id,
         pricing_rule_version,
@@ -1640,7 +1803,14 @@ fn insert_event(
             ),
             None => (None, None, None, None, "unattributed"),
         };
-    if attribution.is_none() {
+    if matches!(
+        attribution,
+        AttributionOutcome::Unknown
+            | AttributionOutcome::SourceOnly {
+                allows_pricing: false,
+                ..
+            }
+    ) {
         cost_status = "unattributed";
     } else if !matches!(event.quality, crate::usage_log::UsageQuality::Complete) {
         cost_status = "partial";
@@ -1849,6 +2019,7 @@ mod tests {
     use super::{ActivationSnapshot, UsageLedger};
     use crate::models::{ActivationRecord, UsageGroupBy, UsageQuery, UsageRange, UsageSourceKind};
     use crate::usage_log::{ParsedUsageEvent, TokenUsage, UsageQuality};
+    use chrono::DateTime;
     use std::{fs, path::Path};
 
     fn rollout_prefix() -> &'static str {
@@ -1880,6 +2051,34 @@ mod tests {
         )
     }
 
+    fn subagent_metadata() -> &'static str {
+        r#"{"type":"session_meta","payload":{"id":"subagent-ledger","model_provider":"openai","source":{"subagent":{"thread_spawn":{"parent_thread_id":"parent-ledger"}}}}}"#
+    }
+
+    fn subagent_prefix_tail() -> &'static str {
+        concat!(
+            r#"{"type":"turn_context","payload":{"model":"gpt-5.6-sol"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-08-01T20:00:00Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100,"output_tokens":10,"total_tokens":110}}}}"#,
+            "\n",
+        )
+    }
+
+    fn subagent_started_event() -> &'static str {
+        concat!(
+            r#"{"timestamp":"2026-08-01T20:00:00Z","type":"event_msg","payload":{"type":"thread_settings_applied","thread_settings":{"model":"gpt-5.6-luna","model_provider_id":"custom"}}}"#,
+            "\n",
+            r#"{"timestamp":"2026-08-01T20:00:00Z","type":"event_msg","payload":{"type":"task_started"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-08-01T20:00:00Z","type":"turn_context","payload":{"model":"gpt-5.6-luna"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-08-01T20:00:00Z","type":"inter_agent_communication_metadata","payload":{"trigger_turn":true}}"#,
+            "\n",
+            r#"{"timestamp":"2026-08-01T20:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":11,"output_tokens":4,"total_tokens":15}}}}"#,
+            "\n",
+        )
+    }
+
     fn append_new_usage(home: &Path) {
         use std::io::Write;
 
@@ -1906,12 +2105,10 @@ mod tests {
             Some(UsageSourceKind::Provider)
         );
         assert_eq!(super::classify_model_provider(Some("unknown")), None);
-        assert!(!super::providers_compatible("custom", "openrouter"));
-        assert!(super::providers_compatible("official", "openai_oauth"));
     }
 
     #[test]
-    fn does_not_guess_official_account_when_provider_conflicts_with_activation() {
+    fn confirmed_activation_wins_over_conflicting_log_provider() {
         let activation = ActivationSnapshot {
             effective_at_ms: 100,
             source_kind: UsageSourceKind::Provider,
@@ -1936,7 +2133,51 @@ mod tests {
             quality: UsageQuality::Complete,
         };
 
-        assert!(super::resolve_attribution(&[activation], &event).is_none());
+        assert!(matches!(
+            super::resolve_attribution(&[activation], &event),
+            super::AttributionOutcome::Confirmed(ActivationSnapshot {
+                source_kind: UsageSourceKind::Provider,
+                provider_id: Some(_),
+                account_id: Some(_),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn official_activation_keeps_official_pricing_when_log_provider_is_custom() {
+        let activation = ActivationSnapshot {
+            effective_at_ms: 100,
+            source_kind: UsageSourceKind::Official,
+            provider_id: None,
+            account_id: Some("official-account".into()),
+            model_provider: Some("openai".into()),
+            display_name_snapshot: "官方账号".into(),
+        };
+        let event = ParsedUsageEvent {
+            ordinal: 0,
+            occurred_at_ms: 200,
+            model: "gpt-5.6-luna".into(),
+            model_provider: Some("custom".into()),
+            usage: TokenUsage {
+                input_tokens: 1,
+                cached_input_tokens: 0,
+                cache_write_input_tokens: 0,
+                output_tokens: 1,
+                reasoning_output_tokens: 0,
+                total_tokens: 2,
+            },
+            quality: UsageQuality::Complete,
+        };
+
+        assert!(matches!(
+            super::resolve_attribution(&[activation], &event),
+            super::AttributionOutcome::Confirmed(ActivationSnapshot {
+                source_kind: UsageSourceKind::Official,
+                account_id: Some(_),
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -2028,6 +2269,107 @@ mod tests {
             0
         );
         assert_eq!(query(&ledger).totals.requests, 1);
+    }
+
+    #[test]
+    fn subagent_inherited_history_is_not_counted() {
+        use std::io::Write;
+
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex");
+        let path = write_rollout(&home, &format!("{}\n", subagent_metadata()));
+        let ledger = UsageLedger::open(&temp.path().join("app")).unwrap();
+        let collection_epoch = DateTime::parse_from_rfc3339("2026-08-01T19:00:00Z")
+            .unwrap()
+            .timestamp_millis();
+        ledger.refresh(&home, collection_epoch).unwrap();
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(format!("{}{}", subagent_prefix_tail(), subagent_started_event()).as_bytes())
+            .unwrap();
+
+        let refreshed = ledger.refresh(&home, collection_epoch + 1_000).unwrap();
+        let overview = query(&ledger);
+
+        assert_eq!(
+            refreshed.events_added, 1,
+            "warnings: {:?}",
+            refreshed.warnings
+        );
+        assert_eq!(overview.totals.requests, 1);
+        assert_eq!(overview.totals.tokens.total_tokens, 15);
+        assert_eq!(overview.rows.len(), 1);
+        assert_eq!(overview.rows[0].source_kind, UsageSourceKind::Provider);
+        assert_eq!(overview.rows[0].source_name, "中转站（账号未确认）");
+        assert_eq!(overview.rows[0].estimated_cost_microusd, None);
+
+        let connection = ledger.open_connection().unwrap();
+        let stored_boundary: i64 = connection
+            .query_row(
+                "SELECT usage_boundary_passed FROM usage_cursors WHERE rollout_id = 'subagent-ledger'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored_boundary, 1);
+        assert!(path.exists());
+
+        connection
+            .execute(
+                "UPDATE usage_metadata SET value = '3' WHERE key = 'usage_parser_version'",
+                [],
+            )
+            .unwrap();
+        let rebuilt = ledger.refresh(&home, collection_epoch + 2_000).unwrap();
+        assert_eq!(rebuilt.events_added, 1, "warnings: {:?}", rebuilt.warnings);
+        assert_eq!(query(&ledger).totals.requests, 1);
+        assert_eq!(query(&ledger).totals.tokens.total_tokens, 15);
+    }
+
+    #[test]
+    fn subagent_boundary_survives_incremental_refresh() {
+        use std::io::Write;
+
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex");
+        let path = write_rollout(&home, &format!("{}\n", subagent_metadata()));
+        let ledger = UsageLedger::open(&temp.path().join("app")).unwrap();
+        let collection_epoch = DateTime::parse_from_rfc3339("2026-08-01T19:00:00Z")
+            .unwrap()
+            .timestamp_millis();
+
+        let first = ledger.refresh(&home, collection_epoch).unwrap();
+        assert_eq!(first.events_added, 0);
+        assert!(first.warnings.is_empty());
+
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(subagent_prefix_tail().as_bytes())
+            .unwrap();
+
+        let second = ledger.refresh(&home, collection_epoch + 1_000).unwrap();
+        assert_eq!(second.events_added, 0);
+        assert!(
+            second
+                .warnings
+                .iter()
+                .any(|warning| warning.message.contains("真实任务边界"))
+        );
+
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(subagent_started_event().as_bytes())
+            .unwrap();
+
+        let third = ledger.refresh(&home, collection_epoch + 2_000).unwrap();
+        assert_eq!(third.events_added, 1, "warnings: {:?}", third.warnings);
+        assert_eq!(query(&ledger).totals.tokens.total_tokens, 15);
     }
 
     #[test]
