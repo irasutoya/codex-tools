@@ -13,6 +13,7 @@ import {
   Plus,
   RefreshCw,
   Save,
+  Tags,
   Trash2,
   TriangleAlert,
   UserRound,
@@ -98,9 +99,16 @@ import {
   type OfficialAccountView,
   type PageProps,
   type Provider,
+  type UsageOverview,
+  type UsageRow,
 } from "@/types"
 
 import { QuotaStatusView } from "./quota-status"
+import {
+  formatTokens,
+  formatUsdMicrousd,
+  getLocalRange,
+} from "../usage/usage-format"
 
 const MAX_DISPLAY_NAME_LENGTH = 100
 const MAX_API_URL_LENGTH = 2_048
@@ -118,6 +126,7 @@ export default function ProvidersPage({ active }: PageProps) {
   const [officialAccounts, setOfficialAccounts] = useState<
     OfficialAccountView[]
   >([])
+  const [usage, setUsage] = useState<UsageOverview>()
   const [deviceAuthorization, setDeviceAuthorization] =
     useState<DeviceAuthorization>()
   const [draft, setDraft] = useState<Provider>()
@@ -151,6 +160,13 @@ export default function ProvidersPage({ active }: PageProps) {
     }
     return grouped
   }, [accounts])
+  const usageByAccount = useMemo(() => {
+    const result = new Map<string, UsageRow>()
+    for (const row of usage?.rows ?? []) {
+      if (row.accountId) result.set(row.accountId, row)
+    }
+    return result
+  }, [usage])
   const load = useCallback(async () => {
     try {
       const overview = await call("get_provider_overview")
@@ -164,13 +180,35 @@ export default function ProvidersPage({ active }: PageProps) {
       throw error
     }
   }, [])
+  const loadUsage = useCallback(async (refresh = false) => {
+    const query = { range: getLocalRange(1), groupBy: "account" as const }
+    try {
+      const result = refresh
+        ? await call("refresh_usage", { query })
+        : await call("get_usage_overview", { query })
+      setUsage(result)
+      return result
+    } catch {
+      // Provider management remains available when usage files are unavailable.
+      return undefined
+    }
+  }, [])
   useEffect(() => {
     if (!active) return
     const timeout = window.setTimeout(() => {
       void load().catch(() => undefined)
+      void loadUsage()
     }, 0)
     return () => window.clearTimeout(timeout)
-  }, [active, load])
+  }, [active, load, loadUsage])
+
+  useEffect(() => {
+    if (!active) return
+    const timer = window.setInterval(() => {
+      void loadUsage(true)
+    }, 30_000)
+    return () => window.clearInterval(timer)
+  }, [active, loadUsage])
 
   useEffect(() => {
     if (!deviceAuthorization) return
@@ -497,6 +535,18 @@ export default function ProvidersPage({ active }: PageProps) {
                             ? "有效期取决于 Cookie 中的访问凭据"
                             : "有效期由 OpenAI 自动管理"}
                       </ItemDescription>
+                      <ItemDescription>
+                        今日{" "}
+                        {formatTokens(
+                          usageByAccount.get(item.id)?.tokens.totalTokens ?? 0
+                        )}{" "}
+                        ·{" "}
+                        {usageCostLabel(
+                          usageByAccount.get(item.id)
+                            ? [usageByAccount.get(item.id)!]
+                            : []
+                        )}
+                      </ItemDescription>
                     </div>
                     <QuotaStatusView quota={item.quota} />
                   </ItemContent>
@@ -566,6 +616,10 @@ export default function ProvidersPage({ active }: PageProps) {
                             )}
                             刷新额度
                           </DropdownMenuItem>
+                          <DropdownMenuItem onClick={() => openUsagePage()}>
+                            <Tags />
+                            价格规则
+                          </DropdownMenuItem>
                           <DropdownMenuItem
                             variant="destructive"
                             disabled={item.active}
@@ -626,6 +680,13 @@ export default function ProvidersPage({ active }: PageProps) {
           )}
           {providers.map((provider) => {
             const linked = accountsByProvider.get(provider.id) ?? []
+            const linkedUsage = linked
+              .map((account) => usageByAccount.get(account.id))
+              .filter((row): row is UsageRow => Boolean(row))
+            const providerTokens = linkedUsage.reduce(
+              (total, row) => total + row.tokens.totalTokens,
+              0
+            )
             return (
               <Card key={provider.id}>
                 <CardHeader>
@@ -646,6 +707,10 @@ export default function ProvidersPage({ active }: PageProps) {
                       {provider.baseUrl}
                     </span>
                     <span>Responses API · 由 Codex 直接请求</span>
+                    <span>
+                      今日 {formatTokens(providerTokens)} ·{" "}
+                      {usageCostLabel(linkedUsage)}
+                    </span>
                   </CardDescription>
                   <CardAction>
                     <DropdownMenu>
@@ -674,6 +739,10 @@ export default function ProvidersPage({ active }: PageProps) {
                           >
                             <KeyRound />
                             添加 API Key
+                          </DropdownMenuItem>
+                          <DropdownMenuItem onClick={() => openUsagePage()}>
+                            <Tags />
+                            价格规则
                           </DropdownMenuItem>
                           <DropdownMenuItem
                             variant="destructive"
@@ -737,6 +806,19 @@ export default function ProvidersPage({ active }: PageProps) {
                             </ItemTitle>
                             <ItemDescription>
                               API Key 保存在本机，切换到此服务时写入 Codex。
+                            </ItemDescription>
+                            <ItemDescription>
+                              今日{" "}
+                              {formatTokens(
+                                usageByAccount.get(item.id)?.tokens
+                                  .totalTokens ?? 0
+                              )}{" "}
+                              ·{" "}
+                              {usageCostLabel(
+                                usageByAccount.get(item.id)
+                                  ? [usageByAccount.get(item.id)!]
+                                  : []
+                              )}
                             </ItemDescription>
                           </ItemContent>
                           <ItemActions className="ml-auto w-auto justify-end">
@@ -1110,6 +1192,29 @@ function formatTimestamp(value: number) {
   const date = new Date(epochMilliseconds(value))
   if (Number.isNaN(date.getTime())) return "时间未知"
   return accountTimestampFormatter.format(date)
+}
+
+function openUsagePage() {
+  window.dispatchEvent(
+    new CustomEvent("codex-tools:navigate", { detail: "usage" })
+  )
+}
+
+function usageCostLabel(rows: UsageRow[]) {
+  if (!rows.length) return "—"
+  const estimated = rows.filter((row) => row.costStatus === "estimated")
+  if (estimated.length) {
+    const cost = estimated.reduce(
+      (total, row) => total + (row.estimatedCostMicrousd ?? 0),
+      0
+    )
+    return formatUsdMicrousd(cost)
+  }
+  if (rows.some((row) => row.costStatus === "subscription")) return "套餐统计"
+  if (rows.some((row) => row.costStatus === "unpriced")) return "未配置价格"
+  if (rows.some((row) => row.costStatus === "unattributed")) return "未归属"
+  if (rows.some((row) => row.costStatus === "partial")) return "部分数据"
+  return "$0.00"
 }
 
 function ProviderEditor({

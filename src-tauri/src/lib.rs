@@ -1,17 +1,22 @@
 mod auth_center;
 mod codex;
+mod local_usage;
 mod models;
 mod network;
 mod official_quota;
 mod platform;
+mod pricing;
 mod provider_sync;
 mod proxy_import;
 mod session_index;
 mod storage;
+mod usage_log;
 
 use auth_center::{AuthCenter, DevicePollResult};
+use chrono::TimeZone;
 use codex::ConfigManager;
 use futures_util::{StreamExt, stream};
+use local_usage::UsageLedger;
 use models::*;
 use session_index::SessionIndex;
 use std::{borrow::Cow, path::PathBuf};
@@ -55,6 +60,73 @@ impl Default for ApiClient {
 #[tauri::command]
 fn get_provider_overview(store: State<Store>) -> Result<ProviderOverview, AppError> {
     store.provider_overview()
+}
+
+#[tauri::command]
+async fn get_usage_overview(
+    ledger: State<'_, UsageLedger>,
+    query: UsageQuery,
+) -> Result<UsageOverview, AppError> {
+    let ledger = ledger.inner().clone();
+    tokio::task::spawn_blocking(move || ledger.query(query))
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?
+}
+
+#[tauri::command]
+async fn refresh_usage(
+    store: State<'_, Store>,
+    ledger: State<'_, UsageLedger>,
+    query: UsageQuery,
+) -> Result<UsageOverview, AppError> {
+    // 对账必须发生在增量解析之前，确保本次新增事件可以使用当前 Provider/账号。
+    record_current_activation(&store, &ledger)?;
+    let codex_home = codex::home(&store.codex_home_setting()?);
+    let now_utc_ms = chrono::Utc::now().timestamp_millis();
+    let ledger = ledger.inner().clone();
+    tokio::task::spawn_blocking(move || {
+        let refreshed = ledger.refresh(&codex_home, now_utc_ms)?;
+        let mut overview = ledger.query(query)?;
+        overview.warnings = refreshed.warnings;
+        if refreshed.partial_lines > 0 {
+            overview.warnings.push(UsageWarning {
+                path: None,
+                message: format!(
+                    "有 {} 条日志行尚未写完，将在下一次刷新时继续读取。",
+                    refreshed.partial_lines
+                ),
+            });
+        }
+        Ok(overview)
+    })
+    .await
+    .map_err(|error| AppError::Internal(error.to_string()))?
+}
+
+#[tauri::command]
+fn list_pricing_rules(
+    ledger: State<UsageLedger>,
+    scope: Option<PricingScope>,
+) -> Result<Vec<PricingRule>, AppError> {
+    ledger.list_pricing_rules(scope)
+}
+
+#[tauri::command]
+fn save_pricing_rule(
+    ledger: State<UsageLedger>,
+    input: SavePricingRule,
+) -> Result<PricingRule, AppError> {
+    ledger.save_pricing_rule(input)
+}
+
+#[tauri::command]
+fn delete_pricing_rule(ledger: State<UsageLedger>, id: String) -> Result<(), AppError> {
+    ledger.delete_pricing_rule(&id)
+}
+
+#[tauri::command]
+fn reprice_usage(ledger: State<UsageLedger>, range: UsageRange) -> Result<RepriceResult, AppError> {
+    ledger.reprice(range)
 }
 
 #[tauri::command]
@@ -212,6 +284,7 @@ async fn poll_openai_device_auth(
     store: State<'_, Store>,
     center: State<'_, AuthCenter>,
     manager: State<'_, ConfigManager>,
+    ledger: State<'_, UsageLedger>,
     activation: State<'_, ActivationLock>,
     operation_id: String,
 ) -> Result<OpenAiDevicePoll, AppError> {
@@ -222,7 +295,7 @@ async fn poll_openai_device_auth(
             let _guard = activation.0.lock().await;
             sync_active_openai_credential(&store, &codex::home(&store.codex_home_setting()?))?;
             let saved = store.save_official_account(&account)?;
-            let repair = activate_openai_record(&store, &manager, &saved).await?;
+            let repair = activate_openai_record(&store, &manager, &ledger, &saved).await?;
             Ok(OpenAiDevicePoll::Complete {
                 account: Box::new(store.official_account_view(&saved.id)?),
                 repair,
@@ -236,6 +309,7 @@ async fn activate_openai_account(
     store: State<'_, Store>,
     center: State<'_, AuthCenter>,
     manager: State<'_, ConfigManager>,
+    ledger: State<'_, UsageLedger>,
     activation: State<'_, ActivationLock>,
     id: String,
 ) -> Result<RepairResult, AppError> {
@@ -245,7 +319,7 @@ async fn activate_openai_account(
         .refresh_account(&store.official_account(&id)?)
         .await?;
     let saved = store.save_official_account(&refreshed)?;
-    activate_openai_record(&store, &manager, &saved).await
+    activate_openai_record(&store, &manager, &ledger, &saved).await
 }
 
 #[tauri::command]
@@ -425,29 +499,48 @@ async fn sync_active_codex_configuration(
 async fn activate_openai_record(
     store: &Store,
     manager: &ConfigManager,
+    ledger: &UsageLedger,
     account: &StoredOfficialAccount,
 ) -> Result<RepairResult, AppError> {
     let home = codex::home(&store.codex_home_setting()?);
     let repair_sessions = provider_sync::configured_provider(&home) == codex::MANAGED_PROVIDER_ID;
-    codex::activate_official_account(&home, &account.credential)?;
-    if let Err(error) = store.activate_official_account(&account.id) {
-        return Err(compensate_activation_failure(store, manager, error).await);
-    }
-    let repair = if repair_sessions {
-        repair_home(home, "openai".into()).await?
-    } else {
-        RepairResult {
-            target_provider: "openai".into(),
-            ..RepairResult::default()
+    let pending_id = begin_activation(
+        ledger,
+        &activation_for_official(account, chrono::Utc::now().timestamp_millis()),
+    )?;
+    let result = async {
+        codex::activate_official_account(&home, &account.credential)?;
+        if let Err(error) = store.activate_official_account(&account.id) {
+            return Err(compensate_activation_failure(store, manager, error).await);
         }
-    };
-    Ok(repair)
+        let repair = if repair_sessions {
+            repair_home(home, "openai".into()).await?
+        } else {
+            RepairResult {
+                target_provider: "openai".into(),
+                ..RepairResult::default()
+            }
+        };
+        Ok::<_, AppError>(repair)
+    }
+    .await;
+    match result {
+        Ok(mut repair) => {
+            confirm_pending(ledger, &pending_id, &mut repair);
+            Ok(repair)
+        }
+        Err(error) => {
+            cancel_pending(ledger, &pending_id);
+            Err(error)
+        }
+    }
 }
 
 #[tauri::command]
 async fn activate_provider(
     store: State<'_, Store>,
     manager: State<'_, ConfigManager>,
+    ledger: State<'_, UsageLedger>,
     activation: State<'_, ActivationLock>,
     id: String,
     account_id: String,
@@ -466,19 +559,36 @@ async fn activate_provider(
     sync_active_openai_credential(&store, &home)?;
     let repair_sessions = provider_sync::configured_provider(&home) != codex::MANAGED_PROVIDER_ID;
     let preview = manager.preview_custom(&home, &provider, &account)?;
-    manager.apply(&preview.operation_id)?;
-    if let Err(error) = store.activate(&id, &account_id) {
-        return Err(compensate_activation_failure(&store, &manager, error).await);
-    }
-    let repair = if repair_sessions {
-        repair_home(home, codex::MANAGED_PROVIDER_ID.into()).await?
-    } else {
-        RepairResult {
-            target_provider: codex::MANAGED_PROVIDER_ID.into(),
-            ..RepairResult::default()
+    let pending_id = begin_activation(
+        &ledger,
+        &activation_for_provider(&provider, &account, chrono::Utc::now().timestamp_millis()),
+    )?;
+    let result = async {
+        manager.apply(&preview.operation_id)?;
+        if let Err(error) = store.activate(&id, &account_id) {
+            return Err(compensate_activation_failure(&store, &manager, error).await);
         }
-    };
-    Ok(repair)
+        let repair = if repair_sessions {
+            repair_home(home, codex::MANAGED_PROVIDER_ID.into()).await?
+        } else {
+            RepairResult {
+                target_provider: codex::MANAGED_PROVIDER_ID.into(),
+                ..RepairResult::default()
+            }
+        };
+        Ok::<_, AppError>(repair)
+    }
+    .await;
+    match result {
+        Ok(mut repair) => {
+            confirm_pending(&ledger, &pending_id, &mut repair);
+            Ok(repair)
+        }
+        Err(error) => {
+            cancel_pending(&ledger, &pending_id);
+            Err(error)
+        }
+    }
 }
 
 #[tauri::command]
@@ -486,6 +596,7 @@ async fn activate_official(
     store: State<'_, Store>,
     center: State<'_, AuthCenter>,
     manager: State<'_, ConfigManager>,
+    ledger: State<'_, UsageLedger>,
     activation: State<'_, ActivationLock>,
 ) -> Result<RepairResult, AppError> {
     let _guard = activation.0.lock().await;
@@ -511,7 +622,7 @@ async fn activate_official(
         .refresh_account(&store.official_account(&id)?)
         .await?;
     let saved = store.save_official_account(&refreshed)?;
-    activate_openai_record(&store, &manager, &saved).await
+    activate_openai_record(&store, &manager, &ledger, &saved).await
 }
 
 async fn compensate_activation_failure(
@@ -630,6 +741,7 @@ fn session_page(
 async fn get_dashboard(
     store: State<'_, Store>,
     index: State<'_, SessionIndex>,
+    ledger: State<'_, UsageLedger>,
 ) -> Result<Dashboard, AppError> {
     let (
         home_setting,
@@ -707,6 +819,14 @@ async fn get_dashboard(
     })
     .await
     .map_err(|error| AppError::Internal(error.to_string()))?;
+    let today_query = UsageQuery {
+        range: local_today_range(),
+        group_by: UsageGroupBy::Account,
+    };
+    let ledger = ledger.inner().clone();
+    let today = tokio::task::spawn_blocking(move || ledger.query(today_query))
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))??;
     Ok(Dashboard {
         provider_count,
         active_provider,
@@ -718,7 +838,37 @@ async fn get_dashboard(
         database_count,
         session_count,
         database_health,
+        today_usage: today.totals.tokens,
+        today_requests: today.totals.requests,
+        today_estimated_cost_microusd: today.totals.estimated_cost_microusd,
+        today_subscription_tokens: today.totals.subscription_tokens,
+        today_unpriced_tokens: today.totals.unpriced_tokens,
+        today_partial_tokens: today.totals.partial_tokens,
+        today_unattributed_tokens: today.totals.unattributed_tokens,
     })
+}
+
+fn local_today_range() -> UsageRange {
+    let now = chrono::Local::now();
+    let start_naive = now
+        .date_naive()
+        .and_hms_opt(0, 0, 0)
+        .expect("本地日期的午夜时间应有效");
+    let end_naive = start_naive + chrono::Duration::days(1);
+    let start = chrono::Local
+        .from_local_datetime(&start_naive)
+        .single()
+        .unwrap_or(now)
+        .timestamp_millis();
+    let end = chrono::Local
+        .from_local_datetime(&end_naive)
+        .single()
+        .unwrap_or_else(|| now + chrono::Duration::days(1))
+        .timestamp_millis();
+    UsageRange {
+        start_at_ms: start,
+        end_at_ms: end,
+    }
 }
 
 fn settings_overview(store: &Store) -> Result<SettingsOverview, AppError> {
@@ -786,9 +936,130 @@ fn custom_headers(
 async fn sync_configured_provider(app: tauri::AppHandle) {
     let store = app.state::<Store>();
     let manager = app.state::<ConfigManager>();
+    let ledger = app.state::<UsageLedger>();
     let activation = app.state::<ActivationLock>();
     let _guard = activation.0.lock().await;
-    let _ = sync_active_codex_configuration(&store, &manager).await;
+    if sync_active_codex_configuration(&store, &manager)
+        .await
+        .is_ok()
+    {
+        let _ = reconcile_current_activation(&store, &ledger);
+    } else {
+        let _ = ledger.cancel_pending_activations();
+    }
+}
+
+fn current_activation(
+    store: &Store,
+    effective_at_ms: i64,
+) -> Result<Option<ActivationRecord>, AppError> {
+    store.read(|state| match state.active.kind {
+        ActiveKind::Official => state
+            .active
+            .account_id
+            .as_deref()
+            .and_then(|id| {
+                state
+                    .official_accounts
+                    .iter()
+                    .find(|account| account.id == id)
+            })
+            .map(|account| activation_for_official(account, effective_at_ms)),
+        ActiveKind::Provider => {
+            let provider = state.active.provider_id.as_deref().and_then(|id| {
+                state
+                    .providers
+                    .iter()
+                    .find(|provider| provider.profile.id == id)
+            })?;
+            let account = state
+                .active
+                .account_id
+                .as_deref()
+                .and_then(|id| provider.accounts.iter().find(|account| account.id == id))?;
+            Some(activation_for_provider(
+                &provider.profile,
+                account,
+                effective_at_ms,
+            ))
+        }
+        ActiveKind::None => None,
+    })
+}
+
+fn record_current_activation(store: &Store, ledger: &UsageLedger) -> Result<(), AppError> {
+    if let Some(activation) = current_activation(store, chrono::Utc::now().timestamp_millis())? {
+        ledger.record_activation(activation)?;
+    }
+    Ok(())
+}
+
+fn reconcile_current_activation(store: &Store, ledger: &UsageLedger) -> Result<(), AppError> {
+    ledger.cancel_pending_activations()?;
+    record_current_activation(store, ledger)
+}
+
+fn activation_for_official(
+    account: &StoredOfficialAccount,
+    effective_at_ms: i64,
+) -> ActivationRecord {
+    ActivationRecord {
+        effective_at_ms,
+        source_kind: UsageSourceKind::Official,
+        provider_id: None,
+        account_id: Some(account.id.clone()),
+        model_provider: Some("openai".into()),
+        display_name_snapshot: match account.source {
+            OfficialAccountSource::OpenAiOauth => account.name.clone(),
+            OfficialAccountSource::ProxyImport => format!("{} · Cookie / 反代", account.name),
+        },
+        auth_source: Some(
+            match account.source {
+                OfficialAccountSource::OpenAiOauth => "openai_oauth",
+                OfficialAccountSource::ProxyImport => "proxy_import",
+            }
+            .into(),
+        ),
+    }
+}
+
+fn activation_for_provider(
+    provider: &ProviderProfile,
+    account: &ProviderAccount,
+    effective_at_ms: i64,
+) -> ActivationRecord {
+    ActivationRecord {
+        effective_at_ms,
+        source_kind: UsageSourceKind::Provider,
+        provider_id: Some(provider.id.clone()),
+        account_id: Some(account.id.clone()),
+        model_provider: Some(codex::MANAGED_PROVIDER_ID.into()),
+        display_name_snapshot: format!("{} · {}", provider.name, account.name),
+        auth_source: Some("api_key".into()),
+    }
+}
+
+fn activation_warning(repair: &mut RepairResult, error: AppError) {
+    repair
+        .warnings
+        .push(format!("账号已切换，但用量归属记录失败：{error}"));
+}
+
+fn confirm_pending(ledger: &UsageLedger, id: &str, repair: &mut RepairResult) {
+    if let Err(error) = ledger.confirm_activation(id) {
+        activation_warning(repair, error);
+    }
+}
+
+fn cancel_pending(ledger: &UsageLedger, id: &str) {
+    let _ = ledger.cancel_activation(id);
+}
+
+fn begin_activation(
+    ledger: &UsageLedger,
+    activation: &ActivationRecord,
+) -> Result<String, AppError> {
+    ledger.begin_activation(activation)
 }
 
 fn show_main_window(app: &tauri::AppHandle) {
@@ -807,11 +1078,14 @@ fn show_main_window(app: &tauri::AppHandle) {
 }
 
 pub fn run() {
+    let store = Store::new().expect("无法初始化应用数据");
+    let usage_ledger = UsageLedger::open(store.root()).expect("无法初始化本机用量数据库");
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _, _| {
             show_main_window(app)
         }))
-        .manage(Store::new().expect("无法初始化应用数据"))
+        .manage(store)
+        .manage(usage_ledger)
         .manage(AuthCenter::default())
         .manage(ConfigManager::default())
         .manage(ActivationLock::default())
@@ -863,6 +1137,12 @@ pub fn run() {
             get_dashboard,
             get_settings_overview,
             get_provider_overview,
+            get_usage_overview,
+            refresh_usage,
+            list_pricing_rules,
+            save_pricing_rule,
+            delete_pricing_rule,
+            reprice_usage,
             save_provider,
             delete_provider,
             save_provider_account,

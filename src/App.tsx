@@ -1,6 +1,15 @@
-import { lazy, Suspense, useRef, useState, type CSSProperties } from "react"
+import {
+  lazy,
+  Suspense,
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type CSSProperties,
+} from "react"
 import {
   Check,
+  ChartNoAxesCombined,
   FileCheck2,
   KeyRound,
   LayoutDashboard,
@@ -44,6 +53,7 @@ import type { Page } from "@/types"
 const pageLoaders = {
   dashboard: () => import("@/features/dashboard/dashboard-page"),
   providers: () => import("@/features/providers/providers-page"),
+  usage: () => import("@/features/usage/usage-page"),
   sessions: () => import("@/features/sessions/sessions-page"),
   settings: () => import("@/features/settings/settings-page"),
 }
@@ -51,6 +61,7 @@ const pageLoaders = {
 const pages = {
   dashboard: lazy(pageLoaders.dashboard),
   providers: lazy(pageLoaders.providers),
+  usage: lazy(pageLoaders.usage),
   sessions: lazy(pageLoaders.sessions),
   settings: lazy(pageLoaders.settings),
 }
@@ -76,6 +87,12 @@ const navigation: NavigationItem[] = [
     icon: KeyRound,
   },
   {
+    id: "usage",
+    label: "用量与费用",
+    description: "查看本机 Token、模型与美元估算费用",
+    icon: ChartNoAxesCombined,
+  },
+  {
     id: "sessions",
     label: "历史会话",
     description: "查看本机会话，并仅在需要时更新连接归属",
@@ -97,7 +114,7 @@ export default function App() {
   )
   const currentNavigation = navigation.find((item) => item.id === page)!
 
-  const navigate = (nextPage: Page) => {
+  const navigate = useCallback((nextPage: Page) => {
     contentRef.current?.scrollTo({ top: 0 })
     setVisitedPages((current) => {
       if (current.has(nextPage)) return current
@@ -106,7 +123,25 @@ export default function App() {
       return next
     })
     setPage(nextPage)
-  }
+  }, [])
+
+  useEffect(() => {
+    const handleNavigation = (event: Event) => {
+      const nextPage = (event as CustomEvent<unknown>).detail
+      if (
+        nextPage === "dashboard" ||
+        nextPage === "providers" ||
+        nextPage === "usage" ||
+        nextPage === "sessions" ||
+        nextPage === "settings"
+      ) {
+        navigate(nextPage)
+      }
+    }
+    window.addEventListener("codex-tools:navigate", handleNavigation)
+    return () =>
+      window.removeEventListener("codex-tools:navigate", handleNavigation)
+  }, [navigate])
 
   const CurrentPageIcon = currentNavigation.icon
 

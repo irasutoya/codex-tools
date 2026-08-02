@@ -3,6 +3,7 @@ import {
   ExternalLink,
   FileText,
   FolderCog,
+  ArrowRight,
   KeyRound,
   MessagesSquare,
   RefreshCw,
@@ -42,6 +43,12 @@ import { call } from "@/lib/ipc"
 import type { Dashboard, PageProps } from "@/types"
 
 import { QuotaStatusView } from "../providers/quota-status"
+import {
+  formatEstimatedUsd,
+  formatTokenDetail,
+  formatTokens,
+  getLocalRange,
+} from "../usage/usage-format"
 
 export default function DashboardPage({ active }: PageProps) {
   const [data, setData] = useState<Dashboard>()
@@ -53,6 +60,12 @@ export default function DashboardPage({ active }: PageProps) {
   const load = useCallback(async () => {
     try {
       setData(await call("get_dashboard"))
+      void call("refresh_usage", {
+        query: { range: getLocalRange(1), groupBy: "account" },
+      })
+        .then(() => call("get_dashboard"))
+        .then(setData)
+        .catch(() => undefined)
       setError(undefined)
     } catch (reason) {
       setError(String(reason))
@@ -282,6 +295,69 @@ export default function DashboardPage({ active }: PageProps) {
         </CardFooter>
       </Card>
 
+      <Card>
+        <CardHeader>
+          <CardTitle>今日本机用量</CardTitle>
+          <CardDescription>
+            官方账号和第三方中转站都从本机 Codex rollout
+            日志统计；美元费用只包含已配置价格。
+          </CardDescription>
+          <CardAction>
+            <div className="flex items-center gap-2">
+              <Badge variant="secondary">{data.todayRequests} 次调用</Badge>
+              <Button size="sm" variant="link" onClick={() => openUsagePage()}>
+                查看明细
+                <ArrowRight data-icon="inline-end" />
+              </Button>
+            </div>
+          </CardAction>
+        </CardHeader>
+        <CardContent>
+          <div className="grid gap-4 sm:grid-cols-3">
+            <div>
+              <p className="text-xs text-muted-foreground">总 Token</p>
+              <p className="mt-1 text-2xl font-semibold tabular-nums">
+                {formatTokens(data.todayUsage.totalTokens)}
+              </p>
+              <p className="mt-1 text-xs text-muted-foreground">
+                {formatTokenDetail(data.todayUsage)}
+              </p>
+            </div>
+            <div>
+              <p className="text-xs text-muted-foreground">估算费用</p>
+              <p className="mt-1 text-2xl font-semibold tabular-nums">
+                {formatEstimatedUsd(
+                  data.todayEstimatedCostMicrousd,
+                  data.todayUnpricedTokens +
+                    data.todayPartialTokens +
+                    data.todayUnattributedTokens +
+                    data.todaySubscriptionTokens
+                )}
+              </p>
+              <p className="mt-1 text-xs text-muted-foreground">
+                {data.todaySubscriptionTokens > 0
+                  ? "官方套餐按 Token 统计"
+                  : "仅统计已匹配 USD 价格的 Token"}
+              </p>
+            </div>
+            <div>
+              <p className="text-xs text-muted-foreground">待确认 Token</p>
+              <p className="mt-1 text-2xl font-semibold tabular-nums">
+                {formatTokens(
+                  data.todayUnpricedTokens +
+                    data.todayPartialTokens +
+                    data.todayUnattributedTokens
+                )}
+              </p>
+              <p className="mt-1 text-xs text-muted-foreground">
+                未定价 {formatTokens(data.todayUnpricedTokens)} · 未归属{" "}
+                {formatTokens(data.todayUnattributedTokens)}
+              </p>
+            </div>
+          </div>
+        </CardContent>
+      </Card>
+
       <section
         className="flex flex-col gap-4"
         aria-labelledby="local-status-title"
@@ -298,5 +374,11 @@ export default function DashboardPage({ active }: PageProps) {
         </div>
       </section>
     </div>
+  )
+}
+
+function openUsagePage() {
+  window.dispatchEvent(
+    new CustomEvent("codex-tools:navigate", { detail: "usage" })
   )
 }
