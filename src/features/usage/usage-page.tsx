@@ -109,7 +109,8 @@ export default function UsagePage({ active }: PageProps) {
   const [customEnd, setCustomEnd] = useState(() => getLocalDateInput())
   const [groupBy, setGroupBy] = useState<UsageGroupBy>("model")
   const [overview, setOverview] = useState<UsageOverview>()
-  const [officialCatalog, setOfficialCatalog] = useState<OfficialPricingCatalog>()
+  const [officialCatalog, setOfficialCatalog] =
+    useState<OfficialPricingCatalog>()
   const [officialCatalogLoading, setOfficialCatalogLoading] = useState(false)
   const [rules, setRules] = useState<PricingRule[]>([])
   const [providers, setProviders] = useState<ProviderOverview>()
@@ -445,7 +446,8 @@ export default function UsagePage({ active }: PageProps) {
           <div>
             <CardTitle>OpenAI 官方实时价格</CardTitle>
             <CardDescription>
-              价格从官方 Markdown 运行时同步，不写死模型；中转站价格规则完全独立。
+              价格从官方 Markdown
+              运行时同步，不写死模型；中转站价格规则完全独立。
             </CardDescription>
           </div>
           <Button
@@ -454,12 +456,20 @@ export default function UsagePage({ active }: PageProps) {
             disabled={officialCatalogLoading}
             onClick={() => void loadOfficialCatalog(true)}
           >
-            {officialCatalogLoading ? <Spinner data-icon="inline-start" /> : <RefreshCw data-icon="inline-start" />}
+            {officialCatalogLoading ? (
+              <Spinner data-icon="inline-start" />
+            ) : (
+              <RefreshCw data-icon="inline-start" />
+            )}
             {officialCatalogLoading ? "正在同步…" : "立即同步"}
           </Button>
         </CardHeader>
         <CardContent className="flex flex-wrap items-center gap-3 text-sm">
-          <Badge variant={officialCatalog?.status === "cached" ? "secondary" : "outline"}>
+          <Badge
+            variant={
+              officialCatalog?.status === "cached" ? "secondary" : "outline"
+            }
+          >
             {officialCatalog?.status === "cached" ? "已缓存" : "等待同步"}
           </Badge>
           <span className="text-muted-foreground">
@@ -472,7 +482,10 @@ export default function UsagePage({ active }: PageProps) {
           )}
           <a
             className="text-primary underline-offset-4 hover:underline"
-            href={officialCatalog?.sourceUrl ?? "https://developers.openai.com/api/docs/pricing.md"}
+            href={
+              officialCatalog?.sourceUrl ??
+              "https://developers.openai.com/api/docs/pricing.md"
+            }
             target="_blank"
             rel="noreferrer"
           >
