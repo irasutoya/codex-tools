@@ -32,8 +32,10 @@ const MAX_RECORD_LINE_BYTES: usize = 8 * 1024 * 1024;
 const COLLECTION_EPOCH_METADATA_KEY: &str = "usage_collection_started_at_ms";
 const COLLECTION_VERSION_METADATA_KEY: &str = "usage_collection_started_version";
 const COLLECTION_MODE_METADATA_KEY: &str = "usage_collection_mode";
+const PARSER_VERSION_METADATA_KEY: &str = "usage_parser_version";
 const COLLECTION_MODE: &str = "after_update";
 const COLLECTION_VERSION: &str = env!("CARGO_PKG_VERSION");
+const PARSER_VERSION: &str = "2";
 
 #[derive(Clone)]
 pub(crate) struct UsageLedger {
@@ -98,6 +100,12 @@ struct ActivationSnapshot {
     display_name_snapshot: String,
 }
 
+enum ActivationResolution {
+    Matched(ActivationSnapshot),
+    Missing,
+    Conflict,
+}
+
 impl UsageLedger {
     pub(crate) fn open(app_data_root: &Path) -> anyhow::Result<Self> {
         fs::create_dir_all(app_data_root)?;
@@ -136,13 +144,14 @@ impl UsageLedger {
         paths.sort();
         paths.dedup();
 
-        let _collection_epoch = match read_collection_epoch(&connection)? {
+        let collection_epoch = match read_collection_epoch(&connection)? {
             Some(epoch) => epoch,
             None => {
                 initialize_collection_epoch(&mut connection, &paths, now_utc_ms)?;
                 now_utc_ms
             }
         };
+        rebuild_usage_for_parser_upgrade(&mut connection, collection_epoch)?;
 
         let activations = load_activations(&connection).map_err(AppError::from)?;
         let pricing_rules = load_pricing_rule_records(&connection).map_err(AppError::from)?;
@@ -153,7 +162,7 @@ impl UsageLedger {
                 &mut connection,
                 &path,
                 now_utc_ms,
-                _collection_epoch,
+                collection_epoch,
                 &activations,
                 &pricing_rules,
             ) {
@@ -802,6 +811,39 @@ fn read_collection_epoch(connection: &Connection) -> Result<Option<i64>, AppErro
         .filter(|value| *value > 0))
 }
 
+fn rebuild_usage_for_parser_upgrade(
+    connection: &mut Connection,
+    collection_epoch: i64,
+) -> Result<(), AppError> {
+    if read_metadata(connection, PARSER_VERSION_METADATA_KEY)?.as_deref() == Some(PARSER_VERSION) {
+        return Ok(());
+    }
+
+    let transaction = connection
+        .transaction()
+        .map_err(|error| AppError::Internal(format!("开始升级本机用量解析器失败：{error}")))?;
+    transaction
+        .execute(
+            "DELETE FROM usage_events WHERE occurred_at_ms >= ?1",
+            params![collection_epoch],
+        )
+        .map_err(|error| AppError::Internal(format!("清理当前统计周期用量失败：{error}")))?;
+    transaction
+        .execute("DELETE FROM usage_cursors", [])
+        .map_err(|error| AppError::Internal(format!("重置本机用量游标失败：{error}")))?;
+    transaction
+        .execute(
+            "INSERT INTO usage_metadata(key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![PARSER_VERSION_METADATA_KEY, PARSER_VERSION],
+        )
+        .map_err(|error| AppError::Internal(format!("保存本机用量解析器版本失败：{error}")))?;
+    transaction
+        .commit()
+        .map_err(|error| AppError::Internal(format!("提交本机用量解析器升级失败：{error}")))?;
+    Ok(())
+}
+
 fn initialize_collection_epoch(
     connection: &mut Connection,
     paths: &[PathBuf],
@@ -832,6 +874,13 @@ fn initialize_collection_epoch(
             params![COLLECTION_MODE_METADATA_KEY, COLLECTION_MODE],
         )
         .map_err(|error| AppError::Internal(format!("保存本机用量统计模式失败：{error}")))?;
+    transaction
+        .execute(
+            "INSERT INTO usage_metadata(key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO NOTHING",
+            params![PARSER_VERSION_METADATA_KEY, PARSER_VERSION],
+        )
+        .map_err(|error| AppError::Internal(format!("保存本机用量解析器版本失败：{error}")))?;
 
     for path in paths {
         let Ok(metadata) = fs::metadata(path) else {
@@ -1385,10 +1434,13 @@ fn microusd_to_usd(value: Option<i64>) -> Option<String> {
 fn resolve_activation(
     activations: &[ActivationSnapshot],
     event: &ParsedUsageEvent,
-) -> Option<ActivationSnapshot> {
-    let activation = activations
+) -> ActivationResolution {
+    let Some(activation) = activations
         .iter()
-        .rfind(|activation| activation.effective_at_ms <= event.occurred_at_ms)?;
+        .rfind(|activation| activation.effective_at_ms <= event.occurred_at_ms)
+    else {
+        return ActivationResolution::Missing;
+    };
     match (
         event.model_provider.as_deref(),
         activation.model_provider.as_deref(),
@@ -1396,20 +1448,22 @@ fn resolve_activation(
         (Some(event_provider), Some(active_provider))
             if !providers_compatible(event_provider, active_provider) =>
         {
-            return None;
+            return ActivationResolution::Conflict;
         }
-        (Some(_), None) => return None,
+        (Some(_), None) => return ActivationResolution::Conflict,
         _ => {}
     }
-    Some(activation.clone())
+    ActivationResolution::Matched(activation.clone())
 }
 
 fn resolve_attribution(
     activations: &[ActivationSnapshot],
     event: &ParsedUsageEvent,
 ) -> Option<ActivationSnapshot> {
-    if let Some(activation) = resolve_activation(activations, event) {
-        return Some(activation);
+    match resolve_activation(activations, event) {
+        ActivationResolution::Matched(activation) => return Some(activation),
+        ActivationResolution::Conflict => return None,
+        ActivationResolution::Missing => {}
     }
     let source_kind = classify_model_provider(event.model_provider.as_deref())?;
     let source_name = match source_kind {
@@ -1792,8 +1846,9 @@ fn u64_db(value: u64) -> Result<i64, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::UsageLedger;
+    use super::{ActivationSnapshot, UsageLedger};
     use crate::models::{ActivationRecord, UsageGroupBy, UsageQuery, UsageRange, UsageSourceKind};
+    use crate::usage_log::{ParsedUsageEvent, TokenUsage, UsageQuality};
     use std::{fs, path::Path};
 
     fn rollout_prefix() -> &'static str {
@@ -1810,6 +1865,17 @@ mod tests {
             r#"{"type":"turn_context","payload":{"model":"gpt-5.6-sol"}}"#,
             "\n",
             r#"{"timestamp":"2026-08-01T10:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100,"cached_input_tokens":20,"cache_write_input_tokens":3,"output_tokens":8,"reasoning_output_tokens":2,"total_tokens":108}}}}"#,
+            "\n",
+        )
+    }
+
+    fn provider_switch_event() -> &'static str {
+        concat!(
+            r#"{"type":"event_msg","payload":{"type":"thread_settings_applied","thread_settings":{"model":"gpt-5.6-luna","model_provider_id":"custom"}}}"#,
+            "\n",
+            r#"{"type":"turn_context","payload":{"model":"gpt-5.6-luna"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-08-02T04:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":11,"output_tokens":4,"total_tokens":15}}}}"#,
             "\n",
         )
     }
@@ -1842,6 +1908,35 @@ mod tests {
         assert_eq!(super::classify_model_provider(Some("unknown")), None);
         assert!(!super::providers_compatible("custom", "openrouter"));
         assert!(super::providers_compatible("official", "openai_oauth"));
+    }
+
+    #[test]
+    fn does_not_guess_official_account_when_provider_conflicts_with_activation() {
+        let activation = ActivationSnapshot {
+            effective_at_ms: 100,
+            source_kind: UsageSourceKind::Provider,
+            provider_id: Some("provider-1".into()),
+            account_id: Some("account-1".into()),
+            model_provider: Some("custom".into()),
+            display_name_snapshot: "中转站 · Key".into(),
+        };
+        let event = ParsedUsageEvent {
+            ordinal: 0,
+            occurred_at_ms: 200,
+            model: "gpt-5.6-luna".into(),
+            model_provider: Some("openai".into()),
+            usage: TokenUsage {
+                input_tokens: 1,
+                cached_input_tokens: 0,
+                cache_write_input_tokens: 0,
+                output_tokens: 1,
+                reasoning_output_tokens: 0,
+                total_tokens: 2,
+            },
+            quality: UsageQuality::Complete,
+        };
+
+        assert!(super::resolve_attribution(&[activation], &event).is_none());
     }
 
     #[test]
@@ -1933,6 +2028,86 @@ mod tests {
             0
         );
         assert_eq!(query(&ledger).totals.requests, 1);
+    }
+
+    #[test]
+    fn parser_upgrade_rebuilds_current_cycle_with_provider_context() {
+        use chrono::DateTime;
+
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex");
+        let path = write_rollout(&home, rollout_prefix());
+        let app = temp.path().join("app");
+        let ledger = UsageLedger::open(&app).unwrap();
+        let collection_epoch = DateTime::parse_from_rfc3339("2026-08-02T03:00:00Z")
+            .unwrap()
+            .timestamp_millis();
+        let activation_at = DateTime::parse_from_rfc3339("2026-08-02T03:59:00Z")
+            .unwrap()
+            .timestamp_millis();
+        let event_at = DateTime::parse_from_rfc3339("2026-08-02T04:00:01Z")
+            .unwrap()
+            .timestamp_millis();
+
+        ledger.refresh(&home, collection_epoch).unwrap();
+        ledger
+            .record_activation(ActivationRecord {
+                effective_at_ms: activation_at,
+                source_kind: UsageSourceKind::Provider,
+                provider_id: Some("provider-1".into()),
+                account_id: Some("account-1".into()),
+                model_provider: Some("custom".into()),
+                display_name_snapshot: "中转站 · Key".into(),
+                auth_source: Some("api_key".into()),
+            })
+            .unwrap();
+        {
+            use std::io::Write;
+
+            let mut file = fs::OpenOptions::new().append(true).open(path).unwrap();
+            file.write_all(provider_switch_event().as_bytes()).unwrap();
+        }
+        ledger.refresh(&home, event_at).unwrap();
+
+        let connection = ledger.open_connection().unwrap();
+        connection
+            .execute(
+                "UPDATE usage_events
+                 SET model_provider = 'openai', source_kind = 'official',
+                     provider_id = NULL, account_id = NULL,
+                     source_name = '官方 OpenAI（账号未确认）'
+                 WHERE model = 'gpt-5.6-luna'",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE usage_cursors SET last_model_provider = 'openai'",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "DELETE FROM usage_metadata WHERE key = 'usage_parser_version'",
+                [],
+            )
+            .unwrap();
+
+        ledger.refresh(&home, event_at + 1_000).unwrap();
+        let overview = ledger
+            .query(UsageQuery {
+                range: UsageRange {
+                    start_at_ms: collection_epoch,
+                    end_at_ms: event_at + 1_000,
+                },
+                group_by: UsageGroupBy::Model,
+            })
+            .unwrap();
+
+        assert_eq!(overview.rows.len(), 1);
+        assert_eq!(overview.rows[0].source_kind, UsageSourceKind::Provider);
+        assert_eq!(overview.rows[0].provider_id.as_deref(), Some("provider-1"));
+        assert_eq!(overview.rows[0].account_id.as_deref(), Some("account-1"));
     }
 
     #[test]

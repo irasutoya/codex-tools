@@ -327,9 +327,10 @@ CREATE TABLE pricing_rules (
 5. 从 offset 开始按行读取，不把整个文件一次性载入内存。
 6. 最后一行没有换行或 JSON 不完整时，不推进该行的 offset。
 7. 每遇到有效 `turn_context`，更新当前 `model`。
-8. 每遇到有效 `token_count`，只读取 `info.last_token_usage`。
-9. 写入事件和更新游标必须在同一 SQLite 事务中。
-10. 单个文件失败不得阻断其他文件；错误进入 warnings。
+8. 每遇到 `thread_settings_applied`，更新 `thread_settings.model` 和 `thread_settings.model_provider_id`。
+9. 每遇到有效 `token_count`，只读取 `info.last_token_usage`。
+10. 写入事件和更新游标必须在同一 SQLite 事务中。
+11. 单个文件失败不得阻断其他文件；错误进入 warnings。
 
 游标必须保存 `last_model` 和 `last_model_provider`，否则从文件中间继续时会丢失上下文。
 
@@ -396,6 +397,8 @@ CREATE TABLE pricing_rules (
 4. 日志无 Provider 时允许按时间线归属，但标记 `compatible_fallback`。
 5. 两者明确冲突时设为 `unattributed`，不得猜测。
 6. 事件早于最早 confirmed 记录时设为 `unattributed`。
+
+解析器升级时只删除并重建 `usage_collection_started_at_ms` 之后的事件和游标；保留统计起点、激活历史和价格规则，确保修复日志解析后不会回放旧 Token。
 
 Cookie/反代导入账号在归属上属于 `official`，但 `auth_source` 保留 `proxy_import`，UI 显示“Cookie / 反代”。
 

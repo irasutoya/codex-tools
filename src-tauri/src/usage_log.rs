@@ -113,7 +113,11 @@ pub(crate) fn parse_line(line: &[u8], state: &mut ParserState) -> Result<LineRes
                 state.rollout_id = Some(id.to_owned());
             }
             if let Some(provider) = payload
-                .and_then(|payload| payload.get("model_provider"))
+                .and_then(|payload| {
+                    payload
+                        .get("model_provider")
+                        .or_else(|| payload.get("model_provider_id"))
+                })
                 .and_then(Value::as_str)
                 .map(str::trim)
                 .filter(|provider| !provider.is_empty())
@@ -133,7 +137,37 @@ pub(crate) fn parse_line(line: &[u8], state: &mut ParserState) -> Result<LineRes
                 state.model = Some(model.to_owned());
             }
             if let Some(provider) = payload
-                .and_then(|payload| payload.get("model_provider"))
+                .and_then(|payload| {
+                    payload
+                        .get("model_provider")
+                        .or_else(|| payload.get("model_provider_id"))
+                })
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|provider| !provider.is_empty())
+            {
+                state.model_provider = Some(provider.to_owned());
+            }
+            Ok(LineResult::Ignored)
+        }
+        Some("event_msg") if payload_type == Some("thread_settings_applied") => {
+            let settings = value
+                .get("payload")
+                .and_then(|payload| payload.get("thread_settings"));
+            if let Some(model) = settings
+                .and_then(|settings| settings.get("model"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|model| !model.is_empty())
+            {
+                state.model = Some(model.to_owned());
+            }
+            if let Some(provider) = settings
+                .and_then(|settings| {
+                    settings
+                        .get("model_provider_id")
+                        .or_else(|| settings.get("model_provider"))
+                })
                 .and_then(Value::as_str)
                 .map(str::trim)
                 .filter(|provider| !provider.is_empty())
@@ -299,6 +333,26 @@ mod tests {
         assert_eq!(parsed.events.len(), 1);
         assert_eq!(parsed.events[0].model, "gpt-5.6-luna");
         assert_eq!(parsed.events[0].usage.total_tokens, 15);
+    }
+
+    #[test]
+    fn applies_provider_changes_from_thread_settings_events() {
+        let text = concat!(
+            r#"{"type":"session_meta","payload":{"id":"rollout-provider-switch","model_provider":"openai"}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"thread_settings_applied","thread_settings":{"model":"gpt-5.6-luna","model_provider_id":"custom"}}}"#,
+            "\n",
+            r#"{"type":"turn_context","payload":{"model":"gpt-5.6-luna"}}"#,
+            "\n",
+            r#"{"type":"event_msg","timestamp":"2026-08-01T10:00:01Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":11,"output_tokens":4,"total_tokens":15}}}}"#,
+            "\n",
+        );
+
+        let parsed = parse_rollout_text(text);
+
+        assert_eq!(parsed.events.len(), 1);
+        assert_eq!(parsed.events[0].model, "gpt-5.6-luna");
+        assert_eq!(parsed.events[0].model_provider.as_deref(), Some("custom"));
     }
 
     #[test]
