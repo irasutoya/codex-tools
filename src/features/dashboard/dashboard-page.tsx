@@ -40,7 +40,15 @@ import {
 import { Spinner } from "@/components/ui/spinner"
 import { notify } from "@/lib/feedback"
 import { call } from "@/lib/ipc"
-import { refreshCoordinator, usePageRefresh } from "@/lib/refresh-coordinator"
+import {
+  refreshCoordinator,
+  useAppForeground,
+  usePageRefresh,
+} from "@/lib/refresh-coordinator"
+import {
+  runQuotaRefresh,
+  useAutoQuotaRefresh,
+} from "@/lib/use-auto-quota-refresh"
 import type { Dashboard, PageProps } from "@/types"
 
 import { QuotaStatusView } from "../providers/quota-status"
@@ -53,6 +61,7 @@ import {
 
 export default function DashboardPage({ active }: PageProps) {
   const refreshSignal = usePageRefresh("dashboard")
+  const foreground = useAppForeground()
   const [data, setData] = useState<Dashboard>()
   const [launching, setLaunching] = useState(false)
   const [refreshing, setRefreshing] = useState(false)
@@ -60,16 +69,9 @@ export default function DashboardPage({ active }: PageProps) {
   const [error, setError] = useState<string>()
   const lastRefreshRevision = useRef<number | undefined>(undefined)
 
-  const load = useCallback(async () => {
+  const loadDashboard = useCallback(async () => {
     try {
       setData(await call("get_dashboard"))
-      void call("refresh_usage", {
-        query: { range: getLocalRange(1), groupBy: "account" },
-      })
-        .then(() => call("get_dashboard"))
-        .then(setData)
-        .then(() => refreshCoordinator.invalidate(["providers", "usage"]))
-        .catch(() => undefined)
       setError(undefined)
     } catch (reason) {
       setError(String(reason))
@@ -77,24 +79,38 @@ export default function DashboardPage({ active }: PageProps) {
     }
   }, [])
 
-  const refreshActiveQuota = useCallback(async () => {
-    if (data?.activeKind !== "official" || !data.activeAccountId) {
-      return false
+  const load = useCallback(async () => {
+    await loadDashboard()
+    void call("refresh_usage", {
+      query: { range: getLocalRange(1), groupBy: "account" },
+    })
+      .then(() => loadDashboard())
+      .then(() => refreshCoordinator.invalidate(["providers", "usage"]))
+      .catch(() => undefined)
+  }, [loadDashboard])
+
+  const activeAccountId =
+    data?.activeKind === "official" ? data.activeAccountId : undefined
+  const refreshQuotaData = useCallback(async () => {
+    if (!activeAccountId) throw new Error("当前没有可刷新的 OpenAI 账号")
+    const result = await call("refresh_official_account_quota", {
+      accountId: activeAccountId,
+    })
+    if (!refreshCoordinator.getForeground()) {
+      refreshCoordinator.invalidate(["dashboard", "providers"])
+      return result
     }
-    try {
-      await call("refresh_official_account_quota", {
-        accountId: data.activeAccountId,
-      })
-      await load()
-      refreshCoordinator.invalidate(["providers"])
-      return true
-    } catch {
-      return false
-    }
-  }, [data, load])
+    await loadDashboard()
+    refreshCoordinator.invalidate(["providers"])
+    return result
+  }, [activeAccountId, loadDashboard])
 
   useEffect(() => {
-    if (!active || lastRefreshRevision.current === refreshSignal.revision) {
+    if (
+      !active ||
+      !foreground ||
+      lastRefreshRevision.current === refreshSignal.revision
+    ) {
       return
     }
     lastRefreshRevision.current = refreshSignal.revision
@@ -102,38 +118,15 @@ export default function DashboardPage({ active }: PageProps) {
       void load().catch(() => undefined)
     }, 0)
     return () => window.clearTimeout(timeout)
-  }, [active, load, refreshSignal.revision])
+  }, [active, foreground, load, refreshSignal.revision])
 
-  useEffect(() => {
-    if (
-      !active ||
-      data?.activeKind !== "official" ||
-      !data.activeAccountId ||
-      document.visibilityState !== "visible"
-    ) {
-      return
-    }
-    let timer: number | undefined
-    const lastAttempt = Math.max(
-      data.activeQuota?.fetchedAt ?? 0,
-      data.activeQuota?.lastAttemptAt ?? 0
-    )
-    const delay = Math.max(1_000, 5 * 60_000 - (Date.now() - lastAttempt))
-    const schedule = (wait: number) => {
-      timer = window.setTimeout(() => {
-        timer = undefined
-        void refreshActiveQuota().then((success) => {
-          if (!success && document.visibilityState === "visible") {
-            schedule(30_000)
-          }
-        })
-      }, wait)
-    }
-    schedule(delay)
-    return () => {
-      if (timer !== undefined) window.clearTimeout(timer)
-    }
-  }, [active, data, refreshActiveQuota])
+  useAutoQuotaRefresh({
+    accountId: activeAccountId,
+    active,
+    foreground,
+    quota: data?.activeQuota,
+    refresh: refreshQuotaData,
+  })
 
   const launchCodex = async () => {
     setLaunching(true)
@@ -160,14 +153,10 @@ export default function DashboardPage({ active }: PageProps) {
   }
 
   const refreshQuota = async () => {
-    if (!data?.activeAccountId) return
+    if (!activeAccountId) return
     setQuotaRefreshing(true)
     try {
-      const quota = await call("refresh_official_account_quota", {
-        accountId: data.activeAccountId,
-      })
-      await load()
-      refreshCoordinator.invalidate(["providers"])
+      const quota = await runQuotaRefresh(activeAccountId, refreshQuotaData)
       if (quota.status === "success") {
         notify.success("当前账号额度已更新")
       } else {

@@ -58,12 +58,17 @@ import { Spinner } from "@/components/ui/spinner"
 import { Textarea } from "@/components/ui/textarea"
 import { notify } from "@/lib/feedback"
 import { call } from "@/lib/ipc"
-import { refreshCoordinator, usePageRefresh } from "@/lib/refresh-coordinator"
+import {
+  refreshCoordinator,
+  useAppForeground,
+  usePageRefresh,
+} from "@/lib/refresh-coordinator"
 import { notifyRepairWarnings } from "@/lib/repair-feedback"
 import type { ConfigInspection, ConfigPatchPreview, PageProps } from "@/types"
 
 export default function SettingsPage({ active }: PageProps) {
   const refreshSignal = usePageRefresh("settings")
+  const foreground = useAppForeground()
   const [inspection, setInspection] = useState<ConfigInspection>()
   const [diagnostics, setDiagnostics] = useState<Record<string, unknown>>()
   const [canPreviewCustom, setCanPreviewCustom] = useState(false)
@@ -88,7 +93,11 @@ export default function SettingsPage({ active }: PageProps) {
   }, [])
 
   useEffect(() => {
-    if (!active || lastRefreshRevision.current === refreshSignal.revision) {
+    if (
+      !active ||
+      !foreground ||
+      lastRefreshRevision.current === refreshSignal.revision
+    ) {
       return
     }
     lastRefreshRevision.current = refreshSignal.revision
@@ -96,7 +105,7 @@ export default function SettingsPage({ active }: PageProps) {
       void load().catch((reason) => setError(String(reason)))
     }, 0)
     return () => window.clearTimeout(timeout)
-  }, [active, load, refreshSignal.revision])
+  }, [active, foreground, load, refreshSignal.revision])
 
   if (error) {
     return (

@@ -65,7 +65,11 @@ import {
 import { call } from "@/lib/ipc"
 import { notify } from "@/lib/feedback"
 import { notifyRepairWarnings } from "@/lib/repair-feedback"
-import { refreshCoordinator, usePageRefresh } from "@/lib/refresh-coordinator"
+import {
+  refreshCoordinator,
+  useAppForeground,
+  usePageRefresh,
+} from "@/lib/refresh-coordinator"
 import { epochMilliseconds } from "@/lib/time"
 import type { PageProps, PageResult, RepairScan, Session } from "@/types"
 
@@ -101,6 +105,7 @@ function formatSessionTimestamp(value: number) {
 
 export default function SessionsPage({ active }: PageProps) {
   const refreshSignal = usePageRefresh("sessions")
+  const foreground = useAppForeground()
   const [scan, setScan] = useState<RepairScan>()
   const [sessions, setSessions] = useState<PageResult<Session>>()
   const [page, setPage] = useState(1)
@@ -139,7 +144,11 @@ export default function SessionsPage({ active }: PageProps) {
   }, [loadScan, loadSessions])
 
   useEffect(() => {
-    if (!active || lastScanRevision.current === refreshSignal.revision) {
+    if (
+      !active ||
+      !foreground ||
+      lastScanRevision.current === refreshSignal.revision
+    ) {
       return
     }
     lastScanRevision.current = refreshSignal.revision
@@ -147,10 +156,10 @@ export default function SessionsPage({ active }: PageProps) {
       void loadScan().catch((reason) => setError(String(reason)))
     }, 0)
     return () => window.clearTimeout(timeout)
-  }, [active, loadScan, refreshSignal.revision])
+  }, [active, foreground, loadScan, refreshSignal.revision])
 
   useEffect(() => {
-    if (!active) {
+    if (!active || !foreground) {
       return
     }
     const revisionChanged =
@@ -171,7 +180,7 @@ export default function SessionsPage({ active }: PageProps) {
         .finally(() => setPaging(false))
     }, 0)
     return () => window.clearTimeout(timeout)
-  }, [active, loadSessions, page, refreshSignal.revision])
+  }, [active, foreground, loadSessions, page, refreshSignal.revision])
 
   const retry = () => {
     setRefreshing(true)

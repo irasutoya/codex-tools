@@ -62,7 +62,11 @@ import {
 } from "@/components/ui/table"
 import { notify } from "@/lib/feedback"
 import { call } from "@/lib/ipc"
-import { refreshCoordinator, usePageRefresh } from "@/lib/refresh-coordinator"
+import {
+  refreshCoordinator,
+  useAppForeground,
+  usePageRefresh,
+} from "@/lib/refresh-coordinator"
 import type {
   CostStatus,
   PageProps,
@@ -106,6 +110,7 @@ type PricingFieldErrors = Partial<Record<PricingField, string>>
 
 export default function UsagePage({ active }: PageProps) {
   const refreshSignal = usePageRefresh("usage")
+  const foreground = useAppForeground()
   const [rangeMode, setRangeMode] = useState<RangeMode>("today")
   const [customStart, setCustomStart] = useState(() => getLocalDateInput())
   const [customEnd, setCustomEnd] = useState(() => getLocalDateInput())
@@ -134,6 +139,7 @@ export default function UsagePage({ active }: PageProps) {
   const [shareLoading, setShareLoading] = useState(false)
   const [shareError, setShareError] = useState<string>()
   const running = useRef(false)
+  const nextRefreshAt = useRef<number | undefined>(undefined)
   const refreshQueued = useRef(false)
   const refreshRequested = useRef(false)
   const requestVersion = useRef(0)
@@ -233,7 +239,7 @@ export default function UsagePage({ active }: PageProps) {
   }, [])
 
   useEffect(() => {
-    if (!active || !customRangeValid) return
+    if (!active || !foreground || !customRangeValid) return
     const currentQuery = getQuery()
     const queryKey = [
       currentQuery.groupBy,
@@ -242,6 +248,7 @@ export default function UsagePage({ active }: PageProps) {
     ].join(":")
     const revisionChanged =
       lastRefreshRevision.current !== refreshSignal.revision
+    const queryChanged = lastQueryKey.current !== queryKey
     if (
       !revisionChanged &&
       initialized.current &&
@@ -251,6 +258,9 @@ export default function UsagePage({ active }: PageProps) {
     }
     lastRefreshRevision.current = refreshSignal.revision
     lastQueryKey.current = queryKey
+    if (initialized.current && (revisionChanged || queryChanged)) {
+      nextRefreshAt.current = Date.now() + 30_000
+    }
     const timeout = window.setTimeout(() => {
       if (!initialized.current) {
         initialized.current = true
@@ -267,6 +277,7 @@ export default function UsagePage({ active }: PageProps) {
   }, [
     active,
     customRangeValid,
+    foreground,
     getQuery,
     loadOfficialCatalog,
     loadOverview,
@@ -275,34 +286,36 @@ export default function UsagePage({ active }: PageProps) {
   ])
 
   useEffect(() => {
-    if (!active || !customRangeValid) return
+    if (!active || !foreground || !customRangeValid) return
     let timer: number | undefined
+    let cancelled = false
     const stopTimer = () => {
       if (timer !== undefined) {
-        window.clearInterval(timer)
+        window.clearTimeout(timer)
         timer = undefined
       }
     }
     const startTimer = () => {
-      if (timer === undefined && document.visibilityState === "visible") {
-        timer = window.setTimeout(async () => {
-          await loadOverview(true, true).catch(() => undefined)
+      if (timer !== undefined) return
+      const target = nextRefreshAt.current ?? Date.now() + 30_000
+      nextRefreshAt.current = target
+      timer = window.setTimeout(
+        async () => {
           timer = undefined
+          await loadOverview(true, true).catch(() => undefined)
+          if (cancelled) return
+          nextRefreshAt.current = Date.now() + 30_000
           startTimer()
-        }, 30_000)
-      }
+        },
+        Math.max(1_000, target - Date.now())
+      )
     }
-    const handleVisibility = () => {
-      if (document.visibilityState === "visible") startTimer()
-      else stopTimer()
-    }
-    document.addEventListener("visibilitychange", handleVisibility)
     startTimer()
     return () => {
+      cancelled = true
       stopTimer()
-      document.removeEventListener("visibilitychange", handleVisibility)
     }
-  }, [active, customRangeValid, loadOverview])
+  }, [active, customRangeValid, foreground, loadOverview])
 
   const refresh = async () => {
     try {

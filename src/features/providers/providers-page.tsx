@@ -89,9 +89,17 @@ import { Switch } from "@/components/ui/switch"
 import { Textarea } from "@/components/ui/textarea"
 import { notify } from "@/lib/feedback"
 import { call } from "@/lib/ipc"
-import { refreshCoordinator, usePageRefresh } from "@/lib/refresh-coordinator"
+import {
+  refreshCoordinator,
+  useAppForeground,
+  usePageRefresh,
+} from "@/lib/refresh-coordinator"
 import { notifyRepairWarnings } from "@/lib/repair-feedback"
 import { epochMilliseconds } from "@/lib/time"
+import {
+  runQuotaRefresh,
+  useAutoQuotaRefresh,
+} from "@/lib/use-auto-quota-refresh"
 import {
   emptyAccount,
   emptyProvider,
@@ -123,6 +131,7 @@ const accountTimestampFormatter = new Intl.DateTimeFormat("zh-CN", {
 
 export default function ProvidersPage({ active }: PageProps) {
   const refreshSignal = usePageRefresh("providers")
+  const foreground = useAppForeground()
   const [providers, setProviders] = useState<Provider[]>([])
   const [accounts, setAccounts] = useState<Account[]>([])
   const [officialAccounts, setOfficialAccounts] = useState<
@@ -198,7 +207,11 @@ export default function ProvidersPage({ active }: PageProps) {
     }
   }, [])
   useEffect(() => {
-    if (!active || lastRefreshRevision.current === refreshSignal.revision) {
+    if (
+      !active ||
+      !foreground ||
+      lastRefreshRevision.current === refreshSignal.revision
+    ) {
       return
     }
     lastRefreshRevision.current = refreshSignal.revision
@@ -207,53 +220,34 @@ export default function ProvidersPage({ active }: PageProps) {
       void loadUsage(true)
     }, 0)
     return () => window.clearTimeout(timeout)
-  }, [active, load, loadUsage, refreshSignal.revision])
+  }, [active, foreground, load, loadUsage, refreshSignal.revision])
 
   const activeOfficialAccount = officialAccounts.find(
     (account) => account.active
   )
   const refreshActiveQuota = useCallback(async () => {
-    if (!activeOfficialAccount) return false
-    try {
-      await call("refresh_official_account_quota", {
-        accountId: activeOfficialAccount.id,
-      })
-      await load()
-      refreshCoordinator.invalidate(["dashboard"])
-      return true
-    } catch {
-      // Automatic quota refresh keeps the last known result on failure.
-      return false
+    if (!activeOfficialAccount) {
+      throw new Error("当前没有可刷新的 OpenAI 账号")
     }
+    const result = await call("refresh_official_account_quota", {
+      accountId: activeOfficialAccount.id,
+    })
+    if (!refreshCoordinator.getForeground()) {
+      refreshCoordinator.invalidate(["dashboard", "providers"])
+      return result
+    }
+    await load()
+    refreshCoordinator.invalidate(["dashboard"])
+    return result
   }, [activeOfficialAccount, load])
 
-  useEffect(() => {
-    if (
-      !active ||
-      !activeOfficialAccount ||
-      document.visibilityState !== "visible"
-    ) {
-      return
-    }
-    let timer: number | undefined
-    const lastAttempt = Math.max(
-      activeOfficialAccount.quota.fetchedAt ?? 0,
-      activeOfficialAccount.quota.lastAttemptAt ?? 0
-    )
-    const delay = Math.max(1_000, 5 * 60_000 - (Date.now() - lastAttempt))
-    const schedule = (wait: number) => {
-      timer = window.setTimeout(() => {
-        timer = undefined
-        void refreshActiveQuota().then((success) => {
-          if (!success && document.visibilityState === "visible") {
-            schedule(30_000)
-          }
-        })
-      }, wait)
-    }
-    schedule(delay)
-    return () => window.clearTimeout(timer)
-  }, [active, activeOfficialAccount, refreshActiveQuota])
+  useAutoQuotaRefresh({
+    accountId: activeOfficialAccount?.id,
+    active,
+    foreground,
+    quota: activeOfficialAccount?.quota,
+    refresh: refreshActiveQuota,
+  })
 
   useEffect(() => {
     if (!deviceAuthorization) return
@@ -292,9 +286,11 @@ export default function ProvidersPage({ active }: PageProps) {
                 `Codex 现在使用 ${result.account.name}。`
               )
               notifyRepairWarnings(result.repair)
-              void call("refresh_official_account_quota", {
-                accountId: result.account.id,
-              })
+              void runQuotaRefresh(result.account.id, () =>
+                call("refresh_official_account_quota", {
+                  accountId: result.account.id,
+                })
+              )
                 .catch((error) =>
                   notify.warning("登录成功，但额度暂未更新", error)
                 )
@@ -640,9 +636,12 @@ export default function ProvidersPage({ active }: PageProps) {
                               void run(
                                 `official:quota:${item.id}`,
                                 async () => {
-                                  const quota = await call(
-                                    "refresh_official_account_quota",
-                                    { accountId: item.id }
+                                  const quota = await runQuotaRefresh(
+                                    item.id,
+                                    () =>
+                                      call("refresh_official_account_quota", {
+                                        accountId: item.id,
+                                      })
                                   )
                                   if (quota.status === "success") {
                                     notify.success("OpenAI 额度已更新")
@@ -1022,9 +1021,11 @@ export default function ProvidersPage({ active }: PageProps) {
               setProxyLoginOpen(false)
               notify.success("Cookie 账号已导入", imported.name)
               try {
-                const quota = await call("refresh_official_account_quota", {
-                  accountId: imported.id,
-                })
+                const quota = await runQuotaRefresh(imported.id, () =>
+                  call("refresh_official_account_quota", {
+                    accountId: imported.id,
+                  })
+                )
                 if (quota.status !== "success") {
                   notify.warning(
                     "Cookie 账号已保存，但额度暂未更新",
