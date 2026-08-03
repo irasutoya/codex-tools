@@ -6,7 +6,10 @@ import {
   planQuotaFailure,
   planQuotaSuccess,
   quotaSignature,
+  shouldRefreshQuotaOnActivation,
 } from "./quota-refresh-policy"
+
+const QUOTA_ACTIVATION_MINIMUM_MS = 10_000
 
 type AutoQuotaRefreshOptions = {
   accountId?: string
@@ -19,6 +22,7 @@ type AutoQuotaRefreshOptions = {
 type QuotaRuntime = {
   failureCount: number
   lastSignature?: string
+  lastAutomaticRefreshAt?: number
   suspended: boolean
   unchangedCount: number
 }
@@ -58,12 +62,21 @@ export function useAutoQuotaRefresh({
   refresh,
 }: AutoQuotaRefreshOptions) {
   const refreshRef = useRef(refresh)
+  const wasActive = useRef(false)
+  const previousAccountId = useRef<string | undefined>(undefined)
 
   useEffect(() => {
     refreshRef.current = refresh
   }, [refresh])
 
   useEffect(() => {
+    const entering =
+      active &&
+      Boolean(accountId) &&
+      (!wasActive.current || previousAccountId.current !== accountId)
+    wasActive.current = active
+    previousAccountId.current = accountId
+
     if (!active || !foreground || !accountId) return
 
     const runtime = getRuntime(accountId)
@@ -90,6 +103,7 @@ export function useAutoQuotaRefresh({
     }
     const refreshOnce = async () => {
       if (cancelled) return
+      runtime.lastAutomaticRefreshAt = Date.now()
       try {
         const result = await runQuotaRefresh(accountId, () =>
           refreshRef.current()
@@ -133,7 +147,17 @@ export function useAutoQuotaRefresh({
       }
     }
 
-    schedule(initialDelay(quota, runtime))
+    const activationAllowed =
+      entering &&
+      shouldRefreshQuotaOnActivation(quota, runtime.failureCount) &&
+      (runtime.lastAutomaticRefreshAt === undefined ||
+        Date.now() - runtime.lastAutomaticRefreshAt >=
+          QUOTA_ACTIVATION_MINIMUM_MS)
+    if (activationAllowed) {
+      void refreshOnce()
+    } else {
+      schedule(initialDelay(quota, runtime))
+    }
     return () => {
       cancelled = true
       if (timer !== undefined) window.clearTimeout(timer)

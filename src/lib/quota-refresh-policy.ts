@@ -97,6 +97,33 @@ export function planQuotaFailure(
   }
 }
 
+export function shouldRefreshQuotaOnActivation(
+  quota: AccountQuota | undefined,
+  failureCount: number,
+  now = Date.now()
+) {
+  if (!quota || quota.status === "never") return true
+  if (quota.status === "unauthorized" || quota.status === "unsupported") {
+    return false
+  }
+
+  if (quota.status === "rate_limited") {
+    return (
+      quota.lastAttemptAt !== undefined &&
+      remainingDelay(quota.lastAttemptAt, QUOTA_RATE_LIMIT_INTERVAL_MS, now) ===
+        0
+    )
+  }
+
+  if (quota.status === "success") {
+    const resetDelay = exhaustedResetDelay(quota, now)
+    return resetDelay === undefined || resetDelay <= 1_000
+  }
+
+  const retryDelay = retryDelays[Math.min(Math.max(failureCount - 1, 0), 5)]
+  return remainingDelay(quota.lastAttemptAt, retryDelay, now) === 0
+}
+
 function exhaustedResetDelay(quota: AccountQuota, now: number) {
   const exhaustedWindows = [quota.data?.primary, quota.data?.secondary]
     .filter((item): item is QuotaWindow => Boolean(item))

@@ -67,6 +67,7 @@ import {
   useAppForeground,
   usePageRefresh,
 } from "@/lib/refresh-coordinator"
+import { shouldRefreshUsageOnEntry } from "@/lib/usage-refresh-policy"
 import type {
   CostStatus,
   PageProps,
@@ -146,6 +147,8 @@ export default function UsagePage({ active }: PageProps) {
   const initialized = useRef(false)
   const lastQueryKey = useRef<string | undefined>(undefined)
   const lastRefreshRevision = useRef<number | undefined>(undefined)
+  const lastAutomaticRefreshAt = useRef<number | undefined>(undefined)
+  const wasActive = useRef(false)
 
   const getSelectedRange = useCallback(() => {
     if (rangeMode === "yesterday") return getLocalDayRange(1)
@@ -214,6 +217,20 @@ export default function UsagePage({ active }: PageProps) {
     [getQuery]
   )
 
+  const refreshAutomatically = useCallback(
+    async (force = false) => {
+      if (
+        !force &&
+        !shouldRefreshUsageOnEntry(lastAutomaticRefreshAt.current)
+      ) {
+        return
+      }
+      lastAutomaticRefreshAt.current = Date.now()
+      await loadOverview(true, true)
+    },
+    [loadOverview]
+  )
+
   const loadRules = useCallback(async () => {
     try {
       setRules(await call("list_pricing_rules", {}))
@@ -239,6 +256,8 @@ export default function UsagePage({ active }: PageProps) {
   }, [])
 
   useEffect(() => {
+    const entered = active && !wasActive.current
+    wasActive.current = active
     if (!active || !foreground || !customRangeValid) return
     const currentQuery = getQuery()
     const queryKey = [
@@ -252,26 +271,29 @@ export default function UsagePage({ active }: PageProps) {
     if (
       !revisionChanged &&
       initialized.current &&
-      lastQueryKey.current === queryKey
+      lastQueryKey.current === queryKey &&
+      !entered
     ) {
       return
     }
     lastRefreshRevision.current = refreshSignal.revision
     lastQueryKey.current = queryKey
-    if (initialized.current && (revisionChanged || queryChanged)) {
+    if (initialized.current && (entered || revisionChanged || queryChanged)) {
       nextRefreshAt.current = Date.now() + 30_000
     }
     const timeout = window.setTimeout(() => {
       if (!initialized.current) {
         initialized.current = true
         void Promise.all([
-          loadOverview().then(() => loadOverview(true, true)),
+          loadOverview().then(() => refreshAutomatically()),
           loadRules(),
           loadOfficialCatalog(true),
         ]).catch(() => undefined)
         return
       }
-      void loadOverview(true, true).catch(() => undefined)
+      void refreshAutomatically(revisionChanged || queryChanged).catch(
+        () => undefined
+      )
     }, 0)
     return () => window.clearTimeout(timeout)
   }, [
@@ -282,6 +304,7 @@ export default function UsagePage({ active }: PageProps) {
     loadOfficialCatalog,
     loadOverview,
     loadRules,
+    refreshAutomatically,
     refreshSignal.revision,
   ])
 
@@ -302,7 +325,7 @@ export default function UsagePage({ active }: PageProps) {
       timer = window.setTimeout(
         async () => {
           timer = undefined
-          await loadOverview(true, true).catch(() => undefined)
+          await refreshAutomatically().catch(() => undefined)
           if (cancelled) return
           nextRefreshAt.current = Date.now() + 30_000
           startTimer()
@@ -315,7 +338,7 @@ export default function UsagePage({ active }: PageProps) {
       cancelled = true
       stopTimer()
     }
-  }, [active, customRangeValid, foreground, loadOverview])
+  }, [active, customRangeValid, foreground, refreshAutomatically])
 
   const refresh = async () => {
     try {

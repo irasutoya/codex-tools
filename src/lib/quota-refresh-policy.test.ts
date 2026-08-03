@@ -9,6 +9,7 @@ import {
   QUOTA_UNCHANGED_INTERVAL_MS,
   planQuotaFailure,
   planQuotaSuccess,
+  shouldRefreshQuotaOnActivation,
   quotaSignature,
 } from "./quota-refresh-policy"
 import type { QuotaRefreshPlan } from "./quota-refresh-policy"
@@ -123,6 +124,55 @@ describe("quota refresh policy", () => {
     )
 
     expect(after).not.toBe(before)
+  })
+
+  it("refreshes on page activation unless the quota must wait", () => {
+    expect(shouldRefreshQuotaOnActivation(undefined, 0, now)).toBe(true)
+    expect(shouldRefreshQuotaOnActivation(quota(), 0, now)).toBe(true)
+    expect(
+      shouldRefreshQuotaOnActivation(
+        quota({
+          data: {
+            kind: "windowed",
+            primary: {
+              usedPercent: 100,
+              remainingPercent: 0,
+              windowSeconds: 18_000,
+              resetAt: now + 60 * 60_000,
+            },
+          },
+        }),
+        0,
+        now
+      )
+    ).toBe(false)
+    expect(
+      shouldRefreshQuotaOnActivation({ status: "rate_limited" }, 1, now)
+    ).toBe(false)
+    expect(
+      shouldRefreshQuotaOnActivation(
+        { status: "rate_limited", lastAttemptAt: now - 5 * 60_000 },
+        1,
+        now
+      )
+    ).toBe(true)
+    expect(
+      shouldRefreshQuotaOnActivation({ status: "unauthorized" }, 1, now)
+    ).toBe(false)
+    expect(
+      shouldRefreshQuotaOnActivation(
+        { status: "error", lastAttemptAt: now - 1_000 },
+        1,
+        now
+      )
+    ).toBe(false)
+    expect(
+      shouldRefreshQuotaOnActivation(
+        { status: "error", lastAttemptAt: now - 30_000 },
+        1,
+        now
+      )
+    ).toBe(true)
   })
 })
 
