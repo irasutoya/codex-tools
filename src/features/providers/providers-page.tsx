@@ -89,6 +89,7 @@ import { Switch } from "@/components/ui/switch"
 import { Textarea } from "@/components/ui/textarea"
 import { notify } from "@/lib/feedback"
 import { call } from "@/lib/ipc"
+import { refreshCoordinator, usePageRefresh } from "@/lib/refresh-coordinator"
 import { notifyRepairWarnings } from "@/lib/repair-feedback"
 import { epochMilliseconds } from "@/lib/time"
 import {
@@ -121,6 +122,7 @@ const accountTimestampFormatter = new Intl.DateTimeFormat("zh-CN", {
 })
 
 export default function ProvidersPage({ active }: PageProps) {
+  const refreshSignal = usePageRefresh("providers")
   const [providers, setProviders] = useState<Provider[]>([])
   const [accounts, setAccounts] = useState<Account[]>([])
   const [officialAccounts, setOfficialAccounts] = useState<
@@ -149,6 +151,7 @@ export default function ProvidersPage({ active }: PageProps) {
     | { kind: "account"; id: string; name: string }
   >()
   const running = useRef(false)
+  const lastRefreshRevision = useRef<number | undefined>(undefined)
   const busy = Boolean(pendingTask)
   const accountsByProvider = useMemo(() => {
     const grouped = new Map<string, Account[]>()
@@ -187,6 +190,7 @@ export default function ProvidersPage({ active }: PageProps) {
         ? await call("refresh_usage", { query })
         : await call("get_usage_overview", { query })
       setUsage(result)
+      if (refresh) refreshCoordinator.invalidate(["dashboard", "usage"])
       return result
     } catch {
       // Provider management remains available when usage files are unavailable.
@@ -194,21 +198,62 @@ export default function ProvidersPage({ active }: PageProps) {
     }
   }, [])
   useEffect(() => {
-    if (!active) return
+    if (!active || lastRefreshRevision.current === refreshSignal.revision) {
+      return
+    }
+    lastRefreshRevision.current = refreshSignal.revision
     const timeout = window.setTimeout(() => {
       void load().catch(() => undefined)
-      void loadUsage()
+      void loadUsage(true)
     }, 0)
     return () => window.clearTimeout(timeout)
-  }, [active, load, loadUsage])
+  }, [active, load, loadUsage, refreshSignal.revision])
+
+  const activeOfficialAccount = officialAccounts.find(
+    (account) => account.active
+  )
+  const refreshActiveQuota = useCallback(async () => {
+    if (!activeOfficialAccount) return false
+    try {
+      await call("refresh_official_account_quota", {
+        accountId: activeOfficialAccount.id,
+      })
+      await load()
+      refreshCoordinator.invalidate(["dashboard"])
+      return true
+    } catch {
+      // Automatic quota refresh keeps the last known result on failure.
+      return false
+    }
+  }, [activeOfficialAccount, load])
 
   useEffect(() => {
-    if (!active) return
-    const timer = window.setInterval(() => {
-      void loadUsage(true)
-    }, 30_000)
-    return () => window.clearInterval(timer)
-  }, [active, loadUsage])
+    if (
+      !active ||
+      !activeOfficialAccount ||
+      document.visibilityState !== "visible"
+    ) {
+      return
+    }
+    let timer: number | undefined
+    const lastAttempt = Math.max(
+      activeOfficialAccount.quota.fetchedAt ?? 0,
+      activeOfficialAccount.quota.lastAttemptAt ?? 0
+    )
+    const delay = Math.max(1_000, 5 * 60_000 - (Date.now() - lastAttempt))
+    const schedule = (wait: number) => {
+      timer = window.setTimeout(() => {
+        timer = undefined
+        void refreshActiveQuota().then((success) => {
+          if (!success && document.visibilityState === "visible") {
+            schedule(30_000)
+          }
+        })
+      }, wait)
+    }
+    schedule(delay)
+    return () => window.clearTimeout(timer)
+  }, [active, activeOfficialAccount, refreshActiveQuota])
 
   useEffect(() => {
     if (!deviceAuthorization) return
@@ -253,11 +298,12 @@ export default function ProvidersPage({ active }: PageProps) {
                 .catch((error) =>
                   notify.warning("登录成功，但额度暂未更新", error)
                 )
-                .finally(() =>
-                  load().catch((error) =>
+                .finally(() => {
+                  refreshCoordinator.invalidate(["dashboard", "settings"])
+                  return load().catch((error) =>
                     notify.warning("登录已完成，但无法读取最新账号列表", error)
                   )
-                )
+                })
             })
             .catch((error) => {
               if (cancelled) return
@@ -296,6 +342,7 @@ export default function ProvidersPage({ active }: PageProps) {
           notify.warning("操作已完成，但无法读取最新列表", error)
         }
       }
+      refreshCoordinator.invalidate(["dashboard", "settings"])
     } catch (error) {
       notify.error(taskFailureTitle(task), error)
     } finally {

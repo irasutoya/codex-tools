@@ -48,6 +48,7 @@ import {
 } from "@/components/ui/sidebar"
 import { Toaster } from "@/components/ui/sonner"
 import { TooltipProvider } from "@/components/ui/tooltip"
+import { refreshCoordinator } from "@/lib/refresh-coordinator"
 import type { Page } from "@/types"
 
 const pageLoaders = {
@@ -113,6 +114,11 @@ export default function App() {
     () => new Set(["dashboard"])
   )
   const currentNavigation = navigation.find((item) => item.id === page)!
+
+  useEffect(() => {
+    refreshCoordinator.start()
+    return () => refreshCoordinator.stop()
+  }, [])
 
   const navigate = useCallback((nextPage: Page) => {
     contentRef.current?.scrollTo({ top: 0 })

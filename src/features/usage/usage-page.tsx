@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react"
+import { useCallback, useEffect, useRef, useState } from "react"
 import {
   BookOpenCheck,
   CalendarDays,
@@ -62,6 +62,7 @@ import {
 } from "@/components/ui/table"
 import { notify } from "@/lib/feedback"
 import { call } from "@/lib/ipc"
+import { refreshCoordinator, usePageRefresh } from "@/lib/refresh-coordinator"
 import type {
   CostStatus,
   PageProps,
@@ -104,6 +105,7 @@ type PricingField = "model" | "provider" | "account" | "prices" | "effective"
 type PricingFieldErrors = Partial<Record<PricingField, string>>
 
 export default function UsagePage({ active }: PageProps) {
+  const refreshSignal = usePageRefresh("usage")
   const [rangeMode, setRangeMode] = useState<RangeMode>("today")
   const [customStart, setCustomStart] = useState(() => getLocalDateInput())
   const [customEnd, setCustomEnd] = useState(() => getLocalDateInput())
@@ -132,8 +134,14 @@ export default function UsagePage({ active }: PageProps) {
   const [shareLoading, setShareLoading] = useState(false)
   const [shareError, setShareError] = useState<string>()
   const running = useRef(false)
+  const refreshQueued = useRef(false)
+  const refreshRequested = useRef(false)
+  const requestVersion = useRef(0)
+  const initialized = useRef(false)
+  const lastQueryKey = useRef<string | undefined>(undefined)
+  const lastRefreshRevision = useRef<number | undefined>(undefined)
 
-  const selectedRange = useMemo(() => {
+  const getSelectedRange = useCallback(() => {
     if (rangeMode === "yesterday") return getLocalDayRange(1)
     if (rangeMode === "7") return getLocalRange(7)
     if (rangeMode === "custom") {
@@ -143,25 +151,48 @@ export default function UsagePage({ active }: PageProps) {
   }, [customEnd, customStart, rangeMode])
   const customRangeValid =
     rangeMode !== "custom" || Boolean(getLocalDateRange(customStart, customEnd))
-  const query = useMemo(
-    () => ({ range: selectedRange, groupBy }),
-    [groupBy, selectedRange]
+  const getQuery = useCallback(
+    () => ({ range: getSelectedRange(), groupBy }),
+    [getSelectedRange, groupBy]
   )
 
   const loadOverview = useCallback(
     async (refresh = false, silent = false) => {
-      if (running.current) return
+      if (running.current) {
+        refreshQueued.current = true
+        refreshRequested.current ||= refresh
+        return
+      }
       running.current = true
       if (!silent) {
         if (refresh) setRefreshing(true)
         else setLoading(true)
       }
       try {
-        const result = refresh
-          ? await call("refresh_usage", { query })
-          : await call("get_usage_overview", { query })
-        setOverview(result)
-        setError(undefined)
+        let result: UsageOverview | undefined
+        let shouldRefresh = refresh
+        do {
+          refreshQueued.current = false
+          refreshRequested.current = false
+          const version = ++requestVersion.current
+          const query = getQuery()
+          result = shouldRefresh
+            ? await call("refresh_usage", { query })
+            : await call("get_usage_overview", { query })
+          const latestQuery = getQuery()
+          const rangeStillMatches =
+            query.groupBy === latestQuery.groupBy &&
+            query.range.startAtMs === latestQuery.range.startAtMs &&
+            query.range.endAtMs === latestQuery.range.endAtMs
+          if (version === requestVersion.current && rangeStillMatches) {
+            setOverview(result)
+            setError(undefined)
+            if (shouldRefresh) {
+              refreshCoordinator.invalidate(["dashboard", "providers"])
+            }
+          }
+          shouldRefresh = refreshRequested.current
+        } while (refreshQueued.current)
         return result
       } catch (reason) {
         setError(String(reason))
@@ -174,7 +205,7 @@ export default function UsagePage({ active }: PageProps) {
         running.current = false
       }
     },
-    [query]
+    [getQuery]
   )
 
   const loadRules = useCallback(async () => {
@@ -203,15 +234,45 @@ export default function UsagePage({ active }: PageProps) {
 
   useEffect(() => {
     if (!active || !customRangeValid) return
+    const currentQuery = getQuery()
+    const queryKey = [
+      currentQuery.groupBy,
+      currentQuery.range.startAtMs,
+      currentQuery.range.endAtMs,
+    ].join(":")
+    const revisionChanged =
+      lastRefreshRevision.current !== refreshSignal.revision
+    if (
+      !revisionChanged &&
+      initialized.current &&
+      lastQueryKey.current === queryKey
+    ) {
+      return
+    }
+    lastRefreshRevision.current = refreshSignal.revision
+    lastQueryKey.current = queryKey
     const timeout = window.setTimeout(() => {
-      void Promise.all([
-        loadOverview().then(() => loadOverview(true, true)),
-        loadRules(),
-        loadOfficialCatalog(true),
-      ]).catch(() => undefined)
+      if (!initialized.current) {
+        initialized.current = true
+        void Promise.all([
+          loadOverview().then(() => loadOverview(true, true)),
+          loadRules(),
+          loadOfficialCatalog(true),
+        ]).catch(() => undefined)
+        return
+      }
+      void loadOverview(true, true).catch(() => undefined)
     }, 0)
     return () => window.clearTimeout(timeout)
-  }, [active, customRangeValid, loadOfficialCatalog, loadOverview, loadRules])
+  }, [
+    active,
+    customRangeValid,
+    getQuery,
+    loadOfficialCatalog,
+    loadOverview,
+    loadRules,
+    refreshSignal.revision,
+  ])
 
   useEffect(() => {
     if (!active || !customRangeValid) return
@@ -224,26 +285,22 @@ export default function UsagePage({ active }: PageProps) {
     }
     const startTimer = () => {
       if (timer === undefined && document.visibilityState === "visible") {
-        timer = window.setInterval(() => {
-          void loadOverview(true, true).catch(() => undefined)
+        timer = window.setTimeout(async () => {
+          await loadOverview(true, true).catch(() => undefined)
+          timer = undefined
+          startTimer()
         }, 30_000)
       }
     }
-    const refreshOnFocus = () => {
-      if (document.visibilityState === "visible") {
-        startTimer()
-        void loadOverview(true, true).catch(() => undefined)
-      } else {
-        stopTimer()
-      }
+    const handleVisibility = () => {
+      if (document.visibilityState === "visible") startTimer()
+      else stopTimer()
     }
-    window.addEventListener("focus", refreshOnFocus)
-    document.addEventListener("visibilitychange", refreshOnFocus)
+    document.addEventListener("visibilitychange", handleVisibility)
     startTimer()
     return () => {
       stopTimer()
-      window.removeEventListener("focus", refreshOnFocus)
-      document.removeEventListener("visibilitychange", refreshOnFocus)
+      document.removeEventListener("visibilitychange", handleVisibility)
     }
   }, [active, customRangeValid, loadOverview])
 
@@ -252,6 +309,7 @@ export default function UsagePage({ active }: PageProps) {
       await loadOverview(true)
       await loadRules()
       await loadOfficialCatalog(true)
+      refreshCoordinator.invalidate(["dashboard", "providers"])
       notify.success("用量已刷新", "已重新扫描本机 Codex rollout 文件。")
     } catch (reason) {
       notify.error("无法刷新本机用量", reason)
@@ -330,11 +388,12 @@ export default function UsagePage({ active }: PageProps) {
       }
       const saved = await call("save_pricing_rule", { input: quickRule })
       if (repriceAfterSave) {
-        await call("reprice_usage", { range: query.range })
+        await call("reprice_usage", { range: getQuery().range })
       }
       setPricingDraft(undefined)
       setPricingFieldErrors({})
       await Promise.all([loadRules(), loadOverview()])
+      refreshCoordinator.invalidate(["dashboard"])
       notify.success(
         "美元价格规则已保存",
         repriceAfterSave
@@ -357,6 +416,7 @@ export default function UsagePage({ active }: PageProps) {
       await call("delete_pricing_rule", { id: pendingDelete.id })
       setPendingDelete(undefined)
       await Promise.all([loadRules(), loadOverview()])
+      refreshCoordinator.invalidate(["dashboard"])
       notify.success(
         "美元价格规则已停用",
         "更新后新周期内未匹配其他规则的数据会显示为未配置价格。"
@@ -368,10 +428,19 @@ export default function UsagePage({ active }: PageProps) {
     }
   }
 
-  if (!overview && loading)
+  const currentRange = getSelectedRange()
+  const displayOverview =
+    overview &&
+    overview.range.startAtMs === currentRange.startAtMs &&
+    overview.range.endAtMs === currentRange.endAtMs
+      ? overview
+      : undefined
+  const hasStaleOverview = Boolean(overview && !displayOverview)
+
+  if (!displayOverview && (loading || hasStaleOverview))
     return <PageLoading label="正在读取本机 Token 用量" />
 
-  if (!overview) {
+  if (!displayOverview) {
     return (
       <Alert variant="destructive">
         <TriangleAlert />
@@ -404,11 +473,13 @@ export default function UsagePage({ active }: PageProps) {
   }
 
   const attentionTokens =
-    overview.totals.unpricedTokens +
-    overview.totals.partialTokens +
-    overview.totals.unattributedTokens
+    displayOverview.totals.unpricedTokens +
+    displayOverview.totals.partialTokens +
+    displayOverview.totals.unattributedTokens
   const hasWarnings =
-    overview.warnings.length > 0 || attentionTokens > 0 || Boolean(pricingError)
+    displayOverview.warnings.length > 0 ||
+    attentionTokens > 0 ||
+    Boolean(pricingError)
   const relayRules = rules.filter(
     (rule) =>
       rule.scopeKind === "provider_model" ||
@@ -422,8 +493,8 @@ export default function UsagePage({ active }: PageProps) {
         <AlertTitle>当前统计周期</AlertTitle>
         <AlertDescription>
           当前仅统计软件更新后产生的新用量
-          {overview.collectionStartedAtMs
-            ? ` · ${formatDateTime(overview.collectionStartedAtMs)} 起`
+          {displayOverview.collectionStartedAtMs
+            ? ` · ${formatDateTime(displayOverview.collectionStartedAtMs)} 起`
             : ""}
           。更新前的数据不计入当前周期。
         </AlertDescription>
@@ -583,24 +654,24 @@ export default function UsagePage({ active }: PageProps) {
           <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
             <MetricCard
               label="总 Token"
-              value={formatTokens(overview.totals.tokens.totalTokens)}
-              detail={`${formatTokenDetail(overview.totals.tokens)} · ${overview.totals.requests} 次调用`}
+              value={formatTokens(displayOverview.totals.tokens.totalTokens)}
+              detail={`${formatTokenDetail(displayOverview.totals.tokens)} · ${displayOverview.totals.requests} 次调用`}
               icon={Layers3}
             />
             <MetricCard
               label="模型调用"
-              value={overview.totals.requests}
-              detail={`统计范围 ${formatRangeLabel(overview.range)}`}
+              value={displayOverview.totals.requests}
+              detail={`统计范围 ${formatRangeLabel(displayOverview.range)}`}
               icon={Database}
             />
             <MetricCard
               label="估算费用"
               value={formatEstimatedUsd(
-                overview.totals.estimatedCostMicrousd,
-                overview.totals.unpricedTokens +
-                  overview.totals.partialTokens +
-                  overview.totals.unattributedTokens +
-                  overview.totals.subscriptionTokens
+                displayOverview.totals.estimatedCostMicrousd,
+                displayOverview.totals.unpricedTokens +
+                  displayOverview.totals.partialTokens +
+                  displayOverview.totals.unattributedTokens +
+                  displayOverview.totals.subscriptionTokens
               )}
               detail={"官方金额为参考估算，不代表套餐实际账单"}
               icon={DollarSign}
@@ -615,8 +686,8 @@ export default function UsagePage({ active }: PageProps) {
           <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-muted-foreground">
             <span className="inline-flex items-center gap-1.5">
               <CalendarDays className="size-3.5" aria-hidden="true" />
-              {formatRangeLabel(overview.range)} · 上次刷新{" "}
-              {formatDateTime(overview.lastRefreshedAtMs)}
+              {formatRangeLabel(displayOverview.range)} · 上次刷新{" "}
+              {formatDateTime(displayOverview.lastRefreshedAtMs)}
             </span>
             <span>
               {formatTimezone()} · 页面打开时自动刷新，之后每 30 秒扫描一次
@@ -631,32 +702,34 @@ export default function UsagePage({ active }: PageProps) {
           <AlertTitle>部分用量需要处理</AlertTitle>
           <AlertDescription>
             <div className="flex flex-col gap-1.5">
-              {overview.totals.unpricedTokens > 0 && (
+              {displayOverview.totals.unpricedTokens > 0 && (
                 <span>
-                  {formatTokens(overview.totals.unpricedTokens)} Token
+                  {formatTokens(displayOverview.totals.unpricedTokens)} Token
                   没有可用价格；可在下方添加 USD 规则后重新计算。
                 </span>
               )}
-              {overview.totals.unattributedTokens > 0 && (
+              {displayOverview.totals.unattributedTokens > 0 && (
                 <span>
-                  {formatTokens(overview.totals.unattributedTokens)} Token
-                  无法确认对应来源；程序不会强行归到当前账号。
+                  {formatTokens(displayOverview.totals.unattributedTokens)}{" "}
+                  Token 无法确认对应来源；程序不会强行归到当前账号。
                 </span>
               )}
-              {overview.totals.partialTokens > 0 && (
+              {displayOverview.totals.partialTokens > 0 && (
                 <span>
-                  {formatTokens(overview.totals.partialTokens)} Token
+                  {formatTokens(displayOverview.totals.partialTokens)} Token
                   的原始日志字段不完整，费用按保守规则处理。
                 </span>
               )}
               {pricingError && <span>价格规则读取失败：{pricingError}</span>}
-              {overview.warnings.length > 0 && (
+              {displayOverview.warnings.length > 0 && (
                 <ul className="list-disc pl-5">
-                  {overview.warnings.slice(0, 5).map((warning, index) => (
-                    <li key={`${warning.path ?? "warning"}-${index}`}>
-                      {warning.message}
-                    </li>
-                  ))}
+                  {displayOverview.warnings
+                    .slice(0, 5)
+                    .map((warning, index) => (
+                      <li key={`${warning.path ?? "warning"}-${index}`}>
+                        {warning.message}
+                      </li>
+                    ))}
                 </ul>
               )}
             </div>
@@ -696,7 +769,7 @@ export default function UsagePage({ active }: PageProps) {
           </CardAction>
         </CardHeader>
         <CardContent>
-          {overview.rows.length === 0 ? (
+          {displayOverview.rows.length === 0 ? (
             <Empty className="min-h-48 border">
               <EmptyHeader>
                 <EmptyMedia variant="icon">
@@ -744,7 +817,7 @@ export default function UsagePage({ active }: PageProps) {
                     </TableRow>
                   </TableHeader>
                   <TableBody>
-                    {overview.rows.map((row) => (
+                    {displayOverview.rows.map((row) => (
                       <TableRow
                         key={row.key}
                         className="cursor-pointer"
@@ -840,7 +913,7 @@ export default function UsagePage({ active }: PageProps) {
                 </Table>
               </div>
               <div className="flex flex-col gap-2 sm:hidden">
-                {overview.rows.map((row) => (
+                {displayOverview.rows.map((row) => (
                   <UsageRowCard
                     key={row.key}
                     row={row}

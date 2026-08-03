@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react"
+import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import {
   Check,
   Copy,
@@ -58,10 +58,12 @@ import { Spinner } from "@/components/ui/spinner"
 import { Textarea } from "@/components/ui/textarea"
 import { notify } from "@/lib/feedback"
 import { call } from "@/lib/ipc"
+import { refreshCoordinator, usePageRefresh } from "@/lib/refresh-coordinator"
 import { notifyRepairWarnings } from "@/lib/repair-feedback"
 import type { ConfigInspection, ConfigPatchPreview, PageProps } from "@/types"
 
 export default function SettingsPage({ active }: PageProps) {
+  const refreshSignal = usePageRefresh("settings")
   const [inspection, setInspection] = useState<ConfigInspection>()
   const [diagnostics, setDiagnostics] = useState<Record<string, unknown>>()
   const [canPreviewCustom, setCanPreviewCustom] = useState(false)
@@ -71,6 +73,7 @@ export default function SettingsPage({ active }: PageProps) {
   const [previewing, setPreviewing] = useState(false)
   const [applyingPreview, setApplyingPreview] = useState(false)
   const [switchingOfficial, setSwitchingOfficial] = useState(false)
+  const lastRefreshRevision = useRef<number | undefined>(undefined)
   const diagnosticsText = useMemo(
     () => JSON.stringify(diagnostics ?? {}, null, 2),
     [diagnostics]
@@ -85,12 +88,15 @@ export default function SettingsPage({ active }: PageProps) {
   }, [])
 
   useEffect(() => {
-    if (!active) return
+    if (!active || lastRefreshRevision.current === refreshSignal.revision) {
+      return
+    }
+    lastRefreshRevision.current = refreshSignal.revision
     const timeout = window.setTimeout(() => {
       void load().catch((reason) => setError(String(reason)))
     }, 0)
     return () => window.clearTimeout(timeout)
-  }, [active, load])
+  }, [active, load, refreshSignal.revision])
 
   if (error) {
     return (
@@ -141,6 +147,7 @@ export default function SettingsPage({ active }: PageProps) {
       await call("apply_activation", { operationId: preview.operationId })
       setPreview(undefined)
       notify.success("Codex 配置已更新")
+      refreshCoordinator.invalidate(["dashboard", "providers"])
       try {
         await load()
       } catch (reason) {
@@ -160,6 +167,7 @@ export default function SettingsPage({ active }: PageProps) {
       const repair = await call("activate_official")
       notify.success("Codex 已切换到 OpenAI")
       notifyRepairWarnings(repair)
+      refreshCoordinator.invalidate(["dashboard", "providers"])
       try {
         await load()
       } catch (reason) {

@@ -1,5 +1,7 @@
 import type { CostStatus, TokenBreakdown, UsageRange } from "@/types"
 
+import { getLocalDateKey } from "@/lib/local-time"
+
 const compactTokenFormatter = new Intl.NumberFormat("en-US", {
   maximumFractionDigits: 1,
 })
@@ -97,8 +99,7 @@ export function getLocalDateInput(daysAgo = 0) {
   const date = new Date()
   date.setHours(0, 0, 0, 0)
   date.setDate(date.getDate() - daysAgo)
-  const pad = (value: number) => String(value).padStart(2, "0")
-  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`
+  return getLocalDateKey(date)
 }
 
 export function getLocalDateRange(startDate: string, endDate: string) {

@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest"
+import { afterEach, describe, expect, it, vi } from "vitest"
 
 import {
   formatCostStatus,
@@ -10,6 +10,8 @@ import {
 } from "./usage-format"
 
 describe("usage formatting", () => {
+  afterEach(() => vi.useRealTimers())
+
   it("formats token counts into readable compact values", () => {
     expect(formatTokens(0)).toBe("0")
     expect(formatTokens(999)).toBe("999")
@@ -36,6 +38,18 @@ describe("usage formatting", () => {
     expect(range.endAtMs - range.startAtMs).toBeGreaterThanOrEqual(
       6 * 24 * 60 * 60 * 1_000
     )
+  })
+
+  it("recomputes relative ranges after local midnight", () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date("2026-08-03T23:59:50"))
+    const before = getLocalRange(1)
+
+    vi.setSystemTime(new Date("2026-08-04T00:00:20"))
+    const after = getLocalRange(1)
+
+    expect(after.startAtMs).toBeGreaterThan(before.startAtMs)
+    expect(new Date(after.startAtMs).getDate()).toBe(4)
   })
 
   it("accepts a valid inclusive local date range", () => {

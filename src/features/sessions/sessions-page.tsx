@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react"
+import { useCallback, useEffect, useRef, useState } from "react"
 import {
   ChevronLeft,
   ChevronRight,
@@ -65,6 +65,7 @@ import {
 import { call } from "@/lib/ipc"
 import { notify } from "@/lib/feedback"
 import { notifyRepairWarnings } from "@/lib/repair-feedback"
+import { refreshCoordinator, usePageRefresh } from "@/lib/refresh-coordinator"
 import { epochMilliseconds } from "@/lib/time"
 import type { PageProps, PageResult, RepairScan, Session } from "@/types"
 
@@ -99,6 +100,7 @@ function formatSessionTimestamp(value: number) {
 }
 
 export default function SessionsPage({ active }: PageProps) {
+  const refreshSignal = usePageRefresh("sessions")
   const [scan, setScan] = useState<RepairScan>()
   const [sessions, setSessions] = useState<PageResult<Session>>()
   const [page, setPage] = useState(1)
@@ -108,6 +110,9 @@ export default function SessionsPage({ active }: PageProps) {
   const [refreshing, setRefreshing] = useState(false)
   const [paging, setPaging] = useState(false)
   const [repairTarget, setRepairTarget] = useState<ManagedProvider>()
+  const loadedPage = useRef<number | undefined>(undefined)
+  const lastScanRevision = useRef<number | undefined>(undefined)
+  const lastSessionRevision = useRef<number | undefined>(undefined)
   const loadScan = useCallback(async () => {
     setScan(await call("scan_codex_data"))
   }, [])
@@ -134,22 +139,39 @@ export default function SessionsPage({ active }: PageProps) {
   }, [loadScan, loadSessions])
 
   useEffect(() => {
-    if (!active) return
+    if (!active || lastScanRevision.current === refreshSignal.revision) {
+      return
+    }
+    lastScanRevision.current = refreshSignal.revision
     const timeout = window.setTimeout(() => {
       void loadScan().catch((reason) => setError(String(reason)))
     }, 0)
     return () => window.clearTimeout(timeout)
-  }, [active, loadScan])
+  }, [active, loadScan, refreshSignal.revision])
 
   useEffect(() => {
-    if (!active) return
+    if (!active) {
+      return
+    }
+    const revisionChanged =
+      lastSessionRevision.current !== undefined &&
+      lastSessionRevision.current !== refreshSignal.revision
+    if (
+      !revisionChanged &&
+      lastSessionRevision.current === refreshSignal.revision &&
+      loadedPage.current === page
+    ) {
+      return
+    }
     const timeout = window.setTimeout(() => {
-      void loadSessions()
+      lastSessionRevision.current = refreshSignal.revision
+      loadedPage.current = page
+      void loadSessions(revisionChanged)
         .catch((reason) => setError(String(reason)))
         .finally(() => setPaging(false))
     }, 0)
     return () => window.clearTimeout(timeout)
-  }, [active, loadSessions])
+  }, [active, loadSessions, page, refreshSignal.revision])
 
   const retry = () => {
     setRefreshing(true)
@@ -221,6 +243,7 @@ export default function SessionsPage({ active }: PageProps) {
       )
       notifyRepairWarnings(result, "会话归属更新已完成")
       setRepairTarget(oppositeProvider(result.targetProvider))
+      refreshCoordinator.invalidate(["dashboard", "usage"])
       try {
         await refreshAll()
       } catch (reason) {
