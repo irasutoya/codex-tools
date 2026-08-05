@@ -33,12 +33,15 @@ class RefreshCoordinator {
   private readonly snapshots = new Map<Page, RefreshSnapshot>()
   private activity: ActivitySnapshot
   private midnightTimer: number | undefined
-  private activityListener: (() => void) | undefined
+  private cleanupActivity: (() => void) | undefined
   private started = false
+  // Tauri WebView 初次加载时 document.hasFocus() 可能一直返回 false，即使窗口已经聚焦；
+  // 因此初始乐观视为前台，之后由 focus/blur/visibilitychange 事件修正。
+  private windowFocused = true
 
   constructor() {
     const localDay = getLocalDateKey()
-    const foreground = isForeground()
+    const foreground = this.isForeground()
     this.activity = {
       foreground,
       backgroundSince: foreground ? undefined : Date.now(),
@@ -78,7 +81,17 @@ class RefreshCoordinator {
     if (this.started || typeof window === "undefined") return
     this.started = true
 
-    const handleActivity = () => this.updateForeground(isForeground())
+    const handleFocus = () => {
+      this.windowFocused = true
+      this.updateForeground(this.isForeground())
+    }
+    const handleBlur = () => {
+      this.windowFocused = false
+      this.updateForeground(this.isForeground())
+    }
+    const handleVisibility = () => {
+      this.updateForeground(this.isForeground())
+    }
 
     const scheduleMidnight = () => {
       this.midnightTimer = window.setTimeout(() => {
@@ -89,11 +102,17 @@ class RefreshCoordinator {
       }, millisecondsUntilNextLocalMidnight())
     }
 
-    this.activityListener = handleActivity
-    window.addEventListener("focus", handleActivity)
-    window.addEventListener("blur", handleActivity)
-    document.addEventListener("visibilitychange", handleActivity)
-    handleActivity()
+    window.addEventListener("focus", handleFocus)
+    window.addEventListener("blur", handleBlur)
+    document.addEventListener("visibilitychange", handleVisibility)
+    this.cleanupActivity = () => {
+      window.removeEventListener("focus", handleFocus)
+      window.removeEventListener("blur", handleBlur)
+      document.removeEventListener("visibilitychange", handleVisibility)
+    }
+    // 初次进入时同步一次真实状态（minimize 等场景），
+    // 但不主动将 document.hasFocus() 的不可靠初值覆盖乐观前台状态。
+    handleFocus()
     scheduleMidnight()
   }
 
@@ -104,12 +123,13 @@ class RefreshCoordinator {
       window.clearTimeout(this.midnightTimer)
       this.midnightTimer = undefined
     }
-    if (this.activityListener) {
-      window.removeEventListener("focus", this.activityListener)
-      window.removeEventListener("blur", this.activityListener)
-      document.removeEventListener("visibilitychange", this.activityListener)
-      this.activityListener = undefined
-    }
+    this.cleanupActivity?.()
+  }
+
+  private isForeground() {
+    if (typeof document === "undefined") return true
+    if (document.visibilityState === "hidden") return false
+    return this.windowFocused
   }
 
   private updateForeground(foreground: boolean) {
@@ -155,13 +175,5 @@ export function useAppForeground() {
     refreshCoordinator.subscribe,
     refreshCoordinator.getForeground,
     refreshCoordinator.getForeground
-  )
-}
-
-function isForeground() {
-  if (typeof document === "undefined") return true
-  return (
-    document.visibilityState === "visible" &&
-    (typeof document.hasFocus !== "function" || document.hasFocus())
   )
 }
