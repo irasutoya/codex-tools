@@ -20,10 +20,7 @@ impl ApiClient {
                     .build()
             })
             .map_err(|error| {
-                crate::AppError::Internal(format!(
-                    "无法初始化网络客户端：{}",
-                    error.without_url()
-                ))
+                crate::AppError::Internal(format!("无法初始化网络客户端：{}", error.without_url()))
             })
     }
 

@@ -168,11 +168,7 @@ pub(crate) async fn activate_provider(
     let preview = manager.preview_custom(&home, &provider, &account)?;
     let pending_id = crate::begin_activation(
         &ledger,
-        &crate::activation_for_provider(
-            &provider,
-            &account,
-            chrono::Utc::now().timestamp_millis(),
-        ),
+        &crate::activation_for_provider(&provider, &account, chrono::Utc::now().timestamp_millis()),
     )?;
     let result = async {
         manager.apply(&preview.operation_id)?;

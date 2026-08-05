@@ -1,11 +1,6 @@
 use crate::{
-    codex,
-    local_usage::UsageLedger,
-    models::*,
-    official_pricing,
-    record_current_activation,
-    state::ApiClient,
-    storage::Store,
+    codex, local_usage::UsageLedger, models::*, official_pricing, record_current_activation,
+    state::ApiClient, storage::Store,
 };
 use chrono::TimeZone;
 use tauri::State;
