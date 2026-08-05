@@ -39,22 +39,29 @@ const QUOTA_REFRESH_CONCURRENCY: usize = 4;
 #[derive(Default)]
 struct ActivationLock(tokio::sync::Mutex<()>);
 
-struct ApiClient(reqwest::Client);
+#[derive(Default)]
+struct ApiClient(network::ClientCache);
 
-impl Default for ApiClient {
-    fn default() -> Self {
-        Self(
-            network::client_builder()
-                .expect("无法读取系统代理设置")
-                .redirect(reqwest::redirect::Policy::none())
-                .connect_timeout(std::time::Duration::from_secs(30))
-                .timeout(std::time::Duration::from_secs(60))
-                .pool_max_idle_per_host(4)
-                .pool_idle_timeout(std::time::Duration::from_secs(90))
-                .tcp_keepalive(std::time::Duration::from_secs(60))
-                .build()
-                .expect("无法初始化 HTTP 客户端"),
-        )
+impl ApiClient {
+    fn current(&self) -> Result<reqwest::Client, AppError> {
+        self.0
+            .current(|builder| {
+                builder
+                    .redirect(reqwest::redirect::Policy::none())
+                    .connect_timeout(std::time::Duration::from_secs(30))
+                    .timeout(std::time::Duration::from_secs(60))
+                    .pool_max_idle_per_host(4)
+                    .pool_idle_timeout(std::time::Duration::from_secs(90))
+                    .tcp_keepalive(std::time::Duration::from_secs(60))
+                    .build()
+            })
+            .map_err(|error| {
+                AppError::Internal(format!("无法初始化网络客户端：{}", error.without_url()))
+            })
+    }
+
+    fn invalidate(&self) {
+        self.0.invalidate();
     }
 }
 
@@ -122,7 +129,8 @@ async fn refresh_official_pricing_catalog(
     if url.host_str() != Some("developers.openai.com") || url.scheme() != "https" {
         return Err(AppError::Internal("官方价格地址域名校验失败。".into()));
     }
-    let mut request = client.0.get(url).timeout(std::time::Duration::from_secs(8));
+    let http = client.current()?;
+    let mut request = http.get(url).timeout(std::time::Duration::from_secs(8));
     if let Some(cached) = cached.as_ref() {
         if let Some(etag) = cached.etag.as_deref() {
             request = request.header(reqwest::header::IF_NONE_MATCH, etag);
@@ -316,7 +324,14 @@ async fn refresh_official_quota(
             return store.save_official_account_quota(account_id, snapshot);
         }
     };
-    match official_quota::fetch_quota(&client.0, &account).await {
+    let http = client.current()?;
+    let mut quota_result = official_quota::fetch_quota(&http, &account).await;
+    if matches!(&quota_result, Err(error) if error.is_retryable()) {
+        client.invalidate();
+        let retry_http = client.current()?;
+        quota_result = official_quota::fetch_quota(&retry_http, &account).await;
+    }
+    match quota_result {
         Ok(data) => {
             snapshot.status = QuotaStatus::Success;
             snapshot.data = Some(data);
@@ -457,8 +472,8 @@ async fn test_provider(
         ));
     }
     let endpoint = models_endpoint(&provider.base_url);
-    let mut request = client
-        .0
+    let http = client.current()?;
+    let mut request = http
         .get(&endpoint)
         .headers(custom_headers(&provider, &account)?);
     let key = account.api_key.as_deref().unwrap_or_default();

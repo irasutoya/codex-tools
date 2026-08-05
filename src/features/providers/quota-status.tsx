@@ -36,6 +36,9 @@ export function QuotaStatusView({ quota }: { quota?: AccountQuota }) {
             更新于 {formatTimestamp(quota.fetchedAt)}
           </span>
         )}
+        {!successful && quota?.lastAttemptAt && (
+          <span>上次尝试于 {formatTimestamp(quota.lastAttemptAt)}</span>
+        )}
       </div>
       {rows.length > 0 && (
         <>

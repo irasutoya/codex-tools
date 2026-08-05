@@ -140,35 +140,39 @@ export default function DashboardPage({ active }: PageProps) {
     }
   }
 
-  const refresh = async () => {
-    setRefreshing(true)
-    try {
-      await load()
-      notify.success("状态已更新")
-    } catch (reason) {
-      notify.error("无法更新状态", reason)
-    } finally {
-      setRefreshing(false)
-    }
-  }
-
   const refreshQuota = async () => {
-    if (!activeAccountId) return
+    if (!activeAccountId) return true
     setQuotaRefreshing(true)
     try {
       const quota = await runQuotaRefresh(activeAccountId, refreshQuotaData)
       if (quota.status === "success") {
         notify.success("当前账号额度已更新")
+        return true
       } else {
         notify.warning(
           "当前账号额度未更新",
           quota.error ?? "OpenAI 暂未返回额度。"
         )
+        return false
       }
     } catch (reason) {
       notify.error("无法刷新当前账号额度", reason)
+      return false
     } finally {
       setQuotaRefreshing(false)
+    }
+  }
+
+  const refresh = async () => {
+    setRefreshing(true)
+    try {
+      await load()
+      const quotaUpdated = await refreshQuota()
+      notify.success(quotaUpdated ? "状态和额度已更新" : "状态已更新")
+    } catch (reason) {
+      notify.error("无法更新状态", reason)
+    } finally {
+      setRefreshing(false)
     }
   }
 
@@ -320,7 +324,7 @@ export default function DashboardPage({ active }: PageProps) {
             ) : (
               <RefreshCw data-icon="inline-start" />
             )}
-            {refreshing ? "正在刷新…" : "刷新状态"}
+            {refreshing ? "正在刷新…" : "刷新状态和额度"}
           </Button>
           {data.activeKind === "official" && data.activeAccountId && (
             <Button

@@ -1,4 +1,16 @@
 use reqwest::{Client, ClientBuilder, NoProxy, Proxy};
+use std::sync::Mutex;
+
+const PROXY_ENV_NAMES: [&str; 8] = [
+    "ALL_PROXY",
+    "all_proxy",
+    "HTTPS_PROXY",
+    "https_proxy",
+    "HTTP_PROXY",
+    "http_proxy",
+    "NO_PROXY",
+    "no_proxy",
+];
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct SystemProxy {
@@ -7,26 +19,89 @@ struct SystemProxy {
     bypass: Vec<String>,
 }
 
-pub fn client_builder() -> Result<ClientBuilder, reqwest::Error> {
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct ProxySnapshot {
+    environment: Vec<(String, Option<String>)>,
+    platform: Option<SystemProxy>,
+}
+
+#[derive(Default)]
+pub(crate) struct ClientCache {
+    cached: Mutex<Option<CachedClient>>,
+}
+
+struct CachedClient {
+    snapshot: ProxySnapshot,
+    client: Client,
+}
+
+impl ClientCache {
+    pub(crate) fn current<F>(&self, configure: F) -> Result<Client, reqwest::Error>
+    where
+        F: FnOnce(ClientBuilder) -> Result<Client, reqwest::Error>,
+    {
+        self.current_for_snapshot(proxy_snapshot(), configure)
+    }
+
+    pub(crate) fn invalidate(&self) {
+        self.cached.lock().expect("网络客户端缓存锁已损坏").take();
+    }
+
+    fn current_for_snapshot<F>(
+        &self,
+        snapshot: ProxySnapshot,
+        configure: F,
+    ) -> Result<Client, reqwest::Error>
+    where
+        F: FnOnce(ClientBuilder) -> Result<Client, reqwest::Error>,
+    {
+        let mut cached = self.cached.lock().expect("网络客户端缓存锁已损坏");
+        if cached
+            .as_ref()
+            .is_some_and(|cached| cached.snapshot == snapshot)
+        {
+            return Ok(cached
+                .as_ref()
+                .expect("客户端缓存刚刚检查过")
+                .client
+                .clone());
+        }
+
+        let client = configure(client_builder_for(&snapshot)?)?;
+        *cached = Some(CachedClient {
+            snapshot,
+            client: client.clone(),
+        });
+        Ok(client)
+    }
+}
+
+fn proxy_snapshot() -> ProxySnapshot {
+    ProxySnapshot {
+        environment: PROXY_ENV_NAMES
+            .iter()
+            .map(|name| ((*name).to_owned(), std::env::var(name).ok()))
+            .collect(),
+        platform: platform_proxy(),
+    }
+}
+
+fn client_builder_for(snapshot: &ProxySnapshot) -> Result<ClientBuilder, reqwest::Error> {
     let builder = Client::builder();
-    if environment_proxy_configured() {
+    if environment_proxy_configured(snapshot) {
         return Ok(builder);
     }
 
-    apply_system_proxy(builder, platform_proxy())
+    apply_system_proxy(builder, snapshot.platform.clone())
 }
 
-fn environment_proxy_configured() -> bool {
-    [
-        "ALL_PROXY",
-        "all_proxy",
-        "HTTPS_PROXY",
-        "https_proxy",
-        "HTTP_PROXY",
-        "http_proxy",
-    ]
-    .into_iter()
-    .any(|name| std::env::var_os(name).is_some_and(|value| !value.is_empty()))
+fn environment_proxy_configured(snapshot: &ProxySnapshot) -> bool {
+    snapshot.environment.iter().any(|(name, value)| {
+        matches!(
+            name.as_str(),
+            "ALL_PROXY" | "all_proxy" | "HTTPS_PROXY" | "https_proxy" | "HTTP_PROXY" | "http_proxy"
+        ) && value.as_ref().is_some_and(|value| !value.is_empty())
+    })
 }
 
 fn apply_system_proxy(
@@ -248,5 +323,37 @@ mod tests {
                 .and_then(ClientBuilder::build)
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn rebuilds_cached_client_when_proxy_snapshot_changes() {
+        let cache = ClientCache::default();
+        let mut builds = 0;
+        let direct = ProxySnapshot::default();
+        let proxied = ProxySnapshot {
+            platform: Some(parse_proxy_server("127.0.0.1:7890")),
+            ..direct.clone()
+        };
+
+        cache
+            .current_for_snapshot(direct.clone(), |_| {
+                builds += 1;
+                Client::builder().build()
+            })
+            .unwrap();
+        cache
+            .current_for_snapshot(direct, |_| {
+                builds += 1;
+                Client::builder().build()
+            })
+            .unwrap();
+        cache
+            .current_for_snapshot(proxied, |_| {
+                builds += 1;
+                Client::builder().build()
+            })
+            .unwrap();
+
+        assert_eq!(builds, 2);
     }
 }
