@@ -1,16 +1,23 @@
-import { lazy, Suspense, useRef, useState, type CSSProperties } from "react"
 import {
-  Check,
-  FileCheck2,
-  KeyRound,
-  LayoutDashboard,
-  MessagesSquare,
-  Monitor,
-  Moon,
-  ShieldCheck,
-  Sun,
-  type LucideIcon,
-} from "lucide-react"
+  lazy,
+  memo,
+  Suspense,
+  useRef,
+  useState,
+  type CSSProperties,
+} from "react"
+import {
+  CheckIcon,
+  FileCheckIcon,
+  Key01Icon,
+  DashboardSquare01Icon,
+  Message01Icon,
+  MonitorDotIcon,
+  Moon02Icon,
+  Shield01Icon,
+  Sun03Icon,
+} from "@hugeicons/core-free-icons"
+import { HugeiconsIcon } from "@hugeicons/react"
 import { useTheme } from "next-themes"
 
 import { PageHeader } from "@/components/page-header"
@@ -49,17 +56,17 @@ const pageLoaders = {
 }
 
 const pages = {
-  dashboard: lazy(pageLoaders.dashboard),
-  providers: lazy(pageLoaders.providers),
-  sessions: lazy(pageLoaders.sessions),
-  settings: lazy(pageLoaders.settings),
+  dashboard: memo(lazy(pageLoaders.dashboard)),
+  providers: memo(lazy(pageLoaders.providers)),
+  sessions: memo(lazy(pageLoaders.sessions)),
+  settings: memo(lazy(pageLoaders.settings)),
 }
 
 type NavigationItem = {
   id: Page
   label: string
   description: string
-  icon: LucideIcon
+  icon: typeof CheckIcon
 }
 
 const navigation: NavigationItem[] = [
@@ -67,25 +74,25 @@ const navigation: NavigationItem[] = [
     id: "dashboard",
     label: "概览",
     description: "查看当前连接、账号额度和本机会话状态",
-    icon: LayoutDashboard,
+    icon: DashboardSquare01Icon,
   },
   {
     id: "providers",
     label: "账号与服务",
     description: "管理 OpenAI 账号与兼容 Responses API 的第三方服务",
-    icon: KeyRound,
+    icon: Key01Icon,
   },
   {
     id: "sessions",
     label: "历史会话",
     description: "查看本机会话，并仅在需要时更新连接归属",
-    icon: MessagesSquare,
+    icon: Message01Icon,
   },
   {
     id: "settings",
     label: "配置",
     description: "检查本机 Codex 配置，并在写入前预览变更",
-    icon: FileCheck2,
+    icon: FileCheckIcon,
   },
 ]
 
@@ -199,7 +206,7 @@ function AppSidebar({
                       onPointerEnter={() => void pageLoaders[item.id]()}
                       onClick={() => onNavigate(item.id)}
                     >
-                      <Icon aria-hidden="true" />
+                      <HugeiconsIcon icon={Icon} aria-hidden="true" />
                       <span>{item.label}</span>
                     </SidebarMenuButton>
                   </SidebarMenuItem>
@@ -211,8 +218,8 @@ function AppSidebar({
       </SidebarContent>
 
       <SidebarFooter>
-        <div className="flex items-start gap-2 rounded-lg bg-sidebar-accent px-3 py-3 text-xs leading-relaxed text-muted-foreground">
-          <ShieldCheck className="mt-0.5 size-4 shrink-0" aria-hidden="true" />
+        <div className="flex items-start gap-2 rounded-lg bg-sidebar-accent px-3 py-3 text-xs leading-relaxed text-muted-foreground [&_svg]:mt-0.5 [&_svg]:size-4 [&_svg]:shrink-0">
+          <HugeiconsIcon icon={Shield01Icon} aria-hidden="true" />
           <span>凭据仅保存在这台设备上</span>
         </div>
       </SidebarFooter>
@@ -221,15 +228,15 @@ function AppSidebar({
 }
 
 const themeOptions = [
-  { id: "system", label: "跟随系统", icon: Monitor },
-  { id: "light", label: "浅色", icon: Sun },
-  { id: "dark", label: "深色", icon: Moon },
+  { id: "system", label: "跟随系统", icon: MonitorDotIcon },
+  { id: "light", label: "浅色", icon: Sun03Icon },
+  { id: "dark", label: "深色", icon: Moon02Icon },
 ] as const
 
 function ThemeMenu() {
   const { theme = "system", setTheme } = useTheme()
   const current = themeOptions.find((option) => option.id === theme)
-  const CurrentIcon = current?.icon ?? Monitor
+  const CurrentIcon = current?.icon ?? MonitorDotIcon
 
   return (
     <DropdownMenu>
@@ -243,7 +250,7 @@ function ThemeMenu() {
           />
         }
       >
-        <CurrentIcon data-icon="inline-start" />
+        <HugeiconsIcon icon={CurrentIcon} data-icon="inline-start" />
       </DropdownMenuTrigger>
       <DropdownMenuContent align="end" className="w-40">
         <DropdownMenuGroup>
@@ -254,10 +261,14 @@ function ThemeMenu() {
                 key={option.id}
                 onClick={() => setTheme(option.id)}
               >
-                <Icon aria-hidden="true" />
+                <HugeiconsIcon icon={Icon} aria-hidden="true" />
                 <span>{option.label}</span>
                 {theme === option.id && (
-                  <Check className="ml-auto" aria-hidden="true" />
+                  <HugeiconsIcon
+                    icon={CheckIcon}
+                    className="ml-auto"
+                    aria-hidden="true"
+                  />
                 )}
               </DropdownMenuItem>
             )

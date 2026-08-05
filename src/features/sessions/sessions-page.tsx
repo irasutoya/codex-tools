@@ -1,16 +1,17 @@
-import { useCallback, useEffect, useState } from "react"
+import { useCallback, useEffect, useRef, useState } from "react"
 import {
-  ChevronLeft,
-  ChevronRight,
-  Database,
-  FileText,
-  Info,
-  MessagesSquare,
-  RefreshCw,
-  ScanSearch,
-  Wrench,
-  TriangleAlert,
-} from "lucide-react"
+  Database01Icon,
+  File01Icon,
+  InformationCircleIcon,
+  Message01Icon,
+  Refresh01Icon,
+  AiSearchIcon,
+  ScanIcon,
+  Alert01Icon,
+  Wrench01Icon,
+  Cancel01Icon,
+} from "@hugeicons/core-free-icons"
+import { HugeiconsIcon } from "@hugeicons/react"
 
 import { ErrorDetails } from "@/components/error-details"
 import { MetricCard } from "@/components/metric-card"
@@ -53,6 +54,19 @@ import {
   ItemGroup,
   ItemTitle,
 } from "@/components/ui/item"
+import {
+  InputGroup,
+  InputGroupAddon,
+  InputGroupButton,
+  InputGroupInput,
+} from "@/components/ui/input-group"
+import {
+  Pagination,
+  PaginationContent,
+  PaginationItem,
+  PaginationNext,
+  PaginationPrevious,
+} from "@/components/ui/pagination"
 import { Spinner } from "@/components/ui/spinner"
 import {
   Table,
@@ -65,15 +79,10 @@ import {
 import { call } from "@/lib/ipc"
 import { notify } from "@/lib/feedback"
 import { notifyRepairWarnings } from "@/lib/repair-feedback"
-import { epochMilliseconds } from "@/lib/time"
+import { formatDateTime } from "@/lib/time"
 import type { PageProps, PageResult, RepairScan, Session } from "@/types"
 
 type ManagedProvider = "openai" | "custom"
-
-const sessionTimestampFormatter = new Intl.DateTimeFormat("zh-CN", {
-  dateStyle: "short",
-  timeStyle: "medium",
-})
 
 function oppositeProvider(provider: string): ManagedProvider {
   return provider === "custom" ? "openai" : "custom"
@@ -91,47 +100,60 @@ function sourceLabel(source: string) {
   return source
 }
 
-function formatSessionTimestamp(value: number) {
-  const date = new Date(epochMilliseconds(value))
-  return Number.isNaN(date.getTime())
-    ? "时间未知"
-    : sessionTimestampFormatter.format(date)
-}
-
 export default function SessionsPage({ active }: PageProps) {
   const [scan, setScan] = useState<RepairScan>()
   const [sessions, setSessions] = useState<PageResult<Session>>()
   const [page, setPage] = useState(1)
+  const [query, setQuery] = useState("")
+  const [debouncedQuery, setDebouncedQuery] = useState("")
   const [confirming, setConfirming] = useState(false)
   const [error, setError] = useState<string>()
   const [busy, setBusy] = useState(false)
   const [refreshing, setRefreshing] = useState(false)
   const [paging, setPaging] = useState(false)
   const [repairTarget, setRepairTarget] = useState<ManagedProvider>()
+  const requestSeq = useRef(0)
+  const currentPageRef = useRef(1)
   const loadScan = useCallback(async () => {
     setScan(await call("scan_codex_data"))
   }, [])
   const loadSessions = useCallback(
-    async (refresh = false) => {
-      const result = await call("list_sessions", {
-        page,
-        pageSize: 50,
-        refresh,
-      })
-      const lastPage = Math.max(1, Math.ceil(result.total / result.pageSize))
-      if (page > lastPage) {
-        setPaging(true)
-        setPage(lastPage)
-        return
+    async (targetPage: number, refresh = false, search = "") => {
+      const requestId = ++requestSeq.current
+      currentPageRef.current = targetPage
+      try {
+        const result = await call("list_sessions", {
+          query: search.trim() || undefined,
+          page: targetPage,
+          pageSize: 50,
+          refresh,
+        })
+        if (requestId !== requestSeq.current) return
+        const lastPage = Math.max(1, Math.ceil(result.total / result.pageSize))
+        if (targetPage > lastPage) {
+          setPaging(true)
+          setPage(lastPage)
+          return
+        }
+        setSessions(result)
+        setPage(targetPage)
+        setPaging(false)
+      } catch (error) {
+        if (requestId === requestSeq.current) {
+          setPaging(false)
+          throw error
+        }
       }
-      setSessions(result)
     },
-    [page]
+    []
   )
   const refreshAll = useCallback(async () => {
-    await Promise.all([loadScan(), loadSessions(true)])
+    await Promise.all([
+      loadScan(),
+      loadSessions(currentPageRef.current, true, debouncedQuery),
+    ])
     setError(undefined)
-  }, [loadScan, loadSessions])
+  }, [debouncedQuery, loadScan, loadSessions])
 
   useEffect(() => {
     if (!active) return
@@ -144,12 +166,25 @@ export default function SessionsPage({ active }: PageProps) {
   useEffect(() => {
     if (!active) return
     const timeout = window.setTimeout(() => {
-      void loadSessions()
-        .catch((reason) => setError(String(reason)))
-        .finally(() => setPaging(false))
+      const nextQuery = query.trim()
+      if (nextQuery !== debouncedQuery) {
+        setPaging(true)
+        setPage(1)
+        setDebouncedQuery(nextQuery)
+      }
+    }, 300)
+    return () => window.clearTimeout(timeout)
+  }, [active, debouncedQuery, query])
+
+  useEffect(() => {
+    if (!active) return
+    const timeout = window.setTimeout(() => {
+      void loadSessions(page, false, debouncedQuery).catch((reason) => {
+        setError(String(reason))
+      })
     }, 0)
     return () => window.clearTimeout(timeout)
-  }, [active, loadSessions])
+  }, [active, debouncedQuery, page, loadSessions])
 
   const retry = () => {
     setRefreshing(true)
@@ -169,7 +204,7 @@ export default function SessionsPage({ active }: PageProps) {
   if (error) {
     return (
       <Alert variant="destructive">
-        <TriangleAlert />
+        <HugeiconsIcon icon={Alert01Icon} />
         <AlertTitle>无法读取历史会话</AlertTitle>
         <AlertDescription>
           <ErrorDetails
@@ -179,7 +214,10 @@ export default function SessionsPage({ active }: PageProps) {
                 {refreshing ? (
                   <Spinner data-icon="inline-start" aria-hidden="true" />
                 ) : (
-                  <RefreshCw data-icon="inline-start" />
+                  <HugeiconsIcon
+                    icon={Refresh01Icon}
+                    data-icon="inline-start"
+                  />
                 )}
                 {refreshing ? "重试中…" : "重试"}
               </Button>
@@ -244,44 +282,74 @@ export default function SessionsPage({ active }: PageProps) {
           title="本机会话"
           description="仅统计当前 Codex 配置目录中的会话文件和数据库。"
           actions={
-            <Button
-              size="sm"
-              variant="outline"
-              disabled={controlsDisabled}
-              onClick={refresh}
-            >
-              {refreshing ? (
-                <Spinner data-icon="inline-start" aria-hidden="true" />
-              ) : (
-                <RefreshCw data-icon="inline-start" />
-              )}
-              {refreshing ? "刷新中…" : "刷新"}
-            </Button>
+            <div className="flex flex-wrap items-center gap-2">
+              <InputGroup className="w-full sm:w-64">
+                <InputGroupAddon align="inline-start">
+                  <HugeiconsIcon icon={AiSearchIcon} />
+                </InputGroupAddon>
+                <InputGroupInput
+                  type="search"
+                  value={query}
+                  onChange={(event) => setQuery(event.target.value)}
+                  placeholder="搜索标题或项目"
+                  aria-label="搜索会话"
+                  disabled={controlsDisabled}
+                />
+                {query && (
+                  <InputGroupAddon align="inline-end">
+                    <InputGroupButton
+                      size="icon-xs"
+                      aria-label="清空搜索"
+                      title="清空搜索"
+                      onClick={() => setQuery("")}
+                    >
+                      <HugeiconsIcon icon={Cancel01Icon} />
+                    </InputGroupButton>
+                  </InputGroupAddon>
+                )}
+              </InputGroup>
+              <Button
+                size="sm"
+                variant="outline"
+                disabled={controlsDisabled}
+                onClick={refresh}
+              >
+                {refreshing ? (
+                  <Spinner data-icon="inline-start" aria-hidden="true" />
+                ) : (
+                  <HugeiconsIcon
+                    icon={Refresh01Icon}
+                    data-icon="inline-start"
+                  />
+                )}
+                {refreshing ? "刷新中…" : "刷新"}
+              </Button>
+            </div>
           }
         />
         <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
           <MetricCard
             label="会话总数"
             value={sessions.total}
-            icon={MessagesSquare}
+            icon={Message01Icon}
             detail="本机可查看的会话"
           />
           <MetricCard
             label="连接归属"
             value={scan.sessionMetaCount}
-            icon={ScanSearch}
+            icon={ScanIcon}
             detail={`配置当前使用 ${providerLabel(scan.currentProvider)}`}
           />
           <MetricCard
             label="会话文件"
             value={scan.rolloutFiles}
-            icon={FileText}
+            icon={File01Icon}
             detail="Codex 保存的对话文件"
           />
           <MetricCard
             label="数据库文件"
             value={scan.databases.length}
-            icon={Database}
+            icon={Database01Icon}
             detail="Codex 保存的会话数据库"
           />
         </div>
@@ -289,7 +357,7 @@ export default function SessionsPage({ active }: PageProps) {
 
       {scan.warnings.length > 0 && (
         <Alert>
-          <TriangleAlert />
+          <HugeiconsIcon icon={Alert01Icon} />
           <AlertTitle>部分会话数据未能检查</AlertTitle>
           <AlertDescription>
             <ErrorDetails error={scan.warnings.join("\n")}>
@@ -312,7 +380,7 @@ export default function SessionsPage({ active }: PageProps) {
         </CardHeader>
         <CardContent className="flex flex-col gap-4">
           <Alert>
-            <Info />
+            <HugeiconsIcon icon={InformationCircleIcon} />
             <AlertTitle>只更新归属信息</AlertTitle>
             <AlertDescription>
               只修改本机元数据中的连接标记，不读取或上传对话正文。若文件同时被
@@ -350,7 +418,7 @@ export default function SessionsPage({ active }: PageProps) {
             {busy ? (
               <Spinner data-icon="inline-start" aria-hidden="true" />
             ) : (
-              <Wrench data-icon="inline-start" />
+              <HugeiconsIcon icon={Wrench01Icon} data-icon="inline-start" />
             )}
             {busy ? "更新中…" : "更新归属"}
           </Button>
@@ -366,7 +434,7 @@ export default function SessionsPage({ active }: PageProps) {
         </CardHeader>
         <CardContent className="min-w-0 overflow-x-auto">
           {sessions.items.length ? (
-            <Table>
+            <Table aria-label="历史会话列表">
               <TableHeader>
                 <TableRow>
                   <TableHead>标题</TableHead>
@@ -396,21 +464,25 @@ export default function SessionsPage({ active }: PageProps) {
                       {session.cwd}
                     </TableCell>
                     <TableCell className="whitespace-nowrap tabular-nums">
-                      {formatSessionTimestamp(session.updatedAt)}
+                      {formatDateTime(session.updatedAt, "compact")}
                     </TableCell>
                   </TableRow>
                 ))}
               </TableBody>
             </Table>
           ) : (
-            <Empty className="min-h-52 border border-dashed">
+            <Empty className="min-h-52 border">
               <EmptyHeader>
                 <EmptyMedia variant="icon">
-                  <MessagesSquare />
+                  <HugeiconsIcon icon={Message01Icon} />
                 </EmptyMedia>
-                <EmptyTitle>暂无历史会话</EmptyTitle>
+                <EmptyTitle>
+                  {debouncedQuery ? "未找到匹配会话" : "暂无历史会话"}
+                </EmptyTitle>
                 <EmptyDescription>
-                  当前 Codex 配置目录中没有找到会话记录。
+                  {debouncedQuery
+                    ? `没有找到标题或项目包含“${debouncedQuery}”的会话。`
+                    : "当前 Codex 配置目录中没有找到会话记录。"}
                 </EmptyDescription>
               </EmptyHeader>
             </Empty>
@@ -427,37 +499,33 @@ export default function SessionsPage({ active }: PageProps) {
                 第 {sessions.page} / {totalPages} 页 · 共 {sessions.total} 项
               </span>
             </div>
-            <div className="flex items-center gap-1">
-              <Button
-                size="icon-sm"
-                variant="outline"
-                disabled={controlsDisabled || sessions.page <= 1}
-                aria-label="上一页"
-                title="上一页"
-                onClick={() => {
-                  setPaging(true)
-                  setPage(Math.max(1, sessions.page - 1))
-                }}
-              >
-                <ChevronLeft data-icon="inline-start" />
-              </Button>
-              <Button
-                size="icon-sm"
-                variant="outline"
-                disabled={
-                  controlsDisabled ||
-                  sessions.page * sessions.pageSize >= sessions.total
-                }
-                aria-label="下一页"
-                title="下一页"
-                onClick={() => {
-                  setPaging(true)
-                  setPage(sessions.page + 1)
-                }}
-              >
-                <ChevronRight data-icon="inline-start" />
-              </Button>
-            </div>
+            <Pagination className="m-0 w-fit">
+              <PaginationContent>
+                <PaginationItem>
+                  <PaginationPrevious
+                    text="上一页"
+                    disabled={controlsDisabled || sessions.page <= 1}
+                    onClick={() => {
+                      setPaging(true)
+                      setPage(Math.max(1, sessions.page - 1))
+                    }}
+                  />
+                </PaginationItem>
+                <PaginationItem>
+                  <PaginationNext
+                    text="下一页"
+                    disabled={
+                      controlsDisabled ||
+                      sessions.page * sessions.pageSize >= sessions.total
+                    }
+                    onClick={() => {
+                      setPaging(true)
+                      setPage(sessions.page + 1)
+                    }}
+                  />
+                </PaginationItem>
+              </PaginationContent>
+            </Pagination>
           </CardFooter>
         )}
       </Card>

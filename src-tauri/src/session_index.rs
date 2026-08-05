@@ -1,6 +1,10 @@
-use crate::{models::SessionSummary, provider_sync};
+use crate::{
+    models::{AppError, PageResult, SessionSummary},
+    provider_sync,
+};
 use serde_json::Value;
 use std::{
+    borrow::Cow,
     collections::HashMap,
     fs,
     io::{BufRead, Read},
@@ -25,6 +29,7 @@ struct CachedIndex {
     home: PathBuf,
     sources: Vec<SourceStamp>,
     sessions: Arc<Vec<SessionSummary>>,
+    database_count: usize,
     checked_at: Instant,
 }
 
@@ -53,9 +58,16 @@ impl SessionIndex {
     }
 
     pub fn load(&self, codex_home: &Path) -> anyhow::Result<Arc<Vec<SessionSummary>>> {
+        Ok(self.load_with_database_count(codex_home)?.0)
+    }
+
+    pub fn load_with_database_count(
+        &self,
+        codex_home: &Path,
+    ) -> anyhow::Result<(Arc<Vec<SessionSummary>>, usize)> {
         let (database_paths, rollout_paths, sources) = session_sources(codex_home);
         let checked_at = Instant::now();
-        if let Some(sessions) = self
+        if let Some((sessions, database_count)) = self
             .cache
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -63,23 +75,26 @@ impl SessionIndex {
             .filter(|cache| cache.home == codex_home && cache.sources == sources)
             .map(|cache| {
                 cache.checked_at = checked_at;
-                cache.sessions.clone()
+                (cache.sessions.clone(), cache.database_count)
             })
         {
-            return Ok(sessions);
+            return Ok((sessions, database_count));
         }
 
         let sessions = Arc::new(rebuild_from_paths(&database_paths, &rollout_paths)?);
+        let database_count = database_paths.len();
+        let result = (sessions.clone(), database_count);
         *self
             .cache
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(CachedIndex {
             home: codex_home.to_path_buf(),
             sources,
-            sessions: sessions.clone(),
+            sessions,
+            database_count,
             checked_at,
         });
-        Ok(sessions)
+        Ok(result)
     }
 
     pub fn invalidate(&self) {
@@ -237,8 +252,84 @@ fn rebuild_from_paths(
     Ok(output)
 }
 
+pub fn session_page(
+    index: &SessionIndex,
+    home: &Path,
+    query: &str,
+    page: usize,
+    page_size: usize,
+) -> Result<PageResult<SessionSummary>, AppError> {
+    let sessions = index.load_recent(home)?;
+    let query = query.trim();
+    let normalized_query = if query.is_ascii() {
+        Cow::Borrowed(query)
+    } else {
+        Cow::Owned(query.to_lowercase())
+    };
+    let query = normalized_query.as_ref();
+    let start = (page - 1).saturating_mul(page_size);
+    if query.is_empty() {
+        return Ok(PageResult {
+            items: sessions
+                .iter()
+                .skip(start)
+                .take(page_size)
+                .cloned()
+                .collect(),
+            total: sessions.len(),
+            page,
+            page_size,
+        });
+    }
+    let mut total = 0;
+    let mut items = Vec::with_capacity(page_size);
+    for session in sessions.iter() {
+        if !session_matches_query(session, query) {
+            continue;
+        }
+        if total >= start && items.len() < page_size {
+            items.push(session.clone());
+        }
+        total += 1;
+    }
+    Ok(PageResult {
+        items,
+        total,
+        page,
+        page_size,
+    })
+}
+
+fn session_matches_query(session: &SessionSummary, normalized_query: &str) -> bool {
+    if normalized_query.is_empty() {
+        return true;
+    }
+    let query_is_ascii = normalized_query.is_ascii();
+    [
+        session.id.as_str(),
+        session.title.as_str(),
+        session.provider.as_str(),
+        session.cwd.as_str(),
+    ]
+    .into_iter()
+    .any(|value| {
+        if query_is_ascii {
+            value
+                .as_bytes()
+                .windows(normalized_query.len())
+                .any(|window| window.eq_ignore_ascii_case(normalized_query.as_bytes()))
+        } else {
+            !value.is_ascii() && value.to_lowercase().contains(normalized_query)
+        }
+    })
+}
+
 fn truncate_text(value: &str, max_chars: usize) -> String {
-    value.chars().take(max_chars).collect()
+    if value.chars().count() <= max_chars {
+        value.to_owned()
+    } else {
+        value.chars().take(max_chars).collect()
+    }
 }
 
 #[cfg(test)]
@@ -371,5 +462,108 @@ mod tests {
         assert_eq!(indexed.len(), 1);
         assert_eq!(indexed[0].id, "safe");
         assert_eq!(indexed[0].title, "kept");
+    }
+
+    #[test]
+    fn session_pages_filter_without_changing_totals_or_page_boundaries() {
+        let temp = tempfile::tempdir().unwrap();
+        let sessions = temp.path().join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        for (id, provider, cwd, title) in [
+            ("one", "custom", "C:/alpha", "Alpha task"),
+            ("two", "openai", "C:/beta", "中文任务"),
+            ("three", "custom", "C:/gamma", "Gamma task"),
+        ] {
+            let contents = format!(
+                "{}\n{}\n",
+                serde_json::json!({
+                    "type": "session_meta",
+                    "payload": {"id": id, "model_provider": provider, "cwd": cwd}
+                }),
+                serde_json::json!({
+                    "type": "event_msg",
+                    "payload": {"type": "user_message", "message": title}
+                })
+            );
+            fs::write(sessions.join(format!("{id}.jsonl")), contents).unwrap();
+        }
+        let index = SessionIndex::default();
+
+        let first = session_page(&index, temp.path(), "", 1, 2).unwrap();
+        let second = session_page(&index, temp.path(), "", 2, 2).unwrap();
+        assert_eq!(first.total, 3);
+        assert_eq!(first.items.len(), 2);
+        assert_eq!(second.total, 3);
+        assert_eq!(second.items.len(), 1);
+        let mut ids = first
+            .items
+            .into_iter()
+            .chain(second.items)
+            .map(|session| session.id)
+            .collect::<Vec<_>>();
+        ids.sort();
+        assert_eq!(ids, ["one", "three", "two"]);
+
+        let ascii = session_page(&index, temp.path(), "ALPHA", 1, 10).unwrap();
+        assert_eq!(ascii.total, 1);
+        assert_eq!(ascii.items[0].id, "one");
+        let unicode = session_page(&index, temp.path(), "中文", 1, 10).unwrap();
+        assert_eq!(unicode.total, 1);
+        assert_eq!(unicode.items[0].id, "two");
+    }
+
+    fn summary(id: &str, title: &str, provider: &str, cwd: &str) -> SessionSummary {
+        SessionSummary {
+            identity: id.into(),
+            id: id.into(),
+            title: title.into(),
+            provider: provider.into(),
+            cwd: cwd.into(),
+            archived: false,
+            updated_at: 0,
+            source_db: "rollout.sqlite".into(),
+            source_rollout: None,
+            original_provider: provider.into(),
+            has_user_event: true,
+        }
+    }
+
+    #[test]
+    fn session_query_matches_ascii_fields_case_insensitively() {
+        let session = summary(
+            "session-01",
+            "修复登录 Bug",
+            "openai-official",
+            "/Users/iqboost/project",
+        );
+        assert!(session_matches_query(&session, "OPENAI"));
+        assert!(session_matches_query(&session, "bug"));
+        assert!(session_matches_query(&session, "project"));
+        assert!(session_matches_query(&session, ""));
+        assert!(!session_matches_query(&session, "absent"));
+    }
+
+    #[test]
+    fn session_query_never_matches_ascii_field_with_cjk_query() {
+        let session = summary(
+            "session-01",
+            "fix login bug",
+            "openai-official",
+            "/Users/iqboost/project",
+        );
+        assert!(!session_matches_query(&session, "登录"));
+    }
+
+    #[test]
+    fn session_query_matches_cjk_title_with_normalized_lowercase() {
+        let session = summary(
+            "session-01",
+            "修复 登录 Bug 与 Setup",
+            "openai-official",
+            "/Users/iqboost/project",
+        );
+        assert!(session_matches_query(&session, "登录"));
+        assert!(session_matches_query(&session, "setup"));
+        assert!(!session_matches_query(&session, "配额"));
     }
 }

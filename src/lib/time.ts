@@ -11,3 +11,24 @@ export function epochMilliseconds(value: number) {
   if (absolute < MILLISECOND_EPOCH_THRESHOLD) return value * 1_000
   return value
 }
+
+const timestampFormatters = {
+  default: new Intl.DateTimeFormat("zh-CN", {
+    dateStyle: "medium",
+    timeStyle: "short",
+  }),
+  compact: new Intl.DateTimeFormat("zh-CN", {
+    dateStyle: "short",
+    timeStyle: "medium",
+  }),
+} as const
+
+export type TimestampFormat = keyof typeof timestampFormatters
+export function formatDateTime(
+  value: number,
+  format: TimestampFormat = "default"
+) {
+  const date = new Date(epochMilliseconds(value))
+  if (Number.isNaN(date.getTime())) return "时间未知"
+  return timestampFormatters[format].format(date)
+}

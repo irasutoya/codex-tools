@@ -1,13 +1,14 @@
 import { useCallback, useEffect, useMemo, useState } from "react"
 import {
-  Check,
-  Copy,
-  Eye,
-  Info,
-  LogIn,
-  RefreshCw,
-  TriangleAlert,
-} from "lucide-react"
+  CheckIcon,
+  Copy01Icon,
+  EyeIcon,
+  InformationCircleIcon,
+  Login01Icon,
+  Refresh01Icon,
+  Alert01Icon,
+} from "@hugeicons/core-free-icons"
+import { HugeiconsIcon } from "@hugeicons/react"
 
 import { ErrorDetails } from "@/components/error-details"
 import { SectionHeader } from "@/components/page-header"
@@ -55,6 +56,7 @@ import {
   ItemTitle,
 } from "@/components/ui/item"
 import { Spinner } from "@/components/ui/spinner"
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Textarea } from "@/components/ui/textarea"
 import { notify } from "@/lib/feedback"
 import { call } from "@/lib/ipc"
@@ -95,7 +97,7 @@ export default function SettingsPage({ active }: PageProps) {
   if (error) {
     return (
       <Alert variant="destructive">
-        <TriangleAlert />
+        <HugeiconsIcon icon={Alert01Icon} />
         <AlertTitle>无法检查 Codex 配置</AlertTitle>
         <AlertDescription>
           <ErrorDetails
@@ -109,7 +111,7 @@ export default function SettingsPage({ active }: PageProps) {
                   void load().catch((reason) => setError(String(reason)))
                 }}
               >
-                <RefreshCw data-icon="inline-start" />
+                <HugeiconsIcon icon={Refresh01Icon} data-icon="inline-start" />
                 重试
               </Button>
             }
@@ -190,7 +192,7 @@ export default function SettingsPage({ active }: PageProps) {
   return (
     <div className="flex flex-col gap-6">
       <Alert>
-        <Info />
+        <HugeiconsIcon icon={InformationCircleIcon} />
         <AlertTitle>只修改连接所需字段</AlertTitle>
         <AlertDescription>
           本应用只管理账号、API 地址、认证信息和连接标记；其他 Codex
@@ -205,94 +207,104 @@ export default function SettingsPage({ active }: PageProps) {
           description="检查当前连接，并在写入前预览本应用负责的字段。"
         />
 
-        <div className="grid items-start gap-3 lg:grid-cols-[minmax(0,3fr)_minmax(18rem,2fr)]">
-          <Card>
-            <CardHeader>
-              <CardTitle>当前配置</CardTitle>
-              <CardDescription className="truncate" title={inspection.path}>
-                {inspection.path}
-              </CardDescription>
-              <CardAction>
-                <Badge variant={inspection.valid ? "default" : "destructive"}>
-                  {inspection.valid ? "可以读取" : "需要处理"}
-                </Badge>
-              </CardAction>
-            </CardHeader>
-            <CardContent className="flex flex-col gap-4">
-              <Item>
-                <ItemContent>
-                  <ItemTitle>当前连接</ItemTitle>
-                  <ItemDescription>{connectionLabel}</ItemDescription>
-                </ItemContent>
-              </Item>
+        <Tabs defaultValue="config">
+          <TabsList>
+            <TabsTrigger value="config">当前配置</TabsTrigger>
+            <TabsTrigger value="diagnostics">诊断信息</TabsTrigger>
+          </TabsList>
+          <TabsContent value="config">
+            <Card>
+              <CardHeader>
+                <CardTitle>当前配置</CardTitle>
+                <CardDescription className="truncate" title={inspection.path}>
+                  {inspection.path}
+                </CardDescription>
+                <CardAction>
+                  <Badge variant={inspection.valid ? "default" : "destructive"}>
+                    {inspection.valid ? "可以读取" : "需要处理"}
+                  </Badge>
+                </CardAction>
+              </CardHeader>
+              <CardContent className="flex flex-col gap-4">
+                <Item>
+                  <ItemContent>
+                    <ItemTitle>当前连接</ItemTitle>
+                    <ItemDescription>{connectionLabel}</ItemDescription>
+                  </ItemContent>
+                </Item>
 
-              {inspection.warnings.length > 0 && (
-                <Alert>
-                  <TriangleAlert />
-                  <AlertTitle>发现需要确认的配置</AlertTitle>
-                  <AlertDescription>
-                    <ul className="flex list-disc flex-col gap-1 pl-4">
-                      {inspection.warnings.map((warning) => (
-                        <li key={warning}>{warning}</li>
-                      ))}
-                    </ul>
-                  </AlertDescription>
-                </Alert>
-              )}
-            </CardContent>
-            <CardFooter className="flex-wrap gap-2">
-              <Button
-                variant="outline"
-                disabled={busy || !canPreviewCustom}
-                title={
-                  canPreviewCustom
-                    ? undefined
-                    : "请先在“账号与服务”中使用一个第三方 API"
-                }
-                onClick={() => void createPreview()}
-              >
-                {previewing ? (
-                  <Spinner data-icon="inline-start" />
-                ) : (
-                  <Eye data-icon="inline-start" />
+                {inspection.warnings.length > 0 && (
+                  <Alert>
+                    <HugeiconsIcon icon={Alert01Icon} />
+                    <AlertTitle>发现需要确认的配置</AlertTitle>
+                    <AlertDescription>
+                      <ul className="flex list-disc flex-col gap-1 pl-4">
+                        {inspection.warnings.map((warning) => (
+                          <li key={warning}>{warning}</li>
+                        ))}
+                      </ul>
+                    </AlertDescription>
+                  </Alert>
                 )}
-                {previewing ? "正在准备…" : "预览修改"}
-              </Button>
-              <Button
-                variant="outline"
-                disabled={busy}
-                onClick={() => setConfirmOfficial(true)}
-              >
-                {switchingOfficial ? (
-                  <Spinner data-icon="inline-start" />
-                ) : (
-                  <LogIn data-icon="inline-start" />
-                )}
-                {switchingOfficial ? "正在切换…" : "使用 OpenAI"}
-              </Button>
-            </CardFooter>
-          </Card>
-
-          <Card>
-            <CardHeader>
-              <CardTitle>诊断信息</CardTitle>
-              <CardDescription>
-                可在反馈问题时复制；这里不包含已保存的 API Key 或登录凭据。
-              </CardDescription>
-            </CardHeader>
-            <CardContent>
-              <pre className="max-h-72 overflow-auto rounded-lg bg-muted/70 p-3 text-xs leading-relaxed whitespace-pre-wrap">
-                {diagnosticsText}
-              </pre>
-            </CardContent>
-            <CardFooter className="justify-end">
-              <Button size="sm" variant="outline" onClick={copyDiagnostics}>
-                <Copy data-icon="inline-start" />
-                复制诊断信息
-              </Button>
-            </CardFooter>
-          </Card>
-        </div>
+              </CardContent>
+              <CardFooter className="flex-wrap gap-2">
+                <Button
+                  variant="outline"
+                  disabled={busy || !canPreviewCustom}
+                  title={
+                    canPreviewCustom
+                      ? undefined
+                      : "请先在“账号与服务”中使用一个第三方 API"
+                  }
+                  onClick={() => void createPreview()}
+                >
+                  {previewing ? (
+                    <Spinner data-icon="inline-start" />
+                  ) : (
+                    <HugeiconsIcon icon={EyeIcon} data-icon="inline-start" />
+                  )}
+                  {previewing ? "正在准备…" : "预览修改"}
+                </Button>
+                <Button
+                  variant="outline"
+                  disabled={busy}
+                  onClick={() => setConfirmOfficial(true)}
+                >
+                  {switchingOfficial ? (
+                    <Spinner data-icon="inline-start" />
+                  ) : (
+                    <HugeiconsIcon
+                      icon={Login01Icon}
+                      data-icon="inline-start"
+                    />
+                  )}
+                  {switchingOfficial ? "正在切换…" : "使用 OpenAI"}
+                </Button>
+              </CardFooter>
+            </Card>
+          </TabsContent>
+          <TabsContent value="diagnostics">
+            <Card>
+              <CardHeader>
+                <CardTitle>诊断信息</CardTitle>
+                <CardDescription>
+                  可在反馈问题时复制；这里不包含已保存的 API Key 或登录凭据。
+                </CardDescription>
+              </CardHeader>
+              <CardContent>
+                <pre className="max-h-72 overflow-auto rounded-lg bg-muted p-3 text-xs leading-relaxed whitespace-pre-wrap">
+                  {diagnosticsText}
+                </pre>
+              </CardContent>
+              <CardFooter className="justify-end">
+                <Button size="sm" variant="outline" onClick={copyDiagnostics}>
+                  <HugeiconsIcon icon={Copy01Icon} data-icon="inline-start" />
+                  复制诊断信息
+                </Button>
+              </CardFooter>
+            </Card>
+          </TabsContent>
+        </Tabs>
       </section>
 
       <Dialog
@@ -339,7 +351,7 @@ export default function SettingsPage({ active }: PageProps) {
               {applyingPreview ? (
                 <Spinner data-icon="inline-start" />
               ) : (
-                <Check data-icon="inline-start" />
+                <HugeiconsIcon icon={CheckIcon} data-icon="inline-start" />
               )}
               {applyingPreview ? "正在写入…" : "确认写入"}
             </Button>

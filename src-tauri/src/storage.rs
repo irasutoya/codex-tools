@@ -3,7 +3,7 @@ use std::{
     fs,
     io::Write,
     path::{Path, PathBuf},
-    sync::{RwLock, RwLockReadGuard},
+    sync::{Mutex, RwLock, RwLockReadGuard},
 };
 
 const MAX_APP_DATA_BYTES: u64 = 16 * 1024 * 1024;
@@ -16,6 +16,7 @@ pub struct Store {
     root: PathBuf,
     path: PathBuf,
     state: RwLock<AppConfig>,
+    persist_mutex: Mutex<()>,
 }
 
 impl Store {
@@ -53,6 +54,7 @@ impl Store {
             root,
             path,
             state: RwLock::new(state),
+            persist_mutex: Mutex::new(()),
         })
     }
 
@@ -104,8 +106,18 @@ impl Store {
             .map_err(|_| AppError::Internal("暂时无法保存应用数据，请重启应用后再试。".into()))?;
         let mut draft = guard.clone();
         let result = mutate(&mut draft)?;
-        atomic_yaml(&self.path, &draft).map_err(|error| AppError::Internal(error.to_string()))?;
+        let bytes = serde_yaml::to_string(&draft)
+            .map_err(|error| AppError::Internal(error.to_string()))?
+            .into_bytes();
         *guard = draft;
+        drop(guard);
+        // 落盘在状态锁之外进行：磁盘写入失败时内存已更新，
+        // 仅本次保存返回错误，与旧版在锁内失败时内存未更新的致命行为不同。
+        let _persisted = self
+            .persist_mutex
+            .lock()
+            .map_err(|_| AppError::Internal("暂时无法保存应用数据，请重启应用后再试。".into()))?;
+        atomic_write(&self.path, &bytes).map_err(|error| AppError::Internal(error.to_string()))?;
         Ok(result)
     }
 
@@ -117,13 +129,7 @@ impl Store {
             .find(|provider| provider.profile.id == id)
             .ok_or_else(|| AppError::InvalidConfig("第三方 API 服务不存在，请刷新页面。".into()))?;
         let mut profile = stored.profile.clone();
-        profile.active = matches!(state.active.kind, ActiveKind::Provider)
-            && state.active.provider_id.as_deref() == Some(profile.id.as_str());
-        profile.active_account_id = if profile.active {
-            state.active.account_id.clone()
-        } else {
-            stored.profile.active_account_id.clone()
-        };
+        mark_active_profile(&state, &mut profile);
         profile.account_count = stored.accounts.len() as u64;
         Ok(profile)
     }
@@ -227,13 +233,7 @@ impl Store {
             .iter()
             .map(|stored| {
                 let mut profile = stored.profile.clone();
-                profile.active = matches!(state.active.kind, ActiveKind::Provider)
-                    && state.active.provider_id.as_deref() == Some(profile.id.as_str());
-                profile.active_account_id = if profile.active {
-                    state.active.account_id.clone()
-                } else {
-                    stored.profile.active_account_id.clone()
-                };
+                mark_active_profile(&state, &mut profile);
                 profile.account_count = stored.accounts.len() as u64;
                 profile.redacted()
             })
@@ -607,40 +607,6 @@ fn normalize_official_account(account: &mut StoredOfficialAccount) -> Result<(),
     Ok(())
 }
 
-fn validate_official_credential(credential: &CodexAuthCredential) -> Result<(), AppError> {
-    let tokens = &credential.tokens;
-    let personal_access_token =
-        tokens.id_token.trim().is_empty() || tokens.refresh_token.trim().is_empty();
-    if credential.auth_mode != "chatgpt"
-        || credential.last_refresh.trim().is_empty()
-        || tokens.access_token.trim().is_empty()
-        || tokens.account_id.trim().is_empty()
-        || (!personal_access_token
-            && (tokens.id_token.trim().is_empty() || tokens.refresh_token.trim().is_empty()))
-    {
-        return Err(AppError::InvalidConfig(
-            "OpenAI 登录信息不完整，请重新登录。".into(),
-        ));
-    }
-    for token in [
-        tokens.id_token.as_str(),
-        tokens.access_token.as_str(),
-        tokens.refresh_token.as_str(),
-    ] {
-        ensure_char_limit(
-            token,
-            MAX_CREDENTIAL_CHARS,
-            "OpenAI 登录凭据过长，请重新登录或导入有效的 Cookie。",
-        )?;
-    }
-    ensure_char_limit(
-        &tokens.account_id,
-        MAX_ACCOUNT_ID_CHARS,
-        "OpenAI 账号标识不能超过 512 个字符。",
-    )?;
-    Ok(())
-}
-
 fn preserve_redacted_headers(
     incoming: &mut std::collections::BTreeMap<String, String>,
     existing: &std::collections::BTreeMap<String, String>,
@@ -672,6 +638,14 @@ pub fn data_root() -> PathBuf {
             .and_then(|path| path.parent().map(Path::to_path_buf))
             .unwrap_or_else(|| PathBuf::from("."))
             .join("data")
+    }
+}
+
+fn mark_active_profile(state: &AppConfig, profile: &mut ProviderProfile) {
+    profile.active = matches!(state.active.kind, ActiveKind::Provider)
+        && state.active.provider_id.as_deref() == Some(profile.id.as_str());
+    if profile.active {
+        profile.active_account_id = state.active.account_id.clone();
     }
 }
 
@@ -1115,5 +1089,42 @@ mod tests {
         disabled.enabled = false;
         assert!(store.save_provider(disabled).is_err());
         assert!(store.provider("active").unwrap().enabled);
+    }
+
+    #[test]
+    fn update_persists_mutated_state_to_disk_for_reopen() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        let store = Store::open(root.clone()).unwrap();
+        store.save_provider(provider("persisted")).unwrap();
+        store.save_account(account("account", "persisted")).unwrap();
+        store.activate("persisted", "account").unwrap();
+
+        let reopened = Store::open(root).unwrap();
+        let state = reopened.snapshot().unwrap();
+        assert_eq!(state.providers.len(), 1);
+        assert_eq!(state.providers[0].profile.id, "persisted");
+        assert_eq!(state.active.provider_id.as_deref(), Some("persisted"));
+        assert_eq!(state.active.account_id.as_deref(), Some("account"));
+    }
+
+    #[test]
+    fn failed_persist_keeps_memory_updated_and_returns_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = Store::open(temp.path().to_path_buf()).unwrap();
+        store.save_provider(provider("one")).unwrap();
+        fs::write(temp.path().join("blocked"), b"file").unwrap();
+        store.path = temp.path().join("blocked").join("app.yaml");
+
+        let result = store.update(|state| {
+            state.codex.home = "/tmp/alternate".into();
+            Ok(())
+        });
+
+        assert!(result.is_err());
+        assert_eq!(
+            store.read(|state| state.codex.home.clone()).unwrap(),
+            "/tmp/alternate"
+        );
     }
 }

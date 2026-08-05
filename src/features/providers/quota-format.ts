@@ -4,6 +4,7 @@ export type QuotaRow = {
   label: string
   value: string
   detail?: string
+  remainingPercent?: number
   resetAt?: number
 }
 
@@ -38,6 +39,7 @@ function windowRow(window: QuotaWindow, fallback: string): QuotaRow {
     label: windowLabel(window.windowSeconds, fallback),
     value: `剩余 ${window.remainingPercent}%`,
     detail: `已用 ${window.usedPercent}%`,
+    remainingPercent: window.remainingPercent,
     resetAt: window.resetAt,
   }
 }

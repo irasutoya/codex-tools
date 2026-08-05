@@ -22,8 +22,18 @@ describe("quotaRows", () => {
         },
       })
     ).toEqual([
-      { label: "5H", value: "剩余 76%", detail: "已用 24%" },
-      { label: "7D", value: "剩余 43%", detail: "已用 57%" },
+      {
+        label: "5H",
+        value: "剩余 76%",
+        detail: "已用 24%",
+        remainingPercent: 76,
+      },
+      {
+        label: "7D",
+        value: "剩余 43%",
+        detail: "已用 57%",
+        remainingPercent: 43,
+      },
     ])
   })
 })

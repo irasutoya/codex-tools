@@ -1,17 +1,15 @@
 use crate::models::{
     AppError, CodexAuthCredential, CodexAuthTokens, MAX_ACCOUNT_ID_CHARS, MAX_CREDENTIAL_CHARS,
     MAX_DISPLAY_NAME_CHARS, OfficialAccountSource, OpenAiDeviceAuthorization, ProviderAccountQuota,
-    StoredOfficialAccount, ensure_char_limit,
+    StoredOfficialAccount, ensure_char_limit, token_identity, token_local_identity,
 };
 use crate::proxy_import::ImportedProxyCredential;
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use futures_util::StreamExt;
 use reqwest::StatusCode;
 use reqwest::header::{HeaderMap, HeaderValue, USER_AGENT};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -101,13 +99,6 @@ struct CompleteTokens {
     access_token: String,
     refresh_token: String,
     expires_in: Option<i64>,
-}
-
-#[derive(Default)]
-struct TokenIdentity {
-    account_id: Option<String>,
-    email: Option<String>,
-    expires_at: Option<i64>,
 }
 
 impl Default for AuthCenter {
@@ -589,53 +580,6 @@ fn apply_imported_profile(
         .unwrap_or_else(|| "Cookie 账号".into());
 }
 
-fn token_local_identity(token: &str) -> String {
-    let digest = Sha256::digest(token.as_bytes());
-    let suffix = digest[..12]
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    format!("proxy-{suffix}")
-}
-
-fn token_identity(token: &str) -> Option<TokenIdentity> {
-    let payload = token.split('.').nth(1)?;
-    let bytes = URL_SAFE_NO_PAD.decode(payload).ok()?;
-    let claims: Value = serde_json::from_slice(&bytes).ok()?;
-    let auth = claims.get("https://api.openai.com/auth");
-    let profile = claims.get("https://api.openai.com/profile");
-    let account_id = claims
-        .get("chatgpt_account_id")
-        .and_then(Value::as_str)
-        .or_else(|| {
-            auth.and_then(|value| value.get("chatgpt_account_id"))
-                .and_then(Value::as_str)
-        })
-        .or_else(|| {
-            claims
-                .pointer("/organizations/0/id")
-                .and_then(Value::as_str)
-        })
-        .filter(|value| !value.trim().is_empty())
-        .map(str::to_owned);
-    let email = claims
-        .get("email")
-        .and_then(Value::as_str)
-        .or_else(|| {
-            profile
-                .and_then(|value| value.get("email"))
-                .and_then(Value::as_str)
-        })
-        .filter(|value| !value.trim().is_empty())
-        .map(str::to_owned);
-    let expires_at = claims.get("exp").and_then(Value::as_i64);
-    Some(TokenIdentity {
-        account_id,
-        email,
-        expires_at,
-    })
-}
-
 fn parse_interval(value: Option<&Value>) -> u64 {
     match value {
         Some(Value::Number(value)) => value.as_u64().unwrap_or(5),
@@ -782,6 +726,7 @@ fn parse_codex_version(output: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 
     fn jwt(claims: Value) -> String {
         let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap());

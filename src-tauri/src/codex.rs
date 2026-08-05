@@ -1,7 +1,8 @@
 use crate::{
     models::{
         AppError, CodexAuthCredential, ConfigInspection, ConfigPatchPreview, ProviderAccount,
-        ProviderProfile,
+        ProviderProfile, is_personal_access_token_credential, token_identity, token_local_identity,
+        validate_official_credential,
     },
     storage::atomic_write,
 };
@@ -111,9 +112,20 @@ impl ConfigManager {
     }
 
     fn remember(&self, draft: PatchDraft<'_>) -> Result<ConfigPatchPreview, AppError> {
+        let PatchDraft {
+            target,
+            original,
+            original_auth,
+            rendered,
+            auth_rendered,
+            public_preview,
+            changes,
+            api_key,
+        } = draft;
         let operation_id = uuid::Uuid::new_v4().to_string();
-        let base_hash = digest(draft.original);
-        let auth_base_hash = digest_bytes(draft.original_auth);
+        let base_hash = digest(original);
+        let auth_base_hash = digest_bytes(original_auth);
+        let target_path = target.display().to_string();
         let mut pending = self
             .pending
             .lock()
@@ -132,19 +144,19 @@ impl ConfigManager {
             PendingPatch {
                 base_hash: base_hash.clone(),
                 auth_base_hash,
-                target: draft.target.clone(),
-                rendered: draft.rendered.clone(),
-                auth_rendered: draft.auth_rendered.clone(),
+                target,
+                rendered,
+                auth_rendered,
                 created_at: Instant::now(),
             },
         );
         Ok(ConfigPatchPreview {
             operation_id,
-            target_path: draft.target.display().to_string(),
+            target_path,
             base_hash,
-            rendered: draft.public_preview,
-            changes: draft.changes,
-            api_key_masked: mask_secret(draft.api_key),
+            rendered: public_preview,
+            changes,
+            api_key_masked: mask_secret(api_key),
         })
     }
 }
@@ -216,6 +228,11 @@ pub fn read_official_account(codex_home: &Path) -> Result<Option<CodexAuthCreden
                         "Codex 的登录文件无法识别，将在切换账号时重新写入。".into(),
                     )
                 })?;
+            let identity = token_identity(personal_access_token);
+            let account_id = identity
+                .as_ref()
+                .and_then(|identity| identity.account_id.clone())
+                .unwrap_or_else(|| token_local_identity(personal_access_token));
             CodexAuthCredential {
                 auth_mode: "chatgpt".into(),
                 openai_api_key: None,
@@ -223,7 +240,7 @@ pub fn read_official_account(codex_home: &Path) -> Result<Option<CodexAuthCreden
                     id_token: String::new(),
                     access_token: personal_access_token.to_owned(),
                     refresh_token: String::new(),
-                    account_id: String::new(),
+                    account_id,
                 },
                 last_refresh: String::new(),
             }
@@ -231,27 +248,6 @@ pub fn read_official_account(codex_home: &Path) -> Result<Option<CodexAuthCreden
     };
     validate_official_credential(&credential)?;
     Ok(Some(credential))
-}
-
-fn validate_official_credential(credential: &CodexAuthCredential) -> Result<(), AppError> {
-    let personal_access_token = is_personal_access_token_credential(credential);
-    if credential.auth_mode != "chatgpt"
-        || credential.tokens.access_token.trim().is_empty()
-        || (!personal_access_token
-            && (credential.tokens.id_token.trim().is_empty()
-                || credential.tokens.refresh_token.trim().is_empty()
-                || credential.tokens.account_id.trim().is_empty()))
-    {
-        return Err(AppError::InvalidConfig(
-            "OpenAI 登录信息不完整，请重新登录。".into(),
-        ));
-    }
-    Ok(())
-}
-
-fn is_personal_access_token_credential(credential: &CodexAuthCredential) -> bool {
-    credential.tokens.id_token.trim().is_empty()
-        || credential.tokens.refresh_token.trim().is_empty()
 }
 
 pub fn inspect(codex_home: &Path) -> ConfigInspection {

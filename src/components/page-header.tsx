@@ -1,10 +1,10 @@
-import type { LucideIcon } from "lucide-react"
+import { HugeiconsIcon, type IconSvgElement } from "@hugeicons/react"
 import type { ReactNode } from "react"
 
 type PageHeaderProps = {
   title: string
   description: string
-  icon: LucideIcon
+  icon: IconSvgElement
   actions?: ReactNode
 }
 
@@ -15,10 +15,10 @@ export function PageHeader({
   actions,
 }: PageHeaderProps) {
   return (
-    <div className="flex items-start justify-between gap-6">
+    <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between sm:gap-6">
       <div className="flex min-w-0 items-start gap-3">
-        <div className="flex size-10 shrink-0 items-center justify-center rounded-xl bg-secondary text-secondary-foreground ring-1 ring-border">
-          <Icon className="size-4" aria-hidden="true" />
+        <div className="flex size-10 shrink-0 items-center justify-center rounded-lg bg-secondary text-secondary-foreground ring-1 ring-border [&_svg:not([class*='size-'])]:size-4">
+          <HugeiconsIcon icon={Icon} aria-hidden="true" />
         </div>
         <div className="min-w-0">
           <h1 className="font-heading text-2xl leading-tight font-semibold tracking-tight">
@@ -30,7 +30,7 @@ export function PageHeader({
         </div>
       </div>
       {actions && (
-        <div className="flex shrink-0 flex-wrap items-center justify-end gap-2">
+        <div className="flex w-full flex-wrap items-center justify-start gap-2 sm:w-auto sm:shrink-0 sm:justify-end">
           {actions}
         </div>
       )}
@@ -52,7 +52,7 @@ export function SectionHeader({
   id,
 }: SectionHeaderProps) {
   return (
-    <div className="flex items-end justify-between gap-6">
+    <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between sm:gap-6">
       <div className="min-w-0">
         <h2 id={id} className="font-heading text-base font-medium">
           {title}
@@ -64,7 +64,7 @@ export function SectionHeader({
         )}
       </div>
       {actions && (
-        <div className="flex shrink-0 flex-wrap items-center justify-end gap-2">
+        <div className="flex w-full flex-wrap items-center justify-start gap-2 sm:w-auto sm:shrink-0 sm:justify-end">
           {actions}
         </div>
       )}

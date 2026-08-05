@@ -97,9 +97,16 @@ export type PageResult<T> = {
   pageSize: number
 }
 
+export type RepairTarget = {
+  id: string
+  sources: string[]
+  current: boolean
+  count: number
+}
+
 export type RepairScan = {
   currentProvider: string
-  targets: Array<{ id: string; sources: string[]; current: boolean }>
+  targets: RepairTarget[]
   rolloutFiles: number
   sessionMetaCount: number
   databases: Array<{ path: string; schema: string; threadCount: number }>

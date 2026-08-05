@@ -1,16 +1,16 @@
 import { useCallback, useEffect, useState } from "react"
 import {
-  ExternalLink,
-  FileText,
-  FolderCog,
-  KeyRound,
-  MessagesSquare,
-  RefreshCw,
-  Server,
-  ShieldCheck,
-  TriangleAlert,
-} from "lucide-react"
-
+  ExternalLinkIcon,
+  File01Icon,
+  FolderCogIcon,
+  Key01Icon,
+  Message01Icon,
+  Refresh01Icon,
+  BoxIcon,
+  Shield01Icon,
+  Alert01Icon,
+} from "@hugeicons/core-free-icons"
+import { HugeiconsIcon } from "@hugeicons/react"
 import { ErrorDetails } from "@/components/error-details"
 import { MetricCard } from "@/components/metric-card"
 import { SectionHeader } from "@/components/page-header"
@@ -52,7 +52,8 @@ export default function DashboardPage({ active }: PageProps) {
 
   const load = useCallback(async () => {
     try {
-      setData(await call("get_dashboard"))
+      const dashboard = await call("get_dashboard")
+      setData(dashboard)
       setError(undefined)
     } catch (reason) {
       setError(String(reason))
@@ -119,7 +120,7 @@ export default function DashboardPage({ active }: PageProps) {
     if (!error) return <PageLoading label="正在读取 Codex 状态" />
     return (
       <Alert variant="destructive">
-        <TriangleAlert />
+        <HugeiconsIcon icon={Alert01Icon} />
         <AlertTitle>无法读取 Codex 状态</AlertTitle>
         <AlertDescription>
           <ErrorDetails
@@ -134,7 +135,10 @@ export default function DashboardPage({ active }: PageProps) {
                 {refreshing ? (
                   <Spinner data-icon="inline-start" />
                 ) : (
-                  <RefreshCw data-icon="inline-start" />
+                  <HugeiconsIcon
+                    icon={Refresh01Icon}
+                    data-icon="inline-start"
+                  />
                 )}
                 {refreshing ? "正在重试…" : "重试"}
               </Button>
@@ -151,25 +155,25 @@ export default function DashboardPage({ active }: PageProps) {
     {
       label: "API 服务",
       value: data.providerCount,
-      icon: Server,
+      icon: BoxIcon,
       detail: "已添加的第三方服务",
     },
     {
       label: "历史会话",
       value: data.sessionCount,
-      icon: MessagesSquare,
+      icon: Message01Icon,
       detail: "本机找到的会话",
     },
     {
       label: "会话数据库",
       value: data.databaseCount,
-      icon: FileText,
+      icon: File01Icon,
       detail: "找到的 Codex 数据库文件",
     },
     {
       label: "数据状态",
       value: data.databaseHealth,
-      icon: ShieldCheck,
+      icon: Shield01Icon,
       detail: "本机会话索引结果",
     },
   ]
@@ -179,7 +183,7 @@ export default function DashboardPage({ active }: PageProps) {
     <div className="flex flex-col gap-6">
       {error && (
         <Alert variant="destructive">
-          <TriangleAlert />
+          <HugeiconsIcon icon={Alert01Icon} />
           <AlertTitle>当前显示的是上次读取结果</AlertTitle>
           <AlertDescription>
             <ErrorDetails error={error}>
@@ -189,98 +193,106 @@ export default function DashboardPage({ active }: PageProps) {
         </Alert>
       )}
 
-      <Card>
-        <CardHeader>
-          <CardTitle>当前连接</CardTitle>
-          <CardDescription>
-            Codex 下一次请求会使用这里显示的账号或 API 服务。
-          </CardDescription>
-          <CardAction>
-            <Badge
-              className="max-w-48 truncate"
-              title={data.activeProvider}
-              variant={data.activeProvider ? "default" : "secondary"}
-            >
-              {data.activeProvider ?? "尚未选择"}
-            </Badge>
-          </CardAction>
-        </CardHeader>
-        <CardContent>
-          <ItemGroup className="gap-0">
-            {data.activeAccount && (
-              <>
-                <Item>
-                  <ItemMedia variant="icon">
-                    <KeyRound />
-                  </ItemMedia>
-                  <ItemContent className="min-w-0">
-                    <ItemTitle>{data.activeAccount}</ItemTitle>
-                    <ItemDescription>
-                      {data.activeKind === "official"
-                        ? "OpenAI 账号"
-                        : "第三方 API Key"}
-                    </ItemDescription>
-                    {data.activeKind === "official" && (
-                      <QuotaStatusView quota={data.activeQuota} />
-                    )}
-                  </ItemContent>
-                </Item>
-                <ItemSeparator />
-              </>
-            )}
-            <Item>
-              <ItemMedia variant="icon">
-                <FolderCog />
-              </ItemMedia>
-              <ItemContent className="min-w-0">
-                <ItemTitle>配置目录</ItemTitle>
-                <ItemDescription
-                  className="truncate font-mono"
-                  title={data.codexHome}
-                >
-                  {data.codexHome}
-                </ItemDescription>
-              </ItemContent>
-            </Item>
-          </ItemGroup>
-        </CardContent>
-        <CardFooter className="flex-wrap gap-2">
-          <Button disabled={busy} onClick={() => void launchCodex()}>
-            {launching ? (
-              <Spinner data-icon="inline-start" />
-            ) : (
-              <ExternalLink data-icon="inline-start" />
-            )}
-            {launching ? "正在打开…" : "打开 Codex"}
-          </Button>
-          <Button
-            variant="outline"
-            disabled={busy}
-            onClick={() => void refresh()}
-          >
-            {refreshing ? (
-              <Spinner data-icon="inline-start" />
-            ) : (
-              <RefreshCw data-icon="inline-start" />
-            )}
-            {refreshing ? "正在刷新…" : "刷新状态"}
-          </Button>
-          {data.activeKind === "official" && data.activeAccountId && (
+      <div className="grid items-start gap-4">
+        <Card>
+          <CardHeader>
+            <CardTitle>当前连接</CardTitle>
+            <CardDescription>
+              Codex 下一次请求会使用这里显示的账号或 API 服务。
+            </CardDescription>
+            <CardAction>
+              <Badge
+                className="max-w-48 truncate"
+                title={data.activeProvider}
+                variant={data.activeProvider ? "default" : "secondary"}
+              >
+                {data.activeProvider ?? "尚未选择"}
+              </Badge>
+            </CardAction>
+          </CardHeader>
+          <CardContent>
+            <ItemGroup className="gap-0">
+              {data.activeAccount && (
+                <>
+                  <Item>
+                    <ItemMedia variant="icon">
+                      <HugeiconsIcon icon={Key01Icon} />
+                    </ItemMedia>
+                    <ItemContent className="min-w-0">
+                      <ItemTitle>{data.activeAccount}</ItemTitle>
+                      <ItemDescription>
+                        {data.activeKind === "official"
+                          ? "OpenAI 账号"
+                          : "第三方 API Key"}
+                      </ItemDescription>
+                      {data.activeKind === "official" && (
+                        <QuotaStatusView quota={data.activeQuota} />
+                      )}
+                    </ItemContent>
+                  </Item>
+                  <ItemSeparator />
+                </>
+              )}
+              <Item>
+                <ItemMedia variant="icon">
+                  <HugeiconsIcon icon={FolderCogIcon} />
+                </ItemMedia>
+                <ItemContent className="min-w-0">
+                  <ItemTitle>配置目录</ItemTitle>
+                  <ItemDescription
+                    className="truncate font-mono"
+                    title={data.codexHome}
+                  >
+                    {data.codexHome}
+                  </ItemDescription>
+                </ItemContent>
+              </Item>
+            </ItemGroup>
+          </CardContent>
+          <CardFooter className="flex-wrap gap-2">
+            <Button disabled={busy} onClick={() => void launchCodex()}>
+              {launching ? (
+                <Spinner data-icon="inline-start" />
+              ) : (
+                <HugeiconsIcon
+                  icon={ExternalLinkIcon}
+                  data-icon="inline-start"
+                />
+              )}
+              {launching ? "正在打开…" : "打开 Codex"}
+            </Button>
             <Button
               variant="outline"
               disabled={busy}
-              onClick={() => void refreshQuota()}
+              onClick={() => void refresh()}
             >
-              {quotaRefreshing ? (
+              {refreshing ? (
                 <Spinner data-icon="inline-start" />
               ) : (
-                <RefreshCw data-icon="inline-start" />
+                <HugeiconsIcon icon={Refresh01Icon} data-icon="inline-start" />
               )}
-              {quotaRefreshing ? "正在查询…" : "刷新当前额度"}
+              {refreshing ? "正在刷新…" : "刷新状态"}
             </Button>
-          )}
-        </CardFooter>
-      </Card>
+            {data.activeKind === "official" && data.activeAccountId && (
+              <Button
+                variant="outline"
+                disabled={busy}
+                onClick={() => void refreshQuota()}
+              >
+                {quotaRefreshing ? (
+                  <Spinner data-icon="inline-start" />
+                ) : (
+                  <HugeiconsIcon
+                    icon={Refresh01Icon}
+                    data-icon="inline-start"
+                  />
+                )}
+                {quotaRefreshing ? "正在查询…" : "刷新当前额度"}
+              </Button>
+            )}
+          </CardFooter>
+        </Card>
+      </div>
 
       <section
         className="flex flex-col gap-4"

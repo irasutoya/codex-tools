@@ -1,22 +1,22 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import {
-  Activity,
-  ArrowRightLeft,
-  Boxes,
-  Check,
-  Copy,
-  ExternalLink,
-  KeyRound,
-  LogIn,
-  MoreHorizontal,
-  Pencil,
-  Plus,
-  RefreshCw,
-  Save,
-  Trash2,
-  TriangleAlert,
-  UserRound,
-} from "lucide-react"
+  Activity01Icon,
+  ArrowUpDownIcon,
+  BoxesIcon,
+  CheckIcon,
+  Copy01Icon,
+  ExternalLinkIcon,
+  Key01Icon,
+  Login01Icon,
+  More01Icon,
+  PencilIcon,
+  Add01Icon,
+  Refresh01Icon,
+  Delete01Icon,
+  Alert01Icon,
+  User02Icon,
+} from "@hugeicons/core-free-icons"
+import { HugeiconsIcon } from "@hugeicons/react"
 
 import { ErrorDetails } from "@/components/error-details"
 import { SectionHeader } from "@/components/page-header"
@@ -43,14 +43,6 @@ import {
   CardTitle,
 } from "@/components/ui/card"
 import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog"
-import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuGroup,
@@ -66,15 +58,6 @@ import {
   EmptyTitle,
 } from "@/components/ui/empty"
 import {
-  Field,
-  FieldContent,
-  FieldDescription,
-  FieldGroup,
-  FieldLabel,
-  FieldTitle,
-} from "@/components/ui/field"
-import { Input } from "@/components/ui/input"
-import {
   Item,
   ItemActions,
   ItemContent,
@@ -84,33 +67,25 @@ import {
   ItemTitle,
 } from "@/components/ui/item"
 import { Spinner } from "@/components/ui/spinner"
-import { Switch } from "@/components/ui/switch"
-import { Textarea } from "@/components/ui/textarea"
 import { notify } from "@/lib/feedback"
 import { call } from "@/lib/ipc"
 import { notifyRepairWarnings } from "@/lib/repair-feedback"
-import { epochMilliseconds } from "@/lib/time"
+import { formatDateTime } from "@/lib/time"
 import {
   emptyAccount,
   emptyProvider,
   type Account,
-  type DeviceAuthorization,
   type OfficialAccountView,
   type PageProps,
   type Provider,
 } from "@/types"
 
 import { QuotaStatusView } from "./quota-status"
-
-const MAX_DISPLAY_NAME_LENGTH = 100
-const MAX_API_URL_LENGTH = 2_048
-const MAX_API_KEY_LENGTH = 65_536
-const MAX_ACCOUNT_ID_LENGTH = 512
-const MAX_COOKIE_CREDENTIAL_LENGTH = 262_144
-const accountTimestampFormatter = new Intl.DateTimeFormat("zh-CN", {
-  dateStyle: "medium",
-  timeStyle: "short",
-})
+import { AccountEditor } from "./account-editor"
+import { ProviderEditor } from "./provider-editor"
+import { ProxyLoginDialog } from "./proxy-login-dialog"
+import { useDeviceAuthorizationPolling } from "./use-device-auth"
+import { taskFailureTitle } from "./provider-utils"
 
 export default function ProvidersPage({ active }: PageProps) {
   const [providers, setProviders] = useState<Provider[]>([])
@@ -118,8 +93,6 @@ export default function ProvidersPage({ active }: PageProps) {
   const [officialAccounts, setOfficialAccounts] = useState<
     OfficialAccountView[]
   >([])
-  const [deviceAuthorization, setDeviceAuthorization] =
-    useState<DeviceAuthorization>()
   const [draft, setDraft] = useState<Provider>()
   const [account, setAccount] = useState<Account>()
   const [pendingActivation, setPendingActivation] = useState<{
@@ -172,74 +145,8 @@ export default function ProvidersPage({ active }: PageProps) {
     return () => window.clearTimeout(timeout)
   }, [active, load])
 
-  useEffect(() => {
-    if (!deviceAuthorization) return
-    const authorization = deviceAuthorization
-    let cancelled = false
-    let timer: number | undefined
-    let pollErrorShown = false
-
-    const scheduleNextPoll = () => {
-      const remainingMs =
-        epochMilliseconds(authorization.expiresAt) - Date.now()
-      if (remainingMs <= 0) {
-        setDeviceAuthorization(undefined)
-        notify.error("登录码已过期", "请重新生成登录码后继续登录。")
-        return
-      }
-      timer = window.setTimeout(
-        () => {
-          void call("poll_openai_device_auth", {
-            operationId: authorization.operationId,
-          })
-            .then((result) => {
-              if (cancelled) return
-              pollErrorShown = false
-              if (result.status === "pending") {
-                scheduleNextPoll()
-                return
-              }
-              setDeviceAuthorization(undefined)
-              if (result.status === "expired") {
-                notify.error("登录码已过期", "请重新生成登录码后继续登录。")
-                return
-              }
-              notify.success(
-                "OpenAI 登录成功",
-                `Codex 现在使用 ${result.account.name}。`
-              )
-              notifyRepairWarnings(result.repair)
-              void call("refresh_official_account_quota", {
-                accountId: result.account.id,
-              })
-                .catch((error) =>
-                  notify.warning("登录成功，但额度暂未更新", error)
-                )
-                .finally(() =>
-                  load().catch((error) =>
-                    notify.warning("登录已完成，但无法读取最新账号列表", error)
-                  )
-                )
-            })
-            .catch((error) => {
-              if (cancelled) return
-              if (!pollErrorShown) {
-                pollErrorShown = true
-                notify.warning("暂时无法确认登录结果，程序将自动重试", error)
-              }
-              scheduleNextPoll()
-            })
-        },
-        Math.min(authorization.intervalSecs * 1000, remainingMs)
-      )
-    }
-
-    scheduleNextPoll()
-    return () => {
-      cancelled = true
-      if (timer !== undefined) window.clearTimeout(timer)
-    }
-  }, [deviceAuthorization, load])
+  const [deviceAuthorization, setDeviceAuthorization] =
+    useDeviceAuthorizationPolling(load)
 
   const run = async (
     task: string,
@@ -270,7 +177,7 @@ export default function ProvidersPage({ active }: PageProps) {
     if (!overviewError) return <PageLoading label="正在读取账号和 API 服务" />
     return (
       <Alert variant="destructive">
-        <TriangleAlert />
+        <HugeiconsIcon icon={Alert01Icon} />
         <AlertTitle>无法读取账号和 API 服务</AlertTitle>
         <AlertDescription>
           <ErrorDetails
@@ -284,7 +191,7 @@ export default function ProvidersPage({ active }: PageProps) {
                   void load().catch(() => undefined)
                 }}
               >
-                <RefreshCw data-icon="inline-start" />
+                <HugeiconsIcon icon={Refresh01Icon} data-icon="inline-start" />
                 重试
               </Button>
             }
@@ -300,7 +207,7 @@ export default function ProvidersPage({ active }: PageProps) {
     <div className="flex flex-col gap-6">
       {overviewError && (
         <Alert variant="destructive">
-          <TriangleAlert />
+          <HugeiconsIcon icon={Alert01Icon} />
           <AlertTitle>显示的是上次读取的账号和服务</AlertTitle>
           <AlertDescription>
             <ErrorDetails
@@ -311,7 +218,10 @@ export default function ProvidersPage({ active }: PageProps) {
                   variant="outline"
                   onClick={() => void load().catch(() => undefined)}
                 >
-                  <RefreshCw data-icon="inline-start" />
+                  <HugeiconsIcon
+                    icon={Refresh01Icon}
+                    data-icon="inline-start"
+                  />
                   刷新
                 </Button>
               }
@@ -351,7 +261,10 @@ export default function ProvidersPage({ active }: PageProps) {
                   {pendingTask === "official:quota:all" ? (
                     <Spinner data-icon="inline-start" />
                   ) : (
-                    <RefreshCw data-icon="inline-start" />
+                    <HugeiconsIcon
+                      icon={Refresh01Icon}
+                      data-icon="inline-start"
+                    />
                   )}
                   刷新全部额度
                 </Button>
@@ -362,7 +275,7 @@ export default function ProvidersPage({ active }: PageProps) {
                 disabled={busy}
                 onClick={() => setProxyLoginOpen(true)}
               >
-                <KeyRound data-icon="inline-start" />
+                <HugeiconsIcon icon={Key01Icon} data-icon="inline-start" />
                 导入 Cookie
               </Button>
               <Button
@@ -370,7 +283,7 @@ export default function ProvidersPage({ active }: PageProps) {
                 disabled={busy || Boolean(deviceAuthorization)}
                 onClick={() => setConfirmOpenAiLogin(true)}
               >
-                <LogIn data-icon="inline-start" />
+                <HugeiconsIcon icon={Login01Icon} data-icon="inline-start" />
                 网页登录
               </Button>
             </>
@@ -379,7 +292,7 @@ export default function ProvidersPage({ active }: PageProps) {
         <div className="flex flex-col gap-3">
           {deviceAuthorization && (
             <Alert>
-              <LogIn />
+              <HugeiconsIcon icon={Login01Icon} />
               <AlertTitle className="flex flex-wrap items-center gap-2">
                 <span>
                   登录码：
@@ -394,7 +307,7 @@ export default function ProvidersPage({ active }: PageProps) {
               </AlertTitle>
               <AlertDescription>
                 在打开的 OpenAI 页面输入此代码。完成后会自动刷新；代码有效期至
-                {formatTimestamp(deviceAuthorization.expiresAt)}。
+                {formatDateTime(deviceAuthorization.expiresAt)}。
               </AlertDescription>
               <div className="mt-3 flex flex-wrap gap-2">
                 <Button
@@ -407,7 +320,7 @@ export default function ProvidersPage({ active }: PageProps) {
                       .catch((error) => notify.error("无法复制登录码", error))
                   }
                 >
-                  <Copy data-icon="inline-start" />
+                  <HugeiconsIcon icon={Copy01Icon} data-icon="inline-start" />
                   复制
                 </Button>
                 <Button
@@ -419,7 +332,10 @@ export default function ProvidersPage({ active }: PageProps) {
                     )
                   }
                 >
-                  <ExternalLink data-icon="inline-start" />
+                  <HugeiconsIcon
+                    icon={ExternalLinkIcon}
+                    data-icon="inline-start"
+                  />
                   打开 OpenAI
                 </Button>
               </div>
@@ -431,7 +347,7 @@ export default function ProvidersPage({ active }: PageProps) {
                 <Empty className="min-h-48">
                   <EmptyHeader>
                     <EmptyMedia variant="icon">
-                      <KeyRound />
+                      <HugeiconsIcon icon={Key01Icon} />
                     </EmptyMedia>
                     <EmptyTitle>尚未添加 OpenAI 账号</EmptyTitle>
                     <EmptyDescription>
@@ -445,7 +361,10 @@ export default function ProvidersPage({ active }: PageProps) {
                       disabled={busy}
                       onClick={() => setProxyLoginOpen(true)}
                     >
-                      <KeyRound data-icon="inline-start" />
+                      <HugeiconsIcon
+                        icon={Key01Icon}
+                        data-icon="inline-start"
+                      />
                       导入 Cookie
                     </Button>
                     <Button
@@ -453,7 +372,10 @@ export default function ProvidersPage({ active }: PageProps) {
                       disabled={busy || Boolean(deviceAuthorization)}
                       onClick={() => setConfirmOpenAiLogin(true)}
                     >
-                      <LogIn data-icon="inline-start" />
+                      <HugeiconsIcon
+                        icon={Login01Icon}
+                        data-icon="inline-start"
+                      />
                       网页登录
                     </Button>
                   </EmptyContent>
@@ -470,9 +392,9 @@ export default function ProvidersPage({ active }: PageProps) {
                 >
                   <ItemMedia variant="icon">
                     {item.source === "proxy_import" ? (
-                      <KeyRound />
+                      <HugeiconsIcon icon={Key01Icon} />
                     ) : (
-                      <UserRound />
+                      <HugeiconsIcon icon={User02Icon} />
                     )}
                   </ItemMedia>
                   <ItemContent className="min-w-0 gap-2">
@@ -482,28 +404,29 @@ export default function ProvidersPage({ active }: PageProps) {
                         {item.source === "proxy_import" ? "Cookie" : "网页登录"}
                       </Badge>
                     </div>
-                    <div className="flex min-w-0 flex-col gap-0.5">
-                      <ItemDescription className="truncate">
-                        {item.email || item.accountId}
-                      </ItemDescription>
-                      <ItemDescription>
-                        {item.expiresAt
-                          ? `有效至 ${formatTimestamp(item.expiresAt)}${
-                              item.source === "open_ai_oauth"
-                                ? "，到期前自动续期"
-                                : ""
-                            }`
-                          : item.source === "proxy_import"
-                            ? "有效期取决于 Cookie 中的访问凭据"
-                            : "有效期由 OpenAI 自动管理"}
-                      </ItemDescription>
-                    </div>
+                    <ItemDescription className="truncate">
+                      {item.email || item.accountId}
+                    </ItemDescription>
+                    <ItemDescription>
+                      {item.expiresAt
+                        ? `有效至 ${formatDateTime(item.expiresAt)}${
+                            item.source === "open_ai_oauth"
+                              ? "，到期前自动续期"
+                              : ""
+                          }`
+                        : item.source === "proxy_import"
+                          ? "有效期取决于 Cookie 中的访问凭据"
+                          : "有效期由 OpenAI 自动管理"}
+                    </ItemDescription>
                     <QuotaStatusView quota={item.quota} />
                   </ItemContent>
-                  <ItemActions className="ml-auto w-auto justify-end self-start">
+                  <ItemActions className="ml-auto w-auto self-start">
                     {item.active ? (
                       <Badge variant="default">
-                        <Check data-icon="inline-start" />
+                        <HugeiconsIcon
+                          icon={CheckIcon}
+                          data-icon="inline-start"
+                        />
                         当前账号
                       </Badge>
                     ) : (
@@ -518,7 +441,10 @@ export default function ProvidersPage({ active }: PageProps) {
                           })
                         }
                       >
-                        <ArrowRightLeft data-icon="inline-start" />
+                        <HugeiconsIcon
+                          icon={ArrowUpDownIcon}
+                          data-icon="inline-start"
+                        />
                         切换
                       </Button>
                     )}
@@ -534,7 +460,10 @@ export default function ProvidersPage({ active }: PageProps) {
                           />
                         }
                       >
-                        <MoreHorizontal data-icon="inline-start" />
+                        <HugeiconsIcon
+                          icon={More01Icon}
+                          data-icon="inline-start"
+                        />
                       </DropdownMenuTrigger>
                       <DropdownMenuContent align="end" className="w-40">
                         <DropdownMenuGroup>
@@ -562,7 +491,7 @@ export default function ProvidersPage({ active }: PageProps) {
                             {pendingTask === `official:quota:${item.id}` ? (
                               <Spinner />
                             ) : (
-                              <RefreshCw />
+                              <HugeiconsIcon icon={Refresh01Icon} />
                             )}
                             刷新额度
                           </DropdownMenuItem>
@@ -576,7 +505,7 @@ export default function ProvidersPage({ active }: PageProps) {
                               })
                             }
                           >
-                            <Trash2 />
+                            <HugeiconsIcon icon={Delete01Icon} />
                             删除账号
                           </DropdownMenuItem>
                         </DropdownMenuGroup>
@@ -599,7 +528,7 @@ export default function ProvidersPage({ active }: PageProps) {
           description="管理兼容 OpenAI Responses API 的服务；请求由 Codex 直接发送，本应用不参与转发。"
           actions={
             <Button size="sm" onClick={() => setDraft(emptyProvider())}>
-              <Plus data-icon="inline-start" />
+              <HugeiconsIcon icon={Add01Icon} data-icon="inline-start" />
               添加服务
             </Button>
           }
@@ -609,7 +538,7 @@ export default function ProvidersPage({ active }: PageProps) {
             <Empty className="min-h-48 border">
               <EmptyHeader>
                 <EmptyMedia variant="icon">
-                  <Boxes />
+                  <HugeiconsIcon icon={BoxesIcon} />
                 </EmptyMedia>
                 <EmptyTitle>尚未添加第三方 API</EmptyTitle>
                 <EmptyDescription>
@@ -618,7 +547,7 @@ export default function ProvidersPage({ active }: PageProps) {
               </EmptyHeader>
               <EmptyContent>
                 <Button size="sm" onClick={() => setDraft(emptyProvider())}>
-                  <Plus data-icon="inline-start" />
+                  <HugeiconsIcon icon={Add01Icon} data-icon="inline-start" />
                   添加服务
                 </Button>
               </EmptyContent>
@@ -633,7 +562,10 @@ export default function ProvidersPage({ active }: PageProps) {
                     {provider.name}
                     {provider.active && (
                       <Badge variant="default">
-                        <Check data-icon="inline-start" />
+                        <HugeiconsIcon
+                          icon={CheckIcon}
+                          data-icon="inline-start"
+                        />
                         使用中
                       </Badge>
                     )}
@@ -659,12 +591,15 @@ export default function ProvidersPage({ active }: PageProps) {
                           />
                         }
                       >
-                        <MoreHorizontal data-icon="inline-start" />
+                        <HugeiconsIcon
+                          icon={More01Icon}
+                          data-icon="inline-start"
+                        />
                       </DropdownMenuTrigger>
                       <DropdownMenuContent align="end" className="w-44">
                         <DropdownMenuGroup>
                           <DropdownMenuItem onClick={() => setDraft(provider)}>
-                            <Pencil />
+                            <HugeiconsIcon icon={PencilIcon} />
                             编辑服务
                           </DropdownMenuItem>
                           <DropdownMenuItem
@@ -672,7 +607,7 @@ export default function ProvidersPage({ active }: PageProps) {
                               setAccount(emptyAccount(provider.id))
                             }
                           >
-                            <KeyRound />
+                            <HugeiconsIcon icon={Key01Icon} />
                             添加 API Key
                           </DropdownMenuItem>
                           <DropdownMenuItem
@@ -686,7 +621,7 @@ export default function ProvidersPage({ active }: PageProps) {
                               })
                             }
                           >
-                            <Trash2 />
+                            <HugeiconsIcon icon={Delete01Icon} />
                             删除服务
                           </DropdownMenuItem>
                         </DropdownMenuGroup>
@@ -709,7 +644,10 @@ export default function ProvidersPage({ active }: PageProps) {
                           variant="secondary"
                           onClick={() => setAccount(emptyAccount(provider.id))}
                         >
-                          <KeyRound data-icon="inline-start" />
+                          <HugeiconsIcon
+                            icon={Key01Icon}
+                            data-icon="inline-start"
+                          />
                           添加 API Key
                         </Button>
                       </EmptyContent>
@@ -723,14 +661,17 @@ export default function ProvidersPage({ active }: PageProps) {
                           className="items-start gap-3 p-3"
                         >
                           <ItemMedia variant="icon">
-                            <KeyRound />
+                            <HugeiconsIcon icon={Key01Icon} />
                           </ItemMedia>
                           <ItemContent>
                             <ItemTitle>
                               {item.name}
                               {item.active && (
                                 <Badge variant="default">
-                                  <Check data-icon="inline-start" />
+                                  <HugeiconsIcon
+                                    icon={CheckIcon}
+                                    data-icon="inline-start"
+                                  />
                                   使用中
                                 </Badge>
                               )}
@@ -739,7 +680,7 @@ export default function ProvidersPage({ active }: PageProps) {
                               API Key 保存在本机，切换到此服务时写入 Codex。
                             </ItemDescription>
                           </ItemContent>
-                          <ItemActions className="ml-auto w-auto justify-end">
+                          <ItemActions className="ml-auto w-auto">
                             {!item.active && (
                               <Button
                                 size="sm"
@@ -757,7 +698,10 @@ export default function ProvidersPage({ active }: PageProps) {
                                 `account:activate:${item.id}` ? (
                                   <Spinner data-icon="inline-start" />
                                 ) : (
-                                  <ArrowRightLeft data-icon="inline-start" />
+                                  <HugeiconsIcon
+                                    icon={ArrowUpDownIcon}
+                                    data-icon="inline-start"
+                                  />
                                 )}
                                 {pendingTask === `account:activate:${item.id}`
                                   ? "切换中…"
@@ -775,7 +719,10 @@ export default function ProvidersPage({ active }: PageProps) {
                                   />
                                 }
                               >
-                                <MoreHorizontal data-icon="inline-start" />
+                                <HugeiconsIcon
+                                  icon={More01Icon}
+                                  data-icon="inline-start"
+                                />
                               </DropdownMenuTrigger>
                               <DropdownMenuContent align="end" className="w-40">
                                 <DropdownMenuGroup>
@@ -815,7 +762,7 @@ export default function ProvidersPage({ active }: PageProps) {
                                     `account:test:${item.id}` ? (
                                       <Spinner />
                                     ) : (
-                                      <Activity />
+                                      <HugeiconsIcon icon={Activity01Icon} />
                                     )}
                                     测试连接
                                   </DropdownMenuItem>
@@ -830,7 +777,7 @@ export default function ProvidersPage({ active }: PageProps) {
                                       })
                                     }
                                   >
-                                    <Trash2 />
+                                    <HugeiconsIcon icon={Delete01Icon} />
                                     删除账号
                                   </DropdownMenuItem>
                                 </DropdownMenuGroup>
@@ -1088,336 +1035,5 @@ export default function ProvidersPage({ active }: PageProps) {
         </AlertDialogContent>
       </AlertDialog>
     </div>
-  )
-}
-
-function taskFailureTitle(task: string) {
-  if (task.startsWith("account:test:")) return "无法完成连接测试"
-  if (task === "provider:save") return "无法保存 API 服务"
-  if (task === "account:save") return "无法保存 API Key"
-  if (task === "proxy:login") return "无法导入 Cookie 账号"
-  if (task.startsWith("official:quota:")) return "无法刷新 OpenAI 额度"
-  if (task === "openai:login") return "无法开始 OpenAI 登录"
-  if (task.startsWith("account:activate:")) return "无法切换 API 服务"
-  if (task.startsWith("openai:activate:")) return "无法切换 OpenAI 账号"
-  if (task.startsWith("openai:delete:")) return "无法删除 OpenAI 账号"
-  if (task.startsWith("delete:provider:")) return "无法删除 API 服务"
-  if (task.startsWith("delete:account:")) return "无法删除 API Key"
-  return "操作未完成"
-}
-
-function formatTimestamp(value: number) {
-  const date = new Date(epochMilliseconds(value))
-  if (Number.isNaN(date.getTime())) return "时间未知"
-  return accountTimestampFormatter.format(date)
-}
-
-function ProviderEditor({
-  value,
-  pendingTask,
-  onChange,
-  onCancel,
-  onSave,
-}: {
-  value: Provider
-  pendingTask?: string
-  onChange: (value: Provider) => void
-  onCancel: () => void
-  onSave: (value: Provider) => void
-}) {
-  const busy = Boolean(pendingTask)
-
-  return (
-    <Dialog
-      open
-      onOpenChange={(open) => {
-        if (!open && !busy) onCancel()
-      }}
-    >
-      <DialogContent className="sm:max-w-md">
-        <DialogHeader>
-          <DialogTitle>
-            {value.id ? "编辑 API 服务" : "添加 API 服务"}
-          </DialogTitle>
-          <DialogDescription>
-            填写服务名称和 Responses API 地址。保存后再添加 API Key。
-          </DialogDescription>
-        </DialogHeader>
-        <FieldGroup>
-          <Field data-disabled={busy}>
-            <FieldLabel htmlFor="provider-name">服务名称</FieldLabel>
-            <Input
-              id="provider-name"
-              autoFocus
-              disabled={busy}
-              required
-              maxLength={MAX_DISPLAY_NAME_LENGTH}
-              placeholder="例如：公司 API"
-              value={value.name}
-              onChange={(event) =>
-                onChange({ ...value, name: event.target.value })
-              }
-            />
-            <FieldDescription>最多 100 个字符。</FieldDescription>
-          </Field>
-          <Field data-disabled={busy}>
-            <FieldLabel htmlFor="provider-base-url">API 地址</FieldLabel>
-            <Input
-              id="provider-base-url"
-              type="url"
-              disabled={busy}
-              required
-              maxLength={MAX_API_URL_LENGTH}
-              placeholder="https://api.example.com/v1"
-              value={value.baseUrl}
-              onChange={(event) =>
-                onChange({ ...value, baseUrl: event.target.value })
-              }
-            />
-            <FieldDescription>
-              最多 2,048 个字符。填写服务商提供的 API 根地址，通常以 /v1 结尾。
-            </FieldDescription>
-          </Field>
-          <Field orientation="horizontal" data-disabled={busy}>
-            <FieldContent>
-              <FieldTitle>启用此服务</FieldTitle>
-              <FieldDescription>
-                关闭后仍会保留配置，但不能切换使用。
-              </FieldDescription>
-            </FieldContent>
-            <Switch
-              id="provider-enabled"
-              aria-label="启用此服务"
-              disabled={busy}
-              checked={value.enabled}
-              onCheckedChange={(enabled) => onChange({ ...value, enabled })}
-            />
-          </Field>
-        </FieldGroup>
-        <DialogFooter>
-          <Button variant="outline" disabled={busy} onClick={onCancel}>
-            取消
-          </Button>
-          <Button
-            disabled={busy || !value.name.trim() || !value.baseUrl.trim()}
-            onClick={() => onSave(value)}
-          >
-            {pendingTask === "provider:save" ? (
-              <Spinner data-icon="inline-start" />
-            ) : (
-              <Save data-icon="inline-start" />
-            )}
-            {pendingTask === "provider:save" ? "正在保存…" : "保存服务"}
-          </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
-  )
-}
-
-function AccountEditor({
-  value,
-  pending,
-  onChange,
-  onCancel,
-  onSave,
-}: {
-  value: Account
-  pending: boolean
-  onChange: (value: Account) => void
-  onCancel: () => void
-  onSave: () => void
-}) {
-  return (
-    <Dialog
-      open
-      onOpenChange={(open) => {
-        if (!open && !pending) onCancel()
-      }}
-    >
-      <DialogContent className="sm:max-w-md">
-        <DialogHeader>
-          <DialogTitle>添加 API Key</DialogTitle>
-          <DialogDescription>
-            可以为同一个第三方服务保存多个 API Key，并随时切换。
-          </DialogDescription>
-        </DialogHeader>
-        <FieldGroup>
-          <Field data-disabled={pending}>
-            <FieldLabel htmlFor="account-name">密钥名称</FieldLabel>
-            <Input
-              id="account-name"
-              autoFocus
-              disabled={pending}
-              required
-              maxLength={MAX_DISPLAY_NAME_LENGTH}
-              placeholder="例如：个人密钥"
-              value={value.name}
-              onChange={(event) =>
-                onChange({ ...value, name: event.target.value })
-              }
-            />
-            <FieldDescription>最多 100 个字符。</FieldDescription>
-          </Field>
-          <Field data-disabled={pending}>
-            <FieldLabel htmlFor="account-api-key">API Key</FieldLabel>
-            <Input
-              id="account-api-key"
-              required
-              disabled={pending}
-              type="password"
-              autoComplete="off"
-              maxLength={MAX_API_KEY_LENGTH}
-              placeholder="sk-…"
-              value={value.apiKey ?? ""}
-              onChange={(event) =>
-                onChange({
-                  ...value,
-                  apiKey: event.target.value,
-                  authKind: "api_key",
-                })
-              }
-            />
-            <FieldDescription>
-              最多 65,536 个字符。密钥保存在本机；切换到此服务时写入 Codex 的
-              auth.json。
-            </FieldDescription>
-          </Field>
-        </FieldGroup>
-        <DialogFooter>
-          <Button variant="outline" disabled={pending} onClick={onCancel}>
-            取消
-          </Button>
-          <Button
-            disabled={pending || !value.name.trim() || !value.apiKey?.trim()}
-            onClick={onSave}
-          >
-            {pending ? (
-              <Spinner data-icon="inline-start" />
-            ) : (
-              <Save data-icon="inline-start" />
-            )}
-            {pending ? "正在保存…" : "保存 API Key"}
-          </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
-  )
-}
-
-function ProxyLoginDialog({
-  pending,
-  onCancel,
-  onLogin,
-}: {
-  pending: boolean
-  onCancel: () => void
-  onLogin: (
-    name: string | undefined,
-    accountId: string | undefined,
-    content: string
-  ) => void
-}) {
-  const [name, setName] = useState("")
-  const [accountId, setAccountId] = useState("")
-  const [hasContent, setHasContent] = useState(false)
-  const contentRef = useRef<HTMLTextAreaElement>(null)
-
-  return (
-    <Dialog
-      open
-      onOpenChange={(open) => {
-        if (!open && !pending) onCancel()
-      }}
-    >
-      <DialogContent className="sm:max-w-lg">
-        <DialogHeader>
-          <DialogTitle>导入 Cookie 账号</DialogTitle>
-          <DialogDescription>
-            粘贴 Cookie Token 或单账号 JSON。这里不会读取浏览器
-            Cookie；导入后会尝试向 OpenAI 查询 5H/7D 额度。
-          </DialogDescription>
-        </DialogHeader>
-        <FieldGroup>
-          <Field data-disabled={pending}>
-            <FieldLabel htmlFor="proxy-account-name">账号名称</FieldLabel>
-            <Input
-              id="proxy-account-name"
-              autoFocus
-              disabled={pending}
-              maxLength={MAX_DISPLAY_NAME_LENGTH}
-              placeholder="可选，例如：工作 Cookie 账号"
-              value={name}
-              onChange={(event) => setName(event.target.value)}
-            />
-          </Field>
-          <Field data-disabled={pending}>
-            <FieldLabel htmlFor="proxy-account-id">
-              ChatGPT Account ID
-            </FieldLabel>
-            <Input
-              id="proxy-account-id"
-              autoComplete="off"
-              disabled={pending}
-              maxLength={MAX_ACCOUNT_ID_LENGTH}
-              placeholder="可选；团队号查询额度时可能需要"
-              value={accountId}
-              onChange={(event) => setAccountId(event.target.value)}
-            />
-            <FieldDescription>
-              最多 512 个字符。个人账号通常留空；单账号 JSON 已包含 accountId
-              时也可留空。
-            </FieldDescription>
-          </Field>
-          <Field data-disabled={pending}>
-            <FieldLabel htmlFor="proxy-account-content">
-              Cookie Token / 单账号 JSON
-            </FieldLabel>
-            <Textarea
-              ref={contentRef}
-              id="proxy-account-content"
-              className="field-sizing-fixed h-40 max-h-40 min-h-40 max-w-full resize-none overflow-x-hidden overflow-y-auto font-mono text-xs break-all"
-              autoComplete="off"
-              disabled={pending}
-              spellCheck={false}
-              wrap="soft"
-              maxLength={MAX_COOKIE_CREDENTIAL_LENGTH}
-              placeholder='粘贴 at-…、accessToken，或包含 "access_token" / "refresh_token" 的单账号 JSON'
-              onInput={(event) =>
-                setHasContent(/\S/.test(event.currentTarget.value))
-              }
-            />
-            <FieldDescription>
-              最多 262,144 个字符。原始 JSON
-              不会保存；程序只提取登录所需字段，并将凭据写入本机应用数据文件。
-            </FieldDescription>
-          </Field>
-        </FieldGroup>
-        <DialogFooter>
-          <Button variant="outline" disabled={pending} onClick={onCancel}>
-            取消
-          </Button>
-          <Button
-            disabled={pending || !hasContent}
-            onClick={() => {
-              const content = contentRef.current?.value ?? ""
-              if (!content.trim()) return
-              onLogin(
-                name.trim() || undefined,
-                accountId.trim() || undefined,
-                content
-              )
-            }}
-          >
-            {pending ? (
-              <Spinner data-icon="inline-start" />
-            ) : (
-              <LogIn data-icon="inline-start" />
-            )}
-            {pending ? "正在导入…" : "导入并登录"}
-          </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
   )
 }

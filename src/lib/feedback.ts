@@ -12,18 +12,8 @@ function formatError(error: unknown) {
           ? ""
           : String(error)
   const boundedRaw = raw.slice(0, MAX_ERROR_DETAIL_LENGTH + 1)
-  let sanitized = ""
-  for (const character of boundedRaw) {
-    const code = character.charCodeAt(0)
-    if (
-      code === 9 ||
-      code === 10 ||
-      code === 13 ||
-      (code >= 32 && code !== 127)
-    ) {
-      sanitized += character
-    }
-  }
+  // eslint-disable-next-line no-control-regex -- 移除错误详情中的控制字符是刻意行为
+  const sanitized = boundedRaw.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "")
   const message = sanitized
     .trim()
     .replace(/^Error:\s*/i, "")

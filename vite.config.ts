@@ -12,4 +12,17 @@ export default defineConfig({
       "@": path.resolve(__dirname, "./src"),
     },
   },
+  build: {
+    target: "es2022",
+    rollupOptions: {
+      output: {
+        manualChunks(id) {
+          if (!id.includes("node_modules")) return
+          if (/\/node_modules\/(react|react-dom|scheduler)\//.test(id)) return "react"
+          if (/\/node_modules\/@base-ui\/react\//.test(id)) return "baseui"
+          if (/\/node_modules\/(sonner|next-themes|class-variance-authority|clsx|tailwind-merge)\//.test(id)) return "ui"
+        },
+      },
+    },
+  },
 })

@@ -1,4 +1,4 @@
-import type { LucideIcon } from "lucide-react"
+import { HugeiconsIcon, type IconSvgElement } from "@hugeicons/react"
 
 import {
   Card,
@@ -13,7 +13,7 @@ type MetricCardProps = {
   label: string
   value: string | number
   detail?: string
-  icon: LucideIcon
+  icon: IconSvgElement
 }
 
 export function MetricCard({
@@ -26,8 +26,10 @@ export function MetricCard({
     <Card size="sm" className="min-h-28">
       <CardHeader>
         <CardDescription>{label}</CardDescription>
-        <CardAction className="text-muted-foreground">
-          <Icon className="size-4" aria-hidden="true" />
+        <CardAction>
+          <div className="flex size-8 items-center justify-center rounded-lg bg-secondary text-secondary-foreground ring-1 ring-border [&_svg:not([class*='size-'])]:size-4">
+            <HugeiconsIcon icon={Icon} aria-hidden="true" />
+          </div>
         </CardAction>
       </CardHeader>
       <CardContent className="flex flex-col gap-0.5">

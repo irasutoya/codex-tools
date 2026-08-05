@@ -1,4 +1,5 @@
-import { Clock3 } from "lucide-react"
+import { Clock03Icon } from "@hugeicons/core-free-icons"
+import { HugeiconsIcon } from "@hugeicons/react"
 
 import { Badge } from "@/components/ui/badge"
 import {
@@ -9,16 +10,21 @@ import {
   ItemGroup,
   ItemTitle,
 } from "@/components/ui/item"
-import { epochMilliseconds } from "@/lib/time"
+import { Progress } from "@/components/ui/progress"
+import { formatDateTime } from "@/lib/time"
 import { cn } from "@/lib/utils"
-import type { AccountQuota } from "@/types"
+import type { AccountQuota, QuotaStatus } from "@/types"
 
 import { quotaRows, quotaStatusText } from "./quota-format"
 
-const quotaTimestampFormatter = new Intl.DateTimeFormat("zh-CN", {
-  dateStyle: "short",
-  timeStyle: "short",
-})
+const quotaBadgeVariants = {
+  success: "default",
+  unsupported: "outline",
+  unauthorized: "destructive",
+  rate_limited: "outline",
+  error: "destructive",
+  never: "outline",
+} as const satisfies Record<QuotaStatus, "default" | "outline" | "destructive">
 
 export function QuotaStatusView({ quota }: { quota?: AccountQuota }) {
   const rows = quotaRows(quota)
@@ -27,13 +33,17 @@ export function QuotaStatusView({ quota }: { quota?: AccountQuota }) {
   return (
     <div className="flex min-w-0 flex-col gap-2.5">
       <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
-        <Badge variant={successful ? "default" : "outline"}>
+        <Badge variant={quotaBadgeVariants[quota?.status ?? "never"]}>
           {quotaStatusText(quota)}
         </Badge>
         {quota?.fetchedAt && (
           <span className="flex items-center gap-1">
-            <Clock3 className="size-3" aria-hidden="true" />
-            更新于 {formatTimestamp(quota.fetchedAt)}
+            <HugeiconsIcon
+              icon={Clock03Icon}
+              className="size-3"
+              aria-hidden="true"
+            />
+            更新于 {formatDateTime(quota.fetchedAt)}
           </span>
         )}
       </div>
@@ -59,6 +69,13 @@ export function QuotaStatusView({ quota }: { quota?: AccountQuota }) {
                   <ItemTitle className="text-base tabular-nums">
                     {row.value}
                   </ItemTitle>
+                  {row.remainingPercent != null && (
+                    <Progress
+                      value={row.remainingPercent}
+                      aria-label={`${row.label}剩余额度`}
+                      className="mt-0.5 max-w-72"
+                    />
+                  )}
                 </ItemContent>
                 {(row.detail || row.resetAt) && (
                   <ItemActions className="ml-auto max-w-[65%]">
@@ -66,7 +83,7 @@ export function QuotaStatusView({ quota }: { quota?: AccountQuota }) {
                       {[
                         row.detail,
                         row.resetAt &&
-                          `重置/到期 ${formatTimestamp(row.resetAt)}`,
+                          `重置/到期 ${formatDateTime(row.resetAt)}`,
                       ]
                         .filter(Boolean)
                         .join(" · ")}
@@ -85,10 +102,4 @@ export function QuotaStatusView({ quota }: { quota?: AccountQuota }) {
       )}
     </div>
   )
-}
-
-function formatTimestamp(value: number) {
-  const date = new Date(epochMilliseconds(value))
-  if (Number.isNaN(date.getTime())) return "时间未知"
-  return quotaTimestampFormatter.format(date)
 }

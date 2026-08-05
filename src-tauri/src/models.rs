@@ -1,4 +1,7 @@
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fmt;
 
@@ -40,6 +43,62 @@ impl From<std::io::Error> for AppError {
     fn from(value: std::io::Error) -> Self {
         Self::Internal(value.to_string())
     }
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct TokenIdentity {
+    pub account_id: Option<String>,
+    pub email: Option<String>,
+    pub expires_at: Option<i64>,
+}
+
+pub(crate) fn token_local_identity(token: &str) -> String {
+    let digest = Sha256::digest(token.as_bytes());
+    let mut result = String::with_capacity(30);
+    result.push_str("proxy-");
+    for &byte in &digest[..12] {
+        result.push(char::from_digit(u32::from(byte >> 4), 16).expect("半字节必为十六进制"));
+        result.push(char::from_digit(u32::from(byte & 0xF), 16).expect("半字节必为十六进制"));
+    }
+    result
+}
+
+pub(crate) fn token_identity(token: &str) -> Option<TokenIdentity> {
+    let payload = token.split('.').nth(1)?;
+    let bytes = URL_SAFE_NO_PAD.decode(payload).ok()?;
+    let claims: Value = serde_json::from_slice(&bytes).ok()?;
+    let auth = claims.get("https://api.openai.com/auth");
+    let profile = claims.get("https://api.openai.com/profile");
+    let account_id = claims
+        .get("chatgpt_account_id")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            auth.and_then(|value| value.get("chatgpt_account_id"))
+                .and_then(Value::as_str)
+        })
+        .or_else(|| {
+            claims
+                .pointer("/organizations/0/id")
+                .and_then(Value::as_str)
+        })
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_owned);
+    let email = claims
+        .get("email")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            profile
+                .and_then(|value| value.get("email"))
+                .and_then(Value::as_str)
+        })
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_owned);
+    let expires_at = claims.get("exp").and_then(Value::as_i64);
+    Some(TokenIdentity {
+        account_id,
+        email,
+        expires_at,
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -436,11 +495,11 @@ pub struct ProviderTestResult {
     pub suggest_v1: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct QuotaWindow {
-    pub used_percent: u8,
-    pub remaining_percent: u8,
+    pub used_percent: f64,
+    pub remaining_percent: f64,
     pub window_seconds: Option<i64>,
     pub reset_at: Option<i64>,
 }
@@ -504,6 +563,7 @@ pub struct RepairTarget {
     pub id: String,
     pub sources: Vec<String>,
     pub current: bool,
+    pub count: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -600,6 +660,47 @@ pub(crate) fn ensure_char_limit(
     if value.chars().count() > limit {
         return Err(AppError::InvalidConfig(message.into()));
     }
+    Ok(())
+}
+
+pub(crate) fn is_personal_access_token_credential(credential: &CodexAuthCredential) -> bool {
+    credential.tokens.id_token.trim().is_empty()
+        || credential.tokens.refresh_token.trim().is_empty()
+}
+
+pub(crate) fn validate_official_credential(
+    credential: &CodexAuthCredential,
+) -> Result<(), AppError> {
+    let tokens = &credential.tokens;
+    let personal_access_token = is_personal_access_token_credential(credential);
+    if credential.auth_mode != "chatgpt"
+        || tokens.access_token.trim().is_empty()
+        || tokens.account_id.trim().is_empty()
+        || (!personal_access_token
+            && (tokens.id_token.trim().is_empty()
+                || tokens.refresh_token.trim().is_empty()
+                || credential.last_refresh.trim().is_empty()))
+    {
+        return Err(AppError::InvalidConfig(
+            "OpenAI 登录信息不完整，请重新登录。".into(),
+        ));
+    }
+    for token in [
+        tokens.id_token.as_str(),
+        tokens.access_token.as_str(),
+        tokens.refresh_token.as_str(),
+    ] {
+        ensure_char_limit(
+            token,
+            MAX_CREDENTIAL_CHARS,
+            "OpenAI 登录凭据过长，请重新登录或导入有效的 Cookie。",
+        )?;
+    }
+    ensure_char_limit(
+        &tokens.account_id,
+        MAX_ACCOUNT_ID_CHARS,
+        "OpenAI 账号标识不能超过 512 个字符。",
+    )?;
     Ok(())
 }
 
@@ -787,5 +888,89 @@ mod tests {
         assert!(!rendered.contains("secret-access-token"));
         assert!(!rendered.contains("secret-refresh-token"));
         assert!(rendered.contains("[REDACTED]"));
+    }
+
+    fn credential() -> CodexAuthCredential {
+        CodexAuthCredential {
+            auth_mode: "chatgpt".into(),
+            openai_api_key: None,
+            tokens: CodexAuthTokens {
+                id_token: "id-secret".into(),
+                access_token: "access-secret".into(),
+                refresh_token: "refresh-secret".into(),
+                account_id: "workspace-account".into(),
+            },
+            last_refresh: "2026-07-14T00:00:00Z".into(),
+        }
+    }
+
+    #[test]
+    fn token_local_identity_renders_stable_lowercase_hex_suffix() {
+        let first = token_local_identity("secret-token");
+        assert!(first.starts_with("proxy-"));
+        assert_eq!(first.len(), "proxy-".len() + 24);
+        assert!(first[6..].chars().all(|c| c.is_ascii_hexdigit()));
+        assert!(first[6..].chars().all(|c| !c.is_ascii_uppercase()));
+        assert_eq!(first, token_local_identity("secret-token"));
+        assert_ne!(first, token_local_identity("other-token"));
+    }
+
+    #[test]
+    fn validate_official_credential_accepts_complete_oauth_login() {
+        assert!(validate_official_credential(&credential()).is_ok());
+    }
+
+    #[test]
+    fn validate_official_credential_rejects_incomplete_login() {
+        let mut missing_access = credential();
+        missing_access.tokens.access_token.clear();
+        assert!(validate_official_credential(&missing_access).is_err());
+
+        let mut missing_account = credential();
+        missing_account.tokens.account_id.clear();
+        assert!(validate_official_credential(&missing_account).is_err());
+
+        let mut missing_refresh = credential();
+        missing_refresh.tokens.refresh_token.clear();
+        assert!(is_personal_access_token_credential(&missing_refresh));
+        assert!(validate_official_credential(&missing_refresh).is_ok());
+
+        let mut missing_last_refresh = credential();
+        missing_last_refresh.last_refresh.clear();
+        assert!(!is_personal_access_token_credential(&missing_last_refresh));
+        assert!(validate_official_credential(&missing_last_refresh).is_err());
+
+        let mut wrong_mode = credential();
+        wrong_mode.auth_mode = "azure".into();
+        assert!(validate_official_credential(&wrong_mode).is_err());
+    }
+
+    #[test]
+    fn validate_official_credential_accepts_personal_access_token_without_session_tokens() {
+        let credential = CodexAuthCredential {
+            tokens: CodexAuthTokens {
+                id_token: String::new(),
+                access_token: "pat-secret".into(),
+                refresh_token: String::new(),
+                account_id: "workspace-account".into(),
+            },
+            last_refresh: String::new(),
+            ..credential()
+        };
+        assert!(is_personal_access_token_credential(&credential));
+        assert!(validate_official_credential(&credential).is_ok());
+    }
+
+    #[test]
+    fn validate_official_credential_rejects_oversized_tokens() {
+        let mut oversized = credential();
+        oversized.tokens.id_token = "x".repeat(MAX_CREDENTIAL_CHARS + 1);
+        let error = validate_official_credential(&oversized).unwrap_err();
+        assert!(error.to_string().contains("凭据过长"));
+
+        let mut oversized_account = credential();
+        oversized_account.tokens.account_id = "a".repeat(MAX_ACCOUNT_ID_CHARS + 1);
+        let error = validate_official_credential(&oversized_account).unwrap_err();
+        assert!(error.to_string().contains("不能超过 512 个字符"));
     }
 }

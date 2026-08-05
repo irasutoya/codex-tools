@@ -22,11 +22,13 @@ pub fn scan(codex_home: &Path) -> RepairScan {
     let mut omitted_warnings = 0;
     let rollouts = rollout_files(codex_home);
     let mut providers = BTreeMap::<String, BTreeSet<String>>::new();
+    let mut counts = BTreeMap::<String, usize>::new();
     let mut session_meta_count = 0;
     for path in &rollouts {
         match rollout_provider(path) {
             Ok(Some(provider)) => {
                 session_meta_count += 1;
+                *counts.entry(provider.clone()).or_default() += 1;
                 providers
                     .entry(provider)
                     .or_default()
@@ -43,17 +45,18 @@ pub fn scan(codex_home: &Path) -> RepairScan {
     let mut databases = vec![];
     for path in database_paths(codex_home) {
         match inspect_database(&path) {
-            Ok(Some((schema, count, found))) => {
-                for provider in found {
+            Ok(Some(inspection)) => {
+                for (provider, provider_count) in &inspection.providers {
+                    *counts.entry(provider.clone()).or_default() += *provider_count as usize;
                     providers
-                        .entry(provider)
+                        .entry(provider.clone())
                         .or_default()
                         .insert("sqlite".into());
                 }
                 databases.push(DatabaseScan {
                     path: path.display().to_string(),
-                    schema,
-                    thread_count: count,
+                    schema: inspection.schema,
+                    thread_count: inspection.thread_count,
                 });
             }
             Ok(None) => {}
@@ -74,10 +77,14 @@ pub fn scan(codex_home: &Path) -> RepairScan {
         current_provider: current_provider.clone(),
         targets: providers
             .into_iter()
-            .map(|(id, sources)| RepairTarget {
-                current: id == current_provider,
-                id,
-                sources: sources.into_iter().collect(),
+            .map(|(id, sources)| {
+                let count = counts.get(&id).copied().unwrap_or(0);
+                RepairTarget {
+                    current: id == current_provider,
+                    id,
+                    sources: sources.into_iter().collect(),
+                    count,
+                }
             })
             .collect(),
         rollout_files: rollouts.len(),
@@ -309,7 +316,7 @@ fn repair_database(path: &Path, target: &str) -> anyhow::Result<usize> {
     Ok(rows)
 }
 
-fn inspect_database(path: &Path) -> anyhow::Result<Option<(String, u64, Vec<String>)>> {
+fn inspect_database(path: &Path) -> anyhow::Result<Option<DatabaseInspection>> {
     let db = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -324,13 +331,24 @@ fn inspect_database(path: &Path) -> anyhow::Result<Option<(String, u64, Vec<Stri
         row.get(0)
     })?;
     let mut statement = db.prepare(&format!(
-        "SELECT DISTINCT model_provider FROM {table} WHERE model_provider IS NOT NULL"
+        "SELECT model_provider, count(*) FROM {table} WHERE model_provider IS NOT NULL GROUP BY model_provider"
     ))?;
     let providers = statement
-        .query_map([], |row| row.get::<_, String>(0))?
-        .flatten()
-        .collect();
-    Ok(Some((table.into(), count, providers)))
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(Some(DatabaseInspection {
+        schema: table.into(),
+        thread_count: count,
+        providers,
+    }))
+}
+
+struct DatabaseInspection {
+    schema: String,
+    thread_count: u64,
+    providers: Vec<(String, u64)>,
 }
 
 fn session_table(
@@ -425,6 +443,54 @@ mod tests {
         assert!(after.contains("\"message\":\"unchanged\""));
         assert!(!data.exists());
         assert!(!data.join("backup").exists());
+    }
+
+    #[test]
+    fn scan_reports_per_provider_counts() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex");
+        fs::create_dir_all(home.join("sessions")).unwrap();
+        fs::write(
+            home.join("sessions/openai.jsonl"),
+            format!(
+                "{}\n",
+                serde_json::json!({"type":"session_meta","payload":{"id":"openai","model_provider":"openai"}})
+            ),
+        )
+        .unwrap();
+        fs::write(
+            home.join("sessions/custom.jsonl"),
+            format!(
+                "{}\n",
+                serde_json::json!({"type":"session_meta","payload":{"id":"custom","model_provider":"custom"}})
+            ),
+        )
+        .unwrap();
+        let db = home.join("state_5.sqlite");
+        let connection = Connection::open(&db).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE threads(id TEXT PRIMARY KEY, model_provider TEXT); INSERT INTO threads VALUES('one','openai'); INSERT INTO threads VALUES('two','openai'); INSERT INTO threads VALUES('three','custom');",
+            )
+            .unwrap();
+        drop(connection);
+
+        let result = scan(&home);
+
+        assert_eq!(result.session_meta_count, 2);
+        assert_eq!(result.rollout_files, 2);
+        assert_eq!(result.databases[0].thread_count, 3);
+        let by_id: BTreeMap<_, _> = result
+            .targets
+            .iter()
+            .map(|target| (target.id.as_str(), target))
+            .collect();
+        assert_eq!(by_id["openai"].count, 3);
+        assert!(by_id["openai"].sources.contains(&"sqlite".to_string()));
+        assert!(by_id["openai"].sources.contains(&"rollout".to_string()));
+        assert_eq!(by_id["custom"].count, 2);
+        assert!(by_id["custom"].sources.contains(&"sqlite".to_string()));
+        assert!(by_id["custom"].sources.contains(&"rollout".to_string()));
     }
 
     #[test]
