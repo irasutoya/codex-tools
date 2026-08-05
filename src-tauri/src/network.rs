@@ -114,22 +114,26 @@ fn apply_system_proxy(
     };
     let no_proxy = no_proxy(&settings.bypass);
 
-    match (&settings.http, &settings.https) {
+    match (settings.http.as_deref(), settings.https.as_deref()) {
         (Some(http), Some(https)) if http == https => {
             builder = builder.proxy(Proxy::all(http)?.no_proxy(no_proxy.clone()));
         }
-        (http, https) => {
-            if let Some(http) = http {
-                builder = builder.proxy(Proxy::http(http)?.no_proxy(no_proxy.clone()));
-            }
-            if let Some(https) = https {
-                builder = builder.proxy(Proxy::https(https)?.no_proxy(no_proxy.clone()));
-            }
+        (Some(http), None) => {
+            // An HTTP proxy can tunnel HTTPS via CONNECT, so a HTTP-only
+            // system setting must cover both URL schemes.
+            builder = builder.proxy(Proxy::all(http)?.no_proxy(no_proxy.clone()));
         }
-    }
-    if settings.http.is_none() && settings.https.is_none() {
-        if let Some(socks) = settings.socks {
-            builder = builder.proxy(Proxy::all(socks)?.no_proxy(no_proxy));
+        (None, Some(https)) => {
+            builder = builder.proxy(Proxy::https(https)?.no_proxy(no_proxy.clone()));
+        }
+        (Some(http), Some(https)) => {
+            builder = builder.proxy(Proxy::http(http)?.no_proxy(no_proxy.clone()));
+            builder = builder.proxy(Proxy::https(https)?.no_proxy(no_proxy.clone()));
+        }
+        (None, None) => {
+            if let Some(socks) = settings.socks {
+                builder = builder.proxy(Proxy::all(socks)?.no_proxy(no_proxy));
+            }
         }
     }
     Ok(builder)
@@ -373,6 +377,18 @@ mod tests {
         };
         assert!(
             apply_system_proxy(Client::builder(), Some(socks))
+                .and_then(ClientBuilder::build)
+                .is_ok()
+        );
+
+        let http_only = SystemProxy {
+            http: Some("http://127.0.0.1:7890".into()),
+            https: None,
+            socks: None,
+            bypass: Vec::new(),
+        };
+        assert!(
+            apply_system_proxy(Client::builder(), Some(http_only))
                 .and_then(ClientBuilder::build)
                 .is_ok()
         );
