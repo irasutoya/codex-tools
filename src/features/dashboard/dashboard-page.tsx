@@ -68,6 +68,7 @@ export default function DashboardPage({ active }: PageProps) {
   const [quotaRefreshing, setQuotaRefreshing] = useState(false)
   const [error, setError] = useState<string>()
   const lastRefreshRevision = useRef<number | undefined>(undefined)
+  const initialized = useRef(false)
 
   const loadDashboard = useCallback(async () => {
     try {
@@ -107,15 +108,20 @@ export default function DashboardPage({ active }: PageProps) {
   }, [activeAccountId, loadDashboard])
 
   useEffect(() => {
+    if (!active) return
+    const firstLoad = !initialized.current
     if (
-      !active ||
-      !foreground ||
-      lastRefreshRevision.current === refreshSignal.revision
+      !firstLoad &&
+      (!foreground || lastRefreshRevision.current === refreshSignal.revision)
     ) {
       return
     }
-    lastRefreshRevision.current = refreshSignal.revision
     const timeout = window.setTimeout(() => {
+      // StrictMode 双挂载时，若在 effect 体内同步写入 revision ref，
+      // 首次加载会被第二次挂载的守卫吞掉（load 永不执行）。
+      // 因此在回调中再写入，保证首次加载一定执行。
+      initialized.current = true
+      lastRefreshRevision.current = refreshSignal.revision
       void load().catch(() => undefined)
     }, 0)
     return () => window.clearTimeout(timeout)

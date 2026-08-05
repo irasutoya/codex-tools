@@ -81,6 +81,7 @@ export default function SettingsPage({ active }: PageProps) {
   const [applyingPreview, setApplyingPreview] = useState(false)
   const [switchingOfficial, setSwitchingOfficial] = useState(false)
   const lastRefreshRevision = useRef<number | undefined>(undefined)
+  const initialized = useRef(false)
   const diagnosticsText = useMemo(
     () => JSON.stringify(diagnostics ?? {}, null, 2),
     [diagnostics]
@@ -95,15 +96,17 @@ export default function SettingsPage({ active }: PageProps) {
   }, [])
 
   useEffect(() => {
+    if (!active) return
+    const firstLoad = !initialized.current
     if (
-      !active ||
-      !foreground ||
-      lastRefreshRevision.current === refreshSignal.revision
+      !firstLoad &&
+      (!foreground || lastRefreshRevision.current === refreshSignal.revision)
     ) {
       return
     }
-    lastRefreshRevision.current = refreshSignal.revision
     const timeout = window.setTimeout(() => {
+      initialized.current = true
+      lastRefreshRevision.current = refreshSignal.revision
       void load().catch((reason) => setError(String(reason)))
     }, 0)
     return () => window.clearTimeout(timeout)

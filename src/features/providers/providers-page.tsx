@@ -179,16 +179,19 @@ export default function ProvidersPage({ active }: PageProps) {
       return undefined
     }
   }, [])
+  const initialized = useRef(false)
   useEffect(() => {
+    if (!active) return
+    const firstLoad = !initialized.current
     if (
-      !active ||
-      !foreground ||
-      lastRefreshRevision.current === refreshSignal.revision
+      !firstLoad &&
+      (!foreground || lastRefreshRevision.current === refreshSignal.revision)
     ) {
       return
     }
-    lastRefreshRevision.current = refreshSignal.revision
     const timeout = window.setTimeout(() => {
+      initialized.current = true
+      lastRefreshRevision.current = refreshSignal.revision
       void load().catch(() => undefined)
       void loadUsage(true)
     }, 0)

@@ -123,6 +123,7 @@ export default function SessionsPage({ active }: PageProps) {
   const currentPageRef = useRef(1)
   const loadedPage = useRef<number | undefined>(undefined)
   const lastScanRevision = useRef<number | undefined>(undefined)
+  const scanInitialized = useRef(false)
   const lastSessionRevision = useRef<number | undefined>(undefined)
   const loadScan = useCallback(async () => {
     setScan(await call("scan_codex_data"))
@@ -166,15 +167,17 @@ export default function SessionsPage({ active }: PageProps) {
   }, [debouncedQuery, loadScan, loadSessions])
 
   useEffect(() => {
+    if (!active) return
+    const firstLoad = !scanInitialized.current
     if (
-      !active ||
-      !foreground ||
-      lastScanRevision.current === refreshSignal.revision
+      !firstLoad &&
+      (!foreground || lastScanRevision.current === refreshSignal.revision)
     ) {
       return
     }
-    lastScanRevision.current = refreshSignal.revision
     const timeout = window.setTimeout(() => {
+      scanInitialized.current = true
+      lastScanRevision.current = refreshSignal.revision
       void loadScan().catch((reason) => setError(String(reason)))
     }, 0)
     return () => window.clearTimeout(timeout)
