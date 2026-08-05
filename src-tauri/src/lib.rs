@@ -2,20 +2,26 @@ mod activation;
 mod auth_center;
 mod codex;
 mod commands;
+mod local_usage;
 mod models;
 mod network;
+mod official_pricing;
 mod official_quota;
 mod platform;
 mod provider_http;
+mod pricing;
 mod provider_sync;
 mod proxy_import;
 mod session_index;
 mod state;
 mod storage;
+mod usage_log;
 
 use activation::sync_active_codex_configuration;
 use auth_center::AuthCenter;
 use codex::ConfigManager;
+use local_usage::UsageLedger;
+use models::*;
 use session_index::SessionIndex;
 use state::{ActivationLock, ApiClient};
 use storage::Store;
@@ -33,9 +39,130 @@ const MIN_WINDOW_HEIGHT: f64 = 520.0;
 async fn sync_configured_provider(app: tauri::AppHandle) {
     let store = app.state::<Store>();
     let manager = app.state::<ConfigManager>();
+    let ledger = app.state::<UsageLedger>();
     let activation = app.state::<ActivationLock>();
     let _guard = activation.0.lock().await;
-    let _ = sync_active_codex_configuration(&store, &manager).await;
+    if sync_active_codex_configuration(&store, &manager)
+        .await
+        .is_ok()
+    {
+        let _ = reconcile_current_activation(&store, &ledger);
+    } else {
+        let _ = ledger.cancel_pending_activations();
+    }
+}
+
+fn current_activation(
+    store: &Store,
+    effective_at_ms: i64,
+) -> Result<Option<ActivationRecord>, AppError> {
+    store.read(|state| match state.active.kind {
+        ActiveKind::Official => state
+            .active
+            .account_id
+            .as_deref()
+            .and_then(|id| {
+                state
+                    .official_accounts
+                    .iter()
+                    .find(|account| account.id == id)
+            })
+            .map(|account| activation_for_official(account, effective_at_ms)),
+        ActiveKind::Provider => {
+            let provider = state.active.provider_id.as_deref().and_then(|id| {
+                state
+                    .providers
+                    .iter()
+                    .find(|provider| provider.profile.id == id)
+            })?;
+            let account = state
+                .active
+                .account_id
+                .as_deref()
+                .and_then(|id| provider.accounts.iter().find(|account| account.id == id))?;
+            Some(activation_for_provider(
+                &provider.profile,
+                account,
+                effective_at_ms,
+            ))
+        }
+        ActiveKind::None => None,
+    })
+}
+
+fn record_current_activation(store: &Store, ledger: &UsageLedger) -> Result<(), AppError> {
+    if let Some(activation) = current_activation(store, chrono::Utc::now().timestamp_millis())? {
+        ledger.record_activation(activation)?;
+    }
+    Ok(())
+}
+
+fn reconcile_current_activation(store: &Store, ledger: &UsageLedger) -> Result<(), AppError> {
+    ledger.cancel_pending_activations()?;
+    record_current_activation(store, ledger)
+}
+
+fn activation_for_official(
+    account: &StoredOfficialAccount,
+    effective_at_ms: i64,
+) -> ActivationRecord {
+    ActivationRecord {
+        effective_at_ms,
+        source_kind: UsageSourceKind::Official,
+        provider_id: None,
+        account_id: Some(account.id.clone()),
+        model_provider: Some("openai".into()),
+        display_name_snapshot: match account.source {
+            OfficialAccountSource::OpenAiOauth => account.name.clone(),
+            OfficialAccountSource::ProxyImport => format!("{} · Cookie / 反代", account.name),
+        },
+        auth_source: Some(
+            match account.source {
+                OfficialAccountSource::OpenAiOauth => "openai_oauth",
+                OfficialAccountSource::ProxyImport => "proxy_import",
+            }
+            .into(),
+        ),
+    }
+}
+
+fn activation_for_provider(
+    provider: &ProviderProfile,
+    account: &ProviderAccount,
+    effective_at_ms: i64,
+) -> ActivationRecord {
+    ActivationRecord {
+        effective_at_ms,
+        source_kind: UsageSourceKind::Provider,
+        provider_id: Some(provider.id.clone()),
+        account_id: Some(account.id.clone()),
+        model_provider: Some(codex::MANAGED_PROVIDER_ID.into()),
+        display_name_snapshot: format!("{} · {}", provider.name, account.name),
+        auth_source: Some("api_key".into()),
+    }
+}
+
+fn activation_warning(repair: &mut RepairResult, error: AppError) {
+    repair
+        .warnings
+        .push(format!("账号已切换，但用量归属记录失败：{error}"));
+}
+
+fn confirm_pending(ledger: &UsageLedger, id: &str, repair: &mut RepairResult) {
+    if let Err(error) = ledger.confirm_activation(id) {
+        activation_warning(repair, error);
+    }
+}
+
+fn cancel_pending(ledger: &UsageLedger, id: &str) {
+    let _ = ledger.cancel_activation(id);
+}
+
+fn begin_activation(
+    ledger: &UsageLedger,
+    activation: &ActivationRecord,
+) -> Result<String, AppError> {
+    ledger.begin_activation(activation)
 }
 
 fn show_main_window(app: &tauri::AppHandle) {
@@ -54,11 +181,14 @@ fn show_main_window(app: &tauri::AppHandle) {
 }
 
 pub fn run() {
+    let store = Store::new().expect("无法初始化应用数据");
+    let usage_ledger = UsageLedger::open(store.root()).expect("无法初始化本机用量数据库");
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _, _| {
             show_main_window(app)
         }))
-        .manage(Store::new().expect("无法初始化应用数据"))
+        .manage(store)
+        .manage(usage_ledger)
         .manage(AuthCenter::default())
         .manage(ConfigManager::default())
         .manage(ActivationLock::default())
@@ -131,6 +261,14 @@ pub fn run() {
             commands::sessions::repair_codex_data,
             commands::sessions::list_sessions,
             commands::dashboard::launch_codex,
+            commands::usage::get_usage_overview,
+            commands::usage::refresh_usage,
+            commands::usage::get_official_pricing_catalog,
+            commands::usage::refresh_official_pricing_catalog,
+            commands::usage::list_pricing_rules,
+            commands::usage::save_pricing_rule,
+            commands::usage::delete_pricing_rule,
+            commands::usage::reprice_usage,
         ])
         .build(tauri::generate_context!())
         .expect("Tauri 运行失败");

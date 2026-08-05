@@ -60,7 +60,8 @@ pub(crate) enum DevicePollResult {
 }
 
 pub struct AuthCenter {
-    client: Result<reqwest::Client, String>,
+    client: crate::network::ClientCache,
+    user_agent: String,
     pending: Mutex<HashMap<String, PendingDeviceAuth>>,
     refresh_lock: Mutex<()>,
 }
@@ -104,14 +105,9 @@ struct CompleteTokens {
 impl Default for AuthCenter {
     fn default() -> Self {
         let user_agent = codex_user_agent();
-        let client = build_oauth_client(&user_agent).map_err(|error| {
-            format!(
-                "无法准备 OpenAI 登录，请重启应用后再试：{}",
-                error.without_url()
-            )
-        });
         Self {
-            client,
+            client: crate::network::ClientCache::default(),
+            user_agent,
             pending: Mutex::new(HashMap::new()),
             refresh_lock: Mutex::new(()),
         }
@@ -120,8 +116,8 @@ impl Default for AuthCenter {
 
 impl AuthCenter {
     pub async fn start_openai(&self) -> Result<OpenAiDeviceAuthorization, AppError> {
-        let response = self
-            .client()?
+        let http = self.client()?;
+        let response = http
             .post(DEVICE_START_URL)
             .json(&json!({ "client_id": CODEX_CLIENT_ID }))
             .send()
@@ -178,8 +174,8 @@ impl AuthCenter {
             LocalPollState::Expired => return Ok(DevicePollResult::Expired),
         };
 
-        let response = self
-            .client()?
+        let http = self.client()?;
+        let response = http
             .post(DEVICE_POLL_URL)
             .json(&json!({
                 "device_auth_id": poll.device_auth_id,
@@ -240,8 +236,8 @@ impl AuthCenter {
         // Refresh tokens can rotate and are single-use. Serializing refreshes prevents
         // two activations from consuming the same token concurrently.
         let _guard = self.refresh_lock.lock().await;
-        let response = self
-            .client()?
+        let http = self.client()?;
+        let response = http
             .post(TOKEN_URL)
             .json(&json!({
                 "client_id": CODEX_CLIENT_ID,
@@ -300,8 +296,8 @@ impl AuthCenter {
             let refresh_token = imported.refresh_token.clone().ok_or_else(|| {
                 AppError::InvalidConfig("Cookie 凭据缺少 accessToken 或 refresh_token。".into())
             })?;
-            let response = self
-                .client()?
+            let http = self.client()?;
+            let response = http
                 .post(TOKEN_URL)
                 .json(&json!({
                     "client_id": CODEX_CLIENT_ID,
@@ -328,10 +324,16 @@ impl AuthCenter {
         account_from_imported_tokens(imported, requested_name)
     }
 
-    fn client(&self) -> Result<&reqwest::Client, AppError> {
+    fn client(&self) -> Result<reqwest::Client, AppError> {
+        let user_agent = self.user_agent.clone();
         self.client
-            .as_ref()
-            .map_err(|message| AppError::Internal(message.clone()))
+            .current(|builder| build_oauth_client(builder, &user_agent))
+            .map_err(|error| {
+                AppError::Internal(format!(
+                    "无法初始化 OpenAI 网络客户端：{}",
+                    error.without_url()
+                ))
+            })
     }
 
     async fn poll_snapshot(&self, operation_id: &str) -> Result<LocalPollState, AppError> {
@@ -356,8 +358,8 @@ impl AuthCenter {
     }
 
     async fn exchange_code(&self, code: &DevicePollResponse) -> Result<CompleteTokens, AppError> {
-        let response = self
-            .client()?
+        let http = self.client()?;
+        let response = http
             .post(TOKEN_URL)
             .form(&[
                 ("grant_type", "authorization_code"),
@@ -381,13 +383,16 @@ impl PendingDeviceAuth {
     }
 }
 
-fn build_oauth_client(user_agent: &str) -> Result<reqwest::Client, reqwest::Error> {
+fn build_oauth_client(
+    builder: reqwest::ClientBuilder,
+    user_agent: &str,
+) -> Result<reqwest::Client, reqwest::Error> {
     let mut headers = HeaderMap::new();
     headers.insert("originator", HeaderValue::from_static(CODEX_ORIGINATOR));
     if let Ok(value) = HeaderValue::from_str(user_agent) {
         headers.insert(USER_AGENT, value);
     }
-    crate::network::client_builder()?
+    builder
         .default_headers(headers)
         .redirect(reqwest::redirect::Policy::none())
         .https_only(true)

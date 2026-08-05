@@ -5,6 +5,7 @@ use crate::{
     },
     codex::{self, ConfigManager},
     commands::sessions::repair_home,
+    local_usage::UsageLedger,
     models::*,
     provider_http, provider_sync,
     state::{ActivationLock, ApiClient},
@@ -75,7 +76,7 @@ pub(crate) async fn test_provider(
     }
     let endpoint = provider_http::models_endpoint(&provider.base_url);
     let mut request = client
-        .0
+        .current()?
         .get(&endpoint)
         .headers(provider_http::custom_headers(&provider, &account)?);
     let key = account.api_key.as_deref().unwrap_or_default();
@@ -146,6 +147,7 @@ pub(crate) async fn apply_activation(
 pub(crate) async fn activate_provider(
     store: State<'_, Store>,
     manager: State<'_, ConfigManager>,
+    ledger: State<'_, UsageLedger>,
     activation: State<'_, ActivationLock>,
     id: String,
     account_id: String,
@@ -164,17 +166,38 @@ pub(crate) async fn activate_provider(
     sync_active_openai_credential(&store, &home)?;
     let repair_sessions = provider_sync::configured_provider(&home) != codex::MANAGED_PROVIDER_ID;
     let preview = manager.preview_custom(&home, &provider, &account)?;
-    manager.apply(&preview.operation_id)?;
-    if let Err(error) = store.activate(&id, &account_id) {
-        return Err(compensate_activation_failure(&store, &manager, error).await);
-    }
-    let repair = if repair_sessions {
-        repair_home(home, codex::MANAGED_PROVIDER_ID.into()).await?
-    } else {
-        RepairResult {
-            target_provider: codex::MANAGED_PROVIDER_ID.into(),
-            ..RepairResult::default()
+    let pending_id = crate::begin_activation(
+        &ledger,
+        &crate::activation_for_provider(
+            &provider,
+            &account,
+            chrono::Utc::now().timestamp_millis(),
+        ),
+    )?;
+    let result = async {
+        manager.apply(&preview.operation_id)?;
+        if let Err(error) = store.activate(&id, &account_id) {
+            return Err(compensate_activation_failure(&store, &manager, error).await);
         }
-    };
-    Ok(repair)
+        let repair = if repair_sessions {
+            repair_home(home, codex::MANAGED_PROVIDER_ID.into()).await?
+        } else {
+            RepairResult {
+                target_provider: codex::MANAGED_PROVIDER_ID.into(),
+                ..RepairResult::default()
+            }
+        };
+        Ok::<_, AppError>(repair)
+    }
+    .await;
+    match result {
+        Ok(mut repair) => {
+            crate::confirm_pending(&ledger, &pending_id, &mut repair);
+            Ok(repair)
+        }
+        Err(error) => {
+            crate::cancel_pending(&ledger, &pending_id);
+            Err(error)
+        }
+    }
 }

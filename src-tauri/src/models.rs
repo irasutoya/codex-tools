@@ -530,6 +530,231 @@ pub struct Dashboard {
     pub database_count: usize,
     pub session_count: usize,
     pub database_health: String,
+    pub today_usage: TokenBreakdown,
+    pub today_requests: u64,
+    pub today_estimated_cost_microusd: u64,
+    pub today_subscription_tokens: u64,
+    pub today_unpriced_tokens: u64,
+    pub today_partial_tokens: u64,
+    pub today_unattributed_tokens: u64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum UsageSourceKind {
+    Official,
+    Provider,
+    Unattributed,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum UsageGroupBy {
+    Model,
+    Account,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CostStatus {
+    Estimated,
+    Subscription,
+    Unpriced,
+    Partial,
+    Unattributed,
+    Zero,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PricingScopeKind {
+    AccountModel,
+    ProviderModel,
+    GlobalModel,
+    ProviderDefault,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PricingMatchKind {
+    Exact,
+    Prefix,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BillingMode {
+    Token,
+    Subscription,
+    Unpriced,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageRange {
+    pub start_at_ms: i64,
+    pub end_at_ms: i64,
+}
+
+impl UsageRange {
+    pub fn validate(&self) -> Result<(), AppError> {
+        if self.start_at_ms < 0 || self.end_at_ms <= self.start_at_ms {
+            return Err(AppError::InvalidConfig("用量查询时间范围无效。".into()));
+        }
+        if self
+            .end_at_ms
+            .checked_sub(self.start_at_ms)
+            .is_none_or(|duration| duration > 366 * 24 * 60 * 60 * 1_000)
+        {
+            return Err(AppError::InvalidConfig(
+                "用量查询范围不能超过 366 天。".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageQuery {
+    pub range: UsageRange,
+    pub group_by: UsageGroupBy,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenBreakdown {
+    pub input_tokens: u64,
+    pub cached_input_tokens: u64,
+    pub cache_write_input_tokens: u64,
+    pub output_tokens: u64,
+    pub reasoning_output_tokens: u64,
+    pub total_tokens: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageTotals {
+    pub tokens: TokenBreakdown,
+    pub requests: u64,
+    pub estimated_cost_microusd: u64,
+    pub subscription_tokens: u64,
+    pub unpriced_tokens: u64,
+    pub partial_tokens: u64,
+    pub unattributed_tokens: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageRow {
+    pub key: String,
+    pub model: String,
+    pub source_kind: UsageSourceKind,
+    pub provider_id: Option<String>,
+    pub account_id: Option<String>,
+    pub source_name: String,
+    pub tokens: TokenBreakdown,
+    pub requests: u64,
+    pub estimated_cost_microusd: Option<u64>,
+    pub cost_status: CostStatus,
+    pub pricing_rule_name: Option<String>,
+    pub pricing_rule_version: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageWarning {
+    pub path: Option<String>,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageOverview {
+    pub range: UsageRange,
+    pub totals: UsageTotals,
+    pub rows: Vec<UsageRow>,
+    pub last_refreshed_at_ms: Option<i64>,
+    pub collection_started_at_ms: Option<i64>,
+    pub collection_started_version: Option<String>,
+    pub warnings: Vec<UsageWarning>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OfficialPricingCatalogView {
+    pub status: String,
+    pub source_url: String,
+    pub version: Option<i64>,
+    pub content_sha256: Option<String>,
+    pub fetched_at_ms: Option<i64>,
+    pub etag: Option<String>,
+    pub model_count: usize,
+    pub models: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageRefreshResult {
+    pub files_scanned: usize,
+    pub events_added: usize,
+    pub events_skipped: usize,
+    pub partial_lines: usize,
+    pub warnings: Vec<UsageWarning>,
+    pub last_refreshed_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PricingRule {
+    pub id: String,
+    pub version: u64,
+    pub active: bool,
+    pub scope_kind: PricingScopeKind,
+    pub provider_id: Option<String>,
+    pub account_id: Option<String>,
+    pub model_pattern: String,
+    pub match_kind: PricingMatchKind,
+    pub billing_mode: BillingMode,
+    pub input_usd_per_million: Option<String>,
+    pub cached_read_usd_per_million: Option<String>,
+    pub cache_write_usd_per_million: Option<String>,
+    pub output_usd_per_million: Option<String>,
+    pub request_fee_usd: Option<String>,
+    pub cache_write_included_in_input: bool,
+    pub effective_from_ms: i64,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+pub type SavePricingRule = PricingRule;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PricingScope {
+    pub scope_kind: PricingScopeKind,
+    pub provider_id: Option<String>,
+    pub account_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivationRecord {
+    pub effective_at_ms: i64,
+    pub source_kind: UsageSourceKind,
+    pub provider_id: Option<String>,
+    pub account_id: Option<String>,
+    pub model_provider: Option<String>,
+    pub display_name_snapshot: String,
+    pub auth_source: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RepriceResult {
+    pub events_repriced: usize,
+    pub estimated_cost_microusd: u64,
+    pub unpriced_events: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]

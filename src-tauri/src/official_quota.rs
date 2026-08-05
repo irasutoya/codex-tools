@@ -16,6 +16,7 @@ const CHATGPT_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Appl
 pub struct QuotaFetchError {
     pub status: QuotaStatus,
     pub message: String,
+    retryable: bool,
 }
 
 impl QuotaFetchError {
@@ -23,7 +24,20 @@ impl QuotaFetchError {
         Self {
             status,
             message: message.into(),
+            retryable: false,
         }
+    }
+
+    fn retryable(message: impl Into<String>) -> Self {
+        Self {
+            status: QuotaStatus::Error,
+            message: message.into(),
+            retryable: true,
+        }
+    }
+
+    pub fn is_retryable(&self) -> bool {
+        self.retryable
     }
 }
 
@@ -74,8 +88,14 @@ async fn fetch_quota_from(
         client.get(endpoint).headers(headers).send(),
     )
     .await
-    .map_err(|_| QuotaFetchError::new(QuotaStatus::Error, "OpenAI 额度查询超时"))?
-    .map_err(|_| QuotaFetchError::new(QuotaStatus::Error, "无法连接 OpenAI 额度服务"))?;
+    .map_err(|_| QuotaFetchError::retryable("OpenAI 额度查询超时"))?
+    .map_err(|error| {
+        if error.is_connect() || error.is_timeout() {
+            QuotaFetchError::retryable("无法连接 OpenAI 额度服务，请检查网络或系统代理")
+        } else {
+            QuotaFetchError::new(QuotaStatus::Error, "无法完成 OpenAI 额度请求")
+        }
+    })?;
     let status = response.status();
     if !status.is_success() {
         let (quota_status, message) = match status {
@@ -452,5 +472,11 @@ mod tests {
             OfficialAccountSource::ProxyImport,
             "workspace-1"
         )));
+    }
+
+    #[test]
+    fn marks_connection_failures_as_safe_to_retry() {
+        assert!(QuotaFetchError::retryable("暂时不可达").is_retryable());
+        assert!(!QuotaFetchError::new(QuotaStatus::Error, "响应无效").is_retryable());
     }
 }

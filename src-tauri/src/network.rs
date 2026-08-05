@@ -1,32 +1,108 @@
 use reqwest::{Client, ClientBuilder, NoProxy, Proxy};
+use std::sync::Mutex;
+
+const PROXY_ENV_NAMES: [&str; 8] = [
+    "ALL_PROXY",
+    "all_proxy",
+    "HTTPS_PROXY",
+    "https_proxy",
+    "HTTP_PROXY",
+    "http_proxy",
+    "NO_PROXY",
+    "no_proxy",
+];
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct SystemProxy {
     http: Option<String>,
     https: Option<String>,
+    socks: Option<String>,
     bypass: Vec<String>,
 }
 
-pub fn client_builder() -> Result<ClientBuilder, reqwest::Error> {
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct ProxySnapshot {
+    environment: Vec<(String, Option<String>)>,
+    platform: Option<SystemProxy>,
+}
+
+#[derive(Default)]
+pub(crate) struct ClientCache {
+    cached: Mutex<Option<CachedClient>>,
+}
+
+struct CachedClient {
+    snapshot: ProxySnapshot,
+    client: Client,
+}
+
+impl ClientCache {
+    pub(crate) fn current<F>(&self, configure: F) -> Result<Client, reqwest::Error>
+    where
+        F: FnOnce(ClientBuilder) -> Result<Client, reqwest::Error>,
+    {
+        self.current_for_snapshot(proxy_snapshot(), configure)
+    }
+
+    pub(crate) fn invalidate(&self) {
+        self.cached.lock().expect("网络客户端缓存锁已损坏").take();
+    }
+
+    fn current_for_snapshot<F>(
+        &self,
+        snapshot: ProxySnapshot,
+        configure: F,
+    ) -> Result<Client, reqwest::Error>
+    where
+        F: FnOnce(ClientBuilder) -> Result<Client, reqwest::Error>,
+    {
+        let mut cached = self.cached.lock().expect("网络客户端缓存锁已损坏");
+        if cached
+            .as_ref()
+            .is_some_and(|cached| cached.snapshot == snapshot)
+        {
+            return Ok(cached
+                .as_ref()
+                .expect("客户端缓存刚刚检查过")
+                .client
+                .clone());
+        }
+
+        let client = configure(client_builder_for(&snapshot)?)?;
+        *cached = Some(CachedClient {
+            snapshot,
+            client: client.clone(),
+        });
+        Ok(client)
+    }
+}
+
+fn proxy_snapshot() -> ProxySnapshot {
+    ProxySnapshot {
+        environment: PROXY_ENV_NAMES
+            .iter()
+            .map(|name| ((*name).to_owned(), std::env::var(name).ok()))
+            .collect(),
+        platform: platform_proxy(),
+    }
+}
+
+fn client_builder_for(snapshot: &ProxySnapshot) -> Result<ClientBuilder, reqwest::Error> {
     let builder = Client::builder();
-    if environment_proxy_configured() {
+    if environment_proxy_configured(snapshot) {
         return Ok(builder);
     }
 
-    apply_system_proxy(builder, platform_proxy())
+    apply_system_proxy(builder, snapshot.platform.clone())
 }
 
-fn environment_proxy_configured() -> bool {
-    [
-        "ALL_PROXY",
-        "all_proxy",
-        "HTTPS_PROXY",
-        "https_proxy",
-        "HTTP_PROXY",
-        "http_proxy",
-    ]
-    .into_iter()
-    .any(|name| std::env::var_os(name).is_some_and(|value| !value.is_empty()))
+fn environment_proxy_configured(snapshot: &ProxySnapshot) -> bool {
+    snapshot.environment.iter().any(|(name, value)| {
+        matches!(
+            name.as_str(),
+            "ALL_PROXY" | "all_proxy" | "HTTPS_PROXY" | "https_proxy" | "HTTP_PROXY" | "http_proxy"
+        ) && value.as_ref().is_some_and(|value| !value.is_empty())
+    })
 }
 
 fn apply_system_proxy(
@@ -38,16 +114,25 @@ fn apply_system_proxy(
     };
     let no_proxy = no_proxy(&settings.bypass);
 
-    match (&settings.http, &settings.https) {
+    match (settings.http.as_deref(), settings.https.as_deref()) {
         (Some(http), Some(https)) if http == https => {
-            builder = builder.proxy(Proxy::all(http)?.no_proxy(no_proxy));
+            builder = builder.proxy(Proxy::all(http)?.no_proxy(no_proxy.clone()));
         }
-        (http, https) => {
-            if let Some(http) = http {
-                builder = builder.proxy(Proxy::http(http)?.no_proxy(no_proxy.clone()));
-            }
-            if let Some(https) = https {
-                builder = builder.proxy(Proxy::https(https)?.no_proxy(no_proxy));
+        (Some(http), None) => {
+            // An HTTP proxy can tunnel HTTPS via CONNECT, so a HTTP-only
+            // system setting must cover both URL schemes.
+            builder = builder.proxy(Proxy::all(http)?.no_proxy(no_proxy.clone()));
+        }
+        (None, Some(https)) => {
+            builder = builder.proxy(Proxy::https(https)?.no_proxy(no_proxy.clone()));
+        }
+        (Some(http), Some(https)) => {
+            builder = builder.proxy(Proxy::http(http)?.no_proxy(no_proxy.clone()));
+            builder = builder.proxy(Proxy::https(https)?.no_proxy(no_proxy.clone()));
+        }
+        (None, None) => {
+            if let Some(socks) = settings.socks {
+                builder = builder.proxy(Proxy::all(socks)?.no_proxy(no_proxy));
             }
         }
     }
@@ -98,6 +183,15 @@ fn parse_proxy_server(value: &str) -> SystemProxy {
             match kind.trim().to_ascii_lowercase().as_str() {
                 "http" => settings.http = normalize_proxy_url(address),
                 "https" => settings.https = normalize_proxy_url(address),
+                "socks" | "socks5" => {
+                    settings.socks = normalize_proxy_url(address).map(|url| {
+                        if url.starts_with("http://") {
+                            url.replacen("http://", "socks5://", 1)
+                        } else {
+                            url
+                        }
+                    })
+                }
                 _ => {}
             }
         } else {
@@ -132,7 +226,8 @@ fn platform_proxy() -> Option<SystemProxy> {
         .ok()
         .into_iter()
         .collect();
-    (settings.http.is_some() || settings.https.is_some()).then_some(settings)
+    (settings.http.is_some() || settings.https.is_some() || settings.socks.is_some())
+        .then_some(settings)
 }
 
 #[cfg(target_os = "macos")]
@@ -172,6 +267,13 @@ fn parse_scutil_proxy(text: &str) -> Option<SystemProxy> {
     let mut settings = SystemProxy {
         http: endpoint(text, "HTTP"),
         https: endpoint(text, "HTTPS"),
+        socks: endpoint(text, "SOCKS").map(|url| {
+            if url.starts_with("http://") {
+                url.replacen("http://", "socks5://", 1)
+            } else {
+                url
+            }
+        }),
         bypass: Vec::new(),
     };
     let mut in_exceptions = false;
@@ -195,7 +297,8 @@ fn parse_scutil_proxy(text: &str) -> Option<SystemProxy> {
         settings.bypass.push("<local>".into());
     }
 
-    (settings.http.is_some() || settings.https.is_some()).then_some(settings)
+    (settings.http.is_some() || settings.https.is_some() || settings.socks.is_some())
+        .then_some(settings)
 }
 
 #[cfg(test)]
@@ -211,6 +314,7 @@ mod tests {
         let split = parse_proxy_server("http=proxy.local:8080;https=secure.local:8443;socks=skip");
         assert_eq!(split.http.as_deref(), Some("http://proxy.local:8080"));
         assert_eq!(split.https.as_deref(), Some("http://secure.local:8443"));
+        assert_eq!(split.socks.as_deref(), Some("socks5://skip"));
     }
 
     #[test]
@@ -233,7 +337,22 @@ mod tests {
         .unwrap();
         assert_eq!(settings.http.as_deref(), Some("http://127.0.0.1:7890"));
         assert_eq!(settings.https, settings.http);
+        assert_eq!(settings.socks, None);
         assert_eq!(settings.bypass, vec!["*.local", "10.0.0.0/8", "<local>"]);
+    }
+
+    #[test]
+    fn parses_macos_socks_only_proxy_settings() {
+        let settings = parse_scutil_proxy(
+            r#"<dictionary> {
+  SOCKSEnable : 1
+  SOCKSPort : 7891
+  SOCKSProxy : 127.0.0.1
+}"#,
+        )
+        .unwrap();
+
+        assert_eq!(settings.socks.as_deref(), Some("socks5://127.0.0.1:7891"));
     }
 
     #[test]
@@ -241,6 +360,7 @@ mod tests {
         let settings = SystemProxy {
             http: Some("http://127.0.0.1:7890".into()),
             https: Some("http://127.0.0.1:7890".into()),
+            socks: None,
             bypass: vec!["<local>;*.example.com".into()],
         };
         assert!(
@@ -248,5 +368,61 @@ mod tests {
                 .and_then(ClientBuilder::build)
                 .is_ok()
         );
+
+        let socks = SystemProxy {
+            http: None,
+            https: None,
+            socks: Some("socks5://127.0.0.1:7891".into()),
+            bypass: Vec::new(),
+        };
+        assert!(
+            apply_system_proxy(Client::builder(), Some(socks))
+                .and_then(ClientBuilder::build)
+                .is_ok()
+        );
+
+        let http_only = SystemProxy {
+            http: Some("http://127.0.0.1:7890".into()),
+            https: None,
+            socks: None,
+            bypass: Vec::new(),
+        };
+        assert!(
+            apply_system_proxy(Client::builder(), Some(http_only))
+                .and_then(ClientBuilder::build)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn rebuilds_cached_client_when_proxy_snapshot_changes() {
+        let cache = ClientCache::default();
+        let mut builds = 0;
+        let direct = ProxySnapshot::default();
+        let proxied = ProxySnapshot {
+            platform: Some(parse_proxy_server("127.0.0.1:7890")),
+            ..direct.clone()
+        };
+
+        cache
+            .current_for_snapshot(direct.clone(), |_| {
+                builds += 1;
+                Client::builder().build()
+            })
+            .unwrap();
+        cache
+            .current_for_snapshot(direct, |_| {
+                builds += 1;
+                Client::builder().build()
+            })
+            .unwrap();
+        cache
+            .current_for_snapshot(proxied, |_| {
+                builds += 1;
+                Client::builder().build()
+            })
+            .unwrap();
+
+        assert_eq!(builds, 2);
     }
 }

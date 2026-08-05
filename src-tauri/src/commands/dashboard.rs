@@ -1,4 +1,7 @@
-use crate::{codex, models::*, platform, session_index::SessionIndex, storage::Store};
+use crate::{
+    codex, commands::usage::local_today_range, local_usage::UsageLedger, models::*, platform,
+    session_index::SessionIndex, storage::Store,
+};
 use tauri::State;
 
 const CODEX_APP_URI: &str = "codex://";
@@ -64,6 +67,7 @@ fn project_active(state: &AppConfig) -> ActiveProjection {
 pub(crate) async fn get_dashboard(
     store: State<'_, Store>,
     index: State<'_, SessionIndex>,
+    ledger: State<'_, UsageLedger>,
 ) -> Result<Dashboard, AppError> {
     let projection = store.read(project_active)?;
     let home = codex::home(&projection.home);
@@ -76,6 +80,14 @@ pub(crate) async fn get_dashboard(
         })
         .await
         .map_err(|error| AppError::Internal(error.to_string()))?;
+    let today_query = UsageQuery {
+        range: local_today_range(),
+        group_by: UsageGroupBy::Account,
+    };
+    let ledger = ledger.inner().clone();
+    let today = tokio::task::spawn_blocking(move || ledger.query(today_query))
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))??;
     Ok(Dashboard {
         provider_count: projection.provider_count,
         active_provider: projection.active_provider,
@@ -87,6 +99,13 @@ pub(crate) async fn get_dashboard(
         database_count,
         session_count,
         database_health,
+        today_usage: today.totals.tokens,
+        today_requests: today.totals.requests,
+        today_estimated_cost_microusd: today.totals.estimated_cost_microusd,
+        today_subscription_tokens: today.totals.subscription_tokens,
+        today_unpriced_tokens: today.totals.unpriced_tokens,
+        today_partial_tokens: today.totals.partial_tokens,
+        today_unattributed_tokens: today.totals.unattributed_tokens,
     })
 }
 

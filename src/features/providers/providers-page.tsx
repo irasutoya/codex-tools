@@ -15,6 +15,7 @@ import {
   Delete01Icon,
   Alert01Icon,
   User02Icon,
+  Tag01Icon,
 } from "@hugeicons/core-free-icons"
 import { HugeiconsIcon } from "@hugeicons/react"
 
@@ -69,8 +70,17 @@ import {
 import { Spinner } from "@/components/ui/spinner"
 import { notify } from "@/lib/feedback"
 import { call } from "@/lib/ipc"
+import {
+  refreshCoordinator,
+  useAppForeground,
+  usePageRefresh,
+} from "@/lib/refresh-coordinator"
 import { notifyRepairWarnings } from "@/lib/repair-feedback"
 import { formatDateTime } from "@/lib/time"
+import {
+  runQuotaRefresh,
+  useAutoQuotaRefresh,
+} from "@/lib/use-auto-quota-refresh"
 import {
   emptyAccount,
   emptyProvider,
@@ -78,6 +88,8 @@ import {
   type OfficialAccountView,
   type PageProps,
   type Provider,
+  type UsageOverview,
+  type UsageRow,
 } from "@/types"
 
 import { QuotaStatusView } from "./quota-status"
@@ -86,13 +98,21 @@ import { ProviderEditor } from "./provider-editor"
 import { ProxyLoginDialog } from "./proxy-login-dialog"
 import { useDeviceAuthorizationPolling } from "./use-device-auth"
 import { taskFailureTitle } from "./provider-utils"
+import {
+  formatTokens,
+  formatUsdMicrousd,
+  getLocalRange,
+} from "../usage/usage-format"
 
 export default function ProvidersPage({ active }: PageProps) {
+  const refreshSignal = usePageRefresh("providers")
+  const foreground = useAppForeground()
   const [providers, setProviders] = useState<Provider[]>([])
   const [accounts, setAccounts] = useState<Account[]>([])
   const [officialAccounts, setOfficialAccounts] = useState<
     OfficialAccountView[]
   >([])
+  const [usage, setUsage] = useState<UsageOverview>()
   const [draft, setDraft] = useState<Provider>()
   const [account, setAccount] = useState<Account>()
   const [pendingActivation, setPendingActivation] = useState<{
@@ -113,6 +133,7 @@ export default function ProvidersPage({ active }: PageProps) {
     | { kind: "account"; id: string; name: string }
   >()
   const running = useRef(false)
+  const lastRefreshRevision = useRef<number | undefined>(undefined)
   const busy = Boolean(pendingTask)
   const accountsByProvider = useMemo(() => {
     const grouped = new Map<string, Account[]>()
@@ -124,6 +145,13 @@ export default function ProvidersPage({ active }: PageProps) {
     }
     return grouped
   }, [accounts])
+  const usageByAccount = useMemo(() => {
+    const result = new Map<string, UsageRow>()
+    for (const row of usage?.rows ?? []) {
+      if (row.accountId) result.set(row.accountId, row)
+    }
+    return result
+  }, [usage])
   const load = useCallback(async () => {
     try {
       const overview = await call("get_provider_overview")
@@ -137,13 +165,62 @@ export default function ProvidersPage({ active }: PageProps) {
       throw error
     }
   }, [])
+  const loadUsage = useCallback(async (refresh = false) => {
+    const query = { range: getLocalRange(1), groupBy: "account" as const }
+    try {
+      const result = refresh
+        ? await call("refresh_usage", { query })
+        : await call("get_usage_overview", { query })
+      setUsage(result)
+      if (refresh) refreshCoordinator.invalidate(["dashboard", "usage"])
+      return result
+    } catch {
+      // Provider management remains available when usage files are unavailable.
+      return undefined
+    }
+  }, [])
   useEffect(() => {
-    if (!active) return
+    if (
+      !active ||
+      !foreground ||
+      lastRefreshRevision.current === refreshSignal.revision
+    ) {
+      return
+    }
+    lastRefreshRevision.current = refreshSignal.revision
     const timeout = window.setTimeout(() => {
       void load().catch(() => undefined)
+      void loadUsage(true)
     }, 0)
     return () => window.clearTimeout(timeout)
-  }, [active, load])
+  }, [active, foreground, load, loadUsage, refreshSignal.revision])
+
+  const activeOfficialAccount = officialAccounts.find(
+    (account) => account.active
+  )
+  const refreshActiveQuota = useCallback(async () => {
+    if (!activeOfficialAccount) {
+      throw new Error("当前没有可刷新的 OpenAI 账号")
+    }
+    const result = await call("refresh_official_account_quota", {
+      accountId: activeOfficialAccount.id,
+    })
+    if (!refreshCoordinator.getForeground()) {
+      refreshCoordinator.invalidate(["dashboard", "providers"])
+      return result
+    }
+    await load()
+    refreshCoordinator.invalidate(["dashboard"])
+    return result
+  }, [activeOfficialAccount, load])
+
+  useAutoQuotaRefresh({
+    accountId: activeOfficialAccount?.id,
+    active,
+    foreground,
+    quota: activeOfficialAccount?.quota,
+    refresh: refreshActiveQuota,
+  })
 
   const [deviceAuthorization, setDeviceAuthorization] =
     useDeviceAuthorizationPolling(load)
@@ -165,6 +242,7 @@ export default function ProvidersPage({ active }: PageProps) {
           notify.warning("操作已完成，但无法读取最新列表", error)
         }
       }
+      refreshCoordinator.invalidate(["dashboard", "settings"])
     } catch (error) {
       notify.error(taskFailureTitle(task), error)
     } finally {
@@ -418,6 +496,18 @@ export default function ProvidersPage({ active }: PageProps) {
                           ? "有效期取决于 Cookie 中的访问凭据"
                           : "有效期由 OpenAI 自动管理"}
                     </ItemDescription>
+                    <ItemDescription>
+                      今日{" "}
+                      {formatTokens(
+                        usageByAccount.get(item.id)?.tokens.totalTokens ?? 0
+                      )}{" "}
+                      ·{" "}
+                      {usageCostLabel(
+                        usageByAccount.get(item.id)
+                          ? [usageByAccount.get(item.id)!]
+                          : []
+                      )}
+                    </ItemDescription>
                     <QuotaStatusView quota={item.quota} />
                   </ItemContent>
                   <ItemActions className="ml-auto w-auto self-start">
@@ -472,9 +562,12 @@ export default function ProvidersPage({ active }: PageProps) {
                               void run(
                                 `official:quota:${item.id}`,
                                 async () => {
-                                  const quota = await call(
-                                    "refresh_official_account_quota",
-                                    { accountId: item.id }
+                                  const quota = await runQuotaRefresh(
+                                    item.id,
+                                    () =>
+                                      call("refresh_official_account_quota", {
+                                        accountId: item.id,
+                                      })
                                   )
                                   if (quota.status === "success") {
                                     notify.success("OpenAI 额度已更新")
@@ -494,6 +587,13 @@ export default function ProvidersPage({ active }: PageProps) {
                               <HugeiconsIcon icon={Refresh01Icon} />
                             )}
                             刷新额度
+                          </DropdownMenuItem>
+                          <DropdownMenuItem onClick={() => openUsagePage()}>
+                            <HugeiconsIcon
+                              icon={Tag01Icon}
+                              aria-hidden="true"
+                            />
+                            价格规则
                           </DropdownMenuItem>
                           <DropdownMenuItem
                             variant="destructive"
@@ -555,6 +655,13 @@ export default function ProvidersPage({ active }: PageProps) {
           )}
           {providers.map((provider) => {
             const linked = accountsByProvider.get(provider.id) ?? []
+            const linkedUsage = linked
+              .map((account) => usageByAccount.get(account.id))
+              .filter((row): row is UsageRow => Boolean(row))
+            const providerTokens = linkedUsage.reduce(
+              (total, row) => total + row.tokens.totalTokens,
+              0
+            )
             return (
               <Card key={provider.id}>
                 <CardHeader>
@@ -578,6 +685,10 @@ export default function ProvidersPage({ active }: PageProps) {
                       {provider.baseUrl}
                     </span>
                     <span>Responses API · 由 Codex 直接请求</span>
+                    <span>
+                      今日 {formatTokens(providerTokens)} ·{" "}
+                      {usageCostLabel(linkedUsage)}
+                    </span>
                   </CardDescription>
                   <CardAction>
                     <DropdownMenu>
@@ -609,6 +720,13 @@ export default function ProvidersPage({ active }: PageProps) {
                           >
                             <HugeiconsIcon icon={Key01Icon} />
                             添加 API Key
+                          </DropdownMenuItem>
+                          <DropdownMenuItem onClick={() => openUsagePage()}>
+                            <HugeiconsIcon
+                              icon={Tag01Icon}
+                              aria-hidden="true"
+                            />
+                            价格规则
                           </DropdownMenuItem>
                           <DropdownMenuItem
                             variant="destructive"
@@ -678,6 +796,19 @@ export default function ProvidersPage({ active }: PageProps) {
                             </ItemTitle>
                             <ItemDescription>
                               API Key 保存在本机，切换到此服务时写入 Codex。
+                            </ItemDescription>
+                            <ItemDescription>
+                              今日{" "}
+                              {formatTokens(
+                                usageByAccount.get(item.id)?.tokens
+                                  .totalTokens ?? 0
+                              )}{" "}
+                              ·{" "}
+                              {usageCostLabel(
+                                usageByAccount.get(item.id)
+                                  ? [usageByAccount.get(item.id)!]
+                                  : []
+                              )}
                             </ItemDescription>
                           </ItemContent>
                           <ItemActions className="ml-auto w-auto">
@@ -840,9 +971,11 @@ export default function ProvidersPage({ active }: PageProps) {
               setProxyLoginOpen(false)
               notify.success("Cookie 账号已导入", imported.name)
               try {
-                const quota = await call("refresh_official_account_quota", {
-                  accountId: imported.id,
-                })
+                const quota = await runQuotaRefresh(imported.id, () =>
+                  call("refresh_official_account_quota", {
+                    accountId: imported.id,
+                  })
+                )
                 if (quota.status !== "success") {
                   notify.warning(
                     "Cookie 账号已保存，但额度暂未更新",
@@ -1036,4 +1169,27 @@ export default function ProvidersPage({ active }: PageProps) {
       </AlertDialog>
     </div>
   )
+}
+
+function openUsagePage() {
+  window.dispatchEvent(
+    new CustomEvent("codex-tools:navigate", { detail: "usage" })
+  )
+}
+
+function usageCostLabel(rows: UsageRow[]) {
+  if (!rows.length) return "—"
+  const estimated = rows.filter((row) => row.costStatus === "estimated")
+  if (estimated.length) {
+    const cost = estimated.reduce(
+      (total, row) => total + (row.estimatedCostMicrousd ?? 0),
+      0
+    )
+    return formatUsdMicrousd(cost)
+  }
+  if (rows.some((row) => row.costStatus === "subscription")) return "套餐统计"
+  if (rows.some((row) => row.costStatus === "unpriced")) return "未配置价格"
+  if (rows.some((row) => row.costStatus === "unattributed")) return "未归属"
+  if (rows.some((row) => row.costStatus === "partial")) return "部分数据"
+  return "$0.00"
 }

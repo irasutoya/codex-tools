@@ -1,4 +1,4 @@
-export type Page = "dashboard" | "providers" | "sessions" | "settings"
+export type Page = "dashboard" | "providers" | "usage" | "sessions" | "settings"
 
 export type PageProps = {
   active: boolean
@@ -40,6 +40,173 @@ export type Dashboard = {
   databaseCount: number
   sessionCount: number
   databaseHealth: string
+  todayUsage: TokenBreakdown
+  todayRequests: number
+  todayEstimatedCostMicrousd: number
+  todaySubscriptionTokens: number
+  todayUnpricedTokens: number
+  todayPartialTokens: number
+  todayUnattributedTokens: number
+}
+
+export type UsageSourceKind = "official" | "provider" | "unattributed"
+
+export type UsageGroupBy = "model" | "account"
+
+export type CostStatus =
+  | "estimated"
+  | "subscription"
+  | "unpriced"
+  | "partial"
+  | "unattributed"
+  | "zero"
+
+export type UsageRange = {
+  startAtMs: number
+  endAtMs: number
+}
+
+export type UsageQuery = {
+  range: UsageRange
+  groupBy: UsageGroupBy
+}
+
+export type TokenBreakdown = {
+  inputTokens: number
+  cachedInputTokens: number
+  cacheWriteInputTokens: number
+  outputTokens: number
+  reasoningOutputTokens: number
+  totalTokens: number
+}
+
+export type UsageRow = {
+  key: string
+  model: string
+  sourceKind: UsageSourceKind
+  providerId?: string
+  accountId?: string
+  sourceName: string
+  tokens: TokenBreakdown
+  requests: number
+  estimatedCostMicrousd?: number
+  costStatus: CostStatus
+  pricingRuleName?: string
+  pricingRuleVersion?: number
+}
+
+export type UsageOverview = {
+  range: UsageRange
+  totals: {
+    tokens: TokenBreakdown
+    requests: number
+    estimatedCostMicrousd: number
+    subscriptionTokens: number
+    unpricedTokens: number
+    partialTokens: number
+    unattributedTokens: number
+  }
+  rows: UsageRow[]
+  lastRefreshedAtMs?: number
+  collectionStartedAtMs?: number
+  collectionStartedVersion?: string
+  warnings: Array<{ path?: string; message: string }>
+}
+
+export type OfficialPricingCatalog = {
+  status: "waiting" | "cached"
+  sourceUrl: string
+  version?: number
+  contentSha256?: string
+  fetchedAtMs?: number
+  etag?: string
+  modelCount: number
+  models: string[]
+}
+
+export type UsageShareAccount = {
+  key: string
+  displayName: string
+  maskedName: string
+  sourceKind: UsageSourceKind
+  totalTokens: number
+  estimatedCostMicrousd: number
+  unpricedTokens: number
+  partialTokens: number
+  requests: number
+  costStatus: CostStatus
+  models: UsageShareAccountModel[]
+}
+
+export type UsageShareAccountModel = {
+  key: string
+  model: string
+  totalTokens: number
+  estimatedCostMicrousd: number
+  unpricedTokens: number
+  partialTokens: number
+  requests: number
+  costStatus: CostStatus
+}
+
+export type UsageShareData = {
+  dateLabel: string
+  timezone: string
+  totalTokens: number
+  estimatedCostMicrousd: number
+  unpricedTokens: number
+  partialTokens: number
+  requests: number
+  accounts: UsageShareAccount[]
+}
+
+export type UsageRefreshResult = {
+  filesScanned: number
+  eventsAdded: number
+  eventsSkipped: number
+  partialLines: number
+  warnings: Array<{ path?: string; message: string }>
+  lastRefreshedAtMs: number
+}
+
+export type RepriceResult = {
+  eventsRepriced: number
+  estimatedCostMicrousd: number
+  unpricedEvents: number
+}
+
+export type PricingScopeKind =
+  "account_model" | "provider_model" | "global_model" | "provider_default"
+
+export type PricingMatchKind = "exact" | "prefix"
+
+export type BillingMode = "token" | "subscription" | "unpriced"
+
+export type PricingScope = {
+  scopeKind: PricingScopeKind
+  providerId?: string
+  accountId?: string
+}
+
+export type PricingRule = {
+  id: string
+  version: number
+  active: boolean
+  scopeKind: PricingScopeKind
+  providerId?: string
+  accountId?: string
+  modelPattern: string
+  matchKind: PricingMatchKind
+  billingMode: BillingMode
+  inputUsdPerMillion?: string
+  cachedReadUsdPerMillion?: string
+  cacheWriteUsdPerMillion?: string
+  outputUsdPerMillion?: string
+  requestFeeUsd?: string
+  cacheWriteIncludedInInput: boolean
+  effectiveFromMs: number
+  createdAtMs: number
+  updatedAtMs: number
 }
 
 export type QuotaStatus =

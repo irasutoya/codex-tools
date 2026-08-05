@@ -24,7 +24,7 @@ Codex Tools 是一个轻量的 Tauri 2 + Rust 桌面应用。它直接更新 Cod
 - 管理多个兼容 OpenAI Responses API 的 Provider 和 API 账号。
 - 只更新受管的 `custom` Provider 字段，保留 MCP、Skills、Hooks、沙箱及未知配置。
 - 在官方账号与第三方 API 之间切换时，同步已识别会话的 Provider 元数据。
-- 直接读取 Codex JSONL/SQLite；不创建应用数据库，不保存聊天正文。
+- 直接读取 Codex JSONL/SQLite；本机用量索引保存在独立的 `usage.sqlite3`，不保存聊天正文。
 - 支持 Windows 10/11 和 macOS 11+，macOS 发布包同时支持 Apple Silicon 与 Intel。
 
 ## 下载与安装
@@ -101,6 +101,19 @@ Provider 字段，并写入所选 OpenAI Account 的完整凭据。配置通过 
 该服务；Codex Tools 只在“测试连接”时检查模型列表接口，不读取或保存响应内容。
 
 ## 数据与安全
+
+### 本机 Token 用量与美元估算
+
+“用量与费用”页面只读取当前电脑上的 Codex 会话 JSONL 日志，不 Hook、注入、抓包或代理
+Codex 请求，也不会上传用量数据。统计范围是本机被 Codex 写入的会话；其他设备、直接绕过
+Codex 调用 API 的请求，以及服务商后台账单不会出现在这里。
+
+页面中的美元金额是根据 OpenAI 内置官方参考价或你手动填写的中转站 USD 价格规则计算的估算值，
+不等于 OpenAI 或中转站的实际扣费。官方套餐实际账单无法只从本机 Token 日志推导，界面会明确标记
+“官方参考价 / 非实际账单”。用量事件、账号归属快照和价格规则保存在应用数据目录的
+`usage.sqlite3`，与账号配置分离。升级后首次刷新会建立新的统计周期，并把已知 rollout 游标置于文件尾部；
+升级前的 Token 不回放、不入账、不展示。中转站价格按服务和模型快速设置，保存后默认只重算当前日期范围；
+页面不提供历史数据入口。
 
 凭据会按产品约定以明文保存在本机。请勿上传、同步或分享以下目录和文件：
 

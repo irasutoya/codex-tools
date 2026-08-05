@@ -89,23 +89,41 @@ pub(crate) async fn sync_active_codex_configuration(
 pub(crate) async fn activate_openai_record(
     store: &Store,
     manager: &ConfigManager,
+    ledger: &crate::local_usage::UsageLedger,
     account: &StoredOfficialAccount,
 ) -> Result<RepairResult, AppError> {
     let home = codex::home(&store.codex_home_setting()?);
     let repair_sessions = provider_sync::configured_provider(&home) == codex::MANAGED_PROVIDER_ID;
-    codex::activate_official_account(&home, &account.credential)?;
-    if let Err(error) = store.activate_official_account(&account.id) {
-        return Err(compensate_activation_failure(store, manager, error).await);
-    }
-    let repair = if repair_sessions {
-        repair_home(home, "openai".into()).await?
-    } else {
-        RepairResult {
-            target_provider: "openai".into(),
-            ..RepairResult::default()
+    let pending_id = crate::begin_activation(
+        ledger,
+        &crate::activation_for_official(account, chrono::Utc::now().timestamp_millis()),
+    )?;
+    let result = async {
+        codex::activate_official_account(&home, &account.credential)?;
+        if let Err(error) = store.activate_official_account(&account.id) {
+            return Err(compensate_activation_failure(store, manager, error).await);
         }
-    };
-    Ok(repair)
+        let repair = if repair_sessions {
+            repair_home(home, "openai".into()).await?
+        } else {
+            RepairResult {
+                target_provider: "openai".into(),
+                ..RepairResult::default()
+            }
+        };
+        Ok::<_, AppError>(repair)
+    }
+    .await;
+    match result {
+        Ok(mut repair) => {
+            crate::confirm_pending(ledger, &pending_id, &mut repair);
+            Ok(repair)
+        }
+        Err(error) => {
+            crate::cancel_pending(ledger, &pending_id);
+            Err(error)
+        }
+    }
 }
 
 pub(crate) async fn compensate_activation_failure(

@@ -12,11 +12,18 @@ import type {
   Provider,
   ProviderOverview,
   ProviderTestResult,
+  PricingRule,
+  PricingScope,
   QuotaRefreshResult,
+  RepriceResult,
   RepairResult,
   RepairScan,
   Session,
   SettingsOverview,
+  UsageOverview,
+  OfficialPricingCatalog,
+  UsageQuery,
+  UsageRange,
 } from "@/types"
 
 type CommandSpec<Args, Result> = {
@@ -28,6 +35,17 @@ type CommandMap = {
   get_dashboard: CommandSpec<undefined, Dashboard>
   get_settings_overview: CommandSpec<undefined, SettingsOverview>
   get_provider_overview: CommandSpec<undefined, ProviderOverview>
+  get_usage_overview: CommandSpec<{ query: UsageQuery }, UsageOverview>
+  refresh_usage: CommandSpec<{ query: UsageQuery }, UsageOverview>
+  get_official_pricing_catalog: CommandSpec<undefined, OfficialPricingCatalog>
+  refresh_official_pricing_catalog: CommandSpec<
+    undefined,
+    OfficialPricingCatalog
+  >
+  list_pricing_rules: CommandSpec<{ scope?: PricingScope }, PricingRule[]>
+  save_pricing_rule: CommandSpec<{ input: PricingRule }, PricingRule>
+  delete_pricing_rule: CommandSpec<{ id: string }, void>
+  reprice_usage: CommandSpec<{ range: UsageRange }, RepriceResult>
   save_provider: CommandSpec<{ provider: Provider }, Provider>
   delete_provider: CommandSpec<{ id: string }, void>
   save_provider_account: CommandSpec<{ account: Account }, Account>

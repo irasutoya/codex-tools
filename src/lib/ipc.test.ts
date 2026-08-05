@@ -34,4 +34,18 @@ describe("Tauri IPC wrapper", () => {
     expect(mockedInvoke).toHaveBeenCalledTimes(1)
     expect(mockedInvoke).toHaveBeenCalledWith(command, args)
   })
+
+  it("forwards usage and USD pricing commands", async () => {
+    mockedInvoke.mockResolvedValue({ rows: [] })
+    const query = {
+      range: { startAtMs: 1, endAtMs: 2 },
+      groupBy: "model" as const,
+    }
+
+    await call("get_usage_overview", { query })
+    expect(mockedInvoke).toHaveBeenCalledWith("get_usage_overview", { query })
+
+    await call("list_pricing_rules", {})
+    expect(mockedInvoke).toHaveBeenCalledWith("list_pricing_rules", {})
+  })
 })

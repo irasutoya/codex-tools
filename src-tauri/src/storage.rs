@@ -726,24 +726,24 @@ fn create_private_file(path: &Path) -> std::io::Result<fs::File> {
 }
 
 #[cfg(unix)]
-fn secure_directory(path: &Path) -> std::io::Result<()> {
+pub(crate) fn secure_directory(path: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))
 }
 
 #[cfg(not(unix))]
-fn secure_directory(_path: &Path) -> std::io::Result<()> {
+pub(crate) fn secure_directory(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
 #[cfg(unix)]
-fn secure_file(path: &Path) -> std::io::Result<()> {
+pub(crate) fn secure_file(path: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(path, fs::Permissions::from_mode(0o600))
 }
 
 #[cfg(not(unix))]
-fn secure_file(_path: &Path) -> std::io::Result<()> {
+pub(crate) fn secure_file(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 

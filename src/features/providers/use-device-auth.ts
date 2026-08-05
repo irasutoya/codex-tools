@@ -2,8 +2,10 @@ import { useEffect, useState } from "react"
 
 import { notify } from "@/lib/feedback"
 import { call } from "@/lib/ipc"
+import { refreshCoordinator } from "@/lib/refresh-coordinator"
 import { notifyRepairWarnings } from "@/lib/repair-feedback"
 import { epochMilliseconds } from "@/lib/time"
+import { runQuotaRefresh } from "@/lib/use-auto-quota-refresh"
 import type { DeviceAuthorization } from "@/types"
 
 export function useDeviceAuthorizationPolling(onRefresh: () => Promise<void>) {
@@ -47,17 +49,20 @@ export function useDeviceAuthorizationPolling(onRefresh: () => Promise<void>) {
                 `Codex 现在使用 ${result.account.name}。`
               )
               notifyRepairWarnings(result.repair)
-              void call("refresh_official_account_quota", {
-                accountId: result.account.id,
-              })
+              void runQuotaRefresh(result.account.id, () =>
+                call("refresh_official_account_quota", {
+                  accountId: result.account.id,
+                })
+              )
                 .catch((error) =>
                   notify.warning("登录成功，但额度暂未更新", error)
                 )
-                .finally(() =>
-                  onRefresh().catch((error) =>
+                .finally(() => {
+                  refreshCoordinator.invalidate(["dashboard", "settings"])
+                  return onRefresh().catch((error) =>
                     notify.warning("登录已完成，但无法读取最新账号列表", error)
                   )
-                )
+                })
             })
             .catch((error) => {
               if (cancelled) return

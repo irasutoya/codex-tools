@@ -1,5 +1,6 @@
-import { useCallback, useEffect, useState } from "react"
+import { useCallback, useEffect, useRef, useState } from "react"
 import {
+  ArrowRightIcon,
   ExternalLinkIcon,
   File01Icon,
   FolderCogIcon,
@@ -39,18 +40,36 @@ import {
 import { Spinner } from "@/components/ui/spinner"
 import { notify } from "@/lib/feedback"
 import { call } from "@/lib/ipc"
+import {
+  refreshCoordinator,
+  useAppForeground,
+  usePageRefresh,
+} from "@/lib/refresh-coordinator"
+import {
+  runQuotaRefresh,
+  useAutoQuotaRefresh,
+} from "@/lib/use-auto-quota-refresh"
 import type { Dashboard, PageProps } from "@/types"
 
 import { QuotaStatusView } from "../providers/quota-status"
+import {
+  formatEstimatedUsd,
+  formatTokenDetail,
+  formatTokens,
+  getLocalRange,
+} from "../usage/usage-format"
 
 export default function DashboardPage({ active }: PageProps) {
+  const refreshSignal = usePageRefresh("dashboard")
+  const foreground = useAppForeground()
   const [data, setData] = useState<Dashboard>()
   const [launching, setLaunching] = useState(false)
   const [refreshing, setRefreshing] = useState(false)
   const [quotaRefreshing, setQuotaRefreshing] = useState(false)
   const [error, setError] = useState<string>()
+  const lastRefreshRevision = useRef<number | undefined>(undefined)
 
-  const load = useCallback(async () => {
+  const loadDashboard = useCallback(async () => {
     try {
       const dashboard = await call("get_dashboard")
       setData(dashboard)
@@ -61,13 +80,54 @@ export default function DashboardPage({ active }: PageProps) {
     }
   }, [])
 
+  const load = useCallback(async () => {
+    await loadDashboard()
+    void call("refresh_usage", {
+      query: { range: getLocalRange(1), groupBy: "account" },
+    })
+      .then(() => loadDashboard())
+      .then(() => refreshCoordinator.invalidate(["providers", "usage"]))
+      .catch(() => undefined)
+  }, [loadDashboard])
+
+  const activeAccountId =
+    data?.activeKind === "official" ? data.activeAccountId : undefined
+  const refreshQuotaData = useCallback(async () => {
+    if (!activeAccountId) throw new Error("当前没有可刷新的 OpenAI 账号")
+    const result = await call("refresh_official_account_quota", {
+      accountId: activeAccountId,
+    })
+    if (!refreshCoordinator.getForeground()) {
+      refreshCoordinator.invalidate(["dashboard", "providers"])
+      return result
+    }
+    await loadDashboard()
+    refreshCoordinator.invalidate(["providers"])
+    return result
+  }, [activeAccountId, loadDashboard])
+
   useEffect(() => {
-    if (!active) return
+    if (
+      !active ||
+      !foreground ||
+      lastRefreshRevision.current === refreshSignal.revision
+    ) {
+      return
+    }
+    lastRefreshRevision.current = refreshSignal.revision
     const timeout = window.setTimeout(() => {
       void load().catch(() => undefined)
     }, 0)
     return () => window.clearTimeout(timeout)
-  }, [active, load])
+  }, [active, foreground, load, refreshSignal.revision])
+
+  useAutoQuotaRefresh({
+    accountId: activeAccountId,
+    active,
+    foreground,
+    quota: data?.activeQuota,
+    refresh: refreshQuotaData,
+  })
 
   const launchCodex = async () => {
     setLaunching(true)
@@ -81,38 +141,39 @@ export default function DashboardPage({ active }: PageProps) {
     }
   }
 
-  const refresh = async () => {
-    setRefreshing(true)
-    try {
-      await load()
-      notify.success("状态已更新")
-    } catch (reason) {
-      notify.error("无法更新状态", reason)
-    } finally {
-      setRefreshing(false)
-    }
-  }
-
   const refreshQuota = async () => {
-    if (!data?.activeAccountId) return
+    if (!activeAccountId) return true
     setQuotaRefreshing(true)
     try {
-      const quota = await call("refresh_official_account_quota", {
-        accountId: data.activeAccountId,
-      })
-      await load()
+      const quota = await runQuotaRefresh(activeAccountId, refreshQuotaData)
       if (quota.status === "success") {
         notify.success("当前账号额度已更新")
+        return true
       } else {
         notify.warning(
           "当前账号额度未更新",
           quota.error ?? "OpenAI 暂未返回额度。"
         )
+        return false
       }
     } catch (reason) {
       notify.error("无法刷新当前账号额度", reason)
+      return false
     } finally {
       setQuotaRefreshing(false)
+    }
+  }
+
+  const refresh = async () => {
+    setRefreshing(true)
+    try {
+      await load()
+      const quotaUpdated = await refreshQuota()
+      notify.success(quotaUpdated ? "状态和额度已更新" : "状态已更新")
+    } catch (reason) {
+      notify.error("无法更新状态", reason)
+    } finally {
+      setRefreshing(false)
     }
   }
 
@@ -271,7 +332,7 @@ export default function DashboardPage({ active }: PageProps) {
               ) : (
                 <HugeiconsIcon icon={Refresh01Icon} data-icon="inline-start" />
               )}
-              {refreshing ? "正在刷新…" : "刷新状态"}
+              {refreshing ? "正在刷新…" : "刷新状态和额度"}
             </Button>
             {data.activeKind === "official" && data.activeAccountId && (
               <Button
@@ -294,6 +355,69 @@ export default function DashboardPage({ active }: PageProps) {
         </Card>
       </div>
 
+      <Card>
+        <CardHeader>
+          <CardTitle>今日本机用量</CardTitle>
+          <CardDescription>
+            官方账号和第三方中转站都从本机 Codex rollout
+            日志统计；美元费用只包含已配置价格。
+          </CardDescription>
+          <CardAction>
+            <div className="flex items-center gap-2">
+              <Badge variant="secondary">{data.todayRequests} 次调用</Badge>
+              <Button size="sm" variant="link" onClick={() => openUsagePage()}>
+                查看明细
+                <HugeiconsIcon icon={ArrowRightIcon} data-icon="inline-end" />
+              </Button>
+            </div>
+          </CardAction>
+        </CardHeader>
+        <CardContent>
+          <div className="grid gap-4 sm:grid-cols-3">
+            <div>
+              <p className="text-xs text-muted-foreground">总 Token</p>
+              <p className="mt-1 text-2xl font-semibold tabular-nums">
+                {formatTokens(data.todayUsage.totalTokens)}
+              </p>
+              <p className="mt-1 text-xs text-muted-foreground">
+                {formatTokenDetail(data.todayUsage)}
+              </p>
+            </div>
+            <div>
+              <p className="text-xs text-muted-foreground">估算费用</p>
+              <p className="mt-1 text-2xl font-semibold tabular-nums">
+                {formatEstimatedUsd(
+                  data.todayEstimatedCostMicrousd,
+                  data.todayUnpricedTokens +
+                    data.todayPartialTokens +
+                    data.todayUnattributedTokens +
+                    data.todaySubscriptionTokens
+                )}
+              </p>
+              <p className="mt-1 text-xs text-muted-foreground">
+                {data.todaySubscriptionTokens > 0
+                  ? "官方套餐按 Token 统计"
+                  : "仅统计已匹配 USD 价格的 Token"}
+              </p>
+            </div>
+            <div>
+              <p className="text-xs text-muted-foreground">待确认 Token</p>
+              <p className="mt-1 text-2xl font-semibold tabular-nums">
+                {formatTokens(
+                  data.todayUnpricedTokens +
+                    data.todayPartialTokens +
+                    data.todayUnattributedTokens
+                )}
+              </p>
+              <p className="mt-1 text-xs text-muted-foreground">
+                未定价 {formatTokens(data.todayUnpricedTokens)} · 未归属{" "}
+                {formatTokens(data.todayUnattributedTokens)}
+              </p>
+            </div>
+          </div>
+        </CardContent>
+      </Card>
+
       <section
         className="flex flex-col gap-4"
         aria-labelledby="local-status-title"
@@ -310,5 +434,11 @@ export default function DashboardPage({ active }: PageProps) {
         </div>
       </section>
     </div>
+  )
+}
+
+function openUsagePage() {
+  window.dispatchEvent(
+    new CustomEvent("codex-tools:navigate", { detail: "usage" })
   )
 }
