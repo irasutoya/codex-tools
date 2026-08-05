@@ -120,6 +120,10 @@ export default function UsagePage({ active }: PageProps) {
   const [officialCatalog, setOfficialCatalog] =
     useState<OfficialPricingCatalog>()
   const [officialCatalogLoading, setOfficialCatalogLoading] = useState(false)
+  const [officialCatalogError, setOfficialCatalogError] = useState<string>()
+  const [officialCatalogFailed, setOfficialCatalogFailed] = useState(false)
+  const [officialCatalogRetryRevision, setOfficialCatalogRetryRevision] =
+    useState(0)
   const [rules, setRules] = useState<PricingRule[]>([])
   const [providers, setProviders] = useState<ProviderOverview>()
   const [pricingDraft, setPricingDraft] = useState<PricingRule>()
@@ -149,6 +153,7 @@ export default function UsagePage({ active }: PageProps) {
   const lastRefreshRevision = useRef<number | undefined>(undefined)
   const lastAutomaticRefreshAt = useRef<number | undefined>(undefined)
   const wasActive = useRef(false)
+  const officialCatalogRetryCount = useRef(0)
 
   const getSelectedRange = useCallback(() => {
     if (rangeMode === "yesterday") return getLocalDayRange(1)
@@ -248,12 +253,44 @@ export default function UsagePage({ active }: PageProps) {
         ? await call("refresh_official_pricing_catalog")
         : await call("get_official_pricing_catalog")
       setOfficialCatalog(result)
+      setOfficialCatalogError(undefined)
+      setOfficialCatalogFailed(false)
+      officialCatalogRetryCount.current = 0
     } catch (reason) {
-      setPricingError(String(reason))
+      setOfficialCatalogError(String(reason))
+      setOfficialCatalogFailed(true)
+      setOfficialCatalogRetryRevision((revision) => revision + 1)
     } finally {
       setOfficialCatalogLoading(false)
     }
   }, [])
+
+  useEffect(() => {
+    if (
+      !active ||
+      !foreground ||
+      officialCatalogLoading ||
+      !officialCatalogFailed
+    ) {
+      return
+    }
+    const delay = Math.min(
+      30_000 * 2 ** officialCatalogRetryCount.current,
+      10 * 60_000
+    )
+    const timer = window.setTimeout(() => {
+      officialCatalogRetryCount.current += 1
+      void loadOfficialCatalog(true)
+    }, delay)
+    return () => window.clearTimeout(timer)
+  }, [
+    active,
+    foreground,
+    officialCatalogLoading,
+    officialCatalogFailed,
+    officialCatalogRetryRevision,
+    loadOfficialCatalog,
+  ])
 
   useEffect(() => {
     const entered = active && !wasActive.current
@@ -515,7 +552,8 @@ export default function UsagePage({ active }: PageProps) {
   const hasWarnings =
     displayOverview.warnings.length > 0 ||
     attentionTokens > 0 ||
-    Boolean(pricingError)
+    Boolean(pricingError) ||
+    Boolean(officialCatalogError)
   const relayRules = rules.filter(
     (rule) =>
       rule.scopeKind === "provider_model" ||
@@ -757,6 +795,9 @@ export default function UsagePage({ active }: PageProps) {
                 </span>
               )}
               {pricingError && <span>价格规则读取失败：{pricingError}</span>}
+              {officialCatalogError && (
+                <span>官方价格同步失败：{officialCatalogError}</span>
+              )}
               {displayOverview.warnings.length > 0 && (
                 <ul className="list-disc pl-5">
                   {displayOverview.warnings
