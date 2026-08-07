@@ -207,7 +207,17 @@ pub fn quit_codex_app(configured: Option<&str>) -> std::io::Result<()> {
     }
     #[cfg(windows)]
     {
-        for name in ["Codex.exe", "ChatGPT.exe"] {
+        // 先按手动配置的可执行文件名结束（与 codex_app_running 的识别逻辑一致），
+        // 再兜底结束默认名称的进程。
+        let mut names = vec!["Codex.exe", "ChatGPT.exe"];
+        if let Some(name) = codex_app_path(configured)
+            .and_then(|path| path.file_name())
+            .and_then(|name| name.to_str())
+            .filter(|name| !names.contains(name))
+        {
+            names.push(name);
+        }
+        for name in names {
             let _ = Command::new("taskkill").args(["/IM", name, "/F"]).status();
         }
         Ok(())
