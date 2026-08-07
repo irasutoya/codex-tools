@@ -29,7 +29,7 @@ Completions 请求转发，其余场景请求仍由 Codex 直连。
 - 通过 Chrome DevTools Protocol (CDP) 解锁 Codex 桌面应用的模型列表：模型目录只包含**当前激活服务商**实际存在的模型（id 与服务 `/models` 接口返回完全一致的可用模型），不注入任何内置模型；生成 `model_catalog_json` 模型目录（`model-catalogs/codex-tools.json`）让 CLI 与应用返回自定义模型；从概览页「打开 Codex（自动解锁）」或设置页重启时以调试模式启动并注入脚本，把选择器白名单补齐为被订阅等级隐藏的当前服务商模型；提示词保持通用、不绑定具体模型版本；注入只作用于内存，不修改安装文件。
 - 在官方账号与第三方 API 之间切换时，同步已识别会话的 Provider 元数据。
 - 直接读取 Codex JSONL/SQLite；本机用量索引保存在独立的 `usage.sqlite3`，不保存聊天正文。
-- 支持 Windows 10/11 和 macOS 11+，macOS 发布包同时支持 Apple Silicon 与 Intel。
+- 支持 Windows 10/11 和 macOS 11+（Apple Silicon）。
 
 ## 下载与安装
 
@@ -40,7 +40,6 @@ Completions 请求转发，其余场景请求仍由 Codex 直连。
 | ------------------- | ----------------------- | ----------------------- |
 | Windows x64         | `_x64-setup.exe` 安装包 | Windows 10/11、WebView2 |
 | macOS Apple Silicon | `_aarch64.dmg` 磁盘映像 | macOS 11 或更高版本     |
-| macOS Intel         | `_x64.dmg` 磁盘映像     | macOS 11 或更高版本     |
 
 > [!IMPORTANT]
 > 当前自动构建的安装包尚未配置 Authenticode 或 Apple Developer ID
@@ -168,9 +167,6 @@ npm run dist:win
 
 # macOS Apple Silicon：输出到 src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/
 npm run dist:mac:arm64
-
-# macOS Intel：输出到 src-tauri/target/x86_64-apple-darwin/release/bundle/dmg/
-npm run dist:mac:x64
 ```
 
 发布流程、版本同步和标签要求见 [发布指南](docs/RELEASING.md)。参与开发前请阅读

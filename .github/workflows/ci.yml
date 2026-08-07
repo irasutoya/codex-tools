@@ -30,12 +30,6 @@ jobs:
             target: aarch64-apple-darwin
             script: dist:mac:arm64
             verify_script: verify:mac:arm64
-          - platform: macos
-            arch: x64
-            runner: macos-15-intel
-            target: x86_64-apple-darwin
-            script: dist:mac:x64
-            verify_script: verify:mac:x64
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     steps:
