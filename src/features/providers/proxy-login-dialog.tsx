@@ -52,7 +52,7 @@ export function ProxyLoginDialog({
         if (!open && !pending) onCancel()
       }}
     >
-      <DialogContent className="sm:max-w-lg">
+      <DialogContent className="max-h-[calc(100dvh-2rem)] w-full max-w-lg overflow-y-auto">
         <DialogHeader>
           <DialogTitle>导入 Cookie 账号</DialogTitle>
           <DialogDescription>

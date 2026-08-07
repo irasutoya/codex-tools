@@ -1,7 +1,6 @@
 import { useMemo, useState } from "react"
 import {
   Copy01Icon,
-  Download01Icon,
   Image01Icon,
   Share01Icon,
 } from "@hugeicons/core-free-icons"
@@ -17,12 +16,25 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog"
+import {
+  Empty,
+  EmptyDescription,
+  EmptyHeader,
+  EmptyMedia,
+  EmptyTitle,
+} from "@/components/ui/empty"
+import {
+  Field,
+  FieldContent,
+  FieldDescription,
+  FieldTitle,
+} from "@/components/ui/field"
 import { Spinner } from "@/components/ui/spinner"
 import { Switch } from "@/components/ui/switch"
+import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group"
 import { notify } from "@/lib/feedback"
 import type { UsageOverview, UsageShareData } from "@/types"
 
-import { UsageShareCard } from "./usage-share-card"
 import {
   buildUsageShareData,
   copySharePngToClipboard,
@@ -70,25 +82,14 @@ export function UsageShareDialog({
         : undefined,
     [accountOverview, dateLabel, modelOverview, timezone]
   )
-  const svg = useMemo(
-    () =>
-      data
-        ? renderUsageShareSvg(
-            data,
-            mode,
-            maskAccounts,
-            showAllAccounts,
-            showAllModels
-          )
-        : "",
-    [data, maskAccounts, mode, showAllAccounts, showAllModels]
-  )
 
-  const withExport = async (action: (markup: string) => Promise<void>) => {
-    if (!svg || !data || exporting) return
+  const withExport = async (
+    action: (shareData: UsageShareData) => Promise<void>
+  ) => {
+    if (!data || exporting) return
     setExporting(true)
     try {
-      await action(svg)
+      await action(data)
     } catch (reason) {
       notify.error("分享图片失败", reason)
     } finally {
@@ -106,14 +107,14 @@ export function UsageShareDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-w-4xl sm:max-w-4xl">
+      <DialogContent className="max-h-[calc(100dvh-3rem)] max-w-4xl overflow-y-auto">
         <DialogHeader className="pr-8">
           <DialogTitle className="flex items-center gap-2">
-            <HugeiconsIcon icon={Share01Icon} className="size-4" />
+            <HugeiconsIcon icon={Share01Icon} size={16} />
             分享今日用量
           </DialogTitle>
           <DialogDescription>
-            模型只显示在所属账号下；官方账号和中转站的同名模型不会合并。
+            模型只显示在所属账号下；官方账号和 API 服务的同名模型不会合并。
           </DialogDescription>
         </DialogHeader>
 
@@ -125,15 +126,37 @@ export function UsageShareDialog({
         )}
 
         {loading ? (
-          <div className="flex min-h-48 items-center justify-center rounded-xl border">
-            <Spinner />
-            <span className="ml-2 text-sm text-muted-foreground">
-              正在刷新今日用量和模型明细…
-            </span>
-          </div>
+          <Empty className="min-h-48 border">
+            <EmptyHeader>
+              <EmptyMedia variant="icon">
+                <Spinner aria-hidden="true" />
+              </EmptyMedia>
+              <EmptyTitle>正在刷新今日用量</EmptyTitle>
+              <EmptyDescription>
+                正在读取账号与模型明细，请稍候…
+              </EmptyDescription>
+            </EmptyHeader>
+          </Empty>
         ) : data ? (
           <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_260px]">
-            <UsageShareCard svg={svg} />
+            <div
+              className="max-h-[min(66dvh,780px)] overflow-auto rounded-xl border bg-muted/40 p-3"
+              aria-label="分享卡片预览"
+            >
+              <div
+                className="mx-auto w-fit"
+                // 预览直接渲染 SVG：与导出的 PNG 完全一致（所见即所得）。
+                dangerouslySetInnerHTML={{
+                  __html: renderUsageShareSvg(
+                    data,
+                    mode,
+                    maskAccounts,
+                    showAllAccounts,
+                    showAllModels
+                  ),
+                }}
+              />
+            </div>
             <div className="flex flex-col gap-4 rounded-xl border bg-muted/20 p-4">
               <div>
                 <p className="text-sm font-medium">分享内容</p>
@@ -141,70 +164,64 @@ export function UsageShareDialog({
                   顶部总览汇总全部来源，明细始终按账号保留模型归属。
                 </p>
               </div>
-              <div
-                className="flex flex-wrap gap-2"
-                role="group"
+              <ToggleGroup
+                variant="outline"
+                spacing={2}
+                size="sm"
+                className="flex-wrap"
+                value={[mode]}
+                onValueChange={(value, eventDetails) => {
+                  const next = value[0] as UsageShareMode | undefined
+                  if (next) setMode(next)
+                  else eventDetails.isCanceled = true
+                }}
                 aria-label="分享卡片内容"
               >
-                <Button
-                  size="sm"
-                  variant={mode === "details" ? "secondary" : "outline"}
-                  aria-pressed={mode === "details"}
-                  onClick={() => setMode("details")}
-                >
+                <ToggleGroupItem value="details">
                   总览 + 账号与模型
-                </Button>
-                <Button
-                  size="sm"
-                  variant={mode === "summary" ? "secondary" : "outline"}
-                  aria-pressed={mode === "summary"}
-                  onClick={() => setMode("summary")}
-                >
-                  仅总览
-                </Button>
-              </div>
-              <label className="flex items-center justify-between gap-3 text-sm">
-                <span>
-                  <span className="block font-medium">账号名称脱敏</span>
-                  <span className="mt-1 block text-xs text-muted-foreground">
-                    不显示邮箱完整本地名
-                  </span>
-                </span>
+                </ToggleGroupItem>
+                <ToggleGroupItem value="summary">仅总览</ToggleGroupItem>
+              </ToggleGroup>
+              <Field orientation="horizontal">
+                <FieldContent>
+                  <FieldTitle>账号名称脱敏</FieldTitle>
+                  <FieldDescription>不显示邮箱完整本地名</FieldDescription>
+                </FieldContent>
                 <Switch
                   checked={maskAccounts}
                   onCheckedChange={setMaskAccounts}
                   aria-label="账号名称脱敏"
                 />
-              </label>
+              </Field>
               {mode === "details" && data.accounts.length > 6 && (
-                <label className="flex items-center justify-between gap-3 text-sm">
-                  <span>
-                    <span className="block font-medium">展开全部账号</span>
-                    <span className="mt-1 block text-xs text-muted-foreground">
+                <Field orientation="horizontal">
+                  <FieldContent>
+                    <FieldTitle>展开全部账号</FieldTitle>
+                    <FieldDescription>
                       当前 {data.accounts.length} 个账号
-                    </span>
-                  </span>
+                    </FieldDescription>
+                  </FieldContent>
                   <Switch
                     checked={showAllAccounts}
                     onCheckedChange={setShowAllAccounts}
                     aria-label="展开全部账号"
                   />
-                </label>
+                </Field>
               )}
               {mode === "details" && hasMoreModels && (
-                <label className="flex items-center justify-between gap-3 text-sm">
-                  <span>
-                    <span className="block font-medium">展开全部模型</span>
-                    <span className="mt-1 block text-xs text-muted-foreground">
+                <Field orientation="horizontal">
+                  <FieldContent>
+                    <FieldTitle>展开全部模型</FieldTitle>
+                    <FieldDescription>
                       每个账号默认显示前 4 个模型
-                    </span>
-                  </span>
+                    </FieldDescription>
+                  </FieldContent>
                   <Switch
                     checked={showAllModels}
                     onCheckedChange={setShowAllModels}
                     aria-label="展开全部模型"
                   />
-                </label>
+                </Field>
               )}
               <div className="rounded-lg border bg-background/70 p-3 text-xs leading-relaxed text-muted-foreground">
                 <p>总 Token：{data.totalTokens.toLocaleString("en-US")}</p>
@@ -215,9 +232,17 @@ export function UsageShareDialog({
             </div>
           </div>
         ) : (
-          <div className="flex min-h-48 items-center justify-center rounded-xl border text-sm text-muted-foreground">
-            今天还没有可分享的 Token 记录。
-          </div>
+          <Empty className="min-h-48 border">
+            <EmptyHeader>
+              <EmptyMedia variant="icon">
+                <HugeiconsIcon icon={Share01Icon} />
+              </EmptyMedia>
+              <EmptyTitle>今天还没有可分享的 Token 记录</EmptyTitle>
+              <EmptyDescription>
+                先在 Codex 中发起一次请求，再来生成分享卡片。
+              </EmptyDescription>
+            </EmptyHeader>
+          </Empty>
         )}
 
         <DialogFooter className="flex-col-reverse sm:flex-row sm:items-center">
@@ -227,12 +252,11 @@ export function UsageShareDialog({
           <div className="flex flex-wrap justify-end gap-2">
             <Button
               variant="outline"
-              disabled={!svg || exporting}
+              disabled={!data || exporting}
               onClick={() =>
-                void withExport(async () => {
-                  if (!data) return
+                void withExport(async (shareData) => {
                   await copySharePngToClipboard(
-                    data,
+                    shareData,
                     mode,
                     maskAccounts,
                     showAllAccounts,
@@ -251,30 +275,13 @@ export function UsageShareDialog({
             </Button>
             <Button
               variant="outline"
-              disabled={!svg || exporting}
+              disabled={!data || exporting}
               onClick={() =>
-                void withExport(async (markup) => {
-                  downloadShareFile(
-                    "codex-tools-今日用量.svg",
-                    markup,
-                    "image/svg+xml;charset=utf-8"
-                  )
-                  notify.success("SVG 已保存")
-                })
-              }
-            >
-              <HugeiconsIcon icon={Download01Icon} data-icon="inline-start" />
-              保存 SVG
-            </Button>
-            <Button
-              disabled={!svg || exporting}
-              onClick={() =>
-                void withExport(async () => {
-                  if (!data) return
+                void withExport(async (shareData) => {
                   downloadShareFile(
                     "codex-tools-今日用量.png",
                     await renderSharePng(
-                      data,
+                      shareData,
                       mode,
                       maskAccounts,
                       showAllAccounts,

@@ -1,7 +1,6 @@
 import { invoke } from "@tauri-apps/api/core"
 
 import type {
-  Account,
   AccountQuota,
   ConfigPatchPreview,
   Dashboard,
@@ -20,8 +19,12 @@ import type {
   RepairScan,
   Session,
   SettingsOverview,
+  ModelUnlockResult,
+  ModelUnlockStatus,
   UsageOverview,
+  UsageTrend,
   OfficialPricingCatalog,
+  CodexAppSetting,
   UsageQuery,
   UsageRange,
 } from "@/types"
@@ -34,9 +37,12 @@ type CommandSpec<Args, Result> = {
 type CommandMap = {
   get_dashboard: CommandSpec<undefined, Dashboard>
   get_settings_overview: CommandSpec<undefined, SettingsOverview>
+  get_codex_app_setting: CommandSpec<undefined, CodexAppSetting>
+  save_codex_app_path: CommandSpec<{ path: string | null }, void>
   get_provider_overview: CommandSpec<undefined, ProviderOverview>
   get_usage_overview: CommandSpec<{ query: UsageQuery }, UsageOverview>
   refresh_usage: CommandSpec<{ query: UsageQuery }, UsageOverview>
+  get_usage_trend: CommandSpec<{ range: UsageRange }, UsageTrend>
   get_official_pricing_catalog: CommandSpec<undefined, OfficialPricingCatalog>
   refresh_official_pricing_catalog: CommandSpec<
     undefined,
@@ -48,8 +54,6 @@ type CommandMap = {
   reprice_usage: CommandSpec<{ range: UsageRange }, RepriceResult>
   save_provider: CommandSpec<{ provider: Provider }, Provider>
   delete_provider: CommandSpec<{ id: string }, void>
-  save_provider_account: CommandSpec<{ account: Account }, Account>
-  delete_provider_account: CommandSpec<{ id: string }, void>
   import_proxy_account: CommandSpec<
     { name?: string; accountId?: string; content: string },
     OfficialAccountView
@@ -62,10 +66,9 @@ type CommandMap = {
   activate_openai_account: CommandSpec<{ id: string }, RepairResult>
   delete_openai_account: CommandSpec<{ id: string }, void>
   open_openai_device_page: CommandSpec<undefined, void>
-  test_provider: CommandSpec<
-    { id: string; accountId: string },
-    ProviderTestResult
-  >
+  test_provider: CommandSpec<{ id: string }, ProviderTestResult>
+  list_provider_models: CommandSpec<{ id: string }, string[]>
+  refresh_active_provider_models: CommandSpec<undefined, string[]>
   refresh_official_account_quota: CommandSpec<
     { accountId: string },
     AccountQuota
@@ -76,10 +79,7 @@ type CommandMap = {
     ConfigPatchPreview
   >
   apply_activation: CommandSpec<{ operationId: string }, void>
-  activate_provider: CommandSpec<
-    { id: string; accountId: string },
-    RepairResult
-  >
+  activate_provider: CommandSpec<{ id: string }, RepairResult>
   activate_official: CommandSpec<undefined, RepairResult>
   scan_codex_data: CommandSpec<undefined, RepairScan>
   repair_codex_data: CommandSpec<{ targetProvider: string }, RepairResult>
@@ -92,7 +92,10 @@ type CommandMap = {
     },
     PageResult<Session>
   >
-  launch_codex: CommandSpec<undefined, void>
+  launch_codex: CommandSpec<undefined, ModelUnlockResult>
+  get_model_unlock_status: CommandSpec<undefined, ModelUnlockStatus>
+  unlock_codex_models: CommandSpec<undefined, ModelUnlockResult>
+  launch_codex_with_debug: CommandSpec<undefined, ModelUnlockResult>
 }
 
 type Command = keyof CommandMap

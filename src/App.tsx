@@ -6,25 +6,24 @@ import {
   useEffect,
   useRef,
   useState,
-  type CSSProperties,
 } from "react"
 import {
-  CheckIcon,
   ChartHistogramIcon,
+  CheckIcon,
+  ExternalLinkIcon,
   FileCheckIcon,
   Key01Icon,
   DashboardSquare01Icon,
   Message01Icon,
   MonitorDotIcon,
   Moon02Icon,
-  Shield01Icon,
+  Refresh01Icon,
   Sun03Icon,
 } from "@hugeicons/core-free-icons"
-import { HugeiconsIcon } from "@hugeicons/react"
+import { HugeiconsIcon, type IconSvgElement } from "@hugeicons/react"
 import { useTheme } from "next-themes"
 
-import { PageHeader } from "@/components/page-header"
-import { PageLoading } from "@/components/page-loading"
+import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import {
   DropdownMenu,
@@ -33,24 +32,14 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
-import {
-  Sidebar,
-  SidebarContent,
-  SidebarFooter,
-  SidebarGroup,
-  SidebarGroupContent,
-  SidebarGroupLabel,
-  SidebarHeader,
-  SidebarInset,
-  SidebarMenu,
-  SidebarMenuButton,
-  SidebarMenuItem,
-  SidebarProvider,
-} from "@/components/ui/sidebar"
+import { Skeleton } from "@/components/ui/skeleton"
+import { Spinner } from "@/components/ui/spinner"
 import { Toaster } from "@/components/ui/sonner"
 import { TooltipProvider } from "@/components/ui/tooltip"
+import { notify } from "@/lib/feedback"
+import { call } from "@/lib/ipc"
 import { refreshCoordinator } from "@/lib/refresh-coordinator"
-import type { Page } from "@/types"
+import type { ModelUnlockStatus, Page } from "@/types"
 
 const pageLoaders = {
   dashboard: () => import("@/features/dashboard/dashboard-page"),
@@ -72,38 +61,38 @@ type NavigationItem = {
   id: Page
   label: string
   description: string
-  icon: typeof CheckIcon
+  icon: IconSvgElement
 }
 
 const navigation: NavigationItem[] = [
   {
     id: "dashboard",
     label: "概览",
-    description: "查看当前连接、账号额度和本机会话状态",
+    description: "当前连接、账号额度和本机会话状态",
     icon: DashboardSquare01Icon,
   },
   {
     id: "providers",
-    label: "账号与服务",
-    description: "管理 OpenAI 账号与兼容 Responses API 的第三方服务",
+    label: "连接",
+    description: "管理 OpenAI 账号与第三方 API 服务",
     icon: Key01Icon,
   },
   {
     id: "usage",
-    label: "用量与费用",
+    label: "用量",
     description: "查看本机 Token、模型与美元估算费用",
     icon: ChartHistogramIcon,
   },
   {
     id: "sessions",
-    label: "历史会话",
-    description: "查看本机会话，并仅在需要时更新连接归属",
+    label: "会话",
+    description: "查看本机会话，并更新连接归属",
     icon: Message01Icon,
   },
   {
     id: "settings",
-    label: "配置",
-    description: "检查本机 Codex 配置，并在写入前预览变更",
+    label: "设置",
+    description: "检查 Codex 配置、应用与模型解锁",
     icon: FileCheckIcon,
   },
 ]
@@ -114,7 +103,6 @@ export default function App() {
   const [visitedPages, setVisitedPages] = useState<Set<Page>>(
     () => new Set(["dashboard"])
   )
-  const currentNavigation = navigation.find((item) => item.id === page)!
 
   useEffect(() => {
     refreshCoordinator.start()
@@ -150,115 +138,178 @@ export default function App() {
       window.removeEventListener("codex-tools:navigate", handleNavigation)
   }, [navigate])
 
-  const CurrentPageIcon = currentNavigation.icon
+  const current = navigation.find((item) => item.id === page)!
 
   return (
     <TooltipProvider>
-      <SidebarProvider
-        className="h-full overflow-hidden"
-        style={{ "--sidebar-width": "14.5rem" } as CSSProperties}
-      >
-        <AppSidebar page={page} onNavigate={navigate} />
-        <SidebarInset className="min-h-0 overflow-hidden">
-          <main
-            ref={contentRef}
-            className="min-h-0 flex-1 overflow-y-auto"
-            aria-label={currentNavigation.label}
+      <div className="flex h-full flex-col overflow-hidden">
+        {/* 顶栏：左侧导航标签 + 右侧全局操作（所有控件统一 36px 高度对齐） */}
+        <header className="flex h-14 shrink-0 items-center gap-2 border-b px-3">
+          <nav
+            className="flex min-w-0 flex-1 items-center gap-1"
+            aria-label="主导航"
           >
-            <div className="mx-auto flex w-full max-w-6xl flex-col gap-6 px-8 py-7">
-              <PageHeader
-                title={currentNavigation.label}
-                description={currentNavigation.description}
-                icon={CurrentPageIcon}
-                actions={<ThemeMenu />}
-              />
-              {navigation
-                .filter((item) => visitedPages.has(item.id))
-                .map((item) => {
-                  const PageComponent = pages[item.id]
-                  const active = page === item.id
-                  return (
-                    <section
-                      key={item.id}
-                      hidden={!active}
-                      aria-hidden={!active}
-                      aria-label={item.label}
-                    >
-                      <Suspense fallback={<PageLoading />}>
-                        <PageComponent active={active} />
-                      </Suspense>
-                    </section>
-                  )
-                })}
-            </div>
-          </main>
-        </SidebarInset>
-      </SidebarProvider>
+            {navigation.map((item) => {
+              const Icon = item.icon
+              const active = page === item.id
+              return (
+                <Button
+                  key={item.id}
+                  variant={active ? "default" : "ghost"}
+                  size="default"
+                  aria-current={active ? "page" : undefined}
+                  aria-label={item.label}
+                  title={item.label}
+                  onClick={() => navigate(item.id)}
+                >
+                  <HugeiconsIcon icon={Icon} aria-hidden="true" />
+                  <span>{item.label}</span>
+                </Button>
+              )
+            })}
+          </nav>
+
+          <div className="flex shrink-0 items-center gap-1.5">
+            <Button
+              variant="ghost"
+              size="icon"
+              aria-label="刷新当前页"
+              title="刷新当前页"
+              onClick={() => refreshCoordinator.invalidate([page])}
+            >
+              <HugeiconsIcon icon={Refresh01Icon} data-icon="inline-start" />
+            </Button>
+            <ThemeMenu />
+            <QuickLaunch />
+          </div>
+        </header>
+
+        {/* 内容区：固定窗口，全宽利用 */}
+        <main
+          ref={contentRef}
+          className="min-h-0 flex-1 overflow-y-auto"
+          aria-label={current.label}
+        >
+          <div className="flex w-full flex-col gap-6 p-6 lg:gap-8 lg:p-8">
+            {navigation
+              .filter((item) => visitedPages.has(item.id))
+              .map((item) => {
+                const PageComponent = pages[item.id]
+                const active = page === item.id
+                return (
+                  <section
+                    key={item.id}
+                    hidden={!active}
+                    aria-hidden={!active}
+                    aria-label={item.label}
+                  >
+                    <Suspense fallback={<PageLoading />}>
+                      <PageComponent active={active} />
+                    </Suspense>
+                  </section>
+                )
+              })}
+          </div>
+        </main>
+      </div>
       <Toaster position="bottom-right" closeButton visibleToasts={4} />
     </TooltipProvider>
   )
 }
 
-function AppSidebar({
-  page,
-  onNavigate,
-}: {
-  page: Page
-  onNavigate: (page: Page) => void
-}) {
+function PageLoading() {
   return (
-    <Sidebar collapsible="none" className="border-r border-sidebar-border">
-      <SidebarHeader className="px-3 pt-5">
-        <div className="flex h-12 items-center gap-3 px-2">
-          <img
-            src="/codex-tools.svg"
-            alt=""
-            className="size-8 shrink-0 rounded-lg"
-          />
-          <div className="min-w-0">
-            <div className="truncate text-base font-semibold">Codex Tools</div>
-            <div className="truncate text-xs text-muted-foreground">
-              本机连接管理
-            </div>
+    <div className="flex flex-col gap-4" role="status" aria-live="polite">
+      <div className="grid grid-cols-4 gap-3">
+        {Array.from({ length: 4 }).map((_, index) => (
+          <div key={index} className="flex flex-col gap-2">
+            <Skeleton className="h-3 w-16" />
+            <Skeleton className="h-6 w-14" />
           </div>
-        </div>
-      </SidebarHeader>
+        ))}
+      </div>
+      <Skeleton className="h-64 w-full" />
+    </div>
+  )
+}
 
-      <SidebarContent className="px-1">
-        <SidebarGroup className="pt-4">
-          <SidebarGroupLabel>工作台</SidebarGroupLabel>
-          <SidebarGroupContent>
-            <SidebarMenu>
-              {navigation.map((item) => {
-                const Icon = item.icon
-                return (
-                  <SidebarMenuItem key={item.id}>
-                    <SidebarMenuButton
-                      isActive={page === item.id}
-                      tooltip={item.label}
-                      aria-current={page === item.id ? "page" : undefined}
-                      onFocus={() => void pageLoaders[item.id]()}
-                      onPointerEnter={() => void pageLoaders[item.id]()}
-                      onClick={() => onNavigate(item.id)}
-                    >
-                      <HugeiconsIcon icon={Icon} aria-hidden="true" />
-                      <span>{item.label}</span>
-                    </SidebarMenuButton>
-                  </SidebarMenuItem>
-                )
-              })}
-            </SidebarMenu>
-          </SidebarGroupContent>
-        </SidebarGroup>
-      </SidebarContent>
+async function launchCodex() {
+  try {
+    const result = await call("launch_codex")
+    notify.success(
+      result.injected ? "Codex 已启动并解锁模型列表" : result.message
+    )
+    refreshCoordinator.invalidate(["dashboard", "settings"])
+  } catch (reason) {
+    notify.error("无法启动 Codex", reason)
+  }
+}
 
-      <SidebarFooter>
-        <div className="flex items-start gap-2 rounded-lg bg-sidebar-accent px-3 py-3 text-xs leading-relaxed text-muted-foreground [&_svg]:mt-0.5 [&_svg]:size-4 [&_svg]:shrink-0">
-          <HugeiconsIcon icon={Shield01Icon} aria-hidden="true" />
-          <span>凭据仅保存在这台设备上</span>
-        </div>
-      </SidebarFooter>
-    </Sidebar>
+/** 顶栏右侧的一键启动（全局快捷操作）。 */
+function QuickLaunch() {
+  const [launching, setLaunching] = useState(false)
+  const [status, setStatus] = useState<ModelUnlockStatus>()
+
+  useEffect(() => {
+    let cancelled = false
+    call("get_model_unlock_status")
+      .then((result) => {
+        if (!cancelled) setStatus(result)
+      })
+      .catch(() => undefined)
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
+  const launch = async () => {
+    setLaunching(true)
+    try {
+      await launchCodex()
+      setStatus(await call("get_model_unlock_status"))
+    } catch {
+      // launchCodex 已通过 notify 提示错误。
+    } finally {
+      setLaunching(false)
+    }
+  }
+
+  const statusLabel = status?.injected
+    ? "已解锁"
+    : status?.appFound
+      ? "未解锁"
+      : "未检测到应用"
+
+  return (
+    <div className="flex items-center gap-1.5">
+      <Button
+        variant="default"
+        size="default"
+        title="启动 Codex（自动解锁）"
+        disabled={launching}
+        onClick={() => void launch()}
+      >
+        {launching ? (
+          <Spinner data-icon="inline-start" />
+        ) : (
+          <HugeiconsIcon icon={ExternalLinkIcon} data-icon="inline-start" />
+        )}
+        {launching ? "启动中…" : "启动 Codex"}
+      </Button>
+      <Badge
+        variant={
+          status?.injected
+            ? "default"
+            : status?.appFound
+              ? "secondary"
+              : "outline"
+        }
+        className="inline-flex"
+        title="Codex 模型解锁状态"
+      >
+        {statusLabel}
+      </Badge>
+    </div>
   )
 }
 
@@ -278,7 +329,7 @@ function ThemeMenu() {
       <DropdownMenuTrigger
         render={
           <Button
-            variant="outline"
+            variant="ghost"
             size="icon"
             aria-label={`界面主题：${current?.label ?? "跟随系统"}`}
             title="选择界面主题"

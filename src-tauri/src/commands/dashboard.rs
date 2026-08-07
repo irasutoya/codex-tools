@@ -1,10 +1,8 @@
 use crate::{
-    codex, commands::usage::local_today_range, local_usage::UsageLedger, models::*, platform,
-    session_index::SessionIndex, storage::Store,
+    codex, commands::usage::local_today_range, local_usage::UsageLedger, model_unlock, models::*,
+    platform, session_index::SessionIndex, storage::Store,
 };
 use tauri::State;
-
-const CODEX_APP_URI: &str = "codex://";
 
 #[derive(Debug, Default)]
 struct ActiveProjection {
@@ -14,16 +12,16 @@ struct ActiveProjection {
     active_kind: ActiveKind,
     active_account_id: Option<String>,
     active_account: Option<String>,
+    active_model: Option<String>,
     active_quota: Option<ProviderAccountQuota>,
 }
 
 fn project_active(state: &AppConfig) -> ActiveProjection {
-    let active_stored_provider = state.active.provider_id.as_deref().and_then(|id| {
-        state
-            .providers
-            .iter()
-            .find(|provider| provider.profile.id == id)
-    });
+    let active_stored_provider = state
+        .active
+        .provider_id
+        .as_deref()
+        .and_then(|id| state.providers.iter().find(|provider| provider.id == id));
     let active_official_account = state
         .active
         .account_id
@@ -35,30 +33,24 @@ fn project_active(state: &AppConfig) -> ActiveProjection {
                 .iter()
                 .find(|account| account.id == id)
         });
-    let active_account = active_stored_provider.and_then(|provider| {
-        state
-            .active
-            .account_id
-            .as_deref()
-            .and_then(|id| provider.accounts.iter().find(|account| account.id == id))
-    });
     let active_provider = active_stored_provider
-        .map(|provider| provider.profile.name.clone())
+        .map(|provider| provider.name.clone())
         .or_else(|| active_official_account.map(|account| format!("OpenAI · {}", account.name)))
         .or_else(|| {
             matches!(state.active.kind, ActiveKind::Official).then(|| "OpenAI 账号".into())
         });
+    let active_model = active_stored_provider.and_then(|provider| {
+        let model = provider.model.trim();
+        (!model.is_empty()).then(|| model.to_owned())
+    });
     ActiveProjection {
         home: state.codex.home.clone(),
         provider_count: state.providers.len(),
         active_provider,
         active_kind: state.active.kind,
-        active_account_id: active_account
-            .map(|account| account.id.clone())
-            .or_else(|| active_official_account.map(|account| account.id.clone())),
-        active_account: active_account
-            .map(|account| account.name.clone())
-            .or_else(|| active_official_account.map(|account| account.name.clone())),
+        active_account_id: active_official_account.map(|account| account.id.clone()),
+        active_account: active_official_account.map(|account| account.name.clone()),
+        active_model,
         active_quota: active_official_account.map(|account| account.quota.clone()),
     }
 }
@@ -94,6 +86,7 @@ pub(crate) async fn get_dashboard(
         active_kind: projection.active_kind,
         active_account_id: projection.active_account_id,
         active_account: projection.active_account,
+        active_model: projection.active_model,
         active_quota: projection.active_quota,
         codex_home: home.display().to_string(),
         database_count,
@@ -132,13 +125,30 @@ pub(crate) fn get_settings_overview(store: State<Store>) -> Result<SettingsOverv
     settings_overview(&store)
 }
 
+/// 启动 Codex 桌面应用并默认解锁模型（调试模式启动 + 注入解锁脚本）。
 #[tauri::command]
-pub(crate) fn launch_codex() -> Result<(), AppError> {
-    platform::open_url(CODEX_APP_URI).map_err(|error| {
-        AppError::Internal(format!(
-            "无法打开 Codex，请确认已安装 Codex 桌面应用：{error}"
-        ))
+pub(crate) async fn launch_codex(store: State<'_, Store>) -> Result<ModelUnlockResult, AppError> {
+    model_unlock::launch_with_debug(&store).await
+}
+
+/// 读取 Codex 应用路径设置（手动配置 + 实际检测结果）。
+#[tauri::command]
+pub(crate) fn get_codex_app_setting(store: State<Store>) -> Result<CodexAppSetting, AppError> {
+    let configured = store.codex_app_setting()?;
+    Ok(CodexAppSetting {
+        configured: configured.clone(),
+        detected: platform::codex_app_path(configured.as_deref())
+            .map(|path| path.display().to_string()),
     })
+}
+
+/// 保存手动指定的 Codex 应用路径（`.app` 目录或可执行文件）；`None` 恢复自动检测。
+#[tauri::command]
+pub(crate) fn save_codex_app_path(
+    store: State<Store>,
+    path: Option<String>,
+) -> Result<(), AppError> {
+    store.save_codex_app_path(path)
 }
 
 #[cfg(test)]
@@ -146,7 +156,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn dashboard_projection_identifies_active_provider_account() {
+    fn dashboard_projection_identifies_active_provider() {
         let temp = tempfile::tempdir().unwrap();
         let store = Store::open(temp.path().join("data")).unwrap();
         let provider = store
@@ -158,36 +168,28 @@ mod tests {
                 timeout_secs: 30,
                 enabled: true,
                 active: false,
-                active_account_id: None,
-                account_count: 0,
-            })
-            .unwrap();
-        let account = store
-            .save_account(ProviderAccount {
-                id: String::new(),
-                provider_id: Some(provider.id.clone()),
-                name: "Account".into(),
-                auth_kind: AccountAuthKind::ApiKey,
+                model: "gpt-5.6-luna".into(),
+
+                model_context_windows: Default::default(),
+                available_models: Default::default(),
+                models_dev_meta: Default::default(),
+                api_type: ProviderApiType::Responses,
                 api_key: Some("secret".into()),
-                headers: Default::default(),
-                active: false,
-                email: None,
+                has_api_key: false,
                 created_at: 0,
                 updated_at: 0,
             })
             .unwrap();
-        store.activate(&provider.id, &account.id).unwrap();
+        store.activate(&provider.id).unwrap();
 
         let projection = store.read(project_active).unwrap();
 
         assert!(matches!(projection.active_kind, ActiveKind::Provider));
         assert_eq!(projection.provider_count, 1);
         assert_eq!(projection.active_provider.as_deref(), Some("Provider"));
-        assert_eq!(
-            projection.active_account_id.as_deref(),
-            Some(account.id.as_str())
-        );
-        assert_eq!(projection.active_account.as_deref(), Some("Account"));
+        assert_eq!(projection.active_account_id, None);
+        assert_eq!(projection.active_account, None);
+        assert_eq!(projection.active_model.as_deref(), Some("gpt-5.6-luna"));
         assert!(projection.active_quota.is_none());
     }
 

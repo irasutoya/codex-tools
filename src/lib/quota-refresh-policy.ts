@@ -1,9 +1,11 @@
 import type { AccountQuota, QuotaWindow } from "@/types"
 
+import { epochMilliseconds } from "./time"
+
 export const QUOTA_REFRESH_INTERVAL_MS = 5 * 60_000
 export const QUOTA_UNCHANGED_INTERVAL_MS = 15 * 60_000
 export const QUOTA_IDLE_INTERVAL_MS = 30 * 60_000
-export const QUOTA_RATE_LIMIT_INTERVAL_MS = 5 * 60_000
+const QUOTA_RATE_LIMIT_INTERVAL_MS = 5 * 60_000
 export const QUOTA_EXHAUSTED_GRACE_MS = 10_000
 
 const retryDelays = [
@@ -47,7 +49,7 @@ export function planQuotaSuccess(
     }
   }
 
-  const resetDelay = exhaustedResetDelay(quota, now)
+  const resetDelay = exhaustedResetDelay(quota, now, unchangedCount)
   if (resetDelay !== undefined) {
     return { kind: "schedule", delayMs: resetDelay, reason: "exhausted" }
   }
@@ -116,7 +118,7 @@ export function shouldRefreshQuotaOnActivation(
   }
 
   if (quota.status === "success") {
-    const resetDelay = exhaustedResetDelay(quota, now)
+    const resetDelay = exhaustedResetDelay(quota, now, 0)
     return resetDelay === undefined || resetDelay <= 1_000
   }
 
@@ -124,7 +126,11 @@ export function shouldRefreshQuotaOnActivation(
   return remainingDelay(quota.lastAttemptAt, retryDelay, now) === 0
 }
 
-function exhaustedResetDelay(quota: AccountQuota, now: number) {
+function exhaustedResetDelay(
+  quota: AccountQuota,
+  now: number,
+  unchangedCount: number
+) {
   const exhaustedWindows = [quota.data?.primary, quota.data?.secondary]
     .filter((item): item is QuotaWindow => Boolean(item))
     .filter((item) => item.remainingPercent <= 0)
@@ -139,7 +145,15 @@ function exhaustedResetDelay(quota: AccountQuota, now: number) {
     .filter((value) => value > now)
     .sort((a, b) => a - b)[0]
 
-  if (resetAt === undefined && resetValues.length > 0) return 1_000
+  if (resetAt === undefined && resetValues.length > 0) {
+    // 服务端报告的所有重置时间都已过去：可能是时钟偏差，也可能窗口已翻转。
+    // 按“结果未变化”的节奏退避，避免服务端持续返回“已耗尽”时每秒轮询一次。
+    return unchangedCount >= 4
+      ? QUOTA_IDLE_INTERVAL_MS
+      : unchangedCount >= 2
+        ? QUOTA_UNCHANGED_INTERVAL_MS
+        : QUOTA_REFRESH_INTERVAL_MS
+  }
   return resetAt === undefined
     ? QUOTA_IDLE_INTERVAL_MS
     : resetAt - now + QUOTA_EXHAUSTED_GRACE_MS
@@ -162,8 +176,4 @@ function windowSignature(window: QuotaWindow | undefined) {
     window.windowSeconds,
     window.resetAt,
   ]
-}
-
-function epochMilliseconds(value: number) {
-  return value < 100_000_000_000 ? value * 1_000 : value
 }

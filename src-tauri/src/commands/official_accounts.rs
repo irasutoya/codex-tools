@@ -1,6 +1,7 @@
 use crate::{
     activation::{activate_openai_record, sync_active_openai_credential},
     auth_center::{AuthCenter, DevicePollResult},
+    chat_proxy::ChatProxyRegistry,
     codex::{self, ConfigManager},
     local_usage::UsageLedger,
     models::*,
@@ -135,6 +136,7 @@ pub(crate) async fn poll_openai_device_auth(
     manager: State<'_, ConfigManager>,
     ledger: State<'_, UsageLedger>,
     activation: State<'_, ActivationLock>,
+    proxy: State<'_, ChatProxyRegistry>,
     operation_id: String,
 ) -> Result<OpenAiDevicePoll, AppError> {
     match center.poll_openai(&operation_id).await? {
@@ -144,7 +146,7 @@ pub(crate) async fn poll_openai_device_auth(
             let _guard = activation.0.lock().await;
             sync_active_openai_credential(&store, &codex::home(&store.codex_home_setting()?))?;
             let saved = store.save_official_account(&account)?;
-            let repair = activate_openai_record(&store, &manager, &ledger, &saved).await?;
+            let repair = activate_openai_record(&store, &manager, &ledger, &proxy, &saved).await?;
             Ok(OpenAiDevicePoll::Complete {
                 account: Box::new(store.official_account_view(&saved.id)?),
                 repair,
@@ -160,6 +162,7 @@ pub(crate) async fn activate_openai_account(
     manager: State<'_, ConfigManager>,
     ledger: State<'_, UsageLedger>,
     activation: State<'_, ActivationLock>,
+    proxy: State<'_, ChatProxyRegistry>,
     id: String,
 ) -> Result<RepairResult, AppError> {
     let _guard = activation.0.lock().await;
@@ -168,7 +171,7 @@ pub(crate) async fn activate_openai_account(
         .refresh_account(&store.official_account(&id)?)
         .await?;
     let saved = store.save_official_account(&refreshed)?;
-    activate_openai_record(&store, &manager, &ledger, &saved).await
+    activate_openai_record(&store, &manager, &ledger, &proxy, &saved).await
 }
 
 #[tauri::command]
@@ -178,6 +181,7 @@ pub(crate) async fn activate_official(
     manager: State<'_, ConfigManager>,
     ledger: State<'_, UsageLedger>,
     activation: State<'_, ActivationLock>,
+    proxy: State<'_, ChatProxyRegistry>,
 ) -> Result<RepairResult, AppError> {
     let _guard = activation.0.lock().await;
     let (home_setting, id) = store.read(|state| {
@@ -202,7 +206,7 @@ pub(crate) async fn activate_official(
         .refresh_account(&store.official_account(&id)?)
         .await?;
     let saved = store.save_official_account(&refreshed)?;
-    activate_openai_record(&store, &manager, &ledger, &saved).await
+    activate_openai_record(&store, &manager, &ledger, &proxy, &saved).await
 }
 
 #[tauri::command]

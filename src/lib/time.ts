@@ -23,7 +23,7 @@ const timestampFormatters = {
   }),
 } as const
 
-export type TimestampFormat = keyof typeof timestampFormatters
+type TimestampFormat = keyof typeof timestampFormatters
 export function formatDateTime(
   value: number,
   format: TimestampFormat = "default"

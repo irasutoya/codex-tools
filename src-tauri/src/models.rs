@@ -101,6 +101,16 @@ pub(crate) fn token_identity(token: &str) -> Option<TokenIdentity> {
     })
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderApiType {
+    /// 服务直接提供 OpenAI Responses API，Codex 直连。
+    #[default]
+    Responses,
+    /// 服务只提供 Chat Completions API，通过本机转换代理接入。
+    Chat,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderProfile {
@@ -112,13 +122,38 @@ pub struct ProviderProfile {
     pub headers: BTreeMap<String, String>,
     #[serde(default = "default_timeout_secs")]
     pub timeout_secs: u64,
-    #[serde(default = "default_true")]
+    #[serde(default)]
     pub enabled: bool,
     #[serde(default)]
     pub active: bool,
-    pub active_account_id: Option<String>,
+    /// 切换到该服务时写入 Codex 的默认模型；留空则沿用 Codex 默认模型。
     #[serde(default)]
-    pub account_count: u64,
+    pub model: String,
+    /// 从服务 `/models` 接口读取到的模型上下文窗口（token）；
+    /// 写入模型目录时优先使用，没有返回时回退 Codex 默认值。
+    #[serde(default)]
+    pub model_context_windows: BTreeMap<String, u64>,
+    /// 服务 `/models` 接口返回的可用模型列表（保存服务时静默获取，用户无感知）；
+    /// 只保存接口实际返回的模型 id，是模型目录的唯一来源。
+    #[serde(default)]
+    pub available_models: Vec<String>,
+    /// 从 models.dev（catalog.json）抓取的本服务商模型元数据（slug → 元数据）；
+    /// 只在 id 与服务 `/models` 接口返回完全一致时保留，用于补充窗口/简介/名称。
+    #[serde(default)]
+    pub models_dev_meta: BTreeMap<String, ProviderModelsDevMeta>,
+    /// 服务接入方式：直接 Responses API，或经本机转换代理接入 Chat Completions API。
+    #[serde(default)]
+    pub api_type: ProviderApiType,
+    /// 该服务对应的 API Key；一个服务对应一个 Key。
+    #[serde(default)]
+    pub api_key: Option<String>,
+    /// 是否已保存 API Key；脱敏返回时只暴露此布尔值，不泄露密钥。
+    #[serde(default)]
+    pub has_api_key: bool,
+    #[serde(default)]
+    pub created_at: i64,
+    #[serde(default)]
+    pub updated_at: i64,
 }
 
 impl ProviderProfile {
@@ -171,21 +206,24 @@ impl ProviderProfile {
         }
         self.timeout_secs = self.timeout_secs.clamp(1, 600);
         validate_headers(&self.headers)?;
+        if let Some(key) = self.api_key.as_deref() {
+            let key = key.trim();
+            if key.is_empty() {
+                self.api_key = None;
+            } else {
+                ensure_char_limit(key, MAX_API_KEY_CHARS, "API Key 不能超过 65,536 个字符。")?;
+                self.api_key = Some(key.to_owned());
+            }
+        }
         Ok(())
     }
 
     pub fn redacted(mut self) -> Self {
+        self.has_api_key = self.api_key.is_some();
+        self.api_key = None;
         redact_header_values(&mut self.headers);
         self
     }
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum AccountAuthKind {
-    #[default]
-    ApiKey,
-    OfficialOauth,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -224,60 +262,6 @@ pub struct ProviderAccountQuota {
 pub struct QuotaRefreshResult {
     pub account_id: String,
     pub quota: ProviderAccountQuota,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ProviderAccount {
-    #[serde(default)]
-    pub id: String,
-    pub provider_id: Option<String>,
-    pub name: String,
-    #[serde(default)]
-    pub auth_kind: AccountAuthKind,
-    pub api_key: Option<String>,
-    #[serde(default)]
-    pub headers: BTreeMap<String, String>,
-    #[serde(default)]
-    pub active: bool,
-    pub email: Option<String>,
-    #[serde(default)]
-    pub created_at: i64,
-    #[serde(default)]
-    pub updated_at: i64,
-}
-
-impl ProviderAccount {
-    pub fn normalize_and_validate(&mut self) -> Result<(), AppError> {
-        self.name = self.name.trim().to_owned();
-        let key = self.api_key.as_deref().unwrap_or_default().trim();
-        if self.name.is_empty() || key.is_empty() {
-            return Err(AppError::InvalidConfig("请填写密钥名称和 API Key。".into()));
-        }
-        ensure_char_limit(
-            &self.name,
-            MAX_DISPLAY_NAME_CHARS,
-            "密钥名称不能超过 100 个字符。",
-        )?;
-        ensure_char_limit(key, MAX_API_KEY_CHARS, "API Key 不能超过 65,536 个字符。")?;
-        self.api_key = Some(key.to_owned());
-        validate_headers(&self.headers)
-    }
-
-    pub fn redacted(mut self) -> Self {
-        self.api_key = None;
-        redact_header_values(&mut self.headers);
-        self
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct StoredProvider {
-    #[serde(flatten)]
-    pub profile: ProviderProfile,
-    #[serde(default)]
-    pub accounts: Vec<ProviderAccount>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
@@ -400,7 +384,6 @@ pub struct OfficialAccountView {
 #[serde(rename_all = "camelCase")]
 pub struct ProviderOverview {
     pub providers: Vec<ProviderProfile>,
-    pub accounts: Vec<ProviderAccount>,
     pub official_accounts: Vec<OfficialAccountView>,
 }
 
@@ -442,45 +425,43 @@ pub enum OpenAiDevicePoll {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AppPreferences {
-    #[serde(default = "default_language")]
-    pub language: String,
-    #[serde(default = "default_theme")]
-    pub theme: String,
-    #[serde(default = "default_true")]
-    pub close_to_tray: bool,
-}
-
-impl Default for AppPreferences {
-    fn default() -> Self {
-        Self {
-            language: default_language(),
-            theme: default_theme(),
-            close_to_tray: true,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct CodexPreferences {
     #[serde(default)]
     pub home: String,
+    /// 手动指定的 Codex 桌面应用路径（.app 目录或可执行文件）；
+    /// 为空时自动检测安装位置。
+    #[serde(default)]
+    pub app_path: Option<String>,
+    /// 上次以调试模式启动 Codex 时使用的随机 CDP 端口。端口每次启动随机
+    /// 生成（不固定、不可预测），这里持久化以便应用重启后仍能定位
+    /// 正在运行的调试实例。
+    #[serde(default)]
+    pub last_debug_port: Option<u16>,
+    /// 最近一次由本应用写入 config.toml 的默认模型。切换到 OpenAI 时只清除
+    /// 与这条记录一致的模型，避免误删用户手动设置的值。
+    #[serde(default)]
+    pub last_managed_model: Option<String>,
+}
+
+/// Codex 应用路径设置视图：手动配置 + 实际检测结果。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexAppSetting {
+    pub configured: Option<String>,
+    pub detected: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct AppConfig {
     #[serde(default)]
-    pub app: AppPreferences,
-    #[serde(default)]
     pub codex: CodexPreferences,
     #[serde(default)]
     pub active: ActiveState,
     #[serde(default)]
-    pub providers: Vec<StoredProvider>,
+    pub providers: Vec<ProviderProfile>,
     #[serde(default)]
     pub official_accounts: Vec<StoredOfficialAccount>,
 }
@@ -525,6 +506,7 @@ pub struct Dashboard {
     pub active_kind: ActiveKind,
     pub active_account_id: Option<String>,
     pub active_account: Option<String>,
+    pub active_model: Option<String>,
     pub active_quota: Option<ProviderAccountQuota>,
     pub codex_home: String,
     pub database_count: usize,
@@ -678,6 +660,28 @@ pub struct UsageOverview {
     pub collection_started_at_ms: Option<i64>,
     pub collection_started_version: Option<String>,
     pub warnings: Vec<UsageWarning>,
+    /// 按本机自然日聚合的趋势点；与 totals 同一次查询产出，
+    /// 避免查询后再对同一范围做第二趟全量扫描。
+    pub trend_points: Vec<UsageTrendPoint>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageTrend {
+    pub range: UsageRange,
+    pub points: Vec<UsageTrendPoint>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageTrendPoint {
+    pub day_start_ms: i64,
+    pub tokens: TokenBreakdown,
+    pub requests: u64,
+    pub estimated_cost_microusd: u64,
+    pub unpriced_tokens: u64,
+    pub partial_tokens: u64,
+    pub unattributed_tokens: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -691,6 +695,25 @@ pub struct OfficialPricingCatalogView {
     pub etag: Option<String>,
     pub model_count: usize,
     pub models: Vec<String>,
+    pub rates: Vec<OfficialModelRateView>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OfficialModelRateView {
+    pub model: String,
+    pub long_context_threshold: Option<u64>,
+    pub short: TokenRatesView,
+    pub long: Option<TokenRatesView>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenRatesView {
+    pub input: Option<i64>,
+    pub cached_input: Option<i64>,
+    pub cache_write: Option<i64>,
+    pub output: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -834,6 +857,155 @@ pub struct ConfigPatchPreview {
     pub api_key_masked: String,
 }
 
+/// 注入到 Codex 渲染进程 / 写入 `model-catalogs` 的单个模型条目；
+/// 只作为内部数据，不直接暴露给前端（前端只展示 slug 列表）。
+/// 字段与 Codex CLI 的 `model_catalog_json` 格式兼容（snake_case）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct CodexModelInfo {
+    pub slug: String,
+    pub display_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_context_window: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_reasoning_level: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supported_reasoning_levels: Option<Vec<ReasoningLevelInfo>>,
+    /// CLI catalog 必需字段：系统提示词。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_instructions: Option<String>,
+    /// CLI catalog 必需字段：`list` 表示出现在选择器中。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub visibility: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supported_in_api: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shell_type: Option<String>,
+    // 以下为 CLI `model_catalog_json` 必需的其余字段，带默认值保证总是序列化。
+    #[serde(default = "default_support_verbosity")]
+    pub support_verbosity: bool,
+    #[serde(default = "default_default_verbosity")]
+    pub default_verbosity: String,
+    #[serde(default = "default_apply_patch_tool_type")]
+    pub apply_patch_tool_type: String,
+    #[serde(default = "default_web_search_tool_type")]
+    pub web_search_tool_type: String,
+    #[serde(default = "default_input_modalities")]
+    pub input_modalities: Vec<String>,
+    #[serde(default = "default_supports_image_detail_original")]
+    pub supports_image_detail_original: bool,
+    #[serde(default = "default_truncation_policy")]
+    pub truncation_policy: Value,
+    #[serde(default = "default_supports_parallel_tool_calls")]
+    pub supports_parallel_tool_calls: bool,
+    #[serde(default)]
+    pub experimental_supported_tools: Vec<String>,
+}
+
+fn default_support_verbosity() -> bool {
+    true
+}
+fn default_default_verbosity() -> String {
+    "low".into()
+}
+fn default_apply_patch_tool_type() -> String {
+    "freeform".into()
+}
+fn default_web_search_tool_type() -> String {
+    "text_and_image".into()
+}
+fn default_input_modalities() -> Vec<String> {
+    vec!["text".into(), "image".into()]
+}
+fn default_supports_image_detail_original() -> bool {
+    true
+}
+fn default_truncation_policy() -> Value {
+    serde_json::json!({ "mode": "tokens", "limit": 10000 })
+}
+fn default_supports_parallel_tool_calls() -> bool {
+    true
+}
+
+impl Default for CodexModelInfo {
+    fn default() -> Self {
+        Self {
+            slug: String::new(),
+            display_name: String::new(),
+            description: None,
+            context_window: None,
+            max_context_window: None,
+            default_reasoning_level: None,
+            supported_reasoning_levels: None,
+            base_instructions: None,
+            visibility: None,
+            supported_in_api: None,
+            priority: None,
+            shell_type: None,
+            support_verbosity: default_support_verbosity(),
+            default_verbosity: default_default_verbosity(),
+            apply_patch_tool_type: default_apply_patch_tool_type(),
+            web_search_tool_type: default_web_search_tool_type(),
+            input_modalities: default_input_modalities(),
+            supports_image_detail_original: default_supports_image_detail_original(),
+            truncation_policy: default_truncation_policy(),
+            supports_parallel_tool_calls: default_supports_parallel_tool_calls(),
+            experimental_supported_tools: vec![],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ReasoningLevelInfo {
+    pub effort: String,
+    pub description: Option<String>,
+}
+
+/// models.dev（catalog.json）中单个模型的元数据，只保存与 `/models` 接口
+/// 完全一致 id 的条目。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderModelsDevMeta {
+    pub name: Option<String>,
+    pub context_window: Option<u64>,
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelUnlockStatus {
+    /// 是否找到 Codex 桌面应用安装。
+    pub app_found: bool,
+    /// Codex 桌面应用当前是否在运行。
+    pub app_running: bool,
+    /// 检测到的 CDP 调试端口；None 表示没有可注入的实例。
+    pub debug_port: Option<u16>,
+    /// 解锁脚本是否已注入并生效。
+    pub injected: bool,
+    /// 解锁目录中的模型数量。
+    pub model_count: usize,
+    /// 解锁目录中的模型 slug 列表（去重、排序）。
+    pub models: Vec<String>,
+    /// 需要用户注意的提示；无异常时为 None。
+    pub warning: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelUnlockResult {
+    pub port: u16,
+    pub injected: bool,
+    pub model_count: usize,
+    pub message: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConfigInspection {
@@ -935,41 +1107,39 @@ fn redact_header_values(headers: &mut BTreeMap<String, String>) {
     }
 }
 
-fn default_true() -> bool {
-    true
-}
 fn default_timeout_secs() -> u64 {
     30
-}
-fn default_language() -> String {
-    "zh-CN".into()
-}
-fn default_theme() -> String {
-    "system".into()
 }
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn redacted_account_never_serializes_api_key() {
-        let account = ProviderAccount {
-            id: "account".into(),
-            provider_id: Some("provider".into()),
-            name: "default".into(),
-            auth_kind: AccountAuthKind::ApiKey,
-            api_key: Some("upstream-secret".into()),
+    fn redacted_provider_never_serializes_api_key() {
+        let provider = ProviderProfile {
+            id: "provider".into(),
+            name: "provider".into(),
+            base_url: "https://example.test/v1".into(),
             headers: BTreeMap::from([("x-private-token".into(), "header-secret".into())]),
+            timeout_secs: 30,
+            enabled: true,
             active: false,
-            email: None,
+            model: String::new(),
+
+            model_context_windows: Default::default(),
+            available_models: Default::default(),
+            models_dev_meta: Default::default(),
+            api_type: ProviderApiType::Responses,
+            api_key: Some("upstream-secret".into()),
+            has_api_key: false,
             created_at: 0,
             updated_at: 0,
         }
         .redacted();
-        let serialized = serde_json::to_string(&account).unwrap();
+        let serialized = serde_json::to_string(&provider).unwrap();
         assert!(!serialized.contains("upstream-secret"));
         assert!(!serialized.contains("header-secret"));
-        assert_eq!(account.api_key, None);
+        assert_eq!(provider.api_key, None);
     }
 
     #[test]
@@ -1012,24 +1182,39 @@ mod tests {
             timeout_secs: 30,
             enabled: true,
             active: false,
-            active_account_id: None,
-            account_count: 0,
-        };
-        assert!(provider.normalize_and_validate().is_err());
+            model: String::new(),
 
-        let mut account = ProviderAccount {
-            id: String::new(),
-            provider_id: Some("provider".into()),
-            name: "key".into(),
-            auth_kind: AccountAuthKind::ApiKey,
+            model_context_windows: Default::default(),
+            available_models: Default::default(),
+            models_dev_meta: Default::default(),
+            api_type: ProviderApiType::Responses,
             api_key: Some("x".repeat(MAX_API_KEY_CHARS + 1)),
-            headers: BTreeMap::new(),
-            active: false,
-            email: None,
+            has_api_key: false,
             created_at: 0,
             updated_at: 0,
         };
-        assert!(account.normalize_and_validate().is_err());
+        assert!(provider.normalize_and_validate().is_err());
+
+        let mut oversized = ProviderProfile {
+            id: String::new(),
+            name: "key".into(),
+            base_url: "https://example.test/v1".into(),
+            headers: BTreeMap::new(),
+            timeout_secs: 30,
+            enabled: true,
+            active: false,
+            model: String::new(),
+
+            model_context_windows: Default::default(),
+            available_models: Default::default(),
+            models_dev_meta: Default::default(),
+            api_type: ProviderApiType::Responses,
+            api_key: Some("x".repeat(MAX_API_KEY_CHARS + 1)),
+            has_api_key: false,
+            created_at: 0,
+            updated_at: 0,
+        };
+        assert!(oversized.normalize_and_validate().is_err());
     }
 
     fn official_account() -> StoredOfficialAccount {

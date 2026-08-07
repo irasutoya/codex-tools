@@ -47,6 +47,17 @@ pub(crate) async fn refresh_usage(
 }
 
 #[tauri::command]
+pub(crate) async fn get_usage_trend(
+    ledger: State<'_, UsageLedger>,
+    range: UsageRange,
+) -> Result<UsageTrend, AppError> {
+    let ledger = ledger.inner().clone();
+    tokio::task::spawn_blocking(move || ledger.trend(range))
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?
+}
+
+#[tauri::command]
 pub(crate) fn get_official_pricing_catalog(
     ledger: State<UsageLedger>,
 ) -> Result<OfficialPricingCatalogView, AppError> {
@@ -135,7 +146,17 @@ fn catalog_view(
             fetched_at_ms: Some(catalog.fetched_at_ms),
             etag: catalog.etag,
             model_count: catalog.models.len(),
-            models: catalog.models.keys().cloned().collect(),
+            rates: catalog
+                .models
+                .into_values()
+                .map(|rate| OfficialModelRateView {
+                    model: rate.model,
+                    long_context_threshold: rate.long_context_threshold,
+                    short: token_rates_view(rate.short),
+                    long: rate.long.map(token_rates_view),
+                })
+                .collect(),
+            models: Vec::new(),
         },
         None => OfficialPricingCatalogView {
             status: "waiting".into(),
@@ -146,8 +167,18 @@ fn catalog_view(
             etag: None,
             model_count: 0,
             models: Vec::new(),
+            rates: Vec::new(),
         },
     })
+}
+
+fn token_rates_view(rates: official_pricing::TokenRates) -> TokenRatesView {
+    TokenRatesView {
+        input: rates.input,
+        cached_input: rates.cached_input,
+        cache_write: rates.cache_write,
+        output: rates.output,
+    }
 }
 
 #[tauri::command]

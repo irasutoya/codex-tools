@@ -1,35 +1,24 @@
 import { useCallback, useEffect, useRef, useState } from "react"
 import {
+  Alert01Icon,
   ArrowRightIcon,
+  BoxIcon,
   ExternalLinkIcon,
   File01Icon,
-  FolderCogIcon,
   Key01Icon,
   Message01Icon,
   Refresh01Icon,
-  BoxIcon,
   Shield01Icon,
-  Alert01Icon,
 } from "@hugeicons/core-free-icons"
 import { HugeiconsIcon } from "@hugeicons/react"
 import { ErrorDetails } from "@/components/error-details"
-import { MetricCard } from "@/components/metric-card"
-import { SectionHeader } from "@/components/page-header"
-import { PageLoading } from "@/components/page-loading"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
-import {
-  Card,
-  CardAction,
-  CardContent,
-  CardDescription,
-  CardFooter,
-  CardHeader,
-  CardTitle,
-} from "@/components/ui/card"
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import {
   Item,
+  ItemActions,
   ItemContent,
   ItemDescription,
   ItemGroup,
@@ -37,8 +26,9 @@ import {
   ItemSeparator,
   ItemTitle,
 } from "@/components/ui/item"
+import { Skeleton } from "@/components/ui/skeleton"
 import { Spinner } from "@/components/ui/spinner"
-import { notify } from "@/lib/feedback"
+import { notify, formatError } from "@/lib/feedback"
 import { call } from "@/lib/ipc"
 import {
   refreshCoordinator,
@@ -52,10 +42,11 @@ import {
 import type { Dashboard, PageProps } from "@/types"
 
 import { QuotaStatusView } from "../providers/quota-status"
+import { UsageTrendChart } from "../usage/usage-trend-chart"
 import {
   formatEstimatedUsd,
-  formatTokenDetail,
   formatTokens,
+  getLocalDayRange,
   getLocalRange,
 } from "../usage/usage-format"
 
@@ -76,7 +67,7 @@ export default function DashboardPage({ active }: PageProps) {
       setData(dashboard)
       setError(undefined)
     } catch (reason) {
-      setError(String(reason))
+      setError(formatError(reason))
       throw reason
     }
   }, [])
@@ -138,10 +129,13 @@ export default function DashboardPage({ active }: PageProps) {
   const launchCodex = async () => {
     setLaunching(true)
     try {
-      await call("launch_codex")
-      notify.success("已发送打开 Codex 的请求")
+      const result = await call("launch_codex")
+      notify.success(
+        result.injected ? "Codex 已启动并解锁模型列表" : result.message
+      )
+      refreshCoordinator.invalidate(["settings"])
     } catch (reason) {
-      notify.error("无法打开 Codex", reason)
+      notify.error("无法启动 Codex", reason)
     } finally {
       setLaunching(false)
     }
@@ -184,7 +178,7 @@ export default function DashboardPage({ active }: PageProps) {
   }
 
   if (!data) {
-    if (!error) return <PageLoading label="正在读取 Codex 状态" />
+    if (!error) return <DashboardLoading />
     return (
       <Alert variant="destructive">
         <HugeiconsIcon icon={Alert01Icon} />
@@ -218,36 +212,79 @@ export default function DashboardPage({ active }: PageProps) {
     )
   }
 
-  const metrics = [
-    {
-      label: "API 服务",
-      value: data.providerCount,
-      icon: BoxIcon,
-      detail: "已添加的第三方服务",
-    },
-    {
-      label: "历史会话",
-      value: data.sessionCount,
-      icon: Message01Icon,
-      detail: "本机找到的会话",
-    },
-    {
-      label: "会话数据库",
-      value: data.databaseCount,
-      icon: File01Icon,
-      detail: "找到的 Codex 数据库文件",
-    },
-    {
-      label: "数据状态",
-      value: data.databaseHealth,
-      icon: Shield01Icon,
-      detail: "本机会话索引结果",
-    },
-  ]
-  const busy = launching || refreshing || quotaRefreshing
+  const today = getLocalDayRange(0)
+  const weekStart = getLocalDayRange(6)
 
   return (
     <div className="flex flex-col gap-6">
+      {/* 当前连接：一行横排 */}
+      <Card>
+        <CardContent className="flex items-center justify-between gap-3 p-5">
+          <div className="flex min-w-0 items-center gap-3">
+            <div className="flex size-10 shrink-0 items-center justify-center rounded-lg bg-primary/10 text-primary">
+              <HugeiconsIcon
+                icon={data.activeKind === "official" ? Key01Icon : BoxIcon}
+                className="size-4"
+                aria-hidden="true"
+              />
+            </div>
+            <div className="flex min-w-0 flex-col gap-0.5">
+              <div className="flex items-center gap-1.5">
+                <span className="truncate text-sm font-medium">
+                  {data.activeProvider ?? "尚未选择连接"}
+                </span>
+                <Badge
+                  variant={data.activeProvider ? "default" : "secondary"}
+                  className="shrink-0"
+                >
+                  {data.activeKind === "official"
+                    ? "OpenAI"
+                    : data.activeKind === "provider"
+                      ? "API"
+                      : "未连接"}
+                </Badge>
+              </div>
+              <span
+                className="truncate font-mono text-[11px] text-muted-foreground"
+                title={data.codexHome}
+              >
+                {data.codexHome}
+              </span>
+            </div>
+          </div>
+          <div className="flex shrink-0 items-center gap-1.5">
+            <Button
+              size="sm"
+              disabled={launching || refreshing}
+              onClick={() => void launchCodex()}
+            >
+              {launching ? (
+                <Spinner data-icon="inline-start" />
+              ) : (
+                <HugeiconsIcon
+                  icon={ExternalLinkIcon}
+                  data-icon="inline-start"
+                />
+              )}
+              {launching ? "启动中…" : "启动 Codex"}
+            </Button>
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={launching || refreshing}
+              onClick={() => void refresh()}
+            >
+              {refreshing ? (
+                <Spinner data-icon="inline-start" />
+              ) : (
+                <HugeiconsIcon icon={Refresh01Icon} data-icon="inline-start" />
+              )}
+              {refreshing ? "刷新中…" : "刷新"}
+            </Button>
+          </div>
+        </CardContent>
+      </Card>
+
       {error && (
         <Alert variant="destructive">
           <HugeiconsIcon icon={Alert01Icon} />
@@ -260,191 +297,210 @@ export default function DashboardPage({ active }: PageProps) {
         </Alert>
       )}
 
-      <div className="grid items-start gap-4">
-        <Card>
-          <CardHeader>
-            <CardTitle>当前连接</CardTitle>
-            <CardDescription>
-              Codex 下一次请求会使用这里显示的账号或 API 服务。
-            </CardDescription>
-            <CardAction>
-              <Badge
-                className="max-w-48 truncate"
-                title={data.activeProvider}
-                variant={data.activeProvider ? "default" : "secondary"}
-              >
-                {data.activeProvider ?? "尚未选择"}
-              </Badge>
-            </CardAction>
-          </CardHeader>
-          <CardContent>
-            <ItemGroup className="gap-0">
-              {data.activeAccount && (
-                <>
-                  <Item>
-                    <ItemMedia variant="icon">
-                      <HugeiconsIcon icon={Key01Icon} />
-                    </ItemMedia>
-                    <ItemContent className="min-w-0">
-                      <ItemTitle>{data.activeAccount}</ItemTitle>
-                      <ItemDescription>
-                        {data.activeKind === "official"
-                          ? "OpenAI 账号"
-                          : "第三方 API Key"}
-                      </ItemDescription>
-                      {data.activeKind === "official" && (
-                        <QuotaStatusView quota={data.activeQuota} />
-                      )}
-                    </ItemContent>
-                  </Item>
-                  <ItemSeparator />
-                </>
-              )}
-              <Item>
-                <ItemMedia variant="icon">
-                  <HugeiconsIcon icon={FolderCogIcon} />
-                </ItemMedia>
-                <ItemContent className="min-w-0">
-                  <ItemTitle>配置目录</ItemTitle>
-                  <ItemDescription
-                    className="truncate font-mono"
-                    title={data.codexHome}
-                  >
-                    {data.codexHome}
-                  </ItemDescription>
-                </ItemContent>
-              </Item>
-            </ItemGroup>
-          </CardContent>
-          <CardFooter className="flex-wrap gap-2">
-            <Button disabled={busy} onClick={() => void launchCodex()}>
-              {launching ? (
-                <Spinner data-icon="inline-start" />
-              ) : (
-                <HugeiconsIcon
-                  icon={ExternalLinkIcon}
-                  data-icon="inline-start"
-                />
-              )}
-              {launching ? "正在打开…" : "打开 Codex"}
-            </Button>
-            <Button
-              variant="outline"
-              disabled={busy}
-              onClick={() => void refresh()}
-            >
-              {refreshing ? (
-                <Spinner data-icon="inline-start" />
-              ) : (
-                <HugeiconsIcon icon={Refresh01Icon} data-icon="inline-start" />
-              )}
-              {refreshing ? "正在刷新…" : "刷新状态和额度"}
-            </Button>
-            {data.activeKind === "official" && data.activeAccountId && (
-              <Button
-                variant="outline"
-                disabled={busy}
-                onClick={() => void refreshQuota()}
-              >
-                {quotaRefreshing ? (
-                  <Spinner data-icon="inline-start" />
-                ) : (
-                  <HugeiconsIcon
-                    icon={Refresh01Icon}
-                    data-icon="inline-start"
-                  />
-                )}
-                {quotaRefreshing ? "正在查询…" : "刷新当前额度"}
-              </Button>
-            )}
-          </CardFooter>
-        </Card>
+      {/* 今日数据：4 列横排 */}
+      <div className="grid grid-cols-4 gap-4">
+        <MetricCard
+          label="今日 Token"
+          value={formatTokens(data.todayUsage.totalTokens)}
+        />
+        <MetricCard
+          label="估算费用"
+          value={formatEstimatedUsd(
+            data.todayEstimatedCostMicrousd,
+            data.todayUnpricedTokens +
+              data.todayPartialTokens +
+              data.todayUnattributedTokens +
+              data.todaySubscriptionTokens
+          )}
+        />
+        <MetricCard label="调用" value={String(data.todayRequests)} />
+        <MetricCard
+          label="待确认"
+          value={formatTokens(
+            data.todayUnpricedTokens +
+              data.todayPartialTokens +
+              data.todayUnattributedTokens
+          )}
+        />
       </div>
 
-      <Card>
-        <CardHeader>
-          <CardTitle>今日本机用量</CardTitle>
-          <CardDescription>
-            官方账号和第三方中转站都从本机 Codex rollout
-            日志统计；美元费用只包含已配置价格。
-          </CardDescription>
-          <CardAction>
-            <div className="flex items-center gap-2">
-              <Badge variant="secondary">{data.todayRequests} 次调用</Badge>
-              <Button size="sm" variant="link" onClick={() => openUsagePage()}>
-                查看明细
+      {/* 额度 + 趋势 + 本机状态：横向并排利用宽度 */}
+      <div className="grid grid-cols-1 gap-6 lg:grid-cols-[minmax(0,1.2fr)_minmax(0,1fr)]">
+        <Card>
+          <CardHeader className="pb-2">
+            <div className="flex items-center justify-between gap-2">
+              <CardTitle className="text-sm">最近 7 天趋势</CardTitle>
+              <Button
+                size="sm"
+                variant="link"
+                className="h-auto p-0 text-xs"
+                onClick={() => openPage("usage")}
+              >
+                明细
                 <HugeiconsIcon icon={ArrowRightIcon} data-icon="inline-end" />
               </Button>
             </div>
-          </CardAction>
-        </CardHeader>
-        <CardContent>
-          <div className="grid gap-4 sm:grid-cols-3">
-            <div>
-              <p className="text-xs text-muted-foreground">总 Token</p>
-              <p className="mt-1 text-2xl font-semibold tabular-nums">
-                {formatTokens(data.todayUsage.totalTokens)}
-              </p>
-              <p className="mt-1 text-xs text-muted-foreground">
-                {formatTokenDetail(data.todayUsage)}
-              </p>
-            </div>
-            <div>
-              <p className="text-xs text-muted-foreground">估算费用</p>
-              <p className="mt-1 text-2xl font-semibold tabular-nums">
-                {formatEstimatedUsd(
-                  data.todayEstimatedCostMicrousd,
-                  data.todayUnpricedTokens +
-                    data.todayPartialTokens +
-                    data.todayUnattributedTokens +
-                    data.todaySubscriptionTokens
-                )}
-              </p>
-              <p className="mt-1 text-xs text-muted-foreground">
-                {data.todaySubscriptionTokens > 0
-                  ? "官方套餐按 Token 统计"
-                  : "仅统计已匹配 USD 价格的 Token"}
-              </p>
-            </div>
-            <div>
-              <p className="text-xs text-muted-foreground">待确认 Token</p>
-              <p className="mt-1 text-2xl font-semibold tabular-nums">
-                {formatTokens(
-                  data.todayUnpricedTokens +
-                    data.todayPartialTokens +
-                    data.todayUnattributedTokens
-                )}
-              </p>
-              <p className="mt-1 text-xs text-muted-foreground">
-                未定价 {formatTokens(data.todayUnpricedTokens)} · 未归属{" "}
-                {formatTokens(data.todayUnattributedTokens)}
-              </p>
-            </div>
-          </div>
-        </CardContent>
-      </Card>
+          </CardHeader>
+          <CardContent>
+            <UsageTrendChart
+              range={{
+                startAtMs: weekStart.startAtMs,
+                endAtMs: today.endAtMs,
+              }}
+              refreshKey={refreshSignal.revision}
+            />
+          </CardContent>
+        </Card>
 
-      <section
-        className="flex flex-col gap-4"
-        aria-labelledby="local-status-title"
-      >
-        <SectionHeader
-          id="local-status-title"
-          title="本机状态"
-          description="这些统计来自当前设备上的 Codex 配置和会话文件。"
-        />
-        <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
-          {metrics.map((metric) => (
-            <MetricCard key={metric.label} {...metric} />
-          ))}
+        <div className="flex flex-col gap-6">
+          {/* 当前账号额度 */}
+          {data.activeKind === "official" && data.activeQuota && (
+            <Card>
+              <CardHeader className="pb-2">
+                <div className="flex items-center justify-between gap-2">
+                  <CardTitle className="text-sm">账号额度</CardTitle>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="h-7"
+                    disabled={quotaRefreshing}
+                    onClick={() => void refreshQuota()}
+                  >
+                    {quotaRefreshing ? (
+                      <Spinner data-icon="inline-start" />
+                    ) : (
+                      <HugeiconsIcon
+                        icon={Refresh01Icon}
+                        data-icon="inline-start"
+                      />
+                    )}
+                    {quotaRefreshing ? "查询中…" : "刷新"}
+                  </Button>
+                </div>
+              </CardHeader>
+              <CardContent>
+                <QuotaStatusView quota={data.activeQuota} />
+              </CardContent>
+            </Card>
+          )}
+
+          {/* 本机状态 */}
+          <Card className="flex-1">
+            <CardHeader className="pb-2">
+              <CardTitle className="text-sm">本机状态</CardTitle>
+            </CardHeader>
+            <CardContent>
+              <ItemGroup className="gap-0">
+                <Item size="default">
+                  <ItemMedia variant="icon">
+                    <HugeiconsIcon icon={BoxIcon} />
+                  </ItemMedia>
+                  <ItemContent>
+                    <ItemTitle>API 服务</ItemTitle>
+                    <ItemDescription>{data.providerCount} 个</ItemDescription>
+                  </ItemContent>
+                  <ItemActions>
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      className="h-7"
+                      onClick={() => openPage("providers")}
+                    >
+                      管理
+                    </Button>
+                  </ItemActions>
+                </Item>
+                <ItemSeparator />
+                <Item size="default">
+                  <ItemMedia variant="icon">
+                    <HugeiconsIcon icon={Message01Icon} />
+                  </ItemMedia>
+                  <ItemContent>
+                    <ItemTitle>历史会话</ItemTitle>
+                    <ItemDescription>{data.sessionCount} 个</ItemDescription>
+                  </ItemContent>
+                  <ItemActions>
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      className="h-7"
+                      onClick={() => openPage("sessions")}
+                    >
+                      查看
+                    </Button>
+                  </ItemActions>
+                </Item>
+                <ItemSeparator />
+                <Item size="default">
+                  <ItemMedia variant="icon">
+                    <HugeiconsIcon icon={File01Icon} />
+                  </ItemMedia>
+                  <ItemContent>
+                    <ItemTitle>会话数据库</ItemTitle>
+                    <ItemDescription>{data.databaseCount} 个</ItemDescription>
+                  </ItemContent>
+                </Item>
+                <ItemSeparator />
+                <Item size="default">
+                  <ItemMedia variant="icon">
+                    <HugeiconsIcon icon={Shield01Icon} />
+                  </ItemMedia>
+                  <ItemContent>
+                    <ItemTitle>数据状态</ItemTitle>
+                    <ItemDescription>{data.databaseHealth}</ItemDescription>
+                  </ItemContent>
+                  <ItemActions>
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      className="h-7"
+                      onClick={() => openPage("settings")}
+                    >
+                      检查
+                    </Button>
+                  </ItemActions>
+                </Item>
+              </ItemGroup>
+            </CardContent>
+          </Card>
         </div>
-      </section>
+      </div>
     </div>
   )
 }
 
-function openUsagePage() {
+function MetricCard({ label, value }: { label: string; value: string }) {
+  return (
+    <Card>
+      <CardContent className="flex flex-col gap-1 p-5">
+        <p className="truncate text-sm text-muted-foreground/80">{label}</p>
+        <p className="truncate text-xl font-semibold tracking-tight tabular-nums">
+          {value}
+        </p>
+      </CardContent>
+    </Card>
+  )
+}
+
+function DashboardLoading() {
+  return (
+    <div className="flex flex-col gap-4" role="status" aria-live="polite">
+      <Skeleton className="h-14 w-full" />
+      <div className="grid grid-cols-4 gap-3">
+        {Array.from({ length: 4 }).map((_, index) => (
+          <div key={index} className="flex flex-col gap-1.5">
+            <Skeleton className="h-3 w-16" />
+            <Skeleton className="h-6 w-14" />
+          </div>
+        ))}
+      </div>
+      <Skeleton className="h-64 w-full" />
+    </div>
+  )
+}
+
+function openPage(page: "providers" | "usage" | "sessions" | "settings") {
   window.dispatchEvent(
-    new CustomEvent("codex-tools:navigate", { detail: "usage" })
+    new CustomEvent("codex-tools:navigate", { detail: page })
   )
 }

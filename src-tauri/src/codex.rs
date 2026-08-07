@@ -1,6 +1,7 @@
 use crate::{
+    model_unlock::{self, MODEL_CATALOG_DIR, MODEL_CATALOG_FILE},
     models::{
-        AppError, CodexAuthCredential, ConfigInspection, ConfigPatchPreview, ProviderAccount,
+        AppError, CodexAuthCredential, ConfigInspection, ConfigPatchPreview, ProviderApiType,
         ProviderProfile, is_personal_access_token_credential, token_identity, token_local_identity,
         validate_official_credential,
     },
@@ -20,6 +21,18 @@ pub const MANAGED_PROVIDER_ID: &str = "custom";
 const MAX_CODEX_CONFIG_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_CODEX_AUTH_BYTES: u64 = 4 * 1024 * 1024;
 
+/// 序列化模型目录内容；没有可用模型时返回 `None`（应用时跳过写目录，
+/// 避免用空目录覆盖正在使用的模型目录）。
+fn catalog_bytes(catalog: &[crate::models::CodexModelInfo]) -> Option<Vec<u8>> {
+    if catalog.is_empty() {
+        return None;
+    }
+    let mut bytes =
+        serde_json::to_vec_pretty(&serde_json::json!({ "models": catalog })).unwrap_or_default();
+    bytes.push(b'\n');
+    Some(bytes)
+}
+
 #[derive(Clone)]
 struct PendingPatch {
     base_hash: String,
@@ -27,6 +40,9 @@ struct PendingPatch {
     target: PathBuf,
     rendered: String,
     auth_rendered: Vec<u8>,
+    /// 模型目录文件内容（`{"models": [...]}`）；为空表示没有可用模型，
+    /// 应用时跳过写目录，避免用空目录覆盖正在使用的目录。
+    catalog: Option<Vec<u8>>,
     created_at: Instant,
 }
 
@@ -36,6 +52,7 @@ struct PatchDraft<'a> {
     original_auth: &'a [u8],
     rendered: String,
     auth_rendered: Vec<u8>,
+    catalog: Option<Vec<u8>>,
     public_preview: String,
     changes: Vec<String>,
     api_key: &'a str,
@@ -51,32 +68,53 @@ impl ConfigManager {
         &self,
         codex_home: &Path,
         provider: &ProviderProfile,
-        account: &ProviderAccount,
+        effective_base_url: &str,
     ) -> Result<ConfigPatchPreview, AppError> {
         let path = codex_home.join("config.toml");
         let original = read_optional(&path)?;
         let original_auth = read_optional_bytes(&path.with_file_name("auth.json"))?;
-        let api_key = account
+        let api_key = provider
             .api_key
             .as_deref()
             .filter(|key| !key.trim().is_empty())
             .ok_or_else(|| AppError::InvalidConfig("API Key 为空，请重新填写。".into()))?;
-        let headers = merged_headers(provider, account);
+        // Chat 类型服务经本机转换代理接入：写入 Codex auth.json 的是固定的
+        // 占位 Key，真实的服务商 Key 只保存在本应用，由转换代理注入上游请求。
+        let auth_key = if matches!(provider.api_type, ProviderApiType::Chat) {
+            crate::chat_proxy::PROXY_FIXED_API_KEY
+        } else {
+            api_key
+        };
+        let headers = merged_headers(provider);
+        // 准备模型目录内容，但不在此写入磁盘：预览是只读操作，目录文件在
+        // 真正应用时才落盘，避免未应用的预览覆盖正在使用的模型目录。
+        let catalog =
+            catalog_bytes(&model_unlock::build_model_catalog_with_windows_for_provider(provider));
         let mut document = parse_config_document(&original)?;
-        apply_custom_fields(&mut document, &provider.name, &provider.base_url, &headers)?;
+        apply_custom_fields(
+            &mut document,
+            &provider.name,
+            effective_base_url,
+            &headers,
+            &provider.model,
+        )?;
         let rendered = document.to_string();
-        let auth_rendered = render_api_key_auth(api_key)?;
-        let public_preview = managed_custom_preview(&document, api_key, &headers);
-        let changes = describe_changes();
+        let auth_rendered = render_api_key_auth(auth_key)?;
+        let public_preview = managed_custom_preview(&document, auth_key, &headers);
+        let changes = describe_changes(
+            &provider.model,
+            matches!(provider.api_type, ProviderApiType::Chat),
+        );
         self.remember(PatchDraft {
             target: path,
             original: &original,
             original_auth: &original_auth,
             rendered,
             auth_rendered,
+            catalog,
             public_preview,
             changes,
-            api_key,
+            api_key: auth_key,
         })
     }
 
@@ -100,8 +138,13 @@ impl ConfigManager {
         })?;
         let _: serde_json::Map<String, serde_json::Value> =
             parse_auth_object(&pending.auth_rendered)?;
-        if let Some(parent) = pending.target.parent() {
-            fs::create_dir_all(parent)?;
+        // 先写模型目录文件，再写 config.toml，保证 model_catalog_json 指向
+        // 的内容在配置生效前已就绪；目录为空时不覆盖现有文件。
+        if let Some(catalog) = pending.catalog.as_deref()
+            && let Some(parent) = pending.target.parent()
+        {
+            let catalog_path = parent.join(MODEL_CATALOG_DIR).join(MODEL_CATALOG_FILE);
+            atomic_write(&catalog_path, catalog).map_err(AppError::from)?;
         }
         commit_codex_files(
             &pending.target,
@@ -118,6 +161,7 @@ impl ConfigManager {
             original_auth,
             rendered,
             auth_rendered,
+            catalog,
             public_preview,
             changes,
             api_key,
@@ -147,6 +191,7 @@ impl ConfigManager {
                 target,
                 rendered,
                 auth_rendered,
+                catalog,
                 created_at: Instant::now(),
             },
         );
@@ -176,12 +221,13 @@ pub fn home(configured: &str) -> PathBuf {
 pub fn activate_official_account(
     codex_home: &Path,
     credential: &CodexAuthCredential,
+    managed_model: Option<&str>,
 ) -> Result<(), AppError> {
     validate_official_credential(credential)?;
     fs::create_dir_all(codex_home)?;
     let config_path = codex_home.join("config.toml");
     let mut document = parse_config_document(&read_optional(&config_path)?)?;
-    clear_custom_provider_fields(&mut document)?;
+    clear_custom_provider_fields(&mut document, managed_model)?;
 
     let mut auth_rendered = if is_personal_access_token_credential(credential) {
         serde_json::to_vec_pretty(&serde_json::json!({
@@ -297,8 +343,13 @@ fn apply_custom_fields(
     provider_name: &str,
     base_url: &str,
     headers: &BTreeMap<String, String>,
+    model: &str,
 ) -> Result<(), AppError> {
     update_managed_model_provider_fields(document, MANAGED_PROVIDER_ID);
+    // 设置默认模型，让 Codex 直接调用第三方模型；留空时保留 Codex 默认模型。
+    if !model.trim().is_empty() {
+        document["model"] = value(model.trim());
+    }
     normalize_inline_model_providers(document);
     if document.get("model_providers").is_none() {
         document["model_providers"] = Item::Table(Table::new());
@@ -323,6 +374,9 @@ fn apply_custom_fields(
         custom.remove("http_headers");
     }
     providers.insert(MANAGED_PROVIDER_ID, Item::Table(custom));
+    // 指向本应用生成的模型目录，让 Codex CLI/桌面应用的模型选择器
+    // 能列出自定义模型；目录文件在预览/应用时写入。
+    document["model_catalog_json"] = value(format!("{}/{}", MODEL_CATALOG_DIR, MODEL_CATALOG_FILE));
     Ok(())
 }
 
@@ -379,9 +433,22 @@ fn update_managed_model_provider_fields(document: &mut DocumentMut, provider: &s
     }
 }
 
-fn clear_custom_provider_fields(document: &mut DocumentMut) -> Result<(), AppError> {
+fn clear_custom_provider_fields(
+    document: &mut DocumentMut,
+    managed_model: Option<&str>,
+) -> Result<(), AppError> {
     let root = document.as_table_mut();
     root.remove("model_provider");
+    // 只有当我们之前写入的第三方模型仍然生效时，才把它一并移除，
+    // 避免把用户手动设置的模型误删。
+    if let Some(managed) = managed_model.filter(|value| !value.trim().is_empty())
+        && root
+            .get("model")
+            .and_then(Item::as_str)
+            .is_some_and(|current| current == managed.trim())
+    {
+        root.remove("model");
+    }
     if let Some(profiles) = root.get_mut("profiles").and_then(Item::as_table_mut) {
         for (_, profile) in profiles.iter_mut() {
             update_profile_model_provider(profile, None);
@@ -406,6 +473,14 @@ fn clear_custom_provider_fields(document: &mut DocumentMut) -> Result<(), AppErr
     };
     if remove_provider_table {
         root.remove("model_providers");
+    }
+    // 只移除本应用写入的模型目录指针，保留用户手动设置的 `model_catalog_json`。
+    if root
+        .get("model_catalog_json")
+        .and_then(Item::as_str)
+        .is_some_and(|path| path == format!("{MODEL_CATALOG_DIR}/{MODEL_CATALOG_FILE}"))
+    {
+        root.remove("model_catalog_json");
     }
     Ok(())
 }
@@ -434,13 +509,8 @@ fn update_profile_model_provider(profile: &mut Item, provider: Option<&str>) {
     }
 }
 
-fn merged_headers(
-    provider: &ProviderProfile,
-    account: &ProviderAccount,
-) -> BTreeMap<String, String> {
-    let mut headers = provider.headers.clone();
-    headers.extend(account.headers.clone());
-    headers
+fn merged_headers(provider: &ProviderProfile) -> BTreeMap<String, String> {
+    provider.headers.clone()
 }
 
 fn parse_config_document(text: &str) -> Result<DocumentMut, AppError> {
@@ -531,13 +601,24 @@ fn digest_bytes(value: &[u8]) -> String {
     format!("{:x}", Sha256::digest(value))
 }
 
-fn describe_changes() -> Vec<String> {
-    vec![
+fn describe_changes(model: &str, chat_proxy: bool) -> Vec<String> {
+    let mut changes = vec![
         "保留现有的其他 Codex 设置".into(),
         "将 Codex 切换到所选第三方 API 服务".into(),
-        "写入 Responses API 地址".into(),
+        if chat_proxy {
+            "写入本机转换代理地址（Chat Completions API 自动转为 Responses API）".into()
+        } else {
+            "写入 Responses API 地址".into()
+        },
         "更新 Codex 使用的 API Key".into(),
-    ]
+    ];
+    if !model.trim().is_empty() {
+        changes.push(format!("默认模型设为 {}", model.trim()));
+    }
+    changes.push(format!(
+        "写入模型目录 {MODEL_CATALOG_DIR}/{MODEL_CATALOG_FILE}，供模型选择器列出官方与自定义模型"
+    ));
+    changes
 }
 
 fn mask_secret(secret: &str) -> String {
@@ -562,7 +643,7 @@ fn managed_custom_preview(
     headers: &BTreeMap<String, String>,
 ) -> String {
     let mut preview = DocumentMut::new();
-    for key in ["model_provider"] {
+    for key in ["model", "model_provider", "model_catalog_json"] {
         if let Some(item) = document.get(key) {
             preview[key] = item.clone();
         }
@@ -638,21 +719,14 @@ mod tests {
             timeout_secs: 30,
             enabled: true,
             active: false,
-            active_account_id: None,
-            account_count: 1,
-        }
-    }
+            model: String::new(),
 
-    fn account() -> ProviderAccount {
-        ProviderAccount {
-            id: "account".into(),
-            provider_id: Some("provider".into()),
-            name: "Default".into(),
-            auth_kind: crate::models::AccountAuthKind::ApiKey,
+            model_context_windows: Default::default(),
+            available_models: Default::default(),
+            models_dev_meta: Default::default(),
+            api_type: ProviderApiType::Responses,
             api_key: Some("sk-direct-secret-value".into()),
-            headers: BTreeMap::from([("x-account".into(), "account-secret".into())]),
-            active: false,
-            email: None,
+            has_api_key: false,
             created_at: 0,
             updated_at: 0,
         }
@@ -693,6 +767,7 @@ settings = { model_provider = "old-inline", rules = [{ model_provider = "old-arr
             "Direct Responses",
             "https://responses.example.test/v1",
             &BTreeMap::from([("x-tenant".into(), "tenant-1".into())]),
+            "",
         )
         .unwrap();
         let text = document.to_string();
@@ -701,6 +776,10 @@ settings = { model_provider = "old-inline", rules = [{ model_provider = "old-arr
         assert_eq!(parsed["model"].as_str(), Some("old-model"));
         assert_eq!(parsed["user_setting"].as_str(), Some("keep"));
         assert_eq!(parsed["model_provider"].as_str(), Some("custom"));
+        assert_eq!(
+            parsed["model_catalog_json"].as_str(),
+            Some("model-catalogs/codex-tools.json")
+        );
         assert_eq!(
             parsed["profiles"]["work"]["model_provider"].as_str(),
             Some("custom")
@@ -765,7 +844,7 @@ settings = { model_provider = "old-inline", rules = [{ model_provider = "old-arr
         )
         .unwrap();
         let first = manager
-            .preview_custom(&home, &provider(), &account())
+            .preview_custom(&home, &provider(), provider().base_url.as_str())
             .unwrap();
         assert!(!first.rendered.contains("sk-direct-secret-value"));
         assert!(!first.rendered.contains("provider-secret"));
@@ -785,7 +864,7 @@ settings = { model_provider = "old-inline", rules = [{ model_provider = "old-arr
         assert!(!written.contains("sk-direct-secret-value"));
         assert!(written.contains("requires_openai_auth = true"));
         let second = manager
-            .preview_custom(&home, &provider(), &account())
+            .preview_custom(&home, &provider(), provider().base_url.as_str())
             .unwrap();
         fs::write(home.join("config.toml"), "model = \"external\"\n").unwrap();
         assert!(matches!(
@@ -838,7 +917,7 @@ private_setting = "must-also-not-enter-webview"
 
         let manager = ConfigManager::default();
         let preview = manager
-            .preview_custom(&home, &provider(), &account())
+            .preview_custom(&home, &provider(), provider().base_url.as_str())
             .unwrap();
 
         assert!(!preview.rendered.contains("must-not-enter-webview"));
@@ -862,7 +941,7 @@ private_setting = "must-also-not-enter-webview"
         fs::write(home.join("auth.json"), b"{\"before\":true}").unwrap();
         let manager = ConfigManager::default();
         let preview = manager
-            .preview_custom(&home, &provider(), &account())
+            .preview_custom(&home, &provider(), provider().base_url.as_str())
             .unwrap();
         fs::write(home.join("auth.json"), b"{\"concurrent\":true}").unwrap();
 
@@ -878,6 +957,59 @@ private_setting = "must-also-not-enter-webview"
     }
 
     #[test]
+    fn chat_proxy_activation_writes_fixed_key_and_proxy_url() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex");
+        prepare_home(&home);
+        let mut provider = ProviderProfile {
+            id: "chat".into(),
+            name: "DeepSeek".into(),
+            base_url: "https://api.deepseek.com/v1".into(),
+            headers: BTreeMap::new(),
+            timeout_secs: 30,
+            enabled: true,
+            active: false,
+            model: String::new(),
+
+            model_context_windows: Default::default(),
+            available_models: Default::default(),
+            models_dev_meta: Default::default(),
+            api_type: ProviderApiType::Chat,
+            api_key: Some("sk-real-provider-key".into()),
+            has_api_key: false,
+            created_at: 0,
+            updated_at: 0,
+        };
+        let effective = format!("http://127.0.0.1:{}/v1", crate::chat_proxy::PROXY_PORT);
+        let manager = ConfigManager::default();
+        let preview = manager
+            .preview_custom(&home, &provider, &effective)
+            .unwrap();
+        // 预览绝不泄露真实的服务商 Key。
+        assert!(!preview.rendered.contains("sk-real-provider-key"));
+        manager.apply(&preview.operation_id).unwrap();
+        let config = fs::read_to_string(home.join("config.toml")).unwrap();
+        assert!(config.contains(&effective));
+        assert!(config.contains("wire_api = \"responses\""));
+        let auth: serde_json::Value =
+            serde_json::from_slice(&fs::read(home.join("auth.json")).unwrap()).unwrap();
+        assert_eq!(
+            auth["OPENAI_API_KEY"],
+            crate::chat_proxy::PROXY_FIXED_API_KEY
+        );
+
+        // 直连 Responses 类型的服务仍然写入真实 Key。
+        provider.api_type = ProviderApiType::Responses;
+        let direct = manager
+            .preview_custom(&home, &provider, "https://api.deepseek.com/v1")
+            .unwrap();
+        manager.apply(&direct.operation_id).unwrap();
+        let auth: serde_json::Value =
+            serde_json::from_slice(&fs::read(home.join("auth.json")).unwrap()).unwrap();
+        assert_eq!(auth["OPENAI_API_KEY"], "sk-real-provider-key");
+    }
+
+    #[test]
     fn custom_activation_rejects_invalid_config_and_replaces_invalid_auth() {
         let temp = tempfile::tempdir().unwrap();
         let home = temp.path().join("codex");
@@ -888,7 +1020,7 @@ private_setting = "must-also-not-enter-webview"
 
         assert!(
             manager
-                .preview_custom(&home, &provider(), &account())
+                .preview_custom(&home, &provider(), provider().base_url.as_str())
                 .is_err()
         );
         assert_eq!(fs::read(home.join("config.toml")).unwrap(), invalid_config);
@@ -897,7 +1029,7 @@ private_setting = "must-also-not-enter-webview"
         let invalid_auth = b"{ invalid json";
         fs::write(home.join("auth.json"), invalid_auth).unwrap();
         let preview = manager
-            .preview_custom(&home, &provider(), &account())
+            .preview_custom(&home, &provider(), provider().base_url.as_str())
             .unwrap();
         manager.apply(&preview.operation_id).unwrap();
         let auth: serde_json::Value =
@@ -959,7 +1091,7 @@ settings = { model_provider = "custom" }
             last_refresh: "2026-07-14T00:00:00Z".into(),
         };
 
-        activate_official_account(temp.path(), &credential).unwrap();
+        activate_official_account(temp.path(), &credential, None).unwrap();
 
         let config = fs::read_to_string(temp.path().join("config.toml")).unwrap();
         let parsed = config.parse::<DocumentMut>().unwrap();
@@ -1003,7 +1135,7 @@ model_providers = { custom = { base_url = "https://custom.example.test/v1" }, ot
         .parse::<DocumentMut>()
         .unwrap();
 
-        clear_custom_provider_fields(&mut document).unwrap();
+        clear_custom_provider_fields(&mut document, None).unwrap();
 
         let providers = document["model_providers"].as_inline_table().unwrap();
         assert!(providers.get("custom").is_none());
@@ -1029,7 +1161,7 @@ base_url = "https://custom.example.test/v1"
         .parse::<DocumentMut>()
         .unwrap();
 
-        clear_custom_provider_fields(&mut document).unwrap();
+        clear_custom_provider_fields(&mut document, None).unwrap();
 
         assert_eq!(document["model"].as_str(), Some("custom-model"));
         assert_eq!(document["custom_note"].as_str(), Some("keep"));
@@ -1045,7 +1177,7 @@ model_providers = "invalid"
         .parse::<DocumentMut>()
         .unwrap();
 
-        let error = clear_custom_provider_fields(&mut document).unwrap_err();
+        let error = clear_custom_provider_fields(&mut document, None).unwrap_err();
 
         assert!(error.to_string().contains("model_providers"));
         assert_eq!(document["model_providers"].as_str(), Some("invalid"));
@@ -1064,6 +1196,7 @@ model_providers = "invalid"
             "Custom",
             "https://custom.example.test/v1",
             &BTreeMap::new(),
+            "",
         )
         .unwrap();
 
@@ -1075,6 +1208,100 @@ model_providers = "invalid"
             document["model_providers"]["custom"]["base_url"].as_str(),
             Some("https://custom.example.test/v1")
         );
+    }
+
+    #[test]
+    fn custom_activation_writes_and_preserves_the_default_model() {
+        let mut document = r#"model = "user-kept"
+model_providers = { other = { base_url = "https://other.example.test/v1" } }
+"#
+        .parse::<DocumentMut>()
+        .unwrap();
+
+        apply_custom_fields(
+            &mut document,
+            "Custom",
+            "https://custom.example.test/v1",
+            &BTreeMap::new(),
+            "gpt-5.6-luna",
+        )
+        .unwrap();
+        assert_eq!(document["model"].as_str(), Some("gpt-5.6-luna"));
+
+        // 留空时不覆盖用户已设置的模型。
+        apply_custom_fields(
+            &mut document,
+            "Custom",
+            "https://custom.example.test/v1",
+            &BTreeMap::new(),
+            "",
+        )
+        .unwrap();
+        assert_eq!(document["model"].as_str(), Some("gpt-5.6-luna"));
+    }
+
+    #[test]
+    fn official_switch_removes_only_the_managed_model() {
+        let mut document = r#"model = "gpt-5.6-luna"
+model_provider = "custom"
+
+[model_providers.custom]
+base_url = "https://custom.example.test/v1"
+"#
+        .parse::<DocumentMut>()
+        .unwrap();
+
+        clear_custom_provider_fields(&mut document, Some("gpt-5.6-luna")).unwrap();
+        assert!(document.get("model").is_none());
+        assert!(document.get("model_provider").is_none());
+
+        // 模型与受管模型不一致时保留，避免误删用户设置。
+        let mut manual = r#"model = "my-personal-model"
+model_provider = "custom"
+
+[model_providers.custom]
+base_url = "https://custom.example.test/v1"
+"#
+        .parse::<DocumentMut>()
+        .unwrap();
+        clear_custom_provider_fields(&mut manual, Some("gpt-5.6-luna")).unwrap();
+        assert_eq!(manual["model"].as_str(), Some("my-personal-model"));
+    }
+
+    #[test]
+    fn official_activation_clears_the_managed_model_from_disk() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(
+            temp.path().join("config.toml"),
+            r#"model = "gpt-5.6-luna"
+model_provider = "custom"
+
+[model_providers.custom]
+base_url = "https://custom.example.test/v1"
+"#,
+        )
+        .unwrap();
+        fs::write(temp.path().join("auth.json"), b"{}").unwrap();
+        let credential = CodexAuthCredential {
+            auth_mode: "chatgpt".into(),
+            openai_api_key: None,
+            tokens: crate::models::CodexAuthTokens {
+                id_token: "id-token".into(),
+                access_token: "access-token".into(),
+                refresh_token: "refresh-token".into(),
+                account_id: "account-id".into(),
+            },
+            last_refresh: "2026-07-14T00:00:00Z".into(),
+        };
+
+        activate_official_account(temp.path(), &credential, Some("gpt-5.6-luna")).unwrap();
+
+        let parsed = fs::read_to_string(temp.path().join("config.toml"))
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+        assert!(parsed.get("model").is_none());
+        assert!(parsed.get("model_provider").is_none());
     }
 
     #[test]
@@ -1139,7 +1366,7 @@ model_providers = "invalid"
             last_refresh: "2026-07-31T00:00:00Z".into(),
         };
 
-        activate_official_account(temp.path(), &credential).unwrap();
+        activate_official_account(temp.path(), &credential, None).unwrap();
 
         let auth: serde_json::Value =
             serde_json::from_slice(&fs::read(temp.path().join("auth.json")).unwrap()).unwrap();

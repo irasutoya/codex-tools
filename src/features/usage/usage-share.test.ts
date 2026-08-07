@@ -86,6 +86,7 @@ const accountOverview: UsageOverview = {
   },
   rows: [officialAccount, providerAccount],
   warnings: [],
+  trendPoints: [],
 }
 
 const modelOverview: UsageOverview = {

@@ -92,7 +92,27 @@ describe("quota refresh policy", () => {
           now
         )
       )
-    ).toBe(1_000)
+    ).toBe(QUOTA_REFRESH_INTERVAL_MS)
+    // 重置时间持续停留在过去时按“结果未变化”退避，而不是每秒轮询。
+    expect(
+      scheduledDelay(
+        planQuotaSuccess(
+          quota({
+            data: {
+              kind: "windowed",
+              primary: {
+                usedPercent: 100,
+                remainingPercent: 0,
+                windowSeconds: 18_000,
+                resetAt: now - 1_000,
+              },
+            },
+          }),
+          4,
+          now
+        )
+      )
+    ).toBe(QUOTA_IDLE_INTERVAL_MS)
   })
 
   it("backs off transient failures and suspends terminal states", () => {

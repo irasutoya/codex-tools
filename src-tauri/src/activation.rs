@@ -1,10 +1,12 @@
 use crate::{
+    chat_proxy::ChatProxyRegistry,
     codex::{self, ConfigManager},
     commands::sessions::repair_home,
     models::{ActiveKind, AppError, RepairResult, StoredOfficialAccount},
     provider_sync,
     storage::Store,
 };
+use std::fs;
 
 pub(crate) fn sync_active_openai_credential(
     store: &Store,
@@ -44,9 +46,46 @@ pub(crate) fn sync_active_openai_credential(
     Ok(())
 }
 
+/// 记录 config.toml 当前的默认模型（读取实际文件内容，而不是 Provider 记录：
+/// Provider 没有默认模型时 apply 会保留 config 中的旧值，该旧值同样是本应用
+/// 写入的，需要继续跟踪，切回 OpenAI 时才能精确清除）。
+pub(crate) fn record_written_model(store: &Store, home: &std::path::Path) -> Result<(), AppError> {
+    let model = fs::read_to_string(home.join("config.toml"))
+        .ok()
+        .and_then(|text| text.parse::<toml_edit::DocumentMut>().ok())
+        .and_then(|doc| {
+            doc.get("model")
+                .and_then(toml_edit::Item::as_str)
+                .map(str::trim)
+                .filter(|model| !model.is_empty())
+                .map(str::to_owned)
+        });
+    store.save_last_managed_model(model)
+}
+
+/// 计算切换到 OpenAI 时应从 config.toml 清除的受管模型：只有 config 中的
+/// 当前 model 与最近一次本应用写入的记录完全一致时才清除，避免误删用户
+/// 手动设置的模型。
+fn managed_model_to_remove(
+    store: &Store,
+    home: &std::path::Path,
+) -> Result<Option<String>, AppError> {
+    let recorded = store.last_managed_model()?;
+    let current = fs::read_to_string(home.join("config.toml"))
+        .ok()
+        .and_then(|text| text.parse::<toml_edit::DocumentMut>().ok())
+        .and_then(|doc| {
+            doc.get("model")
+                .and_then(toml_edit::Item::as_str)
+                .map(str::to_owned)
+        });
+    Ok(recorded.filter(|record| current.as_deref() == Some(record.as_str())))
+}
+
 pub(crate) async fn sync_active_codex_configuration(
     store: &Store,
     manager: &ConfigManager,
+    proxy: &ChatProxyRegistry,
 ) -> Result<(), AppError> {
     let (home_setting, active) =
         store.read(|state| (state.codex.home.clone(), state.active.clone()))?;
@@ -58,7 +97,12 @@ pub(crate) async fn sync_active_codex_configuration(
                 AppError::InvalidConfig("当前 OpenAI 登录信息不完整，请重新登录。".into())
             })?;
             let account = store.official_account(account_id)?;
-            codex::activate_official_account(&home, &account.credential)?;
+            // 启动修复路径：active 已指向 OpenAI，但 config.toml 可能仍残留
+            // 本应用上次写入的第三方默认模型；只有与最近一次写入记录一致
+            // 才清除（用户手动设置的模型不受影响）。
+            let managed_model = managed_model_to_remove(store, &home)?;
+            codex::activate_official_account(&home, &account.credential, managed_model.as_deref())?;
+            store.save_last_managed_model(None)?;
             return Ok(());
         }
         ActiveKind::None => return Ok(()),
@@ -68,40 +112,43 @@ pub(crate) async fn sync_active_codex_configuration(
     let provider_id = active.provider_id.as_deref().ok_or_else(|| {
         AppError::InvalidConfig("当前第三方 API 服务信息不完整，请重新选择。".into())
     })?;
-    let account_id = active
-        .account_id
-        .as_deref()
-        .ok_or_else(|| AppError::InvalidConfig("当前 API Key 信息不完整，请重新选择。".into()))?;
     let mut provider = store.provider(provider_id)?;
-    let mut account = store.account(account_id)?;
     provider.normalize_and_validate()?;
-    account.normalize_and_validate()?;
-    if !provider.enabled || account.provider_id.as_deref() != Some(provider_id) {
+    if !provider.enabled {
         return Err(AppError::InvalidConfig(
-            "当前第三方 API 服务或 API Key 已不可用，请重新选择。".into(),
+            "当前第三方 API 服务已不可用，请重新选择。".into(),
         ));
     }
 
-    let preview = manager.preview_custom(&home, &provider, &account)?;
-    manager.apply(&preview.operation_id)
+    let effective_base_url = crate::chat_proxy::effective_base_url(&provider, proxy).await?;
+    let preview = manager.preview_custom(&home, &provider, &effective_base_url)?;
+    manager.apply(&preview.operation_id)?;
+    record_written_model(store, &home)
 }
 
 pub(crate) async fn activate_openai_record(
     store: &Store,
     manager: &ConfigManager,
     ledger: &crate::local_usage::UsageLedger,
+    proxy: &ChatProxyRegistry,
     account: &StoredOfficialAccount,
 ) -> Result<RepairResult, AppError> {
     let home = codex::home(&store.codex_home_setting()?);
     let repair_sessions = provider_sync::configured_provider(&home) == codex::MANAGED_PROVIDER_ID;
+    // 切换前计算本应用写入的默认模型，切回 OpenAI 时把它一并清除，
+    // 避免 Codex 用第三方模型名去请求官方账号；只有与最近一次写入记录
+    // 一致才清除（用户手动设置的模型不受影响）。
+    let managed_model = managed_model_to_remove(store, &home)?;
     let pending_id = crate::begin_activation(
         ledger,
         &crate::activation_for_official(account, chrono::Utc::now().timestamp_millis()),
     )?;
+    // 转换代理保持运行直到应用退出或服务被删除：端口在本机会话内保持稳定，
+    // 切回 OpenAI 再切回第三方服务时，Codex 缓存的地址仍然有效。
     let result = async {
-        codex::activate_official_account(&home, &account.credential)?;
+        codex::activate_official_account(&home, &account.credential, managed_model.as_deref())?;
         if let Err(error) = store.activate_official_account(&account.id) {
-            return Err(compensate_activation_failure(store, manager, error).await);
+            return Err(compensate_activation_failure(store, manager, proxy, error).await);
         }
         let repair = if repair_sessions {
             repair_home(home, "openai".into()).await?
@@ -117,6 +164,8 @@ pub(crate) async fn activate_openai_record(
     match result {
         Ok(mut repair) => {
             crate::confirm_pending(ledger, &pending_id, &mut repair);
+            // 已切回官方：不再存在本应用写入的第三方默认模型。
+            store.save_last_managed_model(None)?;
             Ok(repair)
         }
         Err(error) => {
@@ -129,9 +178,10 @@ pub(crate) async fn activate_openai_record(
 pub(crate) async fn compensate_activation_failure(
     store: &Store,
     manager: &ConfigManager,
+    proxy: &ChatProxyRegistry,
     error: AppError,
 ) -> AppError {
-    match sync_active_codex_configuration(store, manager).await {
+    match sync_active_codex_configuration(store, manager, proxy).await {
         Ok(()) => error,
         Err(rollback) => AppError::Internal(format!(
             "{error}；原来的 Codex 连接也未能恢复，请重新选择账号或服务：{rollback}"
@@ -143,8 +193,8 @@ pub(crate) async fn compensate_activation_failure(
 mod tests {
     use super::*;
     use crate::models::{
-        AccountAuthKind, CodexAuthCredential, CodexAuthTokens, OfficialAccountSource,
-        ProviderAccount, ProviderAccountQuota, ProviderProfile, token_local_identity,
+        CodexAuthCredential, CodexAuthTokens, OfficialAccountSource, ProviderAccountQuota,
+        ProviderApiType, ProviderProfile, token_local_identity,
     };
     use std::fs;
 
@@ -169,29 +219,27 @@ mod tests {
                 timeout_secs: 30,
                 enabled: true,
                 active: false,
-                active_account_id: None,
-                account_count: 0,
-            })
-            .unwrap();
-        let account = store
-            .save_account(ProviderAccount {
-                id: "account".into(),
-                provider_id: Some(provider.id.clone()),
-                name: "Account".into(),
-                auth_kind: AccountAuthKind::ApiKey,
+                model: String::new(),
+
+                model_context_windows: Default::default(),
+                available_models: Default::default(),
+                models_dev_meta: Default::default(),
+                api_type: ProviderApiType::Responses,
                 api_key: Some("secret".into()),
-                headers: Default::default(),
-                active: false,
-                email: None,
+                has_api_key: false,
                 created_at: 0,
                 updated_at: 0,
             })
             .unwrap();
-        store.activate(&provider.id, &account.id).unwrap();
+        store.activate(&provider.id).unwrap();
 
-        sync_active_codex_configuration(&store, &ConfigManager::default())
-            .await
-            .unwrap();
+        sync_active_codex_configuration(
+            &store,
+            &ConfigManager::default(),
+            &ChatProxyRegistry::default(),
+        )
+        .await
+        .unwrap();
 
         let config = fs::read_to_string(home.join("config.toml")).unwrap();
         let document = config.parse::<toml_edit::DocumentMut>().unwrap();
@@ -255,9 +303,13 @@ mod tests {
         )
         .unwrap();
 
-        sync_active_codex_configuration(&store, &ConfigManager::default())
-            .await
-            .unwrap();
+        sync_active_codex_configuration(
+            &store,
+            &ConfigManager::default(),
+            &ChatProxyRegistry::default(),
+        )
+        .await
+        .unwrap();
 
         let config = fs::read_to_string(home.join("config.toml")).unwrap();
         let document = config.parse::<toml_edit::DocumentMut>().unwrap();
@@ -318,9 +370,13 @@ mod tests {
         )
         .unwrap();
 
-        sync_active_codex_configuration(&store, &ConfigManager::default())
-            .await
-            .unwrap();
+        sync_active_codex_configuration(
+            &store,
+            &ConfigManager::default(),
+            &ChatProxyRegistry::default(),
+        )
+        .await
+        .unwrap();
 
         let synced = store.official_account(&saved.id).unwrap();
         assert_eq!(synced.credential.tokens.access_token, "at-proxy-secret");

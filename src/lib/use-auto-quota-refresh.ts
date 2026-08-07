@@ -2,6 +2,8 @@ import { useEffect, useRef } from "react"
 
 import type { AccountQuota } from "@/types"
 
+import { epochMilliseconds } from "./time"
+
 import {
   planQuotaFailure,
   planQuotaSuccess,
@@ -156,7 +158,10 @@ export function useAutoQuotaRefresh({
     if (activationAllowed) {
       void refreshOnce()
     } else {
-      schedule(initialDelay(quota, runtime))
+      // initialDelay 对“应挂起”的计划返回 undefined：不调度任何定时器。
+      // 直接调度 Infinity 会被浏览器钳制为 1ms，等于立即再刷一次，违背挂起语义。
+      const delay = initialDelay(quota, runtime)
+      if (delay !== undefined) schedule(delay)
     }
     return () => {
       cancelled = true
@@ -177,23 +182,25 @@ function getRuntime(accountId: string) {
   return runtime
 }
 
-function initialDelay(quota: AccountQuota | undefined, runtime: QuotaRuntime) {
+/** 返回首次刷新的延迟；返回 `undefined` 表示本轮不应自动刷新（应挂起）。 */
+function initialDelay(
+  quota: AccountQuota | undefined,
+  runtime: QuotaRuntime
+): number | undefined {
   if (!quota || quota.status === "never") return 1_000
   if (quota.status === "success") {
     const plan = planQuotaSuccess(quota, runtime.unchangedCount)
-    if (plan.kind === "suspended") return Number.POSITIVE_INFINITY
+    if (plan.kind === "suspended") return undefined
     if (plan.reason === "exhausted") return plan.delayMs
     return remainingDelay(quota.lastAttemptAt ?? quota.fetchedAt, plan.delayMs)
   }
 
   const plan = planQuotaFailure(quota, Math.max(runtime.failureCount, 1))
-  if (plan.kind === "suspended") return Number.POSITIVE_INFINITY
+  if (plan.kind === "suspended") return undefined
   return plan.delayMs
 }
 
 function remainingDelay(timestamp: number | undefined, delayMs: number) {
   if (!timestamp || !Number.isFinite(timestamp)) return 1_000
-  const milliseconds =
-    timestamp < 100_000_000_000 ? timestamp * 1_000 : timestamp
-  return Math.max(1_000, milliseconds + delayMs - Date.now())
+  return Math.max(1_000, epochMilliseconds(timestamp) + delayMs - Date.now())
 }

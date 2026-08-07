@@ -65,7 +65,7 @@ export function PricingRuleDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="w-full max-w-md">
+      <DialogContent className="max-h-[calc(100dvh-2rem)] w-full max-w-md overflow-y-auto">
         <DialogHeader>
           <DialogTitle>
             {draft.id ? "编辑中转站价格" : "设置中转站价格"}

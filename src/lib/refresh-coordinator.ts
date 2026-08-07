@@ -53,8 +53,6 @@ class RefreshCoordinator {
 
   getSnapshot = (page: Page) => this.snapshots.get(page)!
 
-  getActivitySnapshot = () => this.activity
-
   getForeground = () => this.activity.foreground
 
   subscribe = (listener: () => void) => {

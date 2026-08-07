@@ -1,21 +1,17 @@
-import { useCallback, useEffect, useRef, useState } from "react"
+import { memo, useCallback, useEffect, useRef, useState } from "react"
 import {
   Alert01Icon,
   BookOpen01Icon,
   Calendar01Icon,
-  DatabaseIcon,
   Dollar01Icon,
-  Layers01Icon,
   Refresh01Icon,
+  SecurityCheckIcon,
   Settings02Icon,
   Share01Icon,
-  Tag01Icon,
 } from "@hugeicons/core-free-icons"
 import { HugeiconsIcon } from "@hugeicons/react"
 
 import { ErrorDetails } from "@/components/error-details"
-import { MetricCard } from "@/components/metric-card"
-import { PageLoading } from "@/components/page-loading"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import {
   AlertDialog,
@@ -34,6 +30,7 @@ import {
   CardAction,
   CardContent,
   CardDescription,
+  CardFooter,
   CardHeader,
   CardTitle,
 } from "@/components/ui/card"
@@ -45,7 +42,17 @@ import {
   EmptyMedia,
   EmptyTitle,
 } from "@/components/ui/empty"
-import { Spinner } from "@/components/ui/spinner"
+import { Field, FieldLabel } from "@/components/ui/field"
+import { Input } from "@/components/ui/input"
+import {
+  Item,
+  ItemActions,
+  ItemContent,
+  ItemDescription,
+  ItemGroup,
+  ItemTitle,
+} from "@/components/ui/item"
+import { Skeleton } from "@/components/ui/skeleton"
 import {
   Sheet,
   SheetContent,
@@ -53,6 +60,7 @@ import {
   SheetHeader,
   SheetTitle,
 } from "@/components/ui/sheet"
+import { Spinner } from "@/components/ui/spinner"
 import {
   Table,
   TableBody,
@@ -61,8 +69,11 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table"
-import { notify } from "@/lib/feedback"
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
+import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group"
+import { notify, formatError } from "@/lib/feedback"
 import { call } from "@/lib/ipc"
+import { cn } from "@/lib/utils"
 import {
   refreshCoordinator,
   useAppForeground,
@@ -80,8 +91,10 @@ import type {
   OfficialPricingCatalog,
 } from "@/types"
 
+import { OfficialPricingDialog } from "./official-pricing-dialog"
 import { PricingRuleDialog } from "./pricing-rule-dialog"
 import { UsageShareDialog } from "./usage-share-dialog"
+import { UsageTrendChart } from "./usage-trend-chart"
 import {
   formatCostStatus,
   formatDateTime,
@@ -95,6 +108,7 @@ import {
   getLocalDayRange,
   getLocalRange,
   formatTimezone,
+  pickDisplayOverview,
 } from "./usage-format"
 
 const RANGE_OPTIONS = [
@@ -106,7 +120,7 @@ const RANGE_OPTIONS = [
 
 type RangeMode = (typeof RANGE_OPTIONS)[number]["key"]
 
-type PricingField = "model" | "provider" | "account" | "prices" | "effective"
+type PricingField = "model" | "provider" | "prices" | "effective"
 
 type PricingFieldErrors = Partial<Record<PricingField, string>>
 
@@ -139,6 +153,7 @@ export default function UsagePage({ active }: PageProps) {
     useState<PricingFieldErrors>({})
   const [selectedRow, setSelectedRow] = useState<UsageRow>()
   const [shareOpen, setShareOpen] = useState(false)
+  const [pricingDialogOpen, setPricingDialogOpen] = useState(false)
   const [shareAccountOverview, setShareAccountOverview] =
     useState<UsageOverview>()
   const [shareModelOverview, setShareModelOverview] = useState<UsageOverview>()
@@ -210,7 +225,7 @@ export default function UsagePage({ active }: PageProps) {
         } while (refreshQueued.current)
         return result
       } catch (reason) {
-        setError(String(reason))
+        setError(formatError(reason))
         throw reason
       } finally {
         if (!silent) {
@@ -380,9 +395,11 @@ export default function UsagePage({ active }: PageProps) {
 
   const refresh = async () => {
     try {
-      await loadOverview(true)
-      await loadRules()
-      await loadOfficialCatalog(true)
+      await Promise.all([
+        loadOverview(true),
+        loadRules(),
+        loadOfficialCatalog(true),
+      ])
       refreshCoordinator.invalidate(["dashboard", "providers"])
       notify.success("用量已刷新", "已重新扫描本机 Codex rollout 文件。")
     } catch (reason) {
@@ -415,13 +432,16 @@ export default function UsagePage({ active }: PageProps) {
     }
   }
 
-  const openNewRule = async (model?: string, providerId?: string) => {
-    setPricingError(undefined)
-    setPricingFieldErrors({})
-    setRepriceAfterSave(true)
-    setPricingDraft(createPricingDraft(model, providerId))
-    await ensureProviders(setProviders)
-  }
+  const openNewRule = useCallback(
+    async (model?: string, providerId?: string) => {
+      setPricingError(undefined)
+      setPricingFieldErrors({})
+      setRepriceAfterSave(true)
+      setPricingDraft(createPricingDraft(model, providerId))
+      await ensureProviders(setProviders)
+    },
+    []
+  )
 
   const openEditRule = async (rule: PricingRule) => {
     setPricingError(undefined)
@@ -452,7 +472,9 @@ export default function UsagePage({ active }: PageProps) {
         billingMode: "token",
         accountId: undefined,
         requestFeeUsd: undefined,
-        effectiveFromMs: Date.now(),
+        // 从重算范围起点生效，保证“保存后重算当前范围”能覆盖
+        // 范围内已发生的历史事件，而不是只算保存后的新事件。
+        effectiveFromMs: getQuery().range.startAtMs,
         cachedReadUsdPerMillion:
           pricingDraft.cachedReadUsdPerMillion ??
           pricingDraft.inputUsdPerMillion,
@@ -503,16 +525,13 @@ export default function UsagePage({ active }: PageProps) {
   }
 
   const currentRange = getSelectedRange()
-  const displayOverview =
-    overview &&
-    overview.range.startAtMs === currentRange.startAtMs &&
-    overview.range.endAtMs === currentRange.endAtMs
-      ? overview
-      : undefined
-  const hasStaleOverview = Boolean(overview && !displayOverview)
+  const { display: displayOverview, stale: hasStaleOverview } =
+    pickDisplayOverview(overview, currentRange, customRangeValid)
 
-  if (!displayOverview && (loading || hasStaleOverview))
-    return <PageLoading label="正在读取本机 Token 用量" />
+  // 失败时（error 已设置）不要停在骨架屏：即使旧数据与当前范围不匹配
+  // （stale），也要显示错误提示与重试入口，否则页面会一直转圈且无法恢复。
+  if (!displayOverview && !error && (loading || hasStaleOverview))
+    return <UsageLoading />
 
   if (!displayOverview) {
     return (
@@ -566,546 +585,503 @@ export default function UsagePage({ active }: PageProps) {
 
   return (
     <div className="flex flex-col gap-6">
-      <Alert>
-        <HugeiconsIcon icon={Calendar01Icon} />
-        <AlertTitle>当前统计周期</AlertTitle>
-        <AlertDescription>
-          当前仅统计软件更新后产生的新用量
-          {displayOverview.collectionStartedAtMs
-            ? ` · ${formatDateTime(displayOverview.collectionStartedAtMs)} 起`
-            : ""}
-          。更新前的数据不计入当前周期。
-        </AlertDescription>
-      </Alert>
-
-      {error && (
-        <Alert variant="destructive">
-          <HugeiconsIcon icon={Alert01Icon} />
-          <AlertTitle>当前显示的是上次读取结果</AlertTitle>
-          <AlertDescription>
-            <ErrorDetails error={error}>
-              暂时无法读取最新用量，请稍后刷新。
-            </ErrorDetails>
-          </AlertDescription>
-        </Alert>
-      )}
-
-      <Card>
-        <CardHeader className="gap-3 sm:flex-row sm:items-center sm:justify-between">
-          <div>
-            <CardTitle>OpenAI 官方实时价格</CardTitle>
-            <CardDescription>
-              价格从官方 Markdown
-              运行时同步，不写死模型；中转站价格规则完全独立。
-            </CardDescription>
-          </div>
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <p className="max-w-prose text-sm text-muted-foreground">
+          从本机 Codex rollout 日志统计 Token 与美元估算费用；官方账号自动使用
+          OpenAI 参考价，API 服务按服务和模型匹配价格。
+        </p>
+        <div className="flex flex-wrap items-center gap-2">
           <Button
-            size="sm"
             variant="outline"
-            disabled={officialCatalogLoading}
-            onClick={() => void loadOfficialCatalog(true)}
+            disabled={shareLoading}
+            onClick={() => void openShare()}
           >
-            {officialCatalogLoading ? (
+            {shareLoading ? (
+              <Spinner data-icon="inline-start" />
+            ) : (
+              <HugeiconsIcon icon={Share01Icon} data-icon="inline-start" />
+            )}
+            分享
+          </Button>
+          <Button
+            variant="outline"
+            disabled={refreshing || !customRangeValid}
+            onClick={() => void refresh()}
+          >
+            {refreshing ? (
               <Spinner data-icon="inline-start" />
             ) : (
               <HugeiconsIcon icon={Refresh01Icon} data-icon="inline-start" />
             )}
-            {officialCatalogLoading ? "正在同步…" : "立即同步"}
+            {refreshing ? "正在刷新…" : "刷新"}
           </Button>
-        </CardHeader>
-        <CardContent className="flex flex-wrap items-center gap-3 text-sm">
-          <Badge
-            variant={
-              officialCatalog?.status === "cached" ? "secondary" : "outline"
-            }
-          >
-            {officialCatalog?.status === "cached" ? "已缓存" : "等待同步"}
-          </Badge>
-          <span className="text-muted-foreground">
-            {officialCatalog?.modelCount ?? 0} 个官方模型
-          </span>
-          {officialCatalog?.fetchedAtMs && (
-            <span className="text-muted-foreground">
-              最近同步：{formatDateTime(officialCatalog.fetchedAtMs)}
-            </span>
+        </div>
+      </div>
+      <Tabs defaultValue="details">
+        <TabsList>
+          <TabsTrigger value="details">用量明细</TabsTrigger>
+          <TabsTrigger value="pricing">价格规则</TabsTrigger>
+        </TabsList>
+        <TabsContent value="details" className="flex flex-col gap-8">
+          <Alert>
+            <HugeiconsIcon icon={Calendar01Icon} />
+            <AlertTitle>当前统计周期</AlertTitle>
+            <AlertDescription>
+              当前仅统计软件更新后产生的新用量
+              {displayOverview.collectionStartedAtMs
+                ? ` · ${formatDateTime(displayOverview.collectionStartedAtMs)} 起`
+                : ""}
+              。更新前的数据不计入当前周期。
+            </AlertDescription>
+          </Alert>
+
+          {error && (
+            <Alert variant="destructive">
+              <HugeiconsIcon icon={Alert01Icon} />
+              <AlertTitle>当前显示的是上次读取结果</AlertTitle>
+              <AlertDescription>
+                <ErrorDetails error={error}>
+                  暂时无法读取最新用量，请稍后刷新。
+                </ErrorDetails>
+              </AlertDescription>
+            </Alert>
           )}
-          <a
-            className="text-primary underline-offset-4 hover:underline"
-            href={
-              officialCatalog?.sourceUrl ??
-              "https://developers.openai.com/api/docs/pricing.md"
-            }
-            target="_blank"
-            rel="noreferrer"
-          >
-            查看官方来源
-          </a>
-        </CardContent>
-      </Card>
 
-      <Card>
-        <CardHeader className="gap-4 sm:flex-row sm:items-center sm:justify-between">
-          <div>
-            <CardTitle>用量与费用</CardTitle>
-            <CardDescription>
-              当前仅统计软件更新后产生的新用量；官方账号自动使用 OpenAI
-              参考价，中转站按服务和模型匹配价格。
-            </CardDescription>
-          </div>
-          <CardAction className="flex flex-wrap items-center gap-2">
-            <div
-              className="flex items-center gap-1 rounded-lg border border-border p-1"
-              role="group"
-              aria-label="用量时间范围"
-            >
-              {RANGE_OPTIONS.map((option) => (
-                <Button
-                  key={option.key}
+          <Card>
+            <CardHeader className="gap-3 sm:flex-row sm:flex-wrap sm:items-center sm:justify-between">
+              <div>
+                <CardTitle>统计范围</CardTitle>
+                <CardDescription>
+                  选择时间范围与汇总维度；自定义日期按本机时区计算，最多 366
+                  天。
+                </CardDescription>
+              </div>
+              <CardAction className="flex flex-wrap items-center gap-2">
+                <ToggleGroup
+                  variant="outline"
+                  spacing={0}
                   size="sm"
-                  variant={rangeMode === option.key ? "secondary" : "ghost"}
-                  aria-pressed={rangeMode === option.key}
-                  onClick={() => setRangeMode(option.key)}
+                  value={[rangeMode]}
+                  onValueChange={(value, eventDetails) => {
+                    const next = value[0] as RangeMode | undefined
+                    if (next) setRangeMode(next)
+                    else eventDetails.isCanceled = true
+                  }}
+                  aria-label="用量时间范围"
                 >
-                  {option.label}
-                </Button>
-              ))}
-            </div>
-            <Button
-              size="sm"
-              variant="outline"
-              disabled={refreshing || !customRangeValid}
-              onClick={() => void refresh()}
-            >
-              {refreshing ? (
-                <Spinner data-icon="inline-start" />
-              ) : (
-                <HugeiconsIcon icon={Refresh01Icon} data-icon="inline-start" />
-              )}
-              {refreshing ? "正在刷新…" : "刷新"}
-            </Button>
-            <Button
-              size="sm"
-              variant="outline"
-              disabled={shareLoading}
-              onClick={() => void openShare()}
-            >
-              {shareLoading ? (
-                <Spinner data-icon="inline-start" />
-              ) : (
-                <HugeiconsIcon icon={Share01Icon} data-icon="inline-start" />
-              )}
-              分享
-            </Button>
-          </CardAction>
-        </CardHeader>
-        {rangeMode === "custom" && (
-          <div className="flex flex-wrap items-end gap-3 border-t px-6 pt-4">
-            <label className="flex min-w-36 flex-col gap-1 text-xs font-medium">
-              开始日期
-              <input
-                className="h-8 rounded-lg border border-input bg-transparent px-2.5 text-sm font-normal outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
-                type="date"
-                value={customStart}
-                onChange={(event) => setCustomStart(event.target.value)}
-              />
-            </label>
-            <label className="flex min-w-36 flex-col gap-1 text-xs font-medium">
-              结束日期（含当天）
-              <input
-                className="h-8 rounded-lg border border-input bg-transparent px-2.5 text-sm font-normal outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
-                type="date"
-                value={customEnd}
-                onChange={(event) => setCustomEnd(event.target.value)}
-              />
-            </label>
-            <span className="pb-1 text-xs text-muted-foreground">
-              最多查询 366 天；时间按本机时区计算。
-            </span>
-          </div>
-        )}
-        {!customRangeValid && (
-          <p className="px-6 pt-3 text-sm text-destructive">
-            自定义日期无效：结束日期必须不早于开始日期。
-          </p>
-        )}
-        <CardContent className="flex flex-col gap-5">
-          <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
-            <MetricCard
-              label="总 Token"
-              value={formatTokens(displayOverview.totals.tokens.totalTokens)}
-              detail={`${formatTokenDetail(displayOverview.totals.tokens)} · ${displayOverview.totals.requests} 次调用`}
-              icon={Layers01Icon}
-            />
-            <MetricCard
-              label="模型调用"
-              value={displayOverview.totals.requests}
-              detail={`统计范围 ${formatRangeLabel(displayOverview.range)}`}
-              icon={DatabaseIcon}
-            />
-            <MetricCard
-              label="估算费用"
-              value={formatEstimatedUsd(
-                displayOverview.totals.estimatedCostMicrousd,
-                displayOverview.totals.unpricedTokens +
-                  displayOverview.totals.partialTokens +
-                  displayOverview.totals.unattributedTokens +
-                  displayOverview.totals.subscriptionTokens
-              )}
-              detail={"官方金额为参考估算，不代表套餐实际账单"}
-              icon={Dollar01Icon}
-            />
-            <MetricCard
-              label="需处理 Token"
-              value={formatTokens(attentionTokens)}
-              detail="未配置价格、数据不完整或未归属"
-              icon={Tag01Icon}
-            />
-          </div>
-          <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-muted-foreground">
-            <span className="inline-flex items-center gap-1.5">
-              <HugeiconsIcon
-                icon={Calendar01Icon}
-                className="size-3.5"
-                aria-hidden="true"
-              />
-              {formatRangeLabel(displayOverview.range)} · 上次刷新{" "}
-              {formatDateTime(displayOverview.lastRefreshedAtMs)}
-            </span>
-            <span>
-              {formatTimezone()} · 页面打开时自动刷新，之后每 30 秒扫描一次
-            </span>
-          </div>
-        </CardContent>
-      </Card>
+                  {RANGE_OPTIONS.map((option) => (
+                    <ToggleGroupItem key={option.key} value={option.key}>
+                      {option.label}
+                    </ToggleGroupItem>
+                  ))}
+                </ToggleGroup>
+                <ToggleGroup
+                  variant="outline"
+                  spacing={0}
+                  size="sm"
+                  value={[groupBy]}
+                  onValueChange={(value, eventDetails) => {
+                    const next = value[0] as UsageGroupBy | undefined
+                    if (next) setGroupBy(next)
+                    else eventDetails.isCanceled = true
+                  }}
+                  aria-label="用量汇总维度"
+                >
+                  <ToggleGroupItem value="model">按模型</ToggleGroupItem>
+                  <ToggleGroupItem value="account">按账号</ToggleGroupItem>
+                </ToggleGroup>
+              </CardAction>
+            </CardHeader>
+            {rangeMode === "custom" && (
+              <div className="flex flex-wrap items-end gap-3 border-t px-6 pt-4">
+                <Field className="w-auto min-w-36">
+                  <FieldLabel htmlFor="usage-range-start">开始日期</FieldLabel>
+                  <Input
+                    id="usage-range-start"
+                    type="date"
+                    value={customStart}
+                    onChange={(event) => setCustomStart(event.target.value)}
+                  />
+                </Field>
+                <Field className="w-auto min-w-36">
+                  <FieldLabel htmlFor="usage-range-end">
+                    结束日期（含当天）
+                  </FieldLabel>
+                  <Input
+                    id="usage-range-end"
+                    type="date"
+                    value={customEnd}
+                    onChange={(event) => setCustomEnd(event.target.value)}
+                  />
+                </Field>
+                <span className="pb-1 text-xs text-muted-foreground">
+                  最多查询 366 天；时间按本机时区计算。
+                </span>
+              </div>
+            )}
+            {!customRangeValid && (
+              <p className="px-6 pt-3 text-sm text-destructive">
+                自定义日期无效：结束日期必须不早于开始日期。
+              </p>
+            )}
+            <CardContent className="flex flex-col gap-6">
+              <div className="grid grid-cols-2 gap-5">
+                <StatCard
+                  label="总 Token"
+                  value={formatTokens(
+                    displayOverview.totals.tokens.totalTokens
+                  )}
+                  detail={`${formatTokenDetail(displayOverview.totals.tokens)} · ${displayOverview.totals.requests} 次调用`}
+                />
+                <StatCard
+                  label="模型调用"
+                  value={String(displayOverview.totals.requests)}
+                  detail={`统计范围 ${formatRangeLabel(displayOverview.range)}`}
+                />
+                <StatCard
+                  label="估算费用"
+                  value={formatEstimatedUsd(
+                    displayOverview.totals.estimatedCostMicrousd,
+                    displayOverview.totals.unpricedTokens +
+                      displayOverview.totals.partialTokens +
+                      displayOverview.totals.unattributedTokens +
+                      displayOverview.totals.subscriptionTokens
+                  )}
+                  detail="官方金额为参考估算，不代表套餐实际账单"
+                />
+                <StatCard
+                  label="需处理 Token"
+                  value={formatTokens(attentionTokens)}
+                  detail="未配置价格、数据不完整或未归属"
+                />
+              </div>
+              <div className="flex flex-col gap-2">
+                <div className="text-sm text-muted-foreground">每日趋势</div>
+                <UsageTrendChart
+                  range={displayOverview.range}
+                  refreshKey={refreshSignal.revision}
+                  points={displayOverview.trendPoints}
+                />
+              </div>
+              <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-muted-foreground">
+                <span className="inline-flex items-center gap-1.5">
+                  <HugeiconsIcon
+                    icon={Calendar01Icon}
+                    size={14}
+                    aria-hidden="true"
+                  />
+                  {formatRangeLabel(displayOverview.range)} · 上次刷新{" "}
+                  {formatDateTime(displayOverview.lastRefreshedAtMs)}
+                </span>
+                <span>
+                  {formatTimezone()} · 页面打开时自动刷新，之后每 30 秒扫描一次
+                </span>
+              </div>
+            </CardContent>
+          </Card>
 
-      {hasWarnings && (
-        <Alert variant={attentionTokens > 0 ? "default" : "destructive"}>
-          <HugeiconsIcon icon={Alert01Icon} />
-          <AlertTitle>部分用量需要处理</AlertTitle>
-          <AlertDescription>
-            <div className="flex flex-col gap-1.5">
-              {displayOverview.totals.unpricedTokens > 0 && (
-                <span>
-                  {formatTokens(displayOverview.totals.unpricedTokens)} Token
-                  没有可用价格；可在下方添加 USD 规则后重新计算。
-                </span>
-              )}
-              {displayOverview.totals.unattributedTokens > 0 && (
-                <span>
-                  {formatTokens(displayOverview.totals.unattributedTokens)}{" "}
-                  Token 无法确认对应来源；程序不会强行归到当前账号。
-                </span>
-              )}
-              {displayOverview.totals.partialTokens > 0 && (
-                <span>
-                  {formatTokens(displayOverview.totals.partialTokens)} Token
-                  的原始日志字段不完整，费用按保守规则处理。
-                </span>
-              )}
-              {pricingError && <span>价格规则读取失败：{pricingError}</span>}
-              {officialCatalogError && (
-                <span>官方价格同步失败：{officialCatalogError}</span>
-              )}
-              {displayOverview.warnings.length > 0 && (
-                <ul className="list-disc pl-5">
-                  {displayOverview.warnings
-                    .slice(0, 5)
-                    .map((warning, index) => (
-                      <li key={`${warning.path ?? "warning"}-${index}`}>
-                        {warning.message}
-                      </li>
+          {hasWarnings && (
+            <Alert variant={attentionTokens > 0 ? "default" : "destructive"}>
+              <HugeiconsIcon icon={Alert01Icon} />
+              <AlertTitle>部分用量需要处理</AlertTitle>
+              <AlertDescription>
+                <div className="flex flex-col gap-1.5">
+                  {displayOverview.totals.unpricedTokens > 0 && (
+                    <span>
+                      {formatTokens(displayOverview.totals.unpricedTokens)}{" "}
+                      Token 没有可用价格；可在下方添加 USD 规则后重新计算。
+                    </span>
+                  )}
+                  {displayOverview.totals.unattributedTokens > 0 && (
+                    <span>
+                      {formatTokens(displayOverview.totals.unattributedTokens)}{" "}
+                      Token 无法确认对应来源；程序不会强行归到当前账号。
+                    </span>
+                  )}
+                  {displayOverview.totals.partialTokens > 0 && (
+                    <span>
+                      {formatTokens(displayOverview.totals.partialTokens)} Token
+                      的原始日志字段不完整，费用按保守规则处理。
+                    </span>
+                  )}
+                  {pricingError && (
+                    <span>价格规则读取失败：{pricingError}</span>
+                  )}
+                  {officialCatalogError && (
+                    <span>官方价格同步失败：{officialCatalogError}</span>
+                  )}
+                  {displayOverview.warnings.length > 0 && (
+                    <ul className="list-disc pl-5">
+                      {displayOverview.warnings
+                        .slice(0, 5)
+                        .map((warning, index) => (
+                          <li key={`${warning.path ?? "warning"}-${index}`}>
+                            {warning.message}
+                          </li>
+                        ))}
+                    </ul>
+                  )}
+                </div>
+              </AlertDescription>
+            </Alert>
+          )}
+
+          <Card>
+            <CardHeader>
+              <CardTitle>模型与账号明细</CardTitle>
+              <CardDescription>
+                输入、缓存读取、缓存写入和输出分开统计；汇总维度在上方切换。
+              </CardDescription>
+            </CardHeader>
+            <CardContent>
+              {displayOverview.rows.length === 0 ? (
+                <Empty className="min-h-48 border">
+                  <EmptyHeader>
+                    <EmptyMedia variant="icon">
+                      <HugeiconsIcon icon={BookOpen01Icon} />
+                    </EmptyMedia>
+                    <EmptyTitle>这个时间范围还没有 Token 记录</EmptyTitle>
+                    <EmptyDescription>
+                      先在 Codex 中发起一次请求，再点击“刷新”；官方账号和 API
+                      服务都会记录在本机数据库中。
+                    </EmptyDescription>
+                  </EmptyHeader>
+                  <EmptyContent>
+                    <Button
+                      size="sm"
+                      onClick={() => void refresh()}
+                      disabled={refreshing}
+                    >
+                      {refreshing ? (
+                        <Spinner data-icon="inline-start" />
+                      ) : (
+                        <HugeiconsIcon
+                          icon={Refresh01Icon}
+                          data-icon="inline-start"
+                        />
+                      )}
+                      扫描本机日志
+                    </Button>
+                  </EmptyContent>
+                </Empty>
+              ) : (
+                <>
+                  <div className="hidden sm:block">
+                    <Table className="min-w-[44rem]">
+                      <TableHeader>
+                        <TableRow>
+                          <TableHead>
+                            {groupBy === "model"
+                              ? "模型 / 来源"
+                              : "账号 / 模型"}
+                          </TableHead>
+                          <TableHead className="px-2 text-right">
+                            调用
+                          </TableHead>
+                          <TableHead className="px-2 text-right">
+                            总输入
+                          </TableHead>
+                          <TableHead className="hidden px-2 text-right xl:table-cell">
+                            缓存读取
+                          </TableHead>
+                          <TableHead className="hidden px-2 text-right xl:table-cell">
+                            缓存写入
+                          </TableHead>
+                          <TableHead className="px-2 text-right">
+                            输出
+                          </TableHead>
+                          <TableHead className="px-2 text-right">
+                            总 Token
+                          </TableHead>
+                          <TableHead className="px-2 text-right">
+                            费用
+                          </TableHead>
+                          <TableHead className="px-2">状态</TableHead>
+                          <TableHead className="px-2 text-right">
+                            操作
+                          </TableHead>
+                        </TableRow>
+                      </TableHeader>
+                      <TableBody>
+                        {displayOverview.rows.map((row) => (
+                          <UsageTableRow
+                            key={row.key}
+                            row={row}
+                            onSelect={setSelectedRow}
+                            onOpenNewRule={openNewRule}
+                          />
+                        ))}
+                      </TableBody>
+                    </Table>
+                  </div>
+                  <div className="flex flex-col gap-2 sm:hidden">
+                    {displayOverview.rows.map((row) => (
+                      <UsageRowCard
+                        key={row.key}
+                        row={row}
+                        onSelect={setSelectedRow}
+                      />
                     ))}
-                </ul>
+                  </div>
+                </>
               )}
-            </div>
-          </AlertDescription>
-        </Alert>
-      )}
+            </CardContent>
+          </Card>
+        </TabsContent>
+        <TabsContent value="pricing" className="flex flex-col gap-8">
+          <Card>
+            <CardHeader className="gap-3 sm:flex-row sm:items-center sm:justify-between">
+              <div>
+                <CardTitle>OpenAI 官方实时价格</CardTitle>
+                <CardDescription>
+                  价格从官方 Markdown 运行时同步，不写死模型；API
+                  服务价格规则完全独立。
+                </CardDescription>
+              </div>
+              <Button
+                size="sm"
+                variant="outline"
+                className="min-w-28"
+                disabled={officialCatalogLoading}
+                onClick={() => void loadOfficialCatalog(true)}
+              >
+                {officialCatalogLoading ? (
+                  <Spinner data-icon="inline-start" />
+                ) : (
+                  <HugeiconsIcon
+                    icon={Refresh01Icon}
+                    data-icon="inline-start"
+                  />
+                )}
+                {officialCatalogLoading ? "正在同步…" : "立即同步"}
+              </Button>
+            </CardHeader>
+            <CardContent className="flex flex-wrap items-center gap-3 text-sm">
+              <Badge
+                variant={
+                  officialCatalog?.status === "cached" ? "secondary" : "outline"
+                }
+              >
+                {officialCatalog?.status === "cached" ? "已缓存" : "等待同步"}
+              </Badge>
+              <span className="text-muted-foreground">
+                {officialCatalog?.modelCount ?? 0} 个官方模型
+              </span>
+              {officialCatalog?.fetchedAtMs && (
+                <span className="text-muted-foreground">
+                  最近同步：{formatDateTime(officialCatalog.fetchedAtMs)}
+                </span>
+              )}
+              <Button
+                variant="link"
+                size="sm"
+                className="h-auto px-0"
+                onClick={() => setPricingDialogOpen(true)}
+              >
+                查看官方价格
+              </Button>
+            </CardContent>
+          </Card>
 
-      <Card>
-        <CardHeader>
-          <CardTitle>模型与账号明细</CardTitle>
-          <CardDescription>
-            输入、缓存读取、缓存写入和输出分开统计；点击下方切换汇总维度。
-          </CardDescription>
-          <CardAction>
-            <div
-              className="flex items-center gap-1 rounded-lg border border-border p-1"
-              role="group"
-              aria-label="用量汇总维度"
-            >
-              <Button
-                size="sm"
-                variant={groupBy === "model" ? "secondary" : "ghost"}
-                aria-pressed={groupBy === "model"}
-                onClick={() => setGroupBy("model")}
-              >
-                按模型
-              </Button>
-              <Button
-                size="sm"
-                variant={groupBy === "account" ? "secondary" : "ghost"}
-                aria-pressed={groupBy === "account"}
-                onClick={() => setGroupBy("account")}
-              >
-                按账号
-              </Button>
-            </div>
-          </CardAction>
-        </CardHeader>
-        <CardContent>
-          {displayOverview.rows.length === 0 ? (
-            <Empty className="min-h-48 border">
-              <EmptyHeader>
-                <EmptyMedia variant="icon">
-                  <HugeiconsIcon icon={BookOpen01Icon} />
-                </EmptyMedia>
-                <EmptyTitle>这个时间范围还没有 Token 记录</EmptyTitle>
-                <EmptyDescription>
-                  先在 Codex
-                  中发起一次请求，再点击“刷新”；官方账号和中转站账号都会记录在本机数据库中。
-                </EmptyDescription>
-              </EmptyHeader>
-              <EmptyContent>
-                <Button
-                  size="sm"
-                  onClick={() => void refresh()}
-                  disabled={refreshing}
-                >
-                  {refreshing ? (
-                    <Spinner data-icon="inline-start" />
-                  ) : (
+          <Card>
+            <CardHeader>
+              <CardTitle>API 服务价格</CardTitle>
+              <CardDescription>
+                官方 OpenAI 自动使用内置参考价；API
+                服务只需设置服务和模型的输入、输出价格。
+              </CardDescription>
+              <CardAction>
+                <div className="flex flex-wrap gap-2">
+                  <Button size="sm" onClick={() => void openNewRule()}>
                     <HugeiconsIcon
-                      icon={Refresh01Icon}
+                      icon={Settings02Icon}
                       data-icon="inline-start"
                     />
-                  )}
-                  扫描本机日志
-                </Button>
-              </EmptyContent>
-            </Empty>
-          ) : (
-            <>
-              <div className="hidden sm:block">
-                <Table>
-                  <TableHeader>
-                    <TableRow>
-                      <TableHead>
-                        {groupBy === "model" ? "模型 / 来源" : "账号 / 模型"}
-                      </TableHead>
-                      <TableHead className="text-right">调用</TableHead>
-                      <TableHead className="text-right">总输入</TableHead>
-                      <TableHead className="text-right">缓存读取</TableHead>
-                      <TableHead className="text-right">缓存写入</TableHead>
-                      <TableHead className="text-right">输出</TableHead>
-                      <TableHead className="text-right">总 Token</TableHead>
-                      <TableHead className="text-right">费用</TableHead>
-                      <TableHead>状态</TableHead>
-                      <TableHead className="text-right">操作</TableHead>
-                    </TableRow>
-                  </TableHeader>
-                  <TableBody>
-                    {displayOverview.rows.map((row) => (
-                      <TableRow
-                        key={row.key}
-                        className="cursor-pointer"
-                        role="button"
-                        tabIndex={0}
-                        aria-label={`查看 ${row.model} 的用量详情`}
-                        onClick={() => setSelectedRow(row)}
-                        onKeyDown={(event) => {
-                          if (event.key === "Enter" || event.key === " ") {
-                            event.preventDefault()
-                            setSelectedRow(row)
-                          }
-                        }}
-                      >
-                        <TableCell>
-                          <div
-                            className="max-w-56 truncate font-medium"
-                            title={row.model}
-                          >
-                            {row.model}
-                          </div>
-                          <div className="mt-1 flex max-w-56 items-center gap-1.5">
-                            <Badge
-                              variant={
-                                row.sourceKind === "official"
-                                  ? "secondary"
-                                  : row.sourceKind === "provider"
-                                    ? "outline"
-                                    : "destructive"
-                              }
-                            >
-                              {sourceLabel(row)}
-                            </Badge>
-                            <span
-                              className="truncate text-xs text-muted-foreground"
-                              title={row.sourceName}
-                            >
-                              {row.sourceName}
-                            </span>
-                          </div>
-                        </TableCell>
-                        <TableCell className="text-right tabular-nums">
-                          {row.requests}
-                        </TableCell>
-                        <TableCell className="text-right tabular-nums">
-                          {formatTokens(row.tokens.inputTokens)}
-                        </TableCell>
-                        <TableCell className="text-right tabular-nums">
-                          {formatTokens(row.tokens.cachedInputTokens)}
-                        </TableCell>
-                        <TableCell className="text-right tabular-nums">
-                          {formatTokens(row.tokens.cacheWriteInputTokens)}
-                        </TableCell>
-                        <TableCell className="text-right tabular-nums">
-                          {formatTokens(row.tokens.outputTokens)}
-                        </TableCell>
-                        <TableCell className="text-right font-medium tabular-nums">
-                          {formatTokens(row.tokens.totalTokens)}
-                        </TableCell>
-                        <TableCell className="text-right font-medium tabular-nums">
-                          {formatRowCost(
-                            row.costStatus,
-                            row.estimatedCostMicrousd
-                          )}
-                        </TableCell>
-                        <TableCell>
-                          <Badge variant={statusVariant(row.costStatus)}>
-                            {displayCostStatus(row)}
-                          </Badge>
-                        </TableCell>
-                        <TableCell className="text-right">
-                          {row.sourceKind === "provider" &&
-                          row.costStatus === "unpriced" ? (
-                            <Button
-                              size="sm"
-                              variant="outline"
-                              onClick={(event) => {
-                                event.stopPropagation()
-                                void openNewRule(row.model, row.providerId)
-                              }}
-                            >
-                              设置价格
-                            </Button>
-                          ) : (
-                            <span className="text-xs text-muted-foreground">
-                              查看
-                            </span>
-                          )}
-                        </TableCell>
-                      </TableRow>
-                    ))}
-                  </TableBody>
-                </Table>
-              </div>
-              <div className="flex flex-col gap-2 sm:hidden">
-                {displayOverview.rows.map((row) => (
-                  <UsageRowCard
-                    key={row.key}
-                    row={row}
-                    onClick={() => setSelectedRow(row)}
-                  />
-                ))}
-              </div>
-            </>
-          )}
-        </CardContent>
-      </Card>
-
-      <Card>
-        <CardHeader>
-          <CardTitle>中转站价格</CardTitle>
-          <CardDescription>
-            官方 OpenAI
-            自动使用内置参考价；中转站只需设置服务和模型的输入、输出价格。
-          </CardDescription>
-          <CardAction>
-            <div className="flex flex-wrap gap-2">
-              <Button size="sm" onClick={() => void openNewRule()}>
-                <HugeiconsIcon icon={Settings02Icon} data-icon="inline-start" />
-                添加中转站价格
-              </Button>
-            </div>
-          </CardAction>
-        </CardHeader>
-        <CardContent>
-          <div className="mb-4 flex flex-col gap-1 rounded-lg border border-emerald-200 bg-emerald-50/60 p-3 text-sm dark:border-emerald-900 dark:bg-emerald-950/30">
-            <div className="flex flex-wrap items-center gap-2">
-              <span className="font-medium">OpenAI 官方实时价格</span>
-              <Badge variant="outline">只读</Badge>
-              <Badge variant="secondary">自动启用</Badge>
-            </div>
-            <p className="text-xs leading-relaxed text-muted-foreground">
-              官方 OpenAI / Cookie 账号无需单独添加规则；金额按官方 API
-              价格换算， 仅作为参考估算，不代表套餐实际账单。
-            </p>
-          </div>
-          {relayRules.length === 0 ? (
-            <Empty className="min-h-32 border">
-              <EmptyHeader>
-                <EmptyMedia variant="icon">
-                  <HugeiconsIcon icon={Dollar01Icon} />
-                </EmptyMedia>
-                <EmptyTitle>还没有中转站价格</EmptyTitle>
-                <EmptyDescription>
-                  官方 OpenAI 账号自动使用内置参考价；中转站要显示费用，
-                  请为模型配置价格。
-                </EmptyDescription>
-              </EmptyHeader>
-              <EmptyContent>
-                <Button
-                  size="sm"
-                  variant="outline"
-                  onClick={() => void openNewRule()}
-                >
-                  添加第一条中转站价格
-                </Button>
-              </EmptyContent>
-            </Empty>
-          ) : (
-            <div className="flex flex-col divide-y divide-border rounded-lg border">
-              {relayRules.map((rule) => (
-                <div
-                  key={rule.id}
-                  className="flex flex-wrap items-center justify-between gap-3 p-3"
-                >
-                  <div className="min-w-0">
-                    <div className="flex flex-wrap items-center gap-2">
-                      <span className="font-medium">{rule.modelPattern}</span>
-                      <Badge variant="outline">{scopeLabel(rule)}</Badge>
-                      <Badge variant="secondary">
-                        {billingLabel(rule.billingMode)}
-                      </Badge>
-                    </div>
-                    <p className="mt-1 text-xs text-muted-foreground">
-                      {priceSummary(rule)}
-                    </p>
-                  </div>
-                  <div className="flex shrink-0 items-center gap-2">
+                    添加价格规则
+                  </Button>
+                </div>
+              </CardAction>
+            </CardHeader>
+            <CardContent>
+              <Alert className="mb-4">
+                <HugeiconsIcon icon={SecurityCheckIcon} aria-hidden="true" />
+                <AlertTitle className="flex flex-wrap items-center gap-2">
+                  OpenAI 官方实时价格
+                  <Badge variant="outline">只读</Badge>
+                  <Badge variant="secondary">自动启用</Badge>
+                </AlertTitle>
+                <AlertDescription>
+                  官方 OpenAI / Cookie 账号无需单独添加规则；金额按官方 API
+                  价格换算，仅作为参考估算，不代表套餐实际账单。
+                </AlertDescription>
+              </Alert>
+              {relayRules.length === 0 ? (
+                <Empty className="min-h-32 border">
+                  <EmptyHeader>
+                    <EmptyMedia variant="icon">
+                      <HugeiconsIcon icon={Dollar01Icon} />
+                    </EmptyMedia>
+                    <EmptyTitle>还没有价格规则</EmptyTitle>
+                    <EmptyDescription>
+                      官方 OpenAI 账号自动使用内置参考价；API 服务要显示费用，
+                      请为模型配置价格。
+                    </EmptyDescription>
+                  </EmptyHeader>
+                  <EmptyContent>
                     <Button
                       size="sm"
                       variant="outline"
-                      onClick={() => void openEditRule(rule)}
+                      onClick={() => void openNewRule()}
                     >
-                      编辑
+                      添加第一条价格规则
                     </Button>
-                    <Button
-                      size="sm"
-                      variant="ghost"
-                      disabled={pricingLoading}
-                      onClick={() => setPendingDelete(rule)}
+                  </EmptyContent>
+                </Empty>
+              ) : (
+                <ItemGroup className="gap-3">
+                  {relayRules.map((rule) => (
+                    <Item
+                      key={rule.id}
+                      variant="outline"
+                      className="flex-wrap items-center justify-between p-4"
                     >
-                      停用
-                    </Button>
-                  </div>
-                </div>
-              ))}
-            </div>
-          )}
-        </CardContent>
-      </Card>
+                      <ItemContent className="min-w-0">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <ItemTitle>{rule.modelPattern}</ItemTitle>
+                          <Badge variant="outline">{scopeLabel(rule)}</Badge>
+                          <Badge variant="secondary">
+                            {billingLabel(rule.billingMode)}
+                          </Badge>
+                        </div>
+                        <ItemDescription className="line-clamp-none text-xs">
+                          {priceSummary(rule)}
+                        </ItemDescription>
+                      </ItemContent>
+                      <ItemActions className="shrink-0">
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          onClick={() => void openEditRule(rule)}
+                        >
+                          编辑
+                        </Button>
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          disabled={pricingLoading}
+                          onClick={() => setPendingDelete(rule)}
+                        >
+                          停用
+                        </Button>
+                      </ItemActions>
+                    </Item>
+                  ))}
+                </ItemGroup>
+              )}
+            </CardContent>
+          </Card>
+        </TabsContent>
+      </Tabs>
 
       <PricingRuleDialog
         open={Boolean(pricingDraft)}
@@ -1125,6 +1101,15 @@ export default function UsagePage({ active }: PageProps) {
           setPricingFieldErrors({})
         }}
         onSave={() => void saveRule()}
+      />
+
+      <OfficialPricingDialog
+        open={pricingDialogOpen}
+        onOpenChange={setPricingDialogOpen}
+        catalog={officialCatalog}
+        loading={officialCatalogLoading}
+        error={officialCatalogError}
+        onRefresh={() => void loadOfficialCatalog(true)}
       />
 
       <UsageShareDialog
@@ -1150,7 +1135,7 @@ export default function UsagePage({ active }: PageProps) {
       >
         <SheetContent
           side="right"
-          className="w-full overflow-y-auto sm:max-w-lg"
+          className="overflow-y-auto data-[side=right]:w-full sm:max-w-lg"
         >
           {selectedRow && (
             <>
@@ -1203,12 +1188,16 @@ export default function UsagePage({ active }: PageProps) {
                     value={displayCostStatus(selectedRow)}
                   />
                 </div>
-                <div className="rounded-lg border bg-muted/30 p-3 text-sm">
-                  <p className="font-medium">费用说明</p>
-                  <p className="mt-1 leading-relaxed text-muted-foreground">
-                    {detailCostMessage(selectedRow)}
-                  </p>
-                </div>
+                <Card size="sm">
+                  <CardContent className="flex flex-col gap-1">
+                    <CardTitle className="text-sm font-medium">
+                      费用说明
+                    </CardTitle>
+                    <p className="text-sm leading-relaxed text-muted-foreground">
+                      {detailCostMessage(selectedRow)}
+                    </p>
+                  </CardContent>
+                </Card>
                 <div className="flex flex-col gap-2 text-sm">
                   <DetailLine
                     label="来源类型"
@@ -1260,7 +1249,7 @@ export default function UsagePage({ active }: PageProps) {
       >
         <AlertDialogContent>
           <AlertDialogHeader>
-            <AlertDialogTitle>停用这条中转站价格？</AlertDialogTitle>
+            <AlertDialogTitle>停用这条价格规则？</AlertDialogTitle>
             <AlertDialogDescription>
               停用后不会删除本机账本记录；后续新周期重算时，未匹配其他规则的数据将显示为“未配置价格”。
             </AlertDialogDescription>
@@ -1312,7 +1301,7 @@ function validatePricingDraft(
     return { message: "请填写模型匹配规则。", field: "model" }
   }
   if (!rule.providerId) {
-    return { message: "请选择中转站。", field: "provider" }
+    return { message: "请选择 API 服务。", field: "provider" }
   }
   const prices = [
     rule.inputUsdPerMillion,
@@ -1350,18 +1339,114 @@ async function ensureProviders(
   }
 }
 
-function UsageRowCard({
+// 表格行与移动端卡片是刷新时整表重建的重渲染热点；
+// 通过 memo 让行只在 row 引用变化（数据刷新）时重渲染，
+// 而不是在 refreshing / shareOpen / pricingLoading 等状态切换时全部重建。
+const UsageTableRow = memo(function UsageTableRow({
   row,
-  onClick,
+  onSelect,
+  onOpenNewRule,
 }: {
   row: UsageRow
-  onClick: () => void
+  onSelect: (row: UsageRow) => void
+  onOpenNewRule: (model: string, providerId?: string) => void
+}) {
+  return (
+    <TableRow
+      className="cursor-pointer"
+      role="button"
+      tabIndex={0}
+      aria-label={`查看 ${row.model} 的用量详情`}
+      onClick={() => onSelect(row)}
+      onKeyDown={(event) => {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault()
+          onSelect(row)
+        }
+      }}
+    >
+      <TableCell>
+        <div className="max-w-56 truncate font-medium" title={row.model}>
+          {row.model}
+        </div>
+        <div className="mt-1 flex max-w-56 items-center gap-1.5">
+          <Badge
+            variant={
+              row.sourceKind === "official"
+                ? "secondary"
+                : row.sourceKind === "provider"
+                  ? "outline"
+                  : "destructive"
+            }
+          >
+            {sourceLabel(row)}
+          </Badge>
+          <span
+            className="truncate text-xs text-muted-foreground"
+            title={row.sourceName}
+          >
+            {row.sourceName}
+          </span>
+        </div>
+      </TableCell>
+      <TableCell className="px-2 text-right tabular-nums">
+        {row.requests}
+      </TableCell>
+      <TableCell className="px-2 text-right tabular-nums">
+        {formatTokens(row.tokens.inputTokens)}
+      </TableCell>
+      <TableCell className="hidden px-2 text-right tabular-nums xl:table-cell">
+        {formatTokens(row.tokens.cachedInputTokens)}
+      </TableCell>
+      <TableCell className="hidden px-2 text-right tabular-nums xl:table-cell">
+        {formatTokens(row.tokens.cacheWriteInputTokens)}
+      </TableCell>
+      <TableCell className="px-2 text-right tabular-nums">
+        {formatTokens(row.tokens.outputTokens)}
+      </TableCell>
+      <TableCell className="px-2 text-right font-medium tabular-nums">
+        {formatTokens(row.tokens.totalTokens)}
+      </TableCell>
+      <TableCell className="px-2 text-right font-medium tabular-nums">
+        {formatRowCost(row.costStatus, row.estimatedCostMicrousd)}
+      </TableCell>
+      <TableCell className="px-2">
+        <Badge variant={statusVariant(row.costStatus)}>
+          {displayCostStatus(row)}
+        </Badge>
+      </TableCell>
+      <TableCell className="px-2 text-right">
+        {row.sourceKind === "provider" && row.costStatus === "unpriced" ? (
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={(event) => {
+              event.stopPropagation()
+              void onOpenNewRule(row.model, row.providerId)
+            }}
+          >
+            设置价格
+          </Button>
+        ) : (
+          <span className="text-xs text-muted-foreground">查看</span>
+        )}
+      </TableCell>
+    </TableRow>
+  )
+})
+
+const UsageRowCard = memo(function UsageRowCard({
+  row,
+  onSelect,
+}: {
+  row: UsageRow
+  onSelect: (row: UsageRow) => void
 }) {
   return (
     <button
       type="button"
       className="flex w-full flex-col gap-3 rounded-xl border bg-card p-3 text-left transition-colors hover:bg-muted/50 focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
-      onClick={onClick}
+      onClick={() => onSelect(row)}
     >
       <div className="flex items-start justify-between gap-3">
         <div className="min-w-0">
@@ -1403,14 +1488,42 @@ function UsageRowCard({
       </div>
     </button>
   )
+})
+
+function StatCard({
+  label,
+  value,
+  detail,
+}: {
+  label: string
+  value: string
+  detail?: string
+}) {
+  return (
+    <Card>
+      <CardHeader>
+        <CardDescription>{label}</CardDescription>
+        <CardTitle className="text-2xl font-semibold tabular-nums">
+          {value}
+        </CardTitle>
+      </CardHeader>
+      {detail && (
+        <CardFooter className="text-sm text-muted-foreground">
+          {detail}
+        </CardFooter>
+      )}
+    </Card>
+  )
 }
 
 function DetailMetric({ label, value }: { label: string; value: string }) {
   return (
-    <div className="rounded-lg border bg-card p-3">
-      <p className="text-xs text-muted-foreground">{label}</p>
-      <p className="mt-1 font-medium tabular-nums">{value}</p>
-    </div>
+    <Card size="sm">
+      <CardContent className="flex flex-col gap-1">
+        <p className="text-xs text-muted-foreground">{label}</p>
+        <p className="font-medium tabular-nums">{value}</p>
+      </CardContent>
+    </Card>
   )
 }
 
@@ -1427,7 +1540,10 @@ function DetailLine({
     <div className="flex items-start justify-between gap-4 border-b pb-2 last:border-b-0 last:pb-0">
       <span className="shrink-0 text-muted-foreground">{label}</span>
       <span
-        className={`min-w-0 text-right break-all ${mono ? "font-mono text-xs" : ""}`}
+        className={cn(
+          "min-w-0 text-right break-all",
+          mono && "font-mono text-xs"
+        )}
       >
         {value}
       </span>
@@ -1437,7 +1553,7 @@ function DetailLine({
 
 function sourceLabel(row: UsageRow) {
   if (row.sourceKind === "official") return "官方 OpenAI"
-  if (row.sourceKind === "provider") return "中转站"
+  if (row.sourceKind === "provider") return "API 服务"
   return "未识别"
 }
 
@@ -1496,9 +1612,9 @@ function statusVariant(
 function scopeLabel(rule: PricingRule) {
   if (rule.scopeKind === "global_model") return "全局模型"
   if (rule.scopeKind === "provider_default")
-    return `中转站默认 · ${rule.providerId ?? "未知"}`
+    return `API 服务默认 · ${rule.providerId ?? "未知"}`
   if (rule.scopeKind === "provider_model")
-    return `中转站模型 · ${rule.providerId ?? "未知"}`
+    return `API 服务模型 · ${rule.providerId ?? "未知"}`
   return `账号模型 · ${rule.accountId ?? "未知"}`
 }
 
@@ -1517,4 +1633,22 @@ function priceSummary(rule: PricingRule) {
     `输出 ${rule.outputUsdPerMillion ?? "—"}`,
   ]
   return `${parts.join(" · ")} USD / 1M${rule.requestFeeUsd ? ` · 请求费 $${rule.requestFeeUsd}` : ""}`
+}
+
+function UsageLoading() {
+  return (
+    <div className="flex flex-col gap-6" role="status" aria-live="polite">
+      <div className="grid grid-cols-2 gap-4">
+        {Array.from({ length: 4 }).map((_, index) => (
+          <div key={index} className="flex flex-col gap-2">
+            <Skeleton className="h-4 w-24" />
+            <Skeleton className="h-8 w-16" />
+            <Skeleton className="h-3 w-32" />
+          </div>
+        ))}
+      </div>
+      <Skeleton className="h-40 w-full" />
+      <Skeleton className="h-64 w-full" />
+    </div>
+  )
 }

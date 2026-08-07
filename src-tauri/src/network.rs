@@ -1,5 +1,8 @@
 use reqwest::{Client, ClientBuilder, NoProxy, Proxy};
-use std::sync::Mutex;
+use std::{
+    sync::{Mutex, OnceLock},
+    time::{Duration, Instant},
+};
 
 const PROXY_ENV_NAMES: [&str; 8] = [
     "ALL_PROXY",
@@ -21,9 +24,33 @@ struct SystemProxy {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-struct ProxySnapshot {
+pub(crate) struct ProxySnapshot {
     environment: Vec<(String, Option<String>)>,
     platform: Option<SystemProxy>,
+}
+
+/// 系统代理快照的缓存时长。读取系统代理在 macOS 上要执行 `scutil` 子进程、
+/// 在 Windows 上要读注册表，频繁调用开销不小；代理设置短时间内不会变化，
+/// 缓存几秒即可兼顾正确性与开销。
+const PROXY_SNAPSHOT_CACHE_TTL: Duration = Duration::from_secs(3);
+
+static SNAPSHOT_CACHE: OnceLock<Mutex<Option<(Instant, ProxySnapshot)>>> = OnceLock::new();
+
+/// 带短 TTL 缓存的系统代理快照：短时间内重复调用不会重复执行子进程/
+/// 注册表探测，适合每请求调用的热路径（额度轮询、模型同步、转换代理转发）。
+fn cached_proxy_snapshot() -> ProxySnapshot {
+    let mut cache = SNAPSHOT_CACHE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .expect("网络客户端缓存锁已损坏");
+    if let Some((fetched_at, snapshot)) = cache.as_ref()
+        && fetched_at.elapsed() < PROXY_SNAPSHOT_CACHE_TTL
+    {
+        return snapshot.clone();
+    }
+    let snapshot = proxy_snapshot();
+    *cache = Some((Instant::now(), snapshot.clone()));
+    snapshot
 }
 
 #[derive(Default)]
@@ -41,11 +68,35 @@ impl ClientCache {
     where
         F: FnOnce(ClientBuilder) -> Result<Client, reqwest::Error>,
     {
-        self.current_for_snapshot(proxy_snapshot(), configure)
+        self.current_for_snapshot(cached_proxy_snapshot(), configure)
     }
 
     pub(crate) fn invalidate(&self) {
         self.cached.lock().expect("网络客户端缓存锁已损坏").take();
+        *SNAPSHOT_CACHE
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .expect("网络客户端缓存锁已损坏") = None;
+    }
+
+    /// 带短 TTL 缓存的系统代理快照（关联函数，供转换代理等热路径复用）。
+    pub(crate) fn cached_snapshot() -> ProxySnapshot {
+        cached_proxy_snapshot()
+    }
+
+    /// 按当前系统代理构建一个独立客户端（不参与本缓存）。
+    /// `timeout` 为 `None` 时不设置整体超时，适合长时间流式请求。
+    pub(crate) fn build_standalone(timeout: Option<Duration>) -> Result<Client, reqwest::Error> {
+        let builder = client_builder_for(&proxy_snapshot())?
+            .connect_timeout(Duration::from_secs(30))
+            .pool_max_idle_per_host(4)
+            .pool_idle_timeout(Duration::from_secs(90))
+            .tcp_keepalive(Duration::from_secs(60));
+        match timeout {
+            Some(timeout) => builder.timeout(timeout),
+            None => builder,
+        }
+        .build()
     }
 
     fn current_for_snapshot<F>(

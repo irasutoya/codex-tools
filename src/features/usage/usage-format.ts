@@ -1,5 +1,10 @@
 import { formatDateTime as formatSharedDateTime } from "@/lib/time"
-import type { CostStatus, TokenBreakdown, UsageRange } from "@/types"
+import type {
+  CostStatus,
+  TokenBreakdown,
+  UsageOverview,
+  UsageRange,
+} from "@/types"
 
 import { getLocalDateKey } from "@/lib/local-time"
 
@@ -132,4 +137,21 @@ export function formatRangeLabel(range: UsageRange) {
     day: "numeric",
   })
   return startLabel === endLabel ? startLabel : `${startLabel} – ${endLabel}`
+}
+
+/**
+ * 选择与当前查询范围匹配的概览数据。
+ * 返回 `stale: true` 表示旧数据与当前范围不匹配（页面应显示加载或错误态）。
+ */
+export function pickDisplayOverview(
+  overview: UsageOverview | undefined,
+  currentRange: UsageRange,
+  customRangeValid: boolean
+): { display?: UsageOverview; stale: boolean } {
+  if (!customRangeValid) return { display: overview, stale: false }
+  if (!overview) return { display: undefined, stale: false }
+  const matches =
+    overview.range.startAtMs === currentRange.startAtMs &&
+    overview.range.endAtMs === currentRange.endAtMs
+  return { display: overview, stale: !matches }
 }

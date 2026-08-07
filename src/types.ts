@@ -12,19 +12,17 @@ export type Provider = {
   timeoutSecs: number
   enabled: boolean
   active: boolean
-  activeAccountId?: string
-  accountCount: number
-}
-
-export type Account = {
-  id: string
-  providerId?: string
-  name: string
-  authKind: "api_key" | "official_oauth"
+  model?: string
+  /** 服务接入方式：直连 Responses API，或经本机转换代理接入 Chat Completions API */
+  apiType: "responses" | "chat"
+  /** 从服务 /models 接口读取的模型上下文窗口（token），写入模型目录时优先使用 */
+  modelContextWindows?: Record<string, number>
+  /** 服务 /models 接口返回的可用模型列表（保存服务时静默获取） */
+  availableModels?: string[]
+  /** models.dev（models.json）匹配的模型元数据（slug → 元数据） */
+  modelsDevMeta?: Record<string, ProviderModelsDevMeta>
   apiKey?: string
-  headers: Record<string, string>
-  active: boolean
-  email?: string
+  hasApiKey?: boolean
   createdAt: number
   updatedAt: number
 }
@@ -35,6 +33,7 @@ export type Dashboard = {
   activeKind: "none" | "provider" | "official"
   activeAccountId?: string
   activeAccount?: string
+  activeModel?: string
   activeQuota?: AccountQuota
   codexHome: string
   databaseCount: number
@@ -111,6 +110,23 @@ export type UsageOverview = {
   collectionStartedAtMs?: number
   collectionStartedVersion?: string
   warnings: Array<{ path?: string; message: string }>
+  /** 与 totals 同一趟查询产出的按日趋势点，避免对同一范围重复全量扫描。 */
+  trendPoints: UsageTrendPoint[]
+}
+
+export type UsageTrend = {
+  range: UsageRange
+  points: UsageTrendPoint[]
+}
+
+export type UsageTrendPoint = {
+  dayStartMs: number
+  tokens: TokenBreakdown
+  requests: number
+  estimatedCostMicrousd: number
+  unpricedTokens: number
+  partialTokens: number
+  unattributedTokens: number
 }
 
 export type OfficialPricingCatalog = {
@@ -122,6 +138,21 @@ export type OfficialPricingCatalog = {
   etag?: string
   modelCount: number
   models: string[]
+  rates: OfficialModelRate[]
+}
+
+export type OfficialModelRate = {
+  model: string
+  longContextThreshold?: number
+  short: TokenRates
+  long?: TokenRates
+}
+
+export type TokenRates = {
+  input?: number
+  cachedInput?: number
+  cacheWrite?: number
+  output?: number
 }
 
 export type UsageShareAccount = {
@@ -158,15 +189,6 @@ export type UsageShareData = {
   partialTokens: number
   requests: number
   accounts: UsageShareAccount[]
-}
-
-export type UsageRefreshResult = {
-  filesScanned: number
-  eventsAdded: number
-  eventsSkipped: number
-  partialLines: number
-  warnings: Array<{ path?: string; message: string }>
-  lastRefreshedAtMs: number
 }
 
 export type RepriceResult = {
@@ -306,7 +328,6 @@ export type OfficialAccountView = {
 
 export type ProviderOverview = {
   providers: Provider[]
-  accounts: Account[]
   officialAccounts: OfficialAccountView[]
 }
 
@@ -358,6 +379,36 @@ export type SettingsOverview = {
   canPreviewCustom: boolean
 }
 
+export type CodexAppSetting = {
+  /** 手动配置的 Codex 应用路径（.app 目录或可执行文件） */
+  configured?: string
+  /** 实际检测到的 Codex 应用路径 */
+  detected?: string
+}
+
+export type ProviderModelsDevMeta = {
+  name?: string
+  contextWindow?: number
+  description?: string
+}
+
+export type ModelUnlockStatus = {
+  appFound: boolean
+  appRunning: boolean
+  debugPort?: number
+  injected: boolean
+  modelCount: number
+  models: string[]
+  warning?: string
+}
+
+export type ModelUnlockResult = {
+  port: number
+  injected: boolean
+  modelCount: number
+  message: string
+}
+
 export const emptyProvider = (): Provider => ({
   id: "",
   name: "",
@@ -366,17 +417,10 @@ export const emptyProvider = (): Provider => ({
   timeoutSecs: 30,
   enabled: true,
   active: false,
-  accountCount: 0,
-})
-
-export const emptyAccount = (providerId: string): Account => ({
-  id: "",
-  providerId,
-  name: "默认密钥",
-  authKind: "api_key",
+  model: "",
+  apiType: "responses",
   apiKey: "",
-  headers: {},
-  active: false,
+  hasApiKey: false,
   createdAt: 0,
   updatedAt: 0,
 })

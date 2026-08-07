@@ -1,5 +1,6 @@
 use crate::models::*;
 use std::{
+    collections::BTreeMap,
     fs,
     io::Write,
     path::{Path, PathBuf},
@@ -8,7 +9,6 @@ use std::{
 
 const MAX_APP_DATA_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_SAVED_PROVIDERS: usize = 500;
-const MAX_ACCOUNTS_PER_PROVIDER: usize = 500;
 const MAX_SAVED_OPENAI_ACCOUNTS: usize = 500;
 const MAX_EMAIL_CHARS: usize = 320;
 
@@ -41,7 +41,12 @@ impl Store {
                     "应用数据文件超过 16 MB，程序已停止读取以避免占用过多内存。请备份并检查 app.yaml"
                 );
             }
-            serde_yaml::from_str::<AppConfig>(&text).map_err(|error| {
+            // 旧版 app.yaml 的 providers 是 `profile + accounts[]` 结构，API Key
+            // 存在 accounts 里；新版是扁平 ProviderProfile。升级时一次性迁移，
+            // 把 active account 的 Key/请求头并入 ProviderProfile，避免首次保存
+            // 重写文件时静默丢弃已保存的 API Key。
+            let migrated = migrate_legacy_app_config(&text)?;
+            serde_yaml::from_str::<AppConfig>(&migrated).map_err(|error| {
                 anyhow::anyhow!("应用数据文件损坏，无法读取已保存的账号和服务：{error}")
             })?
         } else {
@@ -85,15 +90,45 @@ impl Store {
         Ok(self.read_state()?.codex.home.clone())
     }
 
+    pub fn codex_app_setting(&self) -> Result<Option<String>, AppError> {
+        Ok(self.read_state()?.codex.app_path.clone())
+    }
+
+    pub fn save_codex_app_path(&self, path: Option<String>) -> Result<(), AppError> {
+        self.update(|state| {
+            state.codex.app_path = path
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty());
+            Ok(())
+        })
+    }
+
+    pub fn last_debug_port(&self) -> Result<Option<u16>, AppError> {
+        Ok(self.read_state()?.codex.last_debug_port)
+    }
+
+    pub fn save_last_debug_port(&self, port: u16) -> Result<(), AppError> {
+        self.update(|state| {
+            state.codex.last_debug_port = Some(port);
+            Ok(())
+        })
+    }
+
+    pub fn last_managed_model(&self) -> Result<Option<String>, AppError> {
+        Ok(self.read_state()?.codex.last_managed_model.clone())
+    }
+
+    pub fn save_last_managed_model(&self, model: Option<String>) -> Result<(), AppError> {
+        self.update(|state| {
+            state.codex.last_managed_model = model;
+            Ok(())
+        })
+    }
+
     pub fn is_active_provider(&self, id: &str) -> Result<bool, AppError> {
         let state = self.read_state()?;
         Ok(matches!(state.active.kind, ActiveKind::Provider)
             && state.active.provider_id.as_deref() == Some(id))
-    }
-
-    pub fn is_active_account(&self, id: &str) -> Result<bool, AppError> {
-        let state = self.read_state()?;
-        Ok(state.active.account_id.as_deref() == Some(id))
     }
 
     pub fn update<T>(
@@ -123,14 +158,13 @@ impl Store {
 
     pub fn provider(&self, id: &str) -> Result<ProviderProfile, AppError> {
         let state = self.read_state()?;
-        let stored = state
+        let mut profile = state
             .providers
             .iter()
-            .find(|provider| provider.profile.id == id)
+            .find(|provider| provider.id == id)
+            .cloned()
             .ok_or_else(|| AppError::InvalidConfig("第三方 API 服务不存在，请刷新页面。".into()))?;
-        let mut profile = stored.profile.clone();
         mark_active_profile(&state, &mut profile);
-        profile.account_count = stored.accounts.len() as u64;
         Ok(profile)
     }
 
@@ -141,21 +175,46 @@ impl Store {
         if provider.id.trim().is_empty() {
             provider.id = uuid::Uuid::new_v4().to_string();
         }
-        provider.normalize_and_validate()?;
-        let existing_headers = {
+        let existing = {
             let state = self.read_state()?;
             state
                 .providers
                 .iter()
-                .find(|value| value.profile.id == provider.id)
-                .map(|value| value.profile.headers.clone())
+                .find(|value| value.id == provider.id)
+                .cloned()
         };
-        let is_new = existing_headers.is_none();
-        if let Some(existing_headers) = existing_headers {
-            preserve_redacted_headers(&mut provider.headers, &existing_headers);
+        let is_new = existing.is_none();
+        if let Some(existing) = existing.as_ref() {
+            preserve_redacted_headers(&mut provider.headers, &existing.headers);
+            // 前端返回的是脱敏后的 api_key（None），保留已保存的 Key。
+            if provider
+                .api_key
+                .as_deref()
+                .is_none_or(|value| value.trim().is_empty())
+            {
+                provider.api_key = existing.api_key.clone();
+            }
+            // 前端可能不回传模型上下文窗口，保留已保存的数据。
+            if provider.model_context_windows.is_empty() {
+                provider.model_context_windows = existing.model_context_windows.clone();
+            }
+            // 前端不回传可用模型列表，保留已保存的数据（保存时静默抓取）。
+            if provider.available_models.is_empty() {
+                provider.available_models = existing.available_models.clone();
+            }
+            // 前端不回传 models.dev 元数据，保留已保存的数据。
+            if provider.models_dev_meta.is_empty() {
+                provider.models_dev_meta = existing.models_dev_meta.clone();
+            }
         }
+        provider.normalize_and_validate()?;
+        let now = chrono::Utc::now().timestamp();
+        if provider.created_at == 0 {
+            provider.created_at = existing.map_or(now, |value| value.created_at);
+        }
+        provider.updated_at = now;
         provider.active = false;
-        provider.account_count = 0;
+        provider.has_api_key = provider.api_key.is_some();
         let saved = provider.clone();
         self.update(|state| {
             if matches!(state.active.kind, ActiveKind::Provider)
@@ -169,25 +228,16 @@ impl Store {
             if let Some(existing) = state
                 .providers
                 .iter_mut()
-                .find(|value| value.profile.id == provider.id)
+                .find(|value| value.id == provider.id)
             {
-                let accounts = std::mem::take(&mut existing.accounts);
-                let active_account_id = existing.profile.active_account_id.clone();
-                *existing = StoredProvider {
-                    profile: provider.clone(),
-                    accounts,
-                };
-                existing.profile.active_account_id = active_account_id;
+                *existing = provider.clone();
             } else {
                 if is_new && state.providers.len() >= MAX_SAVED_PROVIDERS {
                     return Err(AppError::InvalidConfig(
                         "最多可保存 500 个第三方 API 服务，请先删除不再使用的服务。".into(),
                     ));
                 }
-                state.providers.push(StoredProvider {
-                    profile: provider.clone(),
-                    accounts: vec![],
-                });
+                state.providers.push(provider.clone());
             }
             Ok(())
         })?;
@@ -202,7 +252,7 @@ impl Store {
                 ));
             }
             let before = state.providers.len();
-            state.providers.retain(|value| value.profile.id != id);
+            state.providers.retain(|value| value.id != id);
             if before == state.providers.len() {
                 return Err(AppError::InvalidConfig(
                     "第三方 API 服务不存在，可能已被删除。".into(),
@@ -212,18 +262,29 @@ impl Store {
         })
     }
 
-    pub fn account(&self, id: &str) -> Result<ProviderAccount, AppError> {
-        let state = self.read_state()?;
-        let mut account = state
-            .providers
-            .iter()
-            .flat_map(|provider| &provider.accounts)
-            .find(|account| account.id == id)
-            .cloned()
-            .ok_or_else(|| AppError::InvalidConfig("API Key 不存在，可能已被删除。".into()))?;
-        account.active = matches!(state.active.kind, ActiveKind::Provider)
-            && state.active.account_id.as_deref() == Some(account.id.as_str());
-        Ok(account)
+    /// 保存从服务 `/models` 接口读取到的模型上下文窗口，供模型目录使用。
+    /// 保存服务 `/models` 接口返回的可用模型、上下文窗口，以及 models.dev
+    /// 精确匹配的模型元数据，供模型目录使用。
+    pub fn update_provider_models(
+        &self,
+        id: &str,
+        models: Vec<String>,
+        windows: BTreeMap<String, u64>,
+        meta: BTreeMap<String, ProviderModelsDevMeta>,
+    ) -> Result<(), AppError> {
+        self.update(|state| {
+            let provider = state
+                .providers
+                .iter_mut()
+                .find(|value| value.id == id)
+                .ok_or_else(|| {
+                    AppError::InvalidConfig("第三方 API 服务不存在，请刷新页面。".into())
+                })?;
+            provider.available_models = models;
+            provider.model_context_windows = windows;
+            provider.models_dev_meta = meta;
+            Ok(())
+        })
     }
 
     pub fn provider_overview(&self) -> Result<ProviderOverview, AppError> {
@@ -231,22 +292,10 @@ impl Store {
         let providers = state
             .providers
             .iter()
-            .map(|stored| {
-                let mut profile = stored.profile.clone();
-                mark_active_profile(&state, &mut profile);
-                profile.account_count = stored.accounts.len() as u64;
-                profile.redacted()
-            })
-            .collect();
-        let accounts = state
-            .providers
-            .iter()
-            .flat_map(|provider| provider.accounts.iter())
             .cloned()
-            .map(|mut account| {
-                account.active = matches!(state.active.kind, ActiveKind::Provider)
-                    && state.active.account_id.as_deref() == Some(account.id.as_str());
-                account.redacted()
+            .map(|mut profile| {
+                mark_active_profile(&state, &mut profile);
+                profile.redacted()
             })
             .collect();
         let official_accounts = state
@@ -260,142 +309,37 @@ impl Store {
             .collect();
         Ok(ProviderOverview {
             providers,
-            accounts,
             official_accounts,
         })
     }
 
-    pub fn save_account(&self, mut account: ProviderAccount) -> Result<ProviderAccount, AppError> {
-        if account.id.trim().is_empty() {
-            account.id = uuid::Uuid::new_v4().to_string();
-        }
-        let existing = {
-            let state = self.read_state()?;
-            state.providers.iter().find_map(|provider| {
-                provider
-                    .accounts
-                    .iter()
-                    .find(|value| value.id == account.id)
-                    .cloned()
-                    .map(|account| (provider.profile.id.clone(), account))
-            })
-        };
-        let is_new = existing.is_none();
-        if let Some((existing_provider_id, existing)) = existing {
-            if account.provider_id.as_deref() != Some(existing_provider_id.as_str()) {
-                return Err(AppError::InvalidConfig(
-                    "不能把已保存的 API Key 移到其他服务，请新建一个 API Key。".into(),
-                ));
-            }
-            if account
-                .api_key
-                .as_deref()
-                .is_none_or(|value| value.trim().is_empty())
-            {
-                account.api_key = existing.api_key;
-            }
-            preserve_redacted_headers(&mut account.headers, &existing.headers);
-        }
-        account.normalize_and_validate()?;
-        let now = chrono::Utc::now().timestamp();
-        if account.created_at == 0 {
-            account.created_at = now;
-        }
-        account.updated_at = now;
-        account.active = false;
-        let provider_id = account
-            .provider_id
-            .clone()
-            .ok_or_else(|| AppError::InvalidConfig("请选择 API Key 所属的第三方服务。".into()))?;
-        let saved = account.clone();
-        self.update(|state| {
-            if let Some(owner) = state
-                .providers
-                .iter()
-                .find(|provider| provider.accounts.iter().any(|value| value.id == account.id))
-                && owner.profile.id != provider_id
-            {
-                return Err(AppError::InvalidConfig(
-                    "不能把已保存的 API Key 移到其他服务，请新建一个 API Key。".into(),
-                ));
-            }
-            let provider = state
-                .providers
-                .iter_mut()
-                .find(|value| value.profile.id == provider_id)
-                .ok_or_else(|| {
-                    AppError::InvalidConfig("第三方 API 服务不存在，请刷新页面。".into())
-                })?;
-            if let Some(existing) = provider
-                .accounts
-                .iter_mut()
-                .find(|value| value.id == account.id)
-            {
-                *existing = account.clone();
-            } else {
-                if is_new && provider.accounts.len() >= MAX_ACCOUNTS_PER_PROVIDER {
-                    return Err(AppError::InvalidConfig(
-                        "每个第三方 API 服务最多可保存 500 个 API Key，请先删除不再使用的密钥。"
-                            .into(),
-                    ));
-                }
-                provider.accounts.push(account.clone());
-            }
-            Ok(())
-        })?;
-        Ok(saved)
-    }
-
-    pub fn delete_account(&self, id: &str) -> Result<(), AppError> {
-        self.update(|state| {
-            if state.active.account_id.as_deref() == Some(id) {
-                return Err(AppError::InvalidConfig(
-                    "正在使用这个 API Key，切换后才能删除。".into(),
-                ));
-            }
-            let mut found = false;
-            for provider in &mut state.providers {
-                let before = provider.accounts.len();
-                provider.accounts.retain(|value| value.id != id);
-                found |= before != provider.accounts.len();
-            }
-            if !found {
-                return Err(AppError::InvalidConfig(
-                    "API Key 不存在，可能已被删除。".into(),
-                ));
-            }
-            Ok(())
-        })
-    }
-
-    pub fn activate(&self, provider_id: &str, account_id: &str) -> Result<(), AppError> {
+    pub fn activate(&self, provider_id: &str) -> Result<(), AppError> {
         self.update(|state| {
             let provider = state
                 .providers
                 .iter_mut()
-                .find(|value| value.profile.id == provider_id)
+                .find(|value| value.id == provider_id)
                 .ok_or_else(|| {
                     AppError::InvalidConfig("第三方 API 服务不存在，请刷新页面。".into())
                 })?;
-            if !provider.profile.enabled {
+            if !provider.enabled {
                 return Err(AppError::InvalidConfig(
                     "此服务已停用，请先编辑并启用它。".into(),
                 ));
             }
-            if !provider
-                .accounts
-                .iter()
-                .any(|account| account.id == account_id)
+            if provider
+                .api_key
+                .as_deref()
+                .is_none_or(|key| key.trim().is_empty())
             {
                 return Err(AppError::InvalidConfig(
-                    "所选 API Key 不属于这个服务，请刷新页面。".into(),
+                    "此服务还没有 API Key，请先编辑并填写。".into(),
                 ));
             }
-            provider.profile.active_account_id = Some(account_id.to_owned());
             state.active = ActiveState {
                 kind: ActiveKind::Provider,
                 provider_id: Some(provider_id.to_owned()),
-                account_id: Some(account_id.to_owned()),
+                account_id: None,
             };
             Ok(())
         })
@@ -633,20 +577,25 @@ pub fn data_root() -> PathBuf {
     }
     #[cfg(not(target_os = "macos"))]
     {
-        std::env::current_exe()
+        // 优先用户数据目录（Windows 的 %APPDATA% / Linux 的 ~/.local/share），
+        // 避免应用安装在 Program Files 等只读位置时无法写入；
+        // 旧版本把数据放在可执行文件旁的 data/ 目录，仍存在时继续使用（兼容迁移）。
+        let preferred = dirs::data_dir().map(|dir| dir.join("io.github.irasutoya.codex-tools"));
+        let legacy = std::env::current_exe()
             .ok()
             .and_then(|path| path.parent().map(Path::to_path_buf))
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("data")
+            .map(|dir| dir.join("data"));
+        match (preferred, legacy) {
+            (Some(preferred), Some(legacy)) if !preferred.exists() && legacy.exists() => legacy,
+            (Some(preferred), _) => preferred,
+            (None, legacy) => legacy.unwrap_or_else(|| PathBuf::from(".")),
+        }
     }
 }
 
 fn mark_active_profile(state: &AppConfig, profile: &mut ProviderProfile) {
     profile.active = matches!(state.active.kind, ActiveKind::Provider)
         && state.active.provider_id.as_deref() == Some(profile.id.as_str());
-    if profile.active {
-        profile.active_account_id = state.active.account_id.clone();
-    }
 }
 
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
@@ -782,6 +731,67 @@ fn replace_file(source: &Path, target: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// 旧版 app.yaml 迁移：providers 条目如果是 `profile + accounts[]` 结构，
+/// 把 active account（无 active 时取第一个）的 API Key 与请求头并入
+/// ProviderProfile；新格式原样返回。
+fn migrate_legacy_app_config(text: &str) -> anyhow::Result<String> {
+    let mut value: serde_yaml::Value = serde_yaml::from_str(text)?;
+    let Some(providers) = value
+        .get_mut("providers")
+        .and_then(serde_yaml::Value::as_sequence_mut)
+    else {
+        return Ok(text.to_owned());
+    };
+    let mut changed = false;
+    for provider in providers.iter_mut() {
+        let Some(table) = provider.as_mapping_mut() else {
+            continue;
+        };
+        let Some(accounts) = table.remove("accounts") else {
+            continue;
+        };
+        let Some(accounts) = accounts.as_sequence() else {
+            continue;
+        };
+        changed = true;
+        let account = accounts
+            .iter()
+            .find(|account| {
+                account.get("active").and_then(serde_yaml::Value::as_bool) == Some(true)
+            })
+            .or_else(|| accounts.first());
+        let Some(account) = account else {
+            continue;
+        };
+        if let Some(api_key) = account.get("apiKey").cloned()
+            && !matches!(api_key, serde_yaml::Value::Null)
+        {
+            table.insert("apiKey".into(), api_key);
+            table.insert("hasApiKey".into(), serde_yaml::Value::Bool(true));
+        }
+        if let Some(headers) = account.get("headers").cloned() {
+            match (table.get_mut("headers"), headers) {
+                (
+                    Some(serde_yaml::Value::Mapping(profile_headers)),
+                    serde_yaml::Value::Mapping(account_headers),
+                ) => {
+                    for (key, value) in account_headers {
+                        profile_headers.insert(key, value);
+                    }
+                }
+                (None, headers) => {
+                    table.insert("headers".into(), headers);
+                }
+                _ => {}
+            }
+        }
+    }
+    if !changed {
+        return Ok(text.to_owned());
+    }
+    serde_yaml::to_string(&value).map_err(|error| anyhow::anyhow!("迁移旧版应用数据失败：{error}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -832,21 +842,14 @@ mod tests {
             timeout_secs: 30,
             enabled: true,
             active: false,
-            active_account_id: None,
-            account_count: 0,
-        }
-    }
+            model: String::new(),
 
-    fn account(id: &str, provider_id: &str) -> ProviderAccount {
-        ProviderAccount {
-            id: id.into(),
-            provider_id: Some(provider_id.into()),
-            name: id.into(),
-            auth_kind: AccountAuthKind::ApiKey,
+            model_context_windows: Default::default(),
+            available_models: Default::default(),
+            models_dev_meta: Default::default(),
+            api_type: ProviderApiType::Responses,
             api_key: Some("secret".into()),
-            headers: Default::default(),
-            active: false,
-            email: None,
+            has_api_key: false,
             created_at: 0,
             updated_at: 0,
         }
@@ -889,12 +892,12 @@ mod tests {
         let store = Store::open(temp.path().to_path_buf()).unwrap();
         store
             .update(|state| {
-                state.app.theme = "dark".into();
+                state.codex.home = "/tmp/round-trip".into();
                 Ok(())
             })
             .unwrap();
         let reopened = Store::open(temp.path().to_path_buf()).unwrap();
-        assert_eq!(reopened.snapshot().unwrap().app.theme, "dark");
+        assert_eq!(reopened.snapshot().unwrap().codex.home, "/tmp/round-trip");
         assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 1);
     }
 
@@ -986,39 +989,31 @@ mod tests {
         let store = Store::open(temp.path().to_path_buf()).unwrap();
         store
             .update(|state| {
-                state.providers.push(StoredProvider {
-                    profile: ProviderProfile {
-                        id: "provider-1".into(),
-                        name: "Provider".into(),
-                        base_url: "https://example.test/v1".into(),
-                        headers: [("x-secret".into(), "provider-secret".into())]
-                            .into_iter()
-                            .collect(),
-                        timeout_secs: 30,
-                        enabled: true,
-                        active: false,
-                        active_account_id: None,
-                        account_count: 0,
-                    },
-                    accounts: vec![ProviderAccount {
-                        id: "account-1".into(),
-                        provider_id: Some("provider-1".into()),
-                        name: "Account".into(),
-                        auth_kind: AccountAuthKind::ApiKey,
-                        api_key: Some("api-secret".into()),
-                        headers: [("x-secret".into(), "account-secret".into())]
-                            .into_iter()
-                            .collect(),
-                        active: false,
-                        email: None,
-                        created_at: 1,
-                        updated_at: 1,
-                    }],
+                state.providers.push(ProviderProfile {
+                    id: "provider-1".into(),
+                    name: "Provider".into(),
+                    base_url: "https://example.test/v1".into(),
+                    headers: [("x-secret".into(), "provider-secret".into())]
+                        .into_iter()
+                        .collect(),
+                    timeout_secs: 30,
+                    enabled: true,
+                    active: false,
+                    model: String::new(),
+
+                    model_context_windows: Default::default(),
+                    available_models: Default::default(),
+                    models_dev_meta: Default::default(),
+                    api_type: ProviderApiType::Responses,
+                    api_key: Some("api-secret".into()),
+                    has_api_key: false,
+                    created_at: 1,
+                    updated_at: 1,
                 });
                 state.active = ActiveState {
                     kind: ActiveKind::Provider,
                     provider_id: Some("provider-1".into()),
-                    account_id: Some("account-1".into()),
+                    account_id: None,
                 };
                 Ok(())
             })
@@ -1026,14 +1021,10 @@ mod tests {
 
         let overview = store.provider_overview().unwrap();
         assert!(overview.providers[0].active);
-        assert_eq!(overview.providers[0].account_count, 1);
         assert_eq!(overview.providers[0].headers["x-secret"], "");
-        assert!(overview.accounts[0].active);
-        assert!(overview.accounts[0].api_key.is_none());
-        assert_eq!(overview.accounts[0].headers["x-secret"], "");
+        assert!(overview.providers[0].api_key.is_none());
         let serialized = serde_json::to_string(&overview).unwrap();
         assert!(!serialized.contains("provider-secret"));
-        assert!(!serialized.contains("account-secret"));
         assert!(!serialized.contains("api-secret"));
     }
 
@@ -1063,18 +1054,20 @@ mod tests {
     }
 
     #[test]
-    fn account_ids_cannot_move_between_providers() {
+    fn provider_requires_an_api_key_before_activation() {
         let temp = tempfile::tempdir().unwrap();
         let store = Store::open(temp.path().to_path_buf()).unwrap();
-        store.save_provider(provider("one")).unwrap();
-        store.save_provider(provider("two")).unwrap();
-        store.save_account(account("shared", "one")).unwrap();
+        let mut without_key = provider("empty");
+        without_key.api_key = None;
+        store.save_provider(without_key).unwrap();
 
-        let error = store.save_account(account("shared", "two")).unwrap_err();
-        assert!(error.to_string().contains("移到"));
-        let state = store.snapshot().unwrap();
-        assert_eq!(state.providers[0].accounts.len(), 1);
-        assert!(state.providers[1].accounts.is_empty());
+        assert!(store.activate("empty").is_err());
+
+        let mut with_key = provider("ready");
+        with_key.api_key = Some("secret".into());
+        store.save_provider(with_key).unwrap();
+        store.activate("ready").unwrap();
+        assert!(store.provider("ready").unwrap().active);
     }
 
     #[test]
@@ -1082,8 +1075,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let store = Store::open(temp.path().to_path_buf()).unwrap();
         store.save_provider(provider("active")).unwrap();
-        store.save_account(account("account", "active")).unwrap();
-        store.activate("active", "account").unwrap();
+        store.activate("active").unwrap();
 
         let mut disabled = store.provider("active").unwrap();
         disabled.enabled = false;
@@ -1092,20 +1084,38 @@ mod tests {
     }
 
     #[test]
+    fn editing_redacted_provider_preserves_the_saved_api_key() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path().to_path_buf()).unwrap();
+        store.save_provider(provider("editable")).unwrap();
+
+        // 模拟前端保存：overview 返回的是脱敏后的 profile（api_key 为空），
+        // 编辑后只改了名称，密钥必须保留。
+        let mut redacted = store.provider_overview().unwrap().providers[0].clone();
+        assert!(redacted.api_key.is_none());
+        assert!(redacted.has_api_key);
+        redacted.name = "改名后的服务".into();
+        store.save_provider(redacted).unwrap();
+
+        let saved = store.provider("editable").unwrap();
+        assert_eq!(saved.name, "改名后的服务");
+        assert_eq!(saved.api_key.as_deref(), Some("secret"));
+    }
+
+    #[test]
     fn update_persists_mutated_state_to_disk_for_reopen() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().to_path_buf();
         let store = Store::open(root.clone()).unwrap();
         store.save_provider(provider("persisted")).unwrap();
-        store.save_account(account("account", "persisted")).unwrap();
-        store.activate("persisted", "account").unwrap();
+        store.activate("persisted").unwrap();
 
         let reopened = Store::open(root).unwrap();
         let state = reopened.snapshot().unwrap();
         assert_eq!(state.providers.len(), 1);
-        assert_eq!(state.providers[0].profile.id, "persisted");
+        assert_eq!(state.providers[0].id, "persisted");
         assert_eq!(state.active.provider_id.as_deref(), Some("persisted"));
-        assert_eq!(state.active.account_id.as_deref(), Some("account"));
+        assert_eq!(state.active.account_id, None);
     }
 
     #[test]
@@ -1126,5 +1136,85 @@ mod tests {
             store.read(|state| state.codex.home.clone()).unwrap(),
             "/tmp/alternate"
         );
+    }
+
+    #[test]
+    fn legacy_app_yaml_migrates_account_keys_and_headers() {
+        // 旧版 providers 是 profile + accounts[] 结构，API Key 存在 accounts 里：
+        // 迁移后并入 ProviderProfile，首次保存重写文件时不再丢 Key。
+        let text = r#"
+codex:
+  home: "~/.codex"
+active:
+  kind: provider
+  providerId: "p1"
+providers:
+  - id: "p1"
+    name: "DeepSeek"
+    baseUrl: "https://api.deepseek.com/v1"
+    timeoutSecs: 30
+    enabled: true
+    active: true
+    model: "deepseek-chat"
+    apiType: "chat"
+    accounts:
+      - id: "acc-1"
+        providerId: "p1"
+        name: "主密钥"
+        authKind: "apiKey"
+        apiKey: "sk-legacy-secret"
+        headers:
+          x-private-token: "header-secret"
+        active: true
+        createdAt: 0
+        updatedAt: 0
+"#;
+        let migrated = migrate_legacy_app_config(text).unwrap();
+        let config: AppConfig = serde_yaml::from_str(&migrated).unwrap();
+        assert_eq!(config.providers.len(), 1);
+        let provider = &config.providers[0];
+        assert_eq!(provider.api_key.as_deref(), Some("sk-legacy-secret"));
+        assert!(provider.has_api_key);
+        assert_eq!(
+            provider.headers.get("x-private-token").map(String::as_str),
+            Some("header-secret")
+        );
+    }
+
+    #[test]
+    fn legacy_app_yaml_falls_back_to_first_account_without_active_flag() {
+        let text = r#"
+codex:
+  home: "~/.codex"
+providers:
+  - id: "p1"
+    name: "GLM"
+    baseUrl: "https://open.bigmodel.cn/api/paas/v4"
+    timeoutSecs: 30
+    enabled: true
+    active: false
+    accounts:
+      - id: "acc-1"
+        name: "密钥"
+        authKind: "apiKey"
+        apiKey: "sk-first-secret"
+        createdAt: 0
+        updatedAt: 0
+"#;
+        let migrated = migrate_legacy_app_config(text).unwrap();
+        let config: AppConfig = serde_yaml::from_str(&migrated).unwrap();
+        assert_eq!(
+            config.providers[0].api_key.as_deref(),
+            Some("sk-first-secret")
+        );
+    }
+
+    #[test]
+    fn new_format_app_yaml_passes_through_unchanged() {
+        let text = "codex:\n  home: \"~/.codex\"\nproviders: []\n";
+        let migrated = migrate_legacy_app_config(text).unwrap();
+        let config: AppConfig = serde_yaml::from_str(&migrated).unwrap();
+        assert!(config.providers.is_empty());
+        assert!(migrated.contains("providers: []"));
     }
 }

@@ -325,11 +325,13 @@ fn session_matches_query(session: &SessionSummary, normalized_query: &str) -> bo
 }
 
 fn truncate_text(value: &str, max_chars: usize) -> String {
-    if value.chars().count() <= max_chars {
-        value.to_owned()
-    } else {
-        value.chars().take(max_chars).collect()
-    }
+    // 单趟定位截断边界，避免先 `chars().count()` 再 `chars().take()`
+    // 造成的双遍历（会话索引重建时对每个字段都会调用）。
+    let cut = value
+        .char_indices()
+        .enumerate()
+        .find_map(|(count, (index, _))| (count == max_chars).then_some(index));
+    cut.map_or_else(|| value.to_owned(), |index| value[..index].to_owned())
 }
 
 #[cfg(test)]

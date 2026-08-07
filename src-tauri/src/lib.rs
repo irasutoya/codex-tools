@@ -1,9 +1,12 @@
 mod activation;
 mod auth_center;
+mod chat_proxy;
 mod codex;
 mod commands;
 mod local_usage;
+mod model_unlock;
 mod models;
+mod models_dev;
 mod network;
 mod official_pricing;
 mod official_quota;
@@ -19,6 +22,7 @@ mod usage_log;
 
 use activation::sync_active_codex_configuration;
 use auth_center::AuthCenter;
+use chat_proxy::ChatProxyRegistry;
 use codex::ConfigManager;
 use local_usage::UsageLedger;
 use models::*;
@@ -41,8 +45,9 @@ async fn sync_configured_provider(app: tauri::AppHandle) {
     let manager = app.state::<ConfigManager>();
     let ledger = app.state::<UsageLedger>();
     let activation = app.state::<ActivationLock>();
+    let proxy = app.state::<ChatProxyRegistry>();
     let _guard = activation.0.lock().await;
-    if sync_active_codex_configuration(&store, &manager)
+    if sync_active_codex_configuration(&store, &manager, &proxy)
         .await
         .is_ok()
     {
@@ -69,22 +74,12 @@ fn current_activation(
             })
             .map(|account| activation_for_official(account, effective_at_ms)),
         ActiveKind::Provider => {
-            let provider = state.active.provider_id.as_deref().and_then(|id| {
-                state
-                    .providers
-                    .iter()
-                    .find(|provider| provider.profile.id == id)
-            })?;
-            let account = state
+            let provider = state
                 .active
-                .account_id
+                .provider_id
                 .as_deref()
-                .and_then(|id| provider.accounts.iter().find(|account| account.id == id))?;
-            Some(activation_for_provider(
-                &provider.profile,
-                account,
-                effective_at_ms,
-            ))
+                .and_then(|id| state.providers.iter().find(|provider| provider.id == id))?;
+            Some(activation_for_provider(provider, effective_at_ms))
         }
         ActiveKind::None => None,
     })
@@ -126,18 +121,14 @@ fn activation_for_official(
     }
 }
 
-fn activation_for_provider(
-    provider: &ProviderProfile,
-    account: &ProviderAccount,
-    effective_at_ms: i64,
-) -> ActivationRecord {
+fn activation_for_provider(provider: &ProviderProfile, effective_at_ms: i64) -> ActivationRecord {
     ActivationRecord {
         effective_at_ms,
         source_kind: UsageSourceKind::Provider,
         provider_id: Some(provider.id.clone()),
-        account_id: Some(account.id.clone()),
+        account_id: None,
         model_provider: Some(codex::MANAGED_PROVIDER_ID.into()),
-        display_name_snapshot: format!("{} · {}", provider.name, account.name),
+        display_name_snapshot: provider.name.clone(),
         auth_source: Some("api_key".into()),
     }
 }
@@ -184,6 +175,8 @@ pub fn run() {
     let store = Store::new().expect("无法初始化应用数据");
     let usage_ledger = UsageLedger::open(store.root()).expect("无法初始化本机用量数据库");
     let app = tauri::Builder::default()
+        .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_single_instance::init(|app, _, _| {
             show_main_window(app)
         }))
@@ -193,6 +186,7 @@ pub fn run() {
         .manage(ConfigManager::default())
         .manage(ActivationLock::default())
         .manage(ApiClient::default())
+        .manage(ChatProxyRegistry::default())
         .manage(SessionIndex::default())
         .setup(|app| {
             let show =
@@ -242,8 +236,6 @@ pub fn run() {
             commands::providers::get_provider_overview,
             commands::providers::save_provider,
             commands::providers::delete_provider,
-            commands::providers::save_provider_account,
-            commands::providers::delete_provider_account,
             commands::official_accounts::import_proxy_account,
             commands::official_accounts::start_openai_device_auth,
             commands::official_accounts::poll_openai_device_auth,
@@ -251,18 +243,26 @@ pub fn run() {
             commands::official_accounts::delete_openai_account,
             commands::official_accounts::open_openai_device_page,
             commands::providers::test_provider,
+            commands::providers::list_provider_models,
+            commands::providers::refresh_active_provider_models,
             commands::official_accounts::refresh_official_account_quota,
             commands::official_accounts::refresh_all_official_quotas,
             commands::providers::preview_activation,
             commands::providers::apply_activation,
             commands::providers::activate_provider,
             commands::official_accounts::activate_official,
+            commands::model_unlock::get_model_unlock_status,
+            commands::model_unlock::unlock_codex_models,
+            commands::model_unlock::launch_codex_with_debug,
             commands::sessions::scan_codex_data,
             commands::sessions::repair_codex_data,
             commands::sessions::list_sessions,
             commands::dashboard::launch_codex,
+            commands::dashboard::get_codex_app_setting,
+            commands::dashboard::save_codex_app_path,
             commands::usage::get_usage_overview,
             commands::usage::refresh_usage,
+            commands::usage::get_usage_trend,
             commands::usage::get_official_pricing_catalog,
             commands::usage::refresh_official_pricing_catalog,
             commands::usage::list_pricing_rules,
@@ -278,6 +278,10 @@ pub fn run() {
             has_visible_windows: false,
             ..
         } => show_main_window(app),
+        tauri::RunEvent::Exit => {
+            let proxy = app.state::<ChatProxyRegistry>();
+            tauri::async_runtime::block_on(proxy.stop_all());
+        }
         _ => {
             let _ = app;
         }

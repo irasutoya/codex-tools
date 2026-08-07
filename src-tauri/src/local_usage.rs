@@ -3,7 +3,7 @@ use crate::{
         ActivationRecord, AppError, BillingMode, CostStatus, PricingMatchKind, PricingRule,
         PricingScope, PricingScopeKind, RepriceResult, SavePricingRule, TokenBreakdown,
         UsageGroupBy, UsageOverview, UsageQuery, UsageRange, UsageRefreshResult, UsageRow,
-        UsageSourceKind, UsageTotals, UsageWarning,
+        UsageSourceKind, UsageTotals, UsageTrend, UsageTrendPoint, UsageWarning,
     },
     official_pricing::OfficialPricingCatalog,
     pricing::{
@@ -14,11 +14,11 @@ use crate::{
     storage::{secure_directory, secure_file},
     usage_log::{LineResult, ParsedUsageEvent, ParserState, UsageBoundaryState, parse_line},
 };
-use chrono::Utc;
+use chrono::{Local, TimeZone, Utc};
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, btree_map::Entry},
     fs::{self, File},
     io::{BufRead, BufReader, Seek, SeekFrom},
     path::{Path, PathBuf},
@@ -225,7 +225,7 @@ impl UsageLedger {
             .unwrap_or(query.range.end_at_ms);
         let mut statement = connection
             .prepare(
-                "SELECT model, source_kind, provider_id, account_id, source_name,
+                "SELECT occurred_at_ms, model, source_kind, provider_id, account_id, source_name,
                         input_tokens, cached_input_tokens, cache_write_input_tokens,
                         output_tokens, reasoning_output_tokens, total_tokens,
                         cost_status, estimated_cost_microusd, pricing_rule_name,
@@ -252,35 +252,43 @@ impl UsageLedger {
             partial_tokens: 0,
             unattributed_tokens: 0,
         };
+        // 与 totals 同一趟查询产出按日趋势，避免对同一范围做第二趟全量扫描。
+        let mut trend_points = BTreeMap::<i64, UsageTrendPoint>::new();
 
         for row in rows {
             let row =
                 row.map_err(|error| AppError::Internal(format!("读取本机用量失败：{error}")))?;
             let key = aggregate_key(&row, query.group_by);
-            let aggregate = aggregates
-                .entry(key.clone())
-                .or_insert_with(|| UsageAggregate {
-                    key,
-                    model: if query.group_by == UsageGroupBy::Model {
-                        row.model.clone()
-                    } else {
-                        "多个模型".into()
-                    },
-                    source_kind: row.source_kind,
-                    provider_id: row.provider_id.clone(),
-                    account_id: row.account_id.clone(),
-                    source_name: row.source_name.clone(),
-                    tokens: TokenBreakdown::default(),
-                    requests: 0,
-                    estimated_cost_microusd: 0,
-                    has_estimated: false,
-                    has_subscription: false,
-                    has_unpriced: false,
-                    has_partial: false,
-                    has_unattributed: false,
-                    pricing_rule_name: row.pricing_rule_name.clone(),
-                    pricing_rule_version: row.pricing_rule_version,
-                });
+            // 只在新建分组时克隆 key，命中已有分组时通过 entry 直接取到可变引用，
+            // 避免每行都克隆一次聚合键字符串。
+            let aggregate = match aggregates.entry(key) {
+                Entry::Occupied(entry) => entry.into_mut(),
+                Entry::Vacant(entry) => {
+                    let key = entry.key().clone();
+                    entry.insert(UsageAggregate {
+                        key,
+                        model: if query.group_by == UsageGroupBy::Model {
+                            row.model.clone()
+                        } else {
+                            "多个模型".into()
+                        },
+                        source_kind: row.source_kind,
+                        provider_id: row.provider_id.clone(),
+                        account_id: row.account_id.clone(),
+                        source_name: row.source_name.clone(),
+                        tokens: TokenBreakdown::default(),
+                        requests: 0,
+                        estimated_cost_microusd: 0,
+                        has_estimated: false,
+                        has_subscription: false,
+                        has_unpriced: false,
+                        has_partial: false,
+                        has_unattributed: false,
+                        pricing_rule_name: row.pricing_rule_name.clone(),
+                        pricing_rule_version: row.pricing_rule_version,
+                    })
+                }
+            };
             add_tokens(&mut aggregate.tokens, &row.tokens);
             aggregate.requests = aggregate.requests.saturating_add(1);
             aggregate.estimated_cost_microusd = aggregate
@@ -298,7 +306,9 @@ impl UsageLedger {
 
             add_tokens(&mut totals.tokens, &row.tokens);
             totals.requests = totals.requests.saturating_add(1);
-            if row.cost_status == CostStatus::Estimated {
+            if row.cost_status == CostStatus::Estimated
+                || (row.cost_status == CostStatus::Partial && row.estimated_cost_microusd.is_some())
+            {
                 totals.estimated_cost_microusd = totals
                     .estimated_cost_microusd
                     .saturating_add(row.estimated_cost_microusd.unwrap_or(0));
@@ -325,6 +335,15 @@ impl UsageLedger {
                     .unattributed_tokens
                     .saturating_add(row.tokens.total_tokens);
             }
+
+            accumulate_day_point(
+                &mut trend_points,
+                row.occurred_at_ms,
+                &row.tokens,
+                row.cost_status,
+                row.estimated_cost_microusd,
+                row.source_kind,
+            );
         }
 
         let last_refreshed_at_ms = connection
@@ -352,8 +371,8 @@ impl UsageLedger {
                     source_name: aggregate.source_name,
                     tokens: aggregate.tokens,
                     requests: aggregate.requests,
-                    estimated_cost_microusd: aggregate
-                        .has_estimated
+                    estimated_cost_microusd: (aggregate.has_estimated
+                        || aggregate.estimated_cost_microusd > 0)
                         .then_some(aggregate.estimated_cost_microusd),
                     cost_status,
                     pricing_rule_name: aggregate.pricing_rule_name,
@@ -370,6 +389,72 @@ impl UsageLedger {
             collection_started_at_ms: collection_epoch,
             collection_started_version,
             warnings: vec![],
+            trend_points: trend_points.into_values().collect(),
+        })
+    }
+
+    /// 按本机自然日聚合用量事件，返回趋势序列（受统计周期起点约束）。
+    pub(crate) fn trend(&self, range: UsageRange) -> Result<UsageTrend, AppError> {
+        range.validate()?;
+        let connection = self.open_connection().map_err(AppError::from)?;
+        initialize_schema(&connection).map_err(AppError::from)?;
+
+        let collection_epoch = read_collection_epoch(&connection)?;
+        let effective_start = collection_epoch
+            .map(|epoch| range.start_at_ms.max(epoch))
+            .unwrap_or(range.end_at_ms);
+        let mut statement = connection
+            .prepare(
+                "SELECT occurred_at_ms, source_kind,
+                        input_tokens, cached_input_tokens, cache_write_input_tokens,
+                        output_tokens, reasoning_output_tokens, total_tokens,
+                        cost_status, estimated_cost_microusd
+                 FROM usage_events
+                WHERE occurred_at_ms >= ?1 AND occurred_at_ms < ?2
+                 ORDER BY occurred_at_ms, event_ordinal",
+            )
+            .map_err(|error| AppError::Internal(format!("读取本机用量趋势失败：{error}")))?;
+
+        let rows = statement
+            .query_map(params![effective_start, range.end_at_ms], |row| {
+                let tokens = TokenBreakdown {
+                    input_tokens: i64_to_u64(row.get(2)?)?,
+                    cached_input_tokens: i64_to_u64(row.get(3)?)?,
+                    cache_write_input_tokens: i64_to_u64(row.get(4)?)?,
+                    output_tokens: i64_to_u64(row.get(5)?)?,
+                    reasoning_output_tokens: i64_to_u64(row.get(6)?)?,
+                    total_tokens: i64_to_u64(row.get(7)?)?,
+                };
+                Ok(DbTrendRow {
+                    occurred_at_ms: row.get(0)?,
+                    source_kind: parse_source_kind(&row.get::<_, String>(1)?),
+                    tokens,
+                    cost_status: parse_cost_status(&row.get::<_, String>(8)?),
+                    estimated_cost_microusd: row
+                        .get::<_, Option<i64>>(9)?
+                        .map(i64_to_u64)
+                        .transpose()?,
+                })
+            })
+            .map_err(|error| AppError::Internal(format!("读取本机用量趋势失败：{error}")))?;
+
+        let mut points = BTreeMap::<i64, UsageTrendPoint>::new();
+        for row in rows {
+            let row =
+                row.map_err(|error| AppError::Internal(format!("读取本机用量趋势失败：{error}")))?;
+            accumulate_day_point(
+                &mut points,
+                row.occurred_at_ms,
+                &row.tokens,
+                row.cost_status,
+                row.estimated_cost_microusd,
+                row.source_kind,
+            );
+        }
+
+        Ok(UsageTrend {
+            range,
+            points: points.into_values().collect(),
         })
     }
 
@@ -922,6 +1007,8 @@ fn initialize_schema(connection: &Connection) -> anyhow::Result<()> {
              COMMIT;",
         )?;
     }
+    // 旧版数据库（v1–v3）按序迁移到 v4，保留用户已有的用量历史与定价规则，
+    // 而不是让用户删除数据库重新采集。
     if version == 1 {
         connection.execute_batch(
             "BEGIN;
@@ -1780,7 +1867,7 @@ fn source_only_attribution(event: &ParsedUsageEvent) -> AttributionOutcome {
         },
         UsageSourceKind::Provider => AttributionOutcome::SourceOnly {
             source_kind,
-            display_name: "中转站（账号未确认）".into(),
+            display_name: "API 服务（账号未确认）".into(),
             allows_pricing: false,
         },
         UsageSourceKind::Unattributed => AttributionOutcome::Unknown,
@@ -2048,6 +2135,7 @@ fn pricing_rule_label(id: Option<&str>, rules: &[PricingRuleRecord]) -> Option<S
 
 #[derive(Debug)]
 struct DbUsageRow {
+    occurred_at_ms: i64,
     model: String,
     source_kind: UsageSourceKind,
     provider_id: Option<String>,
@@ -2060,25 +2148,35 @@ struct DbUsageRow {
     pricing_rule_version: Option<u64>,
 }
 
+#[derive(Debug)]
+struct DbTrendRow {
+    occurred_at_ms: i64,
+    source_kind: UsageSourceKind,
+    tokens: TokenBreakdown,
+    cost_status: CostStatus,
+    estimated_cost_microusd: Option<u64>,
+}
+
 fn read_usage_row(row: &Row<'_>, _group_by: UsageGroupBy) -> rusqlite::Result<DbUsageRow> {
     Ok(DbUsageRow {
-        model: row.get(0)?,
-        source_kind: parse_source_kind(&row.get::<_, String>(1)?),
-        provider_id: row.get(2)?,
-        account_id: row.get(3)?,
-        source_name: row.get(4)?,
+        occurred_at_ms: row.get(0)?,
+        model: row.get(1)?,
+        source_kind: parse_source_kind(&row.get::<_, String>(2)?),
+        provider_id: row.get(3)?,
+        account_id: row.get(4)?,
+        source_name: row.get(5)?,
         tokens: TokenBreakdown {
-            input_tokens: i64_to_u64(row.get(5)?)?,
-            cached_input_tokens: i64_to_u64(row.get(6)?)?,
-            cache_write_input_tokens: i64_to_u64(row.get(7)?)?,
-            output_tokens: i64_to_u64(row.get(8)?)?,
-            reasoning_output_tokens: i64_to_u64(row.get(9)?)?,
-            total_tokens: i64_to_u64(row.get(10)?)?,
+            input_tokens: i64_to_u64(row.get(6)?)?,
+            cached_input_tokens: i64_to_u64(row.get(7)?)?,
+            cache_write_input_tokens: i64_to_u64(row.get(8)?)?,
+            output_tokens: i64_to_u64(row.get(9)?)?,
+            reasoning_output_tokens: i64_to_u64(row.get(10)?)?,
+            total_tokens: i64_to_u64(row.get(11)?)?,
         },
-        cost_status: parse_cost_status(&row.get::<_, String>(11)?),
-        estimated_cost_microusd: row.get::<_, Option<i64>>(12)?.map(i64_to_u64).transpose()?,
-        pricing_rule_name: row.get(13)?,
-        pricing_rule_version: row.get::<_, Option<i64>>(14)?.map(i64_to_u64).transpose()?,
+        cost_status: parse_cost_status(&row.get::<_, String>(12)?),
+        estimated_cost_microusd: row.get::<_, Option<i64>>(13)?.map(i64_to_u64).transpose()?,
+        pricing_rule_name: row.get(14)?,
+        pricing_rule_version: row.get::<_, Option<i64>>(15)?.map(i64_to_u64).transpose()?,
     })
 }
 
@@ -2113,6 +2211,72 @@ fn add_tokens(target: &mut TokenBreakdown, source: &TokenBreakdown) {
         .reasoning_output_tokens
         .saturating_add(source.reasoning_output_tokens);
     target.total_tokens = target.total_tokens.saturating_add(source.total_tokens);
+}
+
+/// 把时间戳归到本机自然日的起始时刻（毫秒）。
+/// 把单条用量事件累加到按本机自然日分桶的趋势点里（totals 与 trend
+/// 共用同一套聚合规则，避免两趟查询产生不同口径）。
+fn accumulate_day_point(
+    points: &mut BTreeMap<i64, UsageTrendPoint>,
+    occurred_at_ms: i64,
+    tokens: &TokenBreakdown,
+    cost_status: CostStatus,
+    estimated_cost_microusd: Option<u64>,
+    source_kind: UsageSourceKind,
+) {
+    let day_start = local_day_start_ms(occurred_at_ms);
+    let point = match points.entry(day_start) {
+        Entry::Occupied(entry) => entry.into_mut(),
+        Entry::Vacant(entry) => entry.insert(UsageTrendPoint {
+            day_start_ms: day_start,
+            tokens: TokenBreakdown::default(),
+            requests: 0,
+            estimated_cost_microusd: 0,
+            unpriced_tokens: 0,
+            partial_tokens: 0,
+            unattributed_tokens: 0,
+        }),
+    };
+    add_tokens(&mut point.tokens, tokens);
+    point.requests = point.requests.saturating_add(1);
+    if cost_status == CostStatus::Estimated
+        || (cost_status == CostStatus::Partial && estimated_cost_microusd.is_some())
+    {
+        point.estimated_cost_microusd = point
+            .estimated_cost_microusd
+            .saturating_add(estimated_cost_microusd.unwrap_or(0));
+    }
+    if cost_status == CostStatus::Unpriced {
+        point.unpriced_tokens = point.unpriced_tokens.saturating_add(tokens.total_tokens);
+    }
+    if cost_status == CostStatus::Partial {
+        point.partial_tokens = point.partial_tokens.saturating_add(tokens.total_tokens);
+    }
+    if cost_status == CostStatus::Unattributed || source_kind == UsageSourceKind::Unattributed {
+        point.unattributed_tokens = point
+            .unattributed_tokens
+            .saturating_add(tokens.total_tokens);
+    }
+}
+
+fn local_day_start_ms(occurred_at_ms: i64) -> i64 {
+    let local = Local
+        .timestamp_millis_opt(occurred_at_ms)
+        .single()
+        .expect("本地时间戳转换应有效");
+    let midnight = local
+        .date_naive()
+        .and_hms_opt(0, 0, 0)
+        .expect("本机日期的午夜时刻应有效");
+    Local
+        .from_local_datetime(&midnight)
+        .single()
+        .or_else(|| Local.from_local_datetime(&midnight).earliest())
+        .map(|value| value.timestamp_millis())
+        .unwrap_or_else(|| {
+            // 极少数时区在午夜发生 DST 跳变时兜底：直接按当地日期构造。
+            midnight.and_utc().timestamp_millis()
+        })
 }
 
 fn aggregate_cost_status(aggregate: &UsageAggregate) -> CostStatus {
@@ -2177,7 +2341,10 @@ fn u64_db(value: u64) -> Result<i64, String> {
 #[cfg(test)]
 mod tests {
     use super::{ActivationSnapshot, UsageLedger};
-    use crate::models::{ActivationRecord, UsageGroupBy, UsageQuery, UsageRange, UsageSourceKind};
+    use crate::models::{
+        ActivationRecord, BillingMode, CostStatus, PricingMatchKind, PricingScopeKind,
+        SavePricingRule, UsageGroupBy, UsageQuery, UsageRange, UsageSourceKind,
+    };
     use crate::official_pricing::build_catalog;
     use crate::usage_log::{ParsedUsageEvent, TokenUsage, UsageQuality};
     use chrono::DateTime;
@@ -2289,7 +2456,7 @@ mod tests {
             provider_id: Some("provider-1".into()),
             account_id: Some("account-1".into()),
             model_provider: Some("custom".into()),
-            display_name_snapshot: "中转站 · Key".into(),
+            display_name_snapshot: "API 服务 · Key".into(),
         };
         let event = ParsedUsageEvent {
             ordinal: 0,
@@ -2382,6 +2549,101 @@ mod tests {
                 group_by: UsageGroupBy::Model,
             })
             .unwrap()
+    }
+
+    #[test]
+    fn reprice_prices_historical_provider_events_from_the_range_start() {
+        // 事件发生在规则创建之前；规则从重算范围起点生效（前端“保存后重算当前范围”的行为），
+        // 重算后历史事件也必须按新价格估算。
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex");
+        let path = write_rollout(&home, rollout_prefix());
+        let ledger = UsageLedger::open(&temp.path().join("app")).unwrap();
+        let collection_epoch = DateTime::parse_from_rfc3339("2026-08-02T03:00:00Z")
+            .unwrap()
+            .timestamp_millis();
+        let activation_at = DateTime::parse_from_rfc3339("2026-08-02T03:59:00Z")
+            .unwrap()
+            .timestamp_millis();
+        let event_at = DateTime::parse_from_rfc3339("2026-08-02T04:00:01Z")
+            .unwrap()
+            .timestamp_millis();
+
+        ledger.refresh(&home, collection_epoch).unwrap();
+        ledger
+            .record_activation(ActivationRecord {
+                effective_at_ms: activation_at,
+                source_kind: UsageSourceKind::Provider,
+                provider_id: Some("provider-1".into()),
+                account_id: None,
+                model_provider: Some("custom".into()),
+                display_name_snapshot: "API 服务".into(),
+                auth_source: Some("api_key".into()),
+            })
+            .unwrap();
+        {
+            use std::io::Write;
+
+            let mut file = fs::OpenOptions::new().append(true).open(path).unwrap();
+            file.write_all(provider_switch_event().as_bytes()).unwrap();
+        }
+        ledger.refresh(&home, event_at).unwrap();
+
+        // 规则 effective_from = 范围起点（collection_epoch），早于事件时间。
+        ledger
+            .save_pricing_rule(SavePricingRule {
+                id: String::new(),
+                version: 0,
+                active: true,
+                scope_kind: PricingScopeKind::ProviderModel,
+                provider_id: Some("provider-1".into()),
+                account_id: None,
+                model_pattern: "gpt-5.6-luna".into(),
+                match_kind: PricingMatchKind::Exact,
+                billing_mode: BillingMode::Token,
+                input_usd_per_million: Some("2".into()),
+                cached_read_usd_per_million: None,
+                cache_write_usd_per_million: None,
+                output_usd_per_million: Some("8".into()),
+                request_fee_usd: None,
+                cache_write_included_in_input: true,
+                effective_from_ms: collection_epoch,
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            })
+            .unwrap();
+        assert!(
+            collection_epoch < event_at,
+            "rule effective_from must precede event"
+        );
+
+        let repriced = ledger
+            .reprice(UsageRange {
+                start_at_ms: collection_epoch,
+                end_at_ms: event_at + 1,
+            })
+            .unwrap();
+        assert!(repriced.events_repriced >= 1);
+
+        let overview = ledger
+            .query(UsageQuery {
+                range: UsageRange {
+                    start_at_ms: collection_epoch,
+                    end_at_ms: event_at + 1,
+                },
+                group_by: UsageGroupBy::Model,
+            })
+            .unwrap();
+        let row = overview
+            .rows
+            .iter()
+            .find(|row| row.model == "gpt-5.6-luna")
+            .expect("应找到 gpt-5.6-luna 用量行");
+        // 事件发生在规则创建之前，重算后必须按新价格估算（partial 表示
+        // 日志字段不全但费用已按规则计算），而不是停留在“未配置价格”。
+        assert_ne!(row.cost_status, CostStatus::Unpriced);
+        assert!(row.estimated_cost_microusd.unwrap_or(0) > 0);
+        assert_eq!(row.pricing_rule_name.as_deref(), Some("gpt-5.6-luna"));
     }
 
     #[test]
@@ -2478,7 +2740,7 @@ mod tests {
         assert_eq!(overview.totals.tokens.total_tokens, 15);
         assert_eq!(overview.rows.len(), 1);
         assert_eq!(overview.rows[0].source_kind, UsageSourceKind::Provider);
-        assert_eq!(overview.rows[0].source_name, "中转站（账号未确认）");
+        assert_eq!(overview.rows[0].source_name, "API 服务（账号未确认）");
         assert_eq!(overview.rows[0].estimated_cost_microusd, None);
 
         let connection = ledger.open_connection().unwrap();
@@ -2575,7 +2837,7 @@ mod tests {
                 provider_id: Some("provider-1".into()),
                 account_id: Some("account-1".into()),
                 model_provider: Some("custom".into()),
-                display_name_snapshot: "中转站 · Key".into(),
+                display_name_snapshot: "API 服务 · Key".into(),
                 auth_source: Some("api_key".into()),
             })
             .unwrap();
@@ -2667,7 +2929,7 @@ mod tests {
             provider_id: Some("provider-1".into()),
             account_id: Some("account-1".into()),
             model_provider: Some("custom".into()),
-            display_name_snapshot: "中转站 · Key".into(),
+            display_name_snapshot: "API 服务 · Key".into(),
             auth_source: Some("api_key".into()),
         };
 
@@ -2765,5 +3027,212 @@ mod tests {
             Some("OpenAI 官方参考价")
         );
         assert_eq!(overview.rows[0].pricing_rule_version, Some(20260801));
+    }
+
+    fn token_event_full(timestamp: &str, input: u64, output: u64, total: u64) -> String {
+        let line = format!(
+            "{}\n",
+            serde_json::to_string(&serde_json::json!({
+                "timestamp": timestamp,
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "last_token_usage": {
+                            "input_tokens": input,
+                            "cached_input_tokens": 0,
+                            "cache_write_input_tokens": 0,
+                            "output_tokens": output,
+                            "reasoning_output_tokens": 0,
+                            "total_tokens": total,
+                        }
+                    }
+                }
+            }))
+            .expect("测试事件 JSON 序列化应成功")
+        );
+        format!(
+            "{}\n{}",
+            r#"{"type":"turn_context","payload":{"model":"gpt-5.6-sol"}}"#, line
+        )
+    }
+
+    fn token_event_partial(timestamp: &str, input: u64, output: u64, total: u64) -> String {
+        let line = format!(
+            "{}\n",
+            serde_json::to_string(&serde_json::json!({
+                "timestamp": timestamp,
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "last_token_usage": {
+                            "input_tokens": input,
+                            "output_tokens": output,
+                            "total_tokens": total,
+                        }
+                    }
+                }
+            }))
+            .expect("测试事件 JSON 序列化应成功")
+        );
+        format!(
+            "{}\n{}",
+            r#"{"type":"turn_context","payload":{"model":"gpt-5.6-sol"}}"#, line
+        )
+    }
+
+    fn append_events(home: &Path, lines: &[String]) {
+        use std::io::Write;
+
+        let path = home.join("sessions/2026/08/rollout.jsonl");
+        let mut file = fs::OpenOptions::new().append(true).open(path).unwrap();
+        for line in lines {
+            file.write_all(line.as_bytes()).unwrap();
+        }
+    }
+
+    fn trend(ledger: &UsageLedger, start_at_ms: i64, end_at_ms: i64) -> crate::models::UsageTrend {
+        ledger
+            .trend(UsageRange {
+                start_at_ms,
+                end_at_ms,
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn trend_groups_events_by_local_day_in_ascending_order() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex");
+        write_rollout(&home, rollout_prefix());
+        let ledger = UsageLedger::open(&temp.path().join("app")).unwrap();
+        // 首次刷新建立统计周期与游标，不读取已有事件。
+        ledger.refresh(&home, 1_785_542_400_000).unwrap();
+        append_events(
+            &home,
+            &[
+                token_event_full("2026-08-01T00:30:00Z", 100, 8, 108),
+                token_event_full("2026-08-03T12:00:00Z", 11, 4, 15),
+            ],
+        );
+        ledger.refresh(&home, 1_785_758_400_000).unwrap();
+        let result = trend(&ledger, 1_785_542_400_000, 1_785_801_600_000);
+
+        assert_eq!(result.range.start_at_ms, 1_785_542_400_000);
+        assert_eq!(result.range.end_at_ms, 1_785_801_600_000);
+        assert_eq!(result.points.len(), 2);
+        // 按日升序；桶边界必须是本机自然日起点。
+        assert!(
+            result
+                .points
+                .windows(2)
+                .all(|window| window[0].day_start_ms < window[1].day_start_ms)
+        );
+        for point in &result.points {
+            assert_eq!(
+                super::local_day_start_ms(point.day_start_ms),
+                point.day_start_ms
+            );
+        }
+        // 跨日总和与全部事件一致。
+        let total_tokens: u64 = result
+            .points
+            .iter()
+            .map(|point| point.tokens.total_tokens)
+            .sum();
+        let total_requests: u64 = result.points.iter().map(|point| point.requests).sum();
+        assert_eq!(total_tokens, 108 + 15);
+        assert_eq!(total_requests, 2);
+        // 每个事件归属到正确的一天（两个事件相隔超过 2 天，任何时区都落在不同本地日）。
+        let day1 = super::local_day_start_ms(1_785_544_200_000);
+        let day2 = super::local_day_start_ms(1_785_758_400_000);
+        assert_ne!(day1, day2);
+        let first = result
+            .points
+            .iter()
+            .find(|point| point.day_start_ms == day1)
+            .expect("应找到第一天的点");
+        assert_eq!(first.requests, 1);
+        assert_eq!(first.tokens.total_tokens, 108);
+        let second = result
+            .points
+            .iter()
+            .find(|point| point.day_start_ms == day2)
+            .expect("应找到第二天的点");
+        assert_eq!(second.tokens.total_tokens, 15);
+    }
+
+    #[test]
+    fn trend_respects_collection_epoch_and_range_bounds() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex");
+        // 首次刷新前已存在的事件不进入统计周期。
+        let pre_existing = format!("{}{}", rollout_prefix(), rollout_event());
+        write_rollout(&home, &pre_existing);
+        let ledger = UsageLedger::open(&temp.path().join("app")).unwrap();
+        ledger.refresh(&home, 1_785_542_400_000).unwrap();
+        append_events(
+            &home,
+            &[token_event_full("2026-08-03T12:00:00Z", 11, 4, 15)],
+        );
+        ledger.refresh(&home, 1_785_758_400_000).unwrap();
+
+        // 只查询 8/2 一天：既排除周期前的旧事件，也排除范围外的新事件。
+        let result = trend(&ledger, 1_785_628_800_000, 1_785_715_200_000);
+        assert!(result.points.is_empty());
+
+        // 查询 8/3：只包含新事件。
+        let result = trend(&ledger, 1_785_715_200_000, 1_785_801_600_000);
+        assert_eq!(result.points.len(), 1);
+        assert_eq!(result.points[0].requests, 1);
+        assert_eq!(result.points[0].tokens.total_tokens, 15);
+    }
+
+    #[test]
+    fn trend_tracks_cost_and_attention_tokens() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex");
+        write_rollout(&home, rollout_prefix());
+        let ledger = UsageLedger::open(&temp.path().join("app")).unwrap();
+        save_test_catalog(&ledger);
+        ledger.refresh(&home, 1_785_542_400_000).unwrap();
+        // 第一天：完整字段 + 官方参考价 → 有估算、无未定价。
+        ledger
+            .record_activation(ActivationRecord {
+                effective_at_ms: 1_785_542_400_000,
+                source_kind: UsageSourceKind::Official,
+                provider_id: None,
+                account_id: Some("official-account".into()),
+                model_provider: Some("openai".into()),
+                display_name_snapshot: "工作账号".into(),
+                auth_source: Some("openai_oauth".into()),
+            })
+            .unwrap();
+        append_events(
+            &home,
+            &[
+                token_event_full("2026-08-01T00:30:00Z", 100, 8, 108),
+                token_event_partial("2026-08-03T12:00:00Z", 11, 4, 15),
+            ],
+        );
+        ledger.refresh(&home, 1_785_758_400_000).unwrap();
+
+        let result = trend(&ledger, 1_785_542_400_000, 1_785_801_600_000);
+        assert_eq!(result.points.len(), 2);
+        let estimated = result
+            .points
+            .iter()
+            .find(|point| point.tokens.total_tokens == 108)
+            .expect("完整事件的一天");
+        assert!(estimated.estimated_cost_microusd > 0);
+        assert_eq!(estimated.unpriced_tokens, 0);
+        assert_eq!(estimated.partial_tokens, 0);
+        let partial = result
+            .points
+            .iter()
+            .find(|point| point.tokens.total_tokens == 15)
+            .expect("字段不全事件的一天");
+        assert_eq!(partial.partial_tokens, 15);
     }
 }
