@@ -1,4 +1,5 @@
-use crate::models::*;
+use crate::{json_store::JsonStore, models::*};
+use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
     fs,
@@ -7,14 +8,44 @@ use std::{
     sync::{Mutex, RwLock, RwLockReadGuard},
 };
 
-const MAX_APP_DATA_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_SAVED_PROVIDERS: usize = 500;
 const MAX_SAVED_OPENAI_ACCOUNTS: usize = 500;
 const MAX_EMAIL_CHARS: usize = 320;
+#[cfg(test)]
+const MAX_APP_DATA_BYTES: u64 = 32 * 1024 * 1024;
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct AppFile {
+    #[serde(default)]
+    codex: CodexPreferences,
+    #[serde(default)]
+    active: ActiveState,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct ConnectionsFile {
+    #[serde(default)]
+    providers: Vec<ProviderProfile>,
+    #[serde(default)]
+    official_accounts: Vec<StoredOfficialAccount>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct CredentialsFile {
+    #[serde(default)]
+    provider_api_keys: BTreeMap<String, String>,
+    #[serde(default)]
+    provider_headers: BTreeMap<String, BTreeMap<String, String>>,
+}
 
 pub struct Store {
     root: PathBuf,
     path: PathBuf,
+    connections_path: PathBuf,
+    credentials_path: PathBuf,
     state: RwLock<AppConfig>,
     persist_mutex: Mutex<()>,
 }
@@ -28,36 +59,45 @@ impl Store {
     pub fn open(root: PathBuf) -> anyhow::Result<Self> {
         fs::create_dir_all(&root)?;
         secure_directory(&root)?;
-        let path = root.join("app.yaml");
-        let state = if path.exists() {
-            if fs::metadata(&path)?.len() > MAX_APP_DATA_BYTES {
-                anyhow::bail!(
-                    "应用数据文件超过 16 MB，程序已停止读取以避免占用过多内存。请备份并检查 app.yaml"
-                );
+        let path = root.join("app.json");
+        let connections_path = root.join("connections.json");
+        let credentials_path = root.join("credentials.json");
+        let app_file = JsonStore::read_or_default(&path, AppFile::default)?;
+        let connections = JsonStore::read_or_default(&connections_path, ConnectionsFile::default)?;
+        let credentials = JsonStore::read_or_default(&credentials_path, CredentialsFile::default)?;
+        let mut providers = connections.providers;
+        for provider in &mut providers {
+            if let Some(key) = credentials.provider_api_keys.get(&provider.id) {
+                provider.api_key = Some(key.clone());
+                provider.has_api_key = true;
             }
-            let text = fs::read_to_string(&path)?;
-            if text.len() as u64 > MAX_APP_DATA_BYTES {
-                anyhow::bail!(
-                    "应用数据文件超过 16 MB，程序已停止读取以避免占用过多内存。请备份并检查 app.yaml"
-                );
+            if let Some(headers) = credentials.provider_headers.get(&provider.id) {
+                provider.headers = headers.clone();
             }
-            // 旧版 app.yaml 的 providers 是 `profile + accounts[]` 结构，API Key
-            // 存在 accounts 里；新版是扁平 ProviderProfile。升级时一次性迁移，
-            // 把 active account 的 Key/请求头并入 ProviderProfile，避免首次保存
-            // 重写文件时静默丢弃已保存的 API Key。
-            let migrated = migrate_legacy_app_config(&text)?;
-            serde_yaml::from_str::<AppConfig>(&migrated).map_err(|error| {
-                anyhow::anyhow!("应用数据文件损坏，无法读取已保存的账号和服务：{error}")
-            })?
-        } else {
-            let state = AppConfig::default();
-            atomic_yaml(&path, &state)?;
-            state
+        }
+        let state = AppConfig {
+            codex: app_file.codex,
+            active: app_file.active,
+            providers,
+            official_accounts: connections.official_accounts,
         };
-        secure_file(&path)?;
+        if !path.exists() || !connections_path.exists() || !credentials_path.exists() {
+            persist_files(&path, &connections_path, &credentials_path, &state)?;
+        }
+        for name in [
+            "credentials.json",
+            "pricing.json",
+            "usage.json",
+            "sessions.json",
+            "cache.json",
+        ] {
+            JsonStore::ensure_object(&root.join(name))?;
+        }
         Ok(Self {
             root,
             path,
+            connections_path,
+            credentials_path,
             state: RwLock::new(state),
             persist_mutex: Mutex::new(()),
         })
@@ -94,7 +134,7 @@ impl Store {
         Ok(self.read_state()?.codex.app_path.clone())
     }
 
-    pub fn save_codex_app_path(&self, path: Option<String>) -> Result<(), AppError> {
+    pub fn settings_save_codex_app_path(&self, path: Option<String>) -> Result<(), AppError> {
         self.update(|state| {
             state.codex.app_path = path
                 .map(|value| value.trim().to_owned())
@@ -141,18 +181,22 @@ impl Store {
             .map_err(|_| AppError::Internal("暂时无法保存应用数据，请重启应用后再试。".into()))?;
         let mut draft = guard.clone();
         let result = mutate(&mut draft)?;
-        let bytes = serde_yaml::to_string(&draft)
-            .map_err(|error| AppError::Internal(error.to_string()))?
-            .into_bytes();
         *guard = draft;
         drop(guard);
-        // 落盘在状态锁之外进行：磁盘写入失败时内存已更新，
-        // 仅本次保存返回错误，与旧版在锁内失败时内存未更新的致命行为不同。
+        // 落盘在状态锁之外进行，读操作不会被 fsync 阻塞。拿到持久化锁后
+        // 重新读取最新状态，避免并发更新时较旧快照最后写入、覆盖新数据。
         let _persisted = self
             .persist_mutex
             .lock()
             .map_err(|_| AppError::Internal("暂时无法保存应用数据，请重启应用后再试。".into()))?;
-        atomic_write(&self.path, &bytes).map_err(|error| AppError::Internal(error.to_string()))?;
+        let persisted = self.read_state()?.clone();
+        persist_files(
+            &self.path,
+            &self.connections_path,
+            &self.credentials_path,
+            &persisted,
+        )
+        .map_err(|error| AppError::Internal(error.to_string()))?;
         Ok(result)
     }
 
@@ -168,7 +212,7 @@ impl Store {
         Ok(profile)
     }
 
-    pub fn save_provider(
+    pub fn connections_save_provider(
         &self,
         mut provider: ProviderProfile,
     ) -> Result<ProviderProfile, AppError> {
@@ -244,7 +288,7 @@ impl Store {
         Ok(saved)
     }
 
-    pub fn delete_provider(&self, id: &str) -> Result<(), AppError> {
+    pub fn connections_delete_provider(&self, id: &str) -> Result<(), AppError> {
         self.update(|state| {
             if state.active.provider_id.as_deref() == Some(id) {
                 return Err(AppError::InvalidConfig(
@@ -469,7 +513,7 @@ impl Store {
         })
     }
 
-    pub fn activate_official_account(&self, id: &str) -> Result<(), AppError> {
+    pub fn connections_activate_official_account(&self, id: &str) -> Result<(), AppError> {
         self.update(|state| {
             if !state
                 .official_accounts
@@ -562,6 +606,47 @@ fn preserve_redacted_headers(
             *value = saved.clone();
         }
     }
+}
+
+fn persist_files(
+    app_path: &Path,
+    connections_path: &Path,
+    credentials_path: &Path,
+    state: &AppConfig,
+) -> anyhow::Result<()> {
+    let app = AppFile {
+        codex: state.codex.clone(),
+        active: state.active.clone(),
+    };
+    let mut providers = Vec::with_capacity(state.providers.len());
+    let mut credentials = CredentialsFile::default();
+    for provider in &state.providers {
+        let mut public = provider.clone();
+        if let Some(key) = public.api_key.take() {
+            credentials
+                .provider_api_keys
+                .insert(provider.id.clone(), key);
+        }
+        if !public.headers.is_empty() {
+            credentials
+                .provider_headers
+                .insert(provider.id.clone(), public.headers.clone());
+            public.headers = public
+                .headers
+                .keys()
+                .map(|name| (name.clone(), String::new()))
+                .collect();
+        }
+        providers.push(public);
+    }
+    let connections = ConnectionsFile {
+        providers,
+        official_accounts: state.official_accounts.clone(),
+    };
+    JsonStore::write_atomic(app_path, &app)?;
+    JsonStore::write_atomic(connections_path, &connections)?;
+    JsonStore::write_atomic(credentials_path, &credentials)?;
+    Ok(())
 }
 
 pub fn data_root() -> PathBuf {
@@ -658,11 +743,6 @@ fn replace_temporary(temporary: &Path, path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn atomic_yaml(path: &Path, value: &AppConfig) -> anyhow::Result<()> {
-    let text = serde_yaml::to_string(value)?;
-    atomic_write(path, text.as_bytes())
-}
-
 fn create_private_file(path: &Path) -> std::io::Result<fs::File> {
     let mut options = fs::OpenOptions::new();
     options.write(true).create_new(true);
@@ -731,67 +811,6 @@ fn replace_file(source: &Path, target: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// 旧版 app.yaml 迁移：providers 条目如果是 `profile + accounts[]` 结构，
-/// 把 active account（无 active 时取第一个）的 API Key 与请求头并入
-/// ProviderProfile；新格式原样返回。
-fn migrate_legacy_app_config(text: &str) -> anyhow::Result<String> {
-    let mut value: serde_yaml::Value = serde_yaml::from_str(text)?;
-    let Some(providers) = value
-        .get_mut("providers")
-        .and_then(serde_yaml::Value::as_sequence_mut)
-    else {
-        return Ok(text.to_owned());
-    };
-    let mut changed = false;
-    for provider in providers.iter_mut() {
-        let Some(table) = provider.as_mapping_mut() else {
-            continue;
-        };
-        let Some(accounts) = table.remove("accounts") else {
-            continue;
-        };
-        let Some(accounts) = accounts.as_sequence() else {
-            continue;
-        };
-        changed = true;
-        let account = accounts
-            .iter()
-            .find(|account| {
-                account.get("active").and_then(serde_yaml::Value::as_bool) == Some(true)
-            })
-            .or_else(|| accounts.first());
-        let Some(account) = account else {
-            continue;
-        };
-        if let Some(api_key) = account.get("apiKey").cloned()
-            && !matches!(api_key, serde_yaml::Value::Null)
-        {
-            table.insert("apiKey".into(), api_key);
-            table.insert("hasApiKey".into(), serde_yaml::Value::Bool(true));
-        }
-        if let Some(headers) = account.get("headers").cloned() {
-            match (table.get_mut("headers"), headers) {
-                (
-                    Some(serde_yaml::Value::Mapping(profile_headers)),
-                    serde_yaml::Value::Mapping(account_headers),
-                ) => {
-                    for (key, value) in account_headers {
-                        profile_headers.insert(key, value);
-                    }
-                }
-                (None, headers) => {
-                    table.insert("headers".into(), headers);
-                }
-                _ => {}
-            }
-        }
-    }
-    if !changed {
-        return Ok(text.to_owned());
-    }
-    serde_yaml::to_string(&value).map_err(|error| anyhow::anyhow!("迁移旧版应用数据失败：{error}"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -799,13 +818,13 @@ mod tests {
     #[test]
     fn rejects_oversized_app_data_before_parsing() {
         let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("app.yaml");
+        let path = temp.path().join("app.json");
         let file = fs::File::create(&path).unwrap();
         file.set_len(MAX_APP_DATA_BYTES + 1).unwrap();
 
         let error = Store::open(temp.path().to_path_buf()).err().unwrap();
 
-        assert!(error.to_string().contains("超过 16 MB"));
+        assert!(error.to_string().contains("超过 32 MB"));
     }
 
     fn official_account(account_id: &str, suffix: &str) -> StoredOfficialAccount {
@@ -856,12 +875,12 @@ mod tests {
     }
 
     #[test]
-    fn creates_app_yaml_without_touching_unrelated_files() {
+    fn creates_app_json_without_touching_unrelated_files() {
         let temp = tempfile::tempdir().unwrap();
         fs::write(temp.path().join("unrelated.yaml"), "invalid: [").unwrap();
         fs::write(temp.path().join("unrelated.txt"), "user data").unwrap();
         let store = Store::open(temp.path().to_path_buf()).unwrap();
-        assert!(store.path().ends_with("app.yaml"));
+        assert!(store.path().ends_with("app.json"));
         assert_eq!(
             fs::read_to_string(temp.path().join("unrelated.txt")).unwrap(),
             "user data"
@@ -887,7 +906,7 @@ mod tests {
     }
 
     #[test]
-    fn yaml_updates_are_atomic_and_round_trip() {
+    fn json_updates_are_atomic_and_round_trip() {
         let temp = tempfile::tempdir().unwrap();
         let store = Store::open(temp.path().to_path_buf()).unwrap();
         store
@@ -898,7 +917,7 @@ mod tests {
             .unwrap();
         let reopened = Store::open(temp.path().to_path_buf()).unwrap();
         assert_eq!(reopened.snapshot().unwrap().codex.home, "/tmp/round-trip");
-        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 1);
+        assert!(fs::read_dir(temp.path()).unwrap().count() >= 7);
     }
 
     #[test]
@@ -954,7 +973,7 @@ mod tests {
         assert_eq!(second.name, "OpenAI second");
         assert_eq!(store.snapshot().unwrap().official_accounts.len(), 1);
         assert!(
-            fs::read_to_string(store.path())
+            fs::read_to_string(&store.connections_path)
                 .unwrap()
                 .contains("access-secret-second")
         );
@@ -967,7 +986,9 @@ mod tests {
         let saved = store
             .save_official_account(&official_account("workspace-1", "person"))
             .unwrap();
-        store.activate_official_account(&saved.id).unwrap();
+        store
+            .connections_activate_official_account(&saved.id)
+            .unwrap();
 
         let state = store.snapshot().unwrap();
         assert!(matches!(state.active.kind, ActiveKind::Official));
@@ -1049,7 +1070,9 @@ mod tests {
                 .is_err()
         );
 
-        store.activate_official_account(&saved.id).unwrap();
+        store
+            .connections_activate_official_account(&saved.id)
+            .unwrap();
         assert!(store.delete_official_account(&saved.id).is_err());
     }
 
@@ -1059,13 +1082,13 @@ mod tests {
         let store = Store::open(temp.path().to_path_buf()).unwrap();
         let mut without_key = provider("empty");
         without_key.api_key = None;
-        store.save_provider(without_key).unwrap();
+        store.connections_save_provider(without_key).unwrap();
 
         assert!(store.activate("empty").is_err());
 
         let mut with_key = provider("ready");
         with_key.api_key = Some("secret".into());
-        store.save_provider(with_key).unwrap();
+        store.connections_save_provider(with_key).unwrap();
         store.activate("ready").unwrap();
         assert!(store.provider("ready").unwrap().active);
     }
@@ -1074,12 +1097,12 @@ mod tests {
     fn active_provider_cannot_be_disabled() {
         let temp = tempfile::tempdir().unwrap();
         let store = Store::open(temp.path().to_path_buf()).unwrap();
-        store.save_provider(provider("active")).unwrap();
+        store.connections_save_provider(provider("active")).unwrap();
         store.activate("active").unwrap();
 
         let mut disabled = store.provider("active").unwrap();
         disabled.enabled = false;
-        assert!(store.save_provider(disabled).is_err());
+        assert!(store.connections_save_provider(disabled).is_err());
         assert!(store.provider("active").unwrap().enabled);
     }
 
@@ -1087,7 +1110,9 @@ mod tests {
     fn editing_redacted_provider_preserves_the_saved_api_key() {
         let temp = tempfile::tempdir().unwrap();
         let store = Store::open(temp.path().to_path_buf()).unwrap();
-        store.save_provider(provider("editable")).unwrap();
+        store
+            .connections_save_provider(provider("editable"))
+            .unwrap();
 
         // 模拟前端保存：overview 返回的是脱敏后的 profile（api_key 为空），
         // 编辑后只改了名称，密钥必须保留。
@@ -1095,7 +1120,7 @@ mod tests {
         assert!(redacted.api_key.is_none());
         assert!(redacted.has_api_key);
         redacted.name = "改名后的服务".into();
-        store.save_provider(redacted).unwrap();
+        store.connections_save_provider(redacted).unwrap();
 
         let saved = store.provider("editable").unwrap();
         assert_eq!(saved.name, "改名后的服务");
@@ -1107,7 +1132,9 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().to_path_buf();
         let store = Store::open(root.clone()).unwrap();
-        store.save_provider(provider("persisted")).unwrap();
+        store
+            .connections_save_provider(provider("persisted"))
+            .unwrap();
         store.activate("persisted").unwrap();
 
         let reopened = Store::open(root).unwrap();
@@ -1122,9 +1149,9 @@ mod tests {
     fn failed_persist_keeps_memory_updated_and_returns_error() {
         let temp = tempfile::tempdir().unwrap();
         let mut store = Store::open(temp.path().to_path_buf()).unwrap();
-        store.save_provider(provider("one")).unwrap();
+        store.connections_save_provider(provider("one")).unwrap();
         fs::write(temp.path().join("blocked"), b"file").unwrap();
-        store.path = temp.path().join("blocked").join("app.yaml");
+        store.path = temp.path().join("blocked").join("app.json");
 
         let result = store.update(|state| {
             state.codex.home = "/tmp/alternate".into();
@@ -1136,85 +1163,5 @@ mod tests {
             store.read(|state| state.codex.home.clone()).unwrap(),
             "/tmp/alternate"
         );
-    }
-
-    #[test]
-    fn legacy_app_yaml_migrates_account_keys_and_headers() {
-        // 旧版 providers 是 profile + accounts[] 结构，API Key 存在 accounts 里：
-        // 迁移后并入 ProviderProfile，首次保存重写文件时不再丢 Key。
-        let text = r#"
-codex:
-  home: "~/.codex"
-active:
-  kind: provider
-  providerId: "p1"
-providers:
-  - id: "p1"
-    name: "DeepSeek"
-    baseUrl: "https://api.deepseek.com/v1"
-    timeoutSecs: 30
-    enabled: true
-    active: true
-    model: "deepseek-chat"
-    apiType: "chat"
-    accounts:
-      - id: "acc-1"
-        providerId: "p1"
-        name: "主密钥"
-        authKind: "apiKey"
-        apiKey: "sk-legacy-secret"
-        headers:
-          x-private-token: "header-secret"
-        active: true
-        createdAt: 0
-        updatedAt: 0
-"#;
-        let migrated = migrate_legacy_app_config(text).unwrap();
-        let config: AppConfig = serde_yaml::from_str(&migrated).unwrap();
-        assert_eq!(config.providers.len(), 1);
-        let provider = &config.providers[0];
-        assert_eq!(provider.api_key.as_deref(), Some("sk-legacy-secret"));
-        assert!(provider.has_api_key);
-        assert_eq!(
-            provider.headers.get("x-private-token").map(String::as_str),
-            Some("header-secret")
-        );
-    }
-
-    #[test]
-    fn legacy_app_yaml_falls_back_to_first_account_without_active_flag() {
-        let text = r#"
-codex:
-  home: "~/.codex"
-providers:
-  - id: "p1"
-    name: "GLM"
-    baseUrl: "https://open.bigmodel.cn/api/paas/v4"
-    timeoutSecs: 30
-    enabled: true
-    active: false
-    accounts:
-      - id: "acc-1"
-        name: "密钥"
-        authKind: "apiKey"
-        apiKey: "sk-first-secret"
-        createdAt: 0
-        updatedAt: 0
-"#;
-        let migrated = migrate_legacy_app_config(text).unwrap();
-        let config: AppConfig = serde_yaml::from_str(&migrated).unwrap();
-        assert_eq!(
-            config.providers[0].api_key.as_deref(),
-            Some("sk-first-secret")
-        );
-    }
-
-    #[test]
-    fn new_format_app_yaml_passes_through_unchanged() {
-        let text = "codex:\n  home: \"~/.codex\"\nproviders: []\n";
-        let migrated = migrate_legacy_app_config(text).unwrap();
-        let config: AppConfig = serde_yaml::from_str(&migrated).unwrap();
-        assert!(config.providers.is_empty());
-        assert!(migrated.contains("providers: []"));
     }
 }

@@ -379,6 +379,67 @@ export type SettingsOverview = {
   canPreviewCustom: boolean
 }
 
+export type SupportDiagnostics = {
+  schemaVersion: number
+  generatedAt: string
+  app: {
+    name: string
+    version: string
+    buildProfile: string
+  }
+  system: {
+    os: string
+    architecture: string
+    family: string
+  }
+  paths: {
+    dataDirectory: string
+    codexHome: string
+    configFile: string
+  }
+  configuration: {
+    valid: boolean
+    activeProvider?: string
+    managedProviderPresent: boolean
+    warnings: string[]
+  }
+  connection: {
+    activeKind: "none" | "provider" | "official"
+    providerCount: number
+    officialAccountCount: number
+    activeModel?: string
+  }
+  storage: {
+    files: Array<{
+      name: string
+      exists: boolean
+      readable: boolean
+      sizeBytes?: number
+    }>
+    usageDatabase: {
+      exists: boolean
+      sizeBytes?: number
+      schemaVersion?: number
+      quickCheck: string
+      eventCount?: number
+      cursorCount?: number
+    }
+    sessionDatabaseCount: number
+    indexedSessionCount: number
+  }
+  network: {
+    environmentProxyConfigured: boolean
+    noProxyConfigured: boolean
+    systemProxyConfigured: boolean
+    tlsBackend: string
+  }
+  warnings: string[]
+  privacy: {
+    homePathsRedacted: boolean
+    omitted: string[]
+  }
+}
+
 export type CodexAppSetting = {
   /** 手动配置的 Codex 应用路径（.app 目录或可执行文件） */
   configured?: string

@@ -267,31 +267,20 @@ pub fn session_page(
         Cow::Owned(query.to_lowercase())
     };
     let query = normalized_query.as_ref();
+    let matches = sessions
+        .iter()
+        .filter(|session| query.is_empty() || session_matches_query(session, query))
+        .collect::<Vec<_>>();
+    let total = matches.len();
+    let last_page = total.max(1).div_ceil(page_size);
+    let page = page.clamp(1, last_page);
     let start = (page - 1).saturating_mul(page_size);
-    if query.is_empty() {
-        return Ok(PageResult {
-            items: sessions
-                .iter()
-                .skip(start)
-                .take(page_size)
-                .cloned()
-                .collect(),
-            total: sessions.len(),
-            page,
-            page_size,
-        });
-    }
-    let mut total = 0;
-    let mut items = Vec::with_capacity(page_size);
-    for session in sessions.iter() {
-        if !session_matches_query(session, query) {
-            continue;
-        }
-        if total >= start && items.len() < page_size {
-            items.push(session.clone());
-        }
-        total += 1;
-    }
+    let items = matches
+        .into_iter()
+        .skip(start)
+        .take(page_size)
+        .cloned()
+        .collect();
     Ok(PageResult {
         items,
         total,
@@ -512,6 +501,11 @@ mod tests {
         let unicode = session_page(&index, temp.path(), "中文", 1, 10).unwrap();
         assert_eq!(unicode.total, 1);
         assert_eq!(unicode.items[0].id, "two");
+
+        let overflow = session_page(&index, temp.path(), "ALPHA", 8, 2).unwrap();
+        assert_eq!(overflow.page, 1);
+        assert_eq!(overflow.total, 1);
+        assert_eq!(overflow.items[0].id, "one");
     }
 
     fn summary(id: &str, title: &str, provider: &str, cwd: &str) -> SessionSummary {

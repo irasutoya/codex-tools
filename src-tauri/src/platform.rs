@@ -118,7 +118,7 @@ pub fn open_url(url: &str) -> std::io::Result<()> {
 /// 找到 Codex 桌面应用：优先使用手动配置的路径（.app 目录或可执行文件），
 /// 否则自动检测（macOS 返回 `.app` 目录，Windows 返回可执行文件路径）。
 pub fn codex_app_path(configured: Option<&str>) -> Option<PathBuf> {
-    if let Some(path) = configured.and_then(normalize_app_path) {
+    if let Some(path) = configured.and_then(|path| validate_codex_app_path(path).ok()) {
         return Some(path);
     }
     #[cfg(target_os = "macos")]
@@ -135,17 +135,67 @@ pub fn codex_app_path(configured: Option<&str>) -> Option<PathBuf> {
     }
 }
 
-/// 规范化手动配置的应用路径：只接受存在的 `.app` 目录或可执行文件。
-fn normalize_app_path(path: &str) -> Option<PathBuf> {
+/// 校验手动配置的应用路径：只接受 macOS `.app`、Unix 可执行文件或 Windows `.exe`。
+pub fn validate_codex_app_path(path: &str) -> Result<PathBuf, String> {
     let path = PathBuf::from(path.trim());
-    if path.exists() { Some(path) } else { None }
+    if !path.exists() {
+        return Err("选择的 ChatGPT / Codex 启动程序不存在。".into());
+    }
+
+    if path.is_dir() {
+        #[cfg(target_os = "macos")]
+        {
+            let is_app = path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("app"));
+            if is_app && path.join("Contents/MacOS").is_dir() {
+                return Ok(path);
+            }
+            return Err("请选择 ChatGPT / Codex 的 .app 应用，或应用内部的可执行文件。".into());
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            return Err("请选择 ChatGPT / Codex 的可执行文件，不要选择目录。".into());
+        }
+    }
+
+    if !path.is_file() {
+        return Err("选择的 ChatGPT / Codex 启动程序不是有效文件。".into());
+    }
+
+    #[cfg(windows)]
+    {
+        let is_exe = path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("exe"));
+        if !is_exe {
+            return Err("请选择 ChatGPT.exe 或 Codex.exe。".into());
+        }
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = path
+            .metadata()
+            .map_err(|error| format!("无法读取启动程序权限：{error}"))?
+            .permissions()
+            .mode();
+        if mode & 0o111 == 0 {
+            return Err("选择的文件没有执行权限。".into());
+        }
+    }
+
+    Ok(path)
 }
 
 pub fn codex_app_found(configured: Option<&str>) -> bool {
     codex_app_path(configured).is_some()
 }
 
-/// Codex 桌面应用当前是否在运行（用于提示“需要重启才能带调试端口启动”）。
+/// Codex 桌面应用当前是否在运行（仅用于提示用户手动退出后再启动）。
 pub fn codex_app_running(configured: Option<&str>) -> bool {
     #[cfg(target_os = "macos")]
     {
@@ -176,64 +226,10 @@ pub fn codex_app_running(configured: Option<&str>) -> bool {
     }
 }
 
-/// 退出正在运行的 Codex 桌面应用（macOS 优雅退出，Windows 强制结束）。
-pub fn quit_codex_app(configured: Option<&str>) -> std::io::Result<()> {
-    #[cfg(target_os = "macos")]
-    {
-        let path = codex_app_path(configured);
-        // 手动配置的是可执行文件时，无法用 osascript 优雅退出，回退 pkill。
-        if let Some(path) = path.as_deref().filter(|path| !path.is_dir()) {
-            let _ = Command::new("/usr/bin/pkill")
-                .args(["-f", &path.display().to_string()])
-                .status();
-            return Ok(());
-        }
-        let name = path
-            .as_deref()
-            .and_then(Path::file_stem)
-            .and_then(|stem| stem.to_str())
-            .unwrap_or("Codex")
-            .to_string();
-        let status = Command::new("/usr/bin/osascript")
-            .args(["-e", &format!("tell application \"{name}\" to quit")])
-            .status()?;
-        if status.success() {
-            Ok(())
-        } else {
-            Err(std::io::Error::other(
-                "macOS 未能优雅退出 Codex，请手动关闭后再试。",
-            ))
-        }
-    }
-    #[cfg(windows)]
-    {
-        // 先按手动配置的可执行文件名结束（与 codex_app_running 的识别逻辑一致），
-        // 再兜底结束默认名称的进程。
-        let mut names = vec!["Codex.exe", "ChatGPT.exe"];
-        let configured_path = codex_app_path(configured);
-        if let Some(name) = configured_path
-            .as_deref()
-            .and_then(Path::file_name)
-            .and_then(|name| name.to_str())
-            .filter(|name| !names.contains(name))
-        {
-            names.push(name);
-        }
-        for name in names {
-            let _ = Command::new("taskkill").args(["/IM", name, "/F"]).status();
-        }
-        Ok(())
-    }
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        Err(std::io::Error::other("当前系统暂不支持自动重启 Codex。"))
-    }
-}
-
 /// 以调试模式启动 Codex 桌面应用：传入 `--remote-debugging-port` 和
 /// `--remote-allow-origins`，使本应用可以通过 CDP 注入解锁脚本。
 /// `configured` 为手动指定的 `.app` 目录或可执行文件路径。
-pub fn launch_codex_app_with_debug(port: u16, configured: Option<&str>) -> std::io::Result<()> {
+pub fn dashboard_launch_app_with_debug(port: u16, configured: Option<&str>) -> std::io::Result<()> {
     let debug_args = [
         format!("--remote-debugging-port={port}"),
         format!("--remote-allow-origins=http://127.0.0.1:{port}"),
@@ -418,5 +414,43 @@ mod tests {
     fn reports_a_supported_platform_name() {
         assert!(!os_name().is_empty());
         assert!(!os_version().is_empty());
+    }
+
+    #[test]
+    fn rejects_a_missing_manual_app_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("Codex");
+        assert!(validate_codex_app_path(&missing.display().to_string()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn accepts_a_manual_executable_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let executable = temp.path().join("Codex");
+        std::fs::write(&executable, b"#!/bin/sh\n").unwrap();
+        let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&executable, permissions).unwrap();
+
+        assert_eq!(
+            validate_codex_app_path(&executable.display().to_string()).unwrap(),
+            executable
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn accepts_a_macos_app_bundle() {
+        let temp = tempfile::tempdir().unwrap();
+        let bundle = temp.path().join("ChatGPT.app");
+        std::fs::create_dir_all(bundle.join("Contents/MacOS")).unwrap();
+
+        assert_eq!(
+            validate_codex_app_path(&bundle.display().to_string()).unwrap(),
+            bundle
+        );
     }
 }

@@ -1,7 +1,8 @@
 use crate::{
     codex, commands::usage::local_today_range, local_usage::UsageLedger, model_unlock, models::*,
-    platform, session_index::SessionIndex, storage::Store,
+    network, platform, session_index::SessionIndex, storage::Store,
 };
+use std::{fs, path::Path};
 use tauri::State;
 
 #[derive(Debug, Default)]
@@ -56,7 +57,7 @@ fn project_active(state: &AppConfig) -> ActiveProjection {
 }
 
 #[tauri::command]
-pub(crate) async fn get_dashboard(
+pub(crate) async fn dashboard_get(
     store: State<'_, Store>,
     index: State<'_, SessionIndex>,
     ledger: State<'_, UsageLedger>,
@@ -65,21 +66,21 @@ pub(crate) async fn get_dashboard(
     let home = codex::home(&projection.home);
     let index = index.inner().clone();
     let scan_home = home.clone();
-    let (session_count, database_count, database_health) =
+    let session_task =
         tokio::task::spawn_blocking(move || match index.load_with_database_count(&scan_home) {
             Ok((sessions, database_count)) => (sessions.len(), database_count, "可以读取".into()),
             Err(_) => (0, 0, "读取失败".into()),
-        })
-        .await
-        .map_err(|error| AppError::Internal(error.to_string()))?;
+        });
     let today_query = UsageQuery {
         range: local_today_range(),
         group_by: UsageGroupBy::Account,
     };
     let ledger = ledger.inner().clone();
-    let today = tokio::task::spawn_blocking(move || ledger.query(today_query))
-        .await
-        .map_err(|error| AppError::Internal(error.to_string()))??;
+    let usage_task = tokio::task::spawn_blocking(move || ledger.query(today_query));
+    let (session_result, today_result) = tokio::try_join!(session_task, usage_task)
+        .map_err(|error| AppError::Internal(error.to_string()))?;
+    let (session_count, database_count, database_health) = session_result;
+    let today = today_result?;
     Ok(Dashboard {
         provider_count: projection.provider_count,
         active_provider: projection.active_provider,
@@ -121,19 +122,237 @@ fn settings_overview(store: &Store) -> Result<SettingsOverview, AppError> {
 }
 
 #[tauri::command]
-pub(crate) fn get_settings_overview(store: State<Store>) -> Result<SettingsOverview, AppError> {
+pub(crate) fn settings_get_overview(store: State<Store>) -> Result<SettingsOverview, AppError> {
     settings_overview(&store)
+}
+
+#[tauri::command]
+pub(crate) async fn settings_get_diagnostics(
+    store: State<'_, Store>,
+    index: State<'_, SessionIndex>,
+) -> Result<SupportDiagnostics, AppError> {
+    let (home_setting, active_kind, provider_count, official_account_count, active_model) =
+        store.read(|state| {
+            let active_model = state
+                .active
+                .provider_id
+                .as_deref()
+                .and_then(|id| state.providers.iter().find(|provider| provider.id == id))
+                .map(|provider| provider.model.trim())
+                .filter(|model| !model.is_empty())
+                .map(str::to_owned);
+            (
+                state.codex.home.clone(),
+                state.active.kind,
+                state.providers.len(),
+                state.official_accounts.len(),
+                active_model,
+            )
+        })?;
+    let root = store.root().to_path_buf();
+    let home = codex::home(&home_setting);
+    let index = index.inner().clone();
+    tokio::task::spawn_blocking(move || {
+        build_support_diagnostics(
+            &root,
+            &home,
+            &index,
+            active_kind,
+            provider_count,
+            official_account_count,
+            active_model,
+        )
+    })
+    .await
+    .map_err(|error| AppError::Internal(error.to_string()))
+}
+
+fn build_support_diagnostics(
+    root: &Path,
+    home: &Path,
+    index: &SessionIndex,
+    active_kind: ActiveKind,
+    provider_count: usize,
+    official_account_count: usize,
+    active_model: Option<String>,
+) -> SupportDiagnostics {
+    let inspection = codex::inspect(home);
+    let mut warnings = inspection
+        .warnings
+        .iter()
+        .map(|warning| redact_home_text(warning))
+        .collect::<Vec<_>>();
+    let (indexed_session_count, session_database_count) = match index.load_with_database_count(home)
+    {
+        Ok((sessions, database_count)) => (sessions.len(), database_count),
+        Err(error) => {
+            warnings.push(format!(
+                "会话索引读取失败：{}",
+                redact_home_text(&error.to_string())
+            ));
+            (0, 0)
+        }
+    };
+    let usage_database = usage_database_diagnostics(&root.join("usage.sqlite3"), &mut warnings);
+    let files = [
+        "app.json",
+        "connections.json",
+        "credentials.json",
+        "pricing.json",
+        "usage.json",
+        "sessions.json",
+        "cache.json",
+    ]
+    .into_iter()
+    .map(|name| file_diagnostics(root, name))
+    .collect();
+    let active_kind = match active_kind {
+        ActiveKind::Official => "official",
+        ActiveKind::Provider => "provider",
+        ActiveKind::None => "none",
+    };
+    SupportDiagnostics {
+        schema_version: 1,
+        generated_at: chrono::Utc::now().to_rfc3339(),
+        app: SupportAppDiagnostics {
+            name: "Codex Tools".into(),
+            version: env!("CARGO_PKG_VERSION").into(),
+            build_profile: if cfg!(debug_assertions) {
+                "debug".into()
+            } else {
+                "release".into()
+            },
+        },
+        system: SupportSystemDiagnostics {
+            os: std::env::consts::OS.into(),
+            architecture: std::env::consts::ARCH.into(),
+            family: std::env::consts::FAMILY.into(),
+        },
+        paths: SupportPathDiagnostics {
+            data_directory: redact_home_path(root),
+            codex_home: redact_home_path(home),
+            config_file: redact_home_path(&home.join("config.toml")),
+        },
+        configuration: SupportConfigDiagnostics {
+            valid: inspection.valid,
+            active_provider: inspection.active_provider,
+            managed_provider_present: inspection.managed_provider_present,
+            warnings: inspection
+                .warnings
+                .into_iter()
+                .map(|warning| redact_home_text(&warning))
+                .collect(),
+        },
+        connection: SupportConnectionDiagnostics {
+            active_kind: active_kind.into(),
+            provider_count,
+            official_account_count,
+            active_model,
+        },
+        storage: SupportStorageDiagnostics {
+            files,
+            usage_database,
+            session_database_count,
+            indexed_session_count,
+        },
+        network: network::support_diagnostics(),
+        warnings,
+        privacy: SupportPrivacyDiagnostics {
+            home_paths_redacted: true,
+            omitted: vec![
+                "API keys".into(),
+                "OAuth and Cookie tokens".into(),
+                "custom header values".into(),
+                "account identifiers and email addresses".into(),
+                "proxy addresses".into(),
+            ],
+        },
+    }
+}
+
+fn file_diagnostics(root: &Path, name: &str) -> SupportFileDiagnostics {
+    let path = root.join(name);
+    let metadata = fs::metadata(&path).ok();
+    SupportFileDiagnostics {
+        name: name.into(),
+        exists: metadata.is_some(),
+        readable: fs::File::open(path).is_ok(),
+        size_bytes: metadata.map(|value| value.len()),
+    }
+}
+
+fn usage_database_diagnostics(
+    path: &Path,
+    warnings: &mut Vec<String>,
+) -> SupportUsageDatabaseDiagnostics {
+    let metadata = fs::metadata(path).ok();
+    let mut result = SupportUsageDatabaseDiagnostics {
+        exists: metadata.is_some(),
+        size_bytes: metadata.map(|value| value.len()),
+        schema_version: None,
+        quick_check: if path.exists() {
+            "unavailable".into()
+        } else {
+            "missing".into()
+        },
+        event_count: None,
+        cursor_count: None,
+    };
+    if !result.exists {
+        return result;
+    }
+    let flags =
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let Ok(connection) = rusqlite::Connection::open_with_flags(path, flags) else {
+        warnings.push("用量数据库无法以只读方式打开。".into());
+        return result;
+    };
+    result.schema_version = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .ok();
+    result.quick_check = connection
+        .query_row("PRAGMA quick_check(1)", [], |row| row.get(0))
+        .unwrap_or_else(|_| "unavailable".into());
+    result.event_count = connection
+        .query_row("SELECT COUNT(*) FROM usage_events", [], |row| row.get(0))
+        .ok();
+    result.cursor_count = connection
+        .query_row("SELECT COUNT(*) FROM usage_cursors", [], |row| row.get(0))
+        .ok();
+    if result.quick_check != "ok" {
+        warnings.push(format!("用量数据库快速检查结果：{}", result.quick_check));
+    }
+    result
+}
+
+fn redact_home_path(path: &Path) -> String {
+    dirs::home_dir()
+        .and_then(|home| {
+            path.strip_prefix(home)
+                .ok()
+                .map(|relative| Path::new("~").join(relative).display().to_string())
+        })
+        .unwrap_or_else(|| path.display().to_string())
+}
+
+fn redact_home_text(value: &str) -> String {
+    let Some(home) = dirs::home_dir() else {
+        return value.into();
+    };
+    value.replace(&home.display().to_string(), "~")
 }
 
 /// 启动 Codex 桌面应用并默认解锁模型（调试模式启动 + 注入解锁脚本）。
 #[tauri::command]
-pub(crate) async fn launch_codex(store: State<'_, Store>) -> Result<ModelUnlockResult, AppError> {
+pub(crate) async fn dashboard_launch(
+    store: State<'_, Store>,
+) -> Result<ModelUnlockResult, AppError> {
     model_unlock::launch_with_debug(&store).await
 }
 
 /// 读取 Codex 应用路径设置（手动配置 + 实际检测结果）。
 #[tauri::command]
-pub(crate) fn get_codex_app_setting(store: State<Store>) -> Result<CodexAppSetting, AppError> {
+pub(crate) fn settings_get_codex_app(store: State<Store>) -> Result<CodexAppSetting, AppError> {
     let configured = store.codex_app_setting()?;
     Ok(CodexAppSetting {
         configured: configured.clone(),
@@ -144,11 +363,18 @@ pub(crate) fn get_codex_app_setting(store: State<Store>) -> Result<CodexAppSetti
 
 /// 保存手动指定的 Codex 应用路径（`.app` 目录或可执行文件）；`None` 恢复自动检测。
 #[tauri::command]
-pub(crate) fn save_codex_app_path(
+pub(crate) fn settings_save_codex_app_path(
     store: State<Store>,
     path: Option<String>,
 ) -> Result<(), AppError> {
-    store.save_codex_app_path(path)
+    if let Some(path) = path
+        .as_deref()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+    {
+        platform::validate_codex_app_path(path).map_err(AppError::InvalidConfig)?;
+    }
+    store.settings_save_codex_app_path(path)
 }
 
 #[cfg(test)]
@@ -156,11 +382,46 @@ mod tests {
     use super::*;
 
     #[test]
+    fn support_paths_hide_the_user_home_directory() {
+        let home = dirs::home_dir().expect("测试环境应有用户目录");
+        let redacted = redact_home_path(&home.join(".codex/config.toml"));
+
+        assert!(redacted.starts_with('~'));
+        assert!(!redacted.contains(&home.display().to_string()));
+    }
+
+    #[test]
+    fn support_report_contains_health_without_credentials() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("data");
+        let home = temp.path().join("codex-home");
+        fs::create_dir_all(&home).unwrap();
+        UsageLedger::open(&root).unwrap();
+
+        let report = build_support_diagnostics(
+            &root,
+            &home,
+            &SessionIndex::default(),
+            ActiveKind::Provider,
+            1,
+            1,
+            Some("gpt-5.6".into()),
+        );
+        let serialized = serde_json::to_string(&report).unwrap();
+
+        assert_eq!(report.storage.usage_database.quick_check, "ok");
+        assert_eq!(report.storage.usage_database.event_count, Some(0));
+        assert!(report.privacy.home_paths_redacted);
+        assert!(!serialized.contains("api_key"));
+        assert!(!serialized.contains("access_token"));
+    }
+
+    #[test]
     fn dashboard_projection_identifies_active_provider() {
         let temp = tempfile::tempdir().unwrap();
         let store = Store::open(temp.path().join("data")).unwrap();
         let provider = store
-            .save_provider(ProviderProfile {
+            .connections_save_provider(ProviderProfile {
                 id: String::new(),
                 name: "Provider".into(),
                 base_url: "https://example.test/v1".into(),
@@ -221,7 +482,9 @@ mod tests {
                 updated_at: 0,
             })
             .unwrap();
-        store.activate_official_account(&saved.id).unwrap();
+        store
+            .connections_activate_official_account(&saved.id)
+            .unwrap();
 
         let projection = store.read(project_active).unwrap();
 

@@ -101,7 +101,11 @@ pub(crate) async fn sync_active_codex_configuration(
             // 本应用上次写入的第三方默认模型；只有与最近一次写入记录一致
             // 才清除（用户手动设置的模型不受影响）。
             let managed_model = managed_model_to_remove(store, &home)?;
-            codex::activate_official_account(&home, &account.credential, managed_model.as_deref())?;
+            codex::connections_activate_official_account(
+                &home,
+                &account.credential,
+                managed_model.as_deref(),
+            )?;
             store.save_last_managed_model(None)?;
             return Ok(());
         }
@@ -146,8 +150,12 @@ pub(crate) async fn activate_openai_record(
     // 转换代理保持运行直到应用退出或服务被删除：端口在本机会话内保持稳定，
     // 切回 OpenAI 再切回第三方服务时，Codex 缓存的地址仍然有效。
     let result = async {
-        codex::activate_official_account(&home, &account.credential, managed_model.as_deref())?;
-        if let Err(error) = store.activate_official_account(&account.id) {
+        codex::connections_activate_official_account(
+            &home,
+            &account.credential,
+            managed_model.as_deref(),
+        )?;
+        if let Err(error) = store.connections_activate_official_account(&account.id) {
             return Err(compensate_activation_failure(store, manager, proxy, error).await);
         }
         let repair = if repair_sessions {
@@ -211,7 +219,7 @@ mod tests {
             })
             .unwrap();
         let provider = store
-            .save_provider(ProviderProfile {
+            .connections_save_provider(ProviderProfile {
                 id: "provider".into(),
                 name: "Provider".into(),
                 base_url: "http://127.0.0.1:9/v1".into(),
@@ -291,7 +299,9 @@ mod tests {
                 updated_at: 0,
             })
             .unwrap();
-        store.activate_official_account(&saved.id).unwrap();
+        store
+            .connections_activate_official_account(&saved.id)
+            .unwrap();
         fs::write(
             home.join("config.toml"),
             "model_provider = \"custom\"\n[model_providers.custom]\nwire_api = \"responses\"\nbase_url = \"https://wrong.example.test/v1\"\n",
@@ -363,7 +373,9 @@ mod tests {
                 updated_at: 0,
             })
             .unwrap();
-        store.activate_official_account(&saved.id).unwrap();
+        store
+            .connections_activate_official_account(&saved.id)
+            .unwrap();
         fs::write(
             home.join("auth.json"),
             r#"{"personal_access_token":"at-proxy-secret"}"#,

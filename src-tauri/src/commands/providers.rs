@@ -16,12 +16,12 @@ use std::collections::BTreeMap;
 use tauri::State;
 
 #[tauri::command]
-pub(crate) fn get_provider_overview(store: State<Store>) -> Result<ProviderOverview, AppError> {
+pub(crate) fn connections_list(store: State<Store>) -> Result<ProviderOverview, AppError> {
     store.provider_overview()
 }
 
 #[tauri::command]
-pub(crate) async fn save_provider(
+pub(crate) async fn connections_save_provider(
     store: State<'_, Store>,
     manager: State<'_, ConfigManager>,
     activation: State<'_, ActivationLock>,
@@ -48,7 +48,7 @@ pub(crate) async fn save_provider(
                 None => (true, true, true),
             }
         })?;
-        let saved = store.save_provider(provider)?;
+        let saved = store.connections_save_provider(provider)?;
         // 若正在使用此服务，同步配置时（对 Chat 类型）会自动启动/重启本机转换代理。
         if store.is_active_provider(&saved.id)? {
             sync_active_codex_configuration(&store, &manager, &proxy).await?;
@@ -70,17 +70,17 @@ pub(crate) async fn save_provider(
 }
 
 #[tauri::command]
-pub(crate) async fn delete_provider(
+pub(crate) async fn connections_delete_provider(
     store: State<'_, Store>,
     proxy: State<'_, ChatProxyRegistry>,
     id: String,
 ) -> Result<(), AppError> {
     proxy.stop(&id).await;
-    store.delete_provider(&id)
+    store.connections_delete_provider(&id)
 }
 
 #[tauri::command]
-pub(crate) async fn test_provider(
+pub(crate) async fn connections_test_provider(
     store: State<'_, Store>,
     client: State<'_, ApiClient>,
     id: String,
@@ -133,7 +133,7 @@ pub(crate) async fn test_provider(
 }
 
 #[tauri::command]
-pub(crate) async fn list_provider_models(
+pub(crate) async fn connections_list_models(
     store: State<'_, Store>,
     client: State<'_, ApiClient>,
     id: String,
@@ -155,7 +155,7 @@ pub(crate) async fn list_provider_models(
 
 /// 手动刷新当前激活服务商的模型列表（第三方 API 更新模型后使用）。
 #[tauri::command]
-pub(crate) async fn refresh_active_provider_models(
+pub(crate) async fn connections_refresh_models(
     store: State<'_, Store>,
     client: State<'_, ApiClient>,
 ) -> Result<Vec<String>, AppError> {
@@ -230,7 +230,7 @@ async fn sync_provider_models(
 }
 
 #[tauri::command]
-pub(crate) async fn preview_activation(
+pub(crate) async fn settings_preview_activation(
     store: State<'_, Store>,
     manager: State<'_, ConfigManager>,
     proxy: State<'_, ChatProxyRegistry>,
@@ -249,7 +249,7 @@ pub(crate) async fn preview_activation(
 }
 
 #[tauri::command]
-pub(crate) async fn apply_activation(
+pub(crate) async fn settings_apply_activation(
     store: State<'_, Store>,
     manager: State<'_, ConfigManager>,
     activation: State<'_, ActivationLock>,
@@ -263,7 +263,7 @@ pub(crate) async fn apply_activation(
 }
 
 #[tauri::command]
-pub(crate) async fn activate_provider(
+pub(crate) async fn connections_activate(
     store: State<'_, Store>,
     manager: State<'_, ConfigManager>,
     ledger: State<'_, UsageLedger>,

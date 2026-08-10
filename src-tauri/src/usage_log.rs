@@ -68,7 +68,9 @@ pub(crate) enum LineResult {
 
 #[cfg(test)]
 pub(crate) fn parse_rollout_text(text: &str) -> ParsedRollout {
-    let boundary_marker_required = text.lines().any(is_inter_agent_trigger_line);
+    let boundary_marker_required = text
+        .lines()
+        .any(|line| is_inter_agent_trigger_line(line.as_bytes()));
     let mut state = ParserState {
         boundary_marker_required,
         ..ParserState::default()
@@ -153,11 +155,10 @@ pub(crate) fn parse_line(line: &[u8], state: &mut ParserState) -> Result<LineRes
         }
         Some("event_msg") if payload_type == Some("task_started") => {
             if state.usage_boundary == UsageBoundaryState::AwaitingSubagentTaskStart {
-                state.usage_boundary = if state.boundary_marker_required {
-                    UsageBoundaryState::AwaitingSubagentBoundaryMarker
-                } else {
-                    UsageBoundaryState::Started
-                };
+                // task_started identifies the child, but the no-marker format
+                // still needs the following valid turn_context to establish
+                // the boundary.
+                state.usage_boundary = UsageBoundaryState::AwaitingSubagentBoundaryMarker;
             }
             Ok(LineResult::Ignored)
         }
@@ -194,6 +195,11 @@ pub(crate) fn parse_line(line: &[u8], state: &mut ParserState) -> Result<LineRes
                 .filter(|provider| !provider.is_empty())
             {
                 state.model_provider = Some(provider.to_owned());
+            }
+            if !state.boundary_marker_required
+                && state.usage_boundary == UsageBoundaryState::AwaitingSubagentBoundaryMarker
+            {
+                state.usage_boundary = UsageBoundaryState::Started;
             }
             Ok(LineResult::Ignored)
         }
@@ -337,10 +343,16 @@ fn parse_timestamp(value: &Value) -> Option<i64> {
     }
 }
 
-#[cfg(test)]
-fn is_inter_agent_trigger_line(line: &str) -> bool {
-    line.contains(r#""type":"inter_agent_communication_metadata""#)
-        && line.contains(r#""trigger_turn":true"#)
+pub(crate) fn is_inter_agent_trigger_line(line: &[u8]) -> bool {
+    let Ok(value) = serde_json::from_slice::<Value>(line) else {
+        return false;
+    };
+    value.get("type").and_then(Value::as_str) == Some("inter_agent_communication_metadata")
+        && value
+            .get("payload")
+            .and_then(|payload| payload.get("trigger_turn"))
+            .and_then(Value::as_bool)
+            == Some(true)
 }
 
 #[cfg(test)]
@@ -445,6 +457,31 @@ mod tests {
             parsed.state.usage_boundary,
             super::UsageBoundaryState::Started
         );
+    }
+
+    #[test]
+    fn counts_no_marker_subagent_after_task_started_and_turn_context() {
+        let text = concat!(
+            r#"{"type":"session_meta","payload":{"id":"subagent-no-marker","source":{"subagent":{"thread_spawn":{"parent_thread_id":"parent-rollout"}}}}}"#,
+            "\n",
+            r#"{"type":"turn_context","payload":{"model":"gpt-5.6-sol"}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100,"output_tokens":10,"total_tokens":110}}}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"task_started"}}"#,
+            "\n",
+            r#"{"type":"turn_context","payload":{"model":"gpt-5.6-luna"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-08-02T04:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":11,"output_tokens":4,"total_tokens":15}}}}"#,
+            "\n",
+        );
+
+        let parsed = parse_rollout_text(text);
+
+        assert_eq!(parsed.events.len(), 1);
+        assert_eq!(parsed.events[0].model, "gpt-5.6-luna");
+        assert_eq!(parsed.events[0].ordinal, 1);
+        assert_eq!(parsed.events[0].usage.total_tokens, 15);
     }
 
     #[test]

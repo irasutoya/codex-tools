@@ -259,7 +259,7 @@ impl AuthCenter {
         account_from_tokens(tokens, Some(account))
     }
 
-    pub async fn import_proxy_account(
+    pub async fn connections_import_cookie(
         &self,
         imported: ImportedProxyCredential,
         requested_name: Option<String>,

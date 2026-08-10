@@ -1,5 +1,0 @@
-export const MAX_DISPLAY_NAME_LENGTH = 100
-export const MAX_API_URL_LENGTH = 2_048
-export const MAX_API_KEY_LENGTH = 65_536
-export const MAX_ACCOUNT_ID_LENGTH = 512
-export const MAX_COOKIE_CREDENTIAL_LENGTH = 262_144

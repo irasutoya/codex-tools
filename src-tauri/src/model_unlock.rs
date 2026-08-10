@@ -56,7 +56,6 @@ const PROBE_TIMEOUT: Duration = Duration::from_millis(400);
 const MAX_CDP_PROBE_BYTES: usize = 256 * 1024;
 const EVALUATE_TIMEOUT: Duration = Duration::from_secs(5);
 const WAIT_LAUNCH_TIMEOUT: Duration = Duration::from_secs(20);
-const WAIT_QUIT_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// 构造调试端口候选列表：上次启动用的随机端口优先，再补上常见调试端口。
 /// 端口不再固定，本机其他进程无法预测本应用的调试端口。
@@ -258,7 +257,7 @@ pub(crate) async fn status(store: &Store) -> Result<ModelUnlockStatus, AppError>
         catalog_warning
     } else if app_running && debug_port.is_none() {
         Some(
-            "Codex 正在运行，但没有开启调试端口。从概览页点击“打开 Codex（自动解锁）”即可重启并解锁。"
+            "Codex 正在运行，但没有开启调试端口。为避免影响现有会话，请手动退出 Codex 后，再从概览页点击“打开 Codex（自动解锁）”。"
                 .into(),
         )
     } else if debug_port.is_none() {
@@ -285,7 +284,7 @@ pub(crate) async fn unlock(store: &Store) -> Result<ModelUnlockResult, AppError>
 async fn unlock_on(store: &Store, ports: &[u16]) -> Result<ModelUnlockResult, AppError> {
     let port = find_codex_debug_port_on(ports).await.ok_or_else(|| {
         AppError::InvalidConfig(
-            "未找到带调试端口的 Codex 实例，请先用“以调试模式重启 Codex”打开。".into(),
+            "未找到带调试端口的 Codex 实例，请先用“以调试模式启动 Codex 并解锁”打开。".into(),
         )
     })?;
     let active_kind = store.read(|state| state.active.kind)?;
@@ -313,7 +312,8 @@ async fn unlock_on(store: &Store, ports: &[u16]) -> Result<ModelUnlockResult, Ap
 }
 
 /// 启动 Codex 桌面应用（调试模式）并默认解锁模型；
-/// 已在调试端口运行的实例直接重新注入，不无谓重启；
+/// 已在调试端口运行的实例直接重新注入；
+/// 已运行但没有调试端口的实例不会被关闭或重启，而是提示用户手动退出；
 /// 官方账号/无激活服务时只启动 Codex、不注入（由订阅等级或手动配置决定）。
 /// 启动前确保 `model_catalog_json` 指向的目录文件已写入（让 CLI 的
 /// `list-models-for-host` 返回自定义模型），并尽快注入（让 Statsig 补丁先于
@@ -322,8 +322,6 @@ pub(crate) async fn launch_with_debug(store: &Store) -> Result<ModelUnlockResult
     let active_kind = store.read(|state| state.active.kind)?;
     let catalog = model_catalog(store)?;
     let configured = store.codex_app_setting()?;
-    let home = crate::codex::home(&store.codex_home_setting()?);
-    write_model_catalog(&home, &catalog)?;
     let empty_message = |active_kind| match active_kind {
         ActiveKind::Official => {
             "Codex 已启动。官方账号的模型选择器由订阅等级控制，无需解锁。".to_string()
@@ -335,8 +333,10 @@ pub(crate) async fn launch_with_debug(store: &Store) -> Result<ModelUnlockResult
             "Codex 已启动。当前服务商没有可用模型，请编辑服务并保存后重试。".to_string()
         }
     };
-    // 已有调试端口的运行实例：直接重新注入，避免无谓重启。
+    // 已有调试端口的运行实例：直接重新注入，不触碰运行中的进程。
     if let Some(port) = find_codex_debug_port_on(&debug_probe_ports(store)).await {
+        let home = crate::codex::home(&store.codex_home_setting()?);
+        write_model_catalog(&home, &catalog)?;
         if catalog.is_empty() {
             return Ok(ModelUnlockResult {
                 port,
@@ -347,24 +347,20 @@ pub(crate) async fn launch_with_debug(store: &Store) -> Result<ModelUnlockResult
         }
         return inject(port, &catalog).await;
     }
+    // 单实例桌面应用通常会忽略第二次启动传入的调试参数；不关闭或重启
+    // 用户现有的实例，直接要求用户手动退出后再启动。
     if platform::codex_app_running(configured.as_deref()) {
-        platform::quit_codex_app(configured.as_deref())
-            .map_err(|error| AppError::Internal(format!("无法退出正在运行的 Codex：{error}")))?;
-        let quit_deadline = Instant::now() + WAIT_QUIT_TIMEOUT;
-        while platform::codex_app_running(configured.as_deref()) {
-            if Instant::now() >= quit_deadline {
-                return Err(AppError::InvalidConfig(
-                    "Codex 未能正常退出，请手动关闭后重试。".into(),
-                ));
-            }
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        }
+        return Err(AppError::InvalidConfig(
+            "Codex 已在运行但没有开启调试端口。为避免影响现有会话，请手动退出 Codex 后再点击“以调试模式启动 Codex 并解锁”。".into(),
+        ));
     }
+    let home = crate::codex::home(&store.codex_home_setting()?);
+    write_model_catalog(&home, &catalog)?;
     // 每次启动使用随机端口并持久化，避免固定端口可被本机其他进程预测；
     // 探测时校验目标必须是 Codex 页面（app://-），不会误连其他调试端点。
     let debug_port = pick_debug_port();
     store.save_last_debug_port(debug_port)?;
-    platform::launch_codex_app_with_debug(debug_port, configured.as_deref())
+    platform::dashboard_launch_app_with_debug(debug_port, configured.as_deref())
         .map_err(|error| AppError::Internal(format!("无法以调试模式启动 Codex：{error}")))?;
     let deadline = Instant::now() + WAIT_LAUNCH_TIMEOUT;
     let port = loop {
@@ -987,10 +983,10 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let store = Store::open(temp.path().join("data")).unwrap();
         store
-            .save_provider(provider("provider-a", "deepseek-v4-pro"))
+            .connections_save_provider(provider("provider-a", "deepseek-v4-pro"))
             .unwrap();
         store
-            .save_provider(provider("provider-b", "kimi-k2"))
+            .connections_save_provider(provider("provider-b", "kimi-k2"))
             .unwrap();
         store.activate("provider-a").unwrap();
 
@@ -1028,7 +1024,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let store = Store::open(temp.path().join("data")).unwrap();
         store
-            .save_provider(provider("provider", "deepseek-v4-pro"))
+            .connections_save_provider(provider("provider", "deepseek-v4-pro"))
             .unwrap();
         store.activate("provider").unwrap();
         let catalog = model_catalog(&store).unwrap();
@@ -1151,7 +1147,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let store = Store::open(temp.path().join("data")).unwrap();
         store
-            .save_provider(provider("provider", "deepseek-v4-pro"))
+            .connections_save_provider(provider("provider", "deepseek-v4-pro"))
             .unwrap();
         store.activate("provider").unwrap();
         let catalog = model_catalog(&store).unwrap();
@@ -1224,7 +1220,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let store = Store::open(temp.path().join("data")).unwrap();
         store
-            .save_provider(provider("provider", "deepseek-v4-pro"))
+            .connections_save_provider(provider("provider", "deepseek-v4-pro"))
             .unwrap();
         store.activate("provider").unwrap();
 
@@ -1241,7 +1237,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let store = Store::open(temp.path().join("data")).unwrap();
         store
-            .save_provider(provider("provider", "deepseek-v4-pro"))
+            .connections_save_provider(provider("provider", "deepseek-v4-pro"))
             .unwrap();
         store.activate("provider").unwrap();
         let runtime = tokio::runtime::Builder::new_current_thread()

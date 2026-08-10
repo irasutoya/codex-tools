@@ -218,7 +218,7 @@ pub fn home(configured: &str) -> PathBuf {
         .join(".codex")
 }
 
-pub fn activate_official_account(
+pub fn connections_activate_official_account(
     codex_home: &Path,
     credential: &CodexAuthCredential,
     managed_model: Option<&str>,
@@ -1091,7 +1091,7 @@ settings = { model_provider = "custom" }
             last_refresh: "2026-07-14T00:00:00Z".into(),
         };
 
-        activate_official_account(temp.path(), &credential, None).unwrap();
+        connections_activate_official_account(temp.path(), &credential, None).unwrap();
 
         let config = fs::read_to_string(temp.path().join("config.toml")).unwrap();
         let parsed = config.parse::<DocumentMut>().unwrap();
@@ -1294,7 +1294,8 @@ base_url = "https://custom.example.test/v1"
             last_refresh: "2026-07-14T00:00:00Z".into(),
         };
 
-        activate_official_account(temp.path(), &credential, Some("gpt-5.6-luna")).unwrap();
+        connections_activate_official_account(temp.path(), &credential, Some("gpt-5.6-luna"))
+            .unwrap();
 
         let parsed = fs::read_to_string(temp.path().join("config.toml"))
             .unwrap()
@@ -1366,7 +1367,7 @@ base_url = "https://custom.example.test/v1"
             last_refresh: "2026-07-31T00:00:00Z".into(),
         };
 
-        activate_official_account(temp.path(), &credential, None).unwrap();
+        connections_activate_official_account(temp.path(), &credential, None).unwrap();
 
         let auth: serde_json::Value =
             serde_json::from_slice(&fs::read(temp.path().join("auth.json")).unwrap()).unwrap();

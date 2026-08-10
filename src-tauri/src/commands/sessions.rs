@@ -26,12 +26,12 @@ pub(crate) async fn repair_home(
 }
 
 #[tauri::command]
-pub(crate) async fn scan_codex_data(store: State<'_, Store>) -> Result<RepairScan, AppError> {
+pub(crate) async fn sessions_scan(store: State<'_, Store>) -> Result<RepairScan, AppError> {
     scan_home(codex::home(&store.codex_home_setting()?)).await
 }
 
 #[tauri::command]
-pub(crate) async fn repair_codex_data(
+pub(crate) async fn sessions_repair(
     store: State<'_, Store>,
     index: State<'_, SessionIndex>,
     target_provider: String,
@@ -44,7 +44,7 @@ pub(crate) async fn repair_codex_data(
 }
 
 #[tauri::command]
-pub(crate) async fn list_sessions(
+pub(crate) async fn sessions_list(
     store: State<'_, Store>,
     index: State<'_, SessionIndex>,
     query: Option<String>,

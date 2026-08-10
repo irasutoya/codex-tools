@@ -38,7 +38,7 @@ cargo test --manifest-path src-tauri/Cargo.toml --locked
 - 为新增或修复的逻辑补充测试；界面改动请附截图或录屏。
 - 用户可见的变化写入 `CHANGELOG.md` 的 `Unreleased` 部分。
 - 不要在日志、测试夹具、截图或提交历史中包含 API Key、OAuth token、Codex
-  `auth.json`、`data/app.yaml` 或会话正文。
+  `auth.json`、`data/app.json`、`data/credentials.json` 或会话正文。
 - 保持 `package.json`、`package-lock.json`、`src-tauri/Cargo.toml` 和
   `src-tauri/tauri.conf.json` 中的版本一致。
 

@@ -6,7 +6,7 @@ use chrono::TimeZone;
 use tauri::State;
 
 #[tauri::command]
-pub(crate) async fn get_usage_overview(
+pub(crate) async fn usage_get_overview(
     ledger: State<'_, UsageLedger>,
     query: UsageQuery,
 ) -> Result<UsageOverview, AppError> {
@@ -17,13 +17,21 @@ pub(crate) async fn get_usage_overview(
 }
 
 #[tauri::command]
-pub(crate) async fn refresh_usage(
+pub(crate) async fn usage_refresh(
     store: State<'_, Store>,
     ledger: State<'_, UsageLedger>,
     query: UsageQuery,
 ) -> Result<UsageOverview, AppError> {
     // 对账必须发生在增量解析之前，确保本次新增事件可以使用当前 Provider/账号。
     record_current_activation(&store, &ledger)?;
+    let official_account_identities = store.read(|state| {
+        state
+            .official_accounts
+            .iter()
+            .map(|account| (account.id.clone(), account.account_id.clone()))
+            .collect::<Vec<_>>()
+    })?;
+    ledger.sync_official_account_identities(&official_account_identities)?;
     let codex_home = codex::home(&store.codex_home_setting()?);
     let now_utc_ms = chrono::Utc::now().timestamp_millis();
     let ledger = ledger.inner().clone();
@@ -47,7 +55,7 @@ pub(crate) async fn refresh_usage(
 }
 
 #[tauri::command]
-pub(crate) async fn get_usage_trend(
+pub(crate) async fn usage_get_trend(
     ledger: State<'_, UsageLedger>,
     range: UsageRange,
 ) -> Result<UsageTrend, AppError> {
@@ -58,14 +66,14 @@ pub(crate) async fn get_usage_trend(
 }
 
 #[tauri::command]
-pub(crate) fn get_official_pricing_catalog(
+pub(crate) fn usage_get_official_pricing(
     ledger: State<UsageLedger>,
 ) -> Result<OfficialPricingCatalogView, AppError> {
     catalog_view(ledger.official_pricing_catalog()?)
 }
 
 #[tauri::command]
-pub(crate) async fn refresh_official_pricing_catalog(
+pub(crate) async fn usage_refresh_official_pricing(
     client: State<'_, ApiClient>,
     ledger: State<'_, UsageLedger>,
 ) -> Result<OfficialPricingCatalogView, AppError> {
@@ -182,28 +190,31 @@ fn token_rates_view(rates: official_pricing::TokenRates) -> TokenRatesView {
 }
 
 #[tauri::command]
-pub(crate) fn list_pricing_rules(
+pub(crate) fn usage_list_pricing_rules(
     ledger: State<UsageLedger>,
     scope: Option<PricingScope>,
 ) -> Result<Vec<PricingRule>, AppError> {
-    ledger.list_pricing_rules(scope)
+    ledger.usage_list_pricing_rules(scope)
 }
 
 #[tauri::command]
-pub(crate) fn save_pricing_rule(
+pub(crate) fn usage_save_pricing_rule(
     ledger: State<UsageLedger>,
     input: SavePricingRule,
 ) -> Result<PricingRule, AppError> {
-    ledger.save_pricing_rule(input)
+    ledger.usage_save_pricing_rule(input)
 }
 
 #[tauri::command]
-pub(crate) fn delete_pricing_rule(ledger: State<UsageLedger>, id: String) -> Result<(), AppError> {
-    ledger.delete_pricing_rule(&id)
+pub(crate) fn usage_delete_pricing_rule(
+    ledger: State<UsageLedger>,
+    id: String,
+) -> Result<(), AppError> {
+    ledger.usage_delete_pricing_rule(&id)
 }
 
 #[tauri::command]
-pub(crate) fn reprice_usage(
+pub(crate) fn usage_reprice(
     ledger: State<UsageLedger>,
     range: UsageRange,
 ) -> Result<RepriceResult, AppError> {

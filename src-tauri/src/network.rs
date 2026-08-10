@@ -1,3 +1,4 @@
+use crate::models::SupportNetworkDiagnostics;
 use reqwest::{Client, ClientBuilder, NoProxy, Proxy};
 use std::{
     sync::{Mutex, OnceLock},
@@ -154,6 +155,22 @@ fn environment_proxy_configured(snapshot: &ProxySnapshot) -> bool {
             "ALL_PROXY" | "all_proxy" | "HTTPS_PROXY" | "https_proxy" | "HTTP_PROXY" | "http_proxy"
         ) && value.as_ref().is_some_and(|value| !value.is_empty())
     })
+}
+
+pub(crate) fn support_diagnostics() -> SupportNetworkDiagnostics {
+    let snapshot = cached_proxy_snapshot();
+    let no_proxy_configured = snapshot.environment.iter().any(|(name, value)| {
+        matches!(name.as_str(), "NO_PROXY" | "no_proxy")
+            && value.as_ref().is_some_and(|value| !value.trim().is_empty())
+    });
+    SupportNetworkDiagnostics {
+        environment_proxy_configured: environment_proxy_configured(&snapshot),
+        no_proxy_configured,
+        system_proxy_configured: snapshot.platform.is_some_and(|settings| {
+            settings.http.is_some() || settings.https.is_some() || settings.socks.is_some()
+        }),
+        tls_backend: "rustls".into(),
+    }
 }
 
 fn apply_system_proxy(

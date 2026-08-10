@@ -12,7 +12,10 @@ use crate::{
     },
     provider_sync,
     storage::{secure_directory, secure_file},
-    usage_log::{LineResult, ParsedUsageEvent, ParserState, UsageBoundaryState, parse_line},
+    usage_log::{
+        LineResult, ParsedUsageEvent, ParserState, UsageBoundaryState, is_inter_agent_trigger_line,
+        parse_line,
+    },
 };
 use chrono::{Local, TimeZone, Utc};
 use rusqlite::{Connection, OptionalExtension, Row, params};
@@ -26,7 +29,7 @@ use std::{
 };
 use uuid::Uuid;
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 const MAX_ROLLOUT_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_METADATA_SCAN_BYTES: usize = 4 * 1024 * 1024;
 const MAX_RECORD_LINE_BYTES: usize = 8 * 1024 * 1024;
@@ -36,7 +39,7 @@ const COLLECTION_MODE_METADATA_KEY: &str = "usage_collection_mode";
 const PARSER_VERSION_METADATA_KEY: &str = "usage_parser_version";
 const COLLECTION_MODE: &str = "after_update";
 const COLLECTION_VERSION: &str = env!("CARGO_PKG_VERSION");
-const PARSER_VERSION: &str = "4";
+const PARSER_VERSION: &str = "5";
 
 #[derive(Clone)]
 pub(crate) struct UsageLedger {
@@ -79,6 +82,7 @@ struct StoredCursor {
     last_model_provider: Option<String>,
     usage_boundary_passed: bool,
     usage_boundary: i64,
+    subagent_boundary_mode: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -225,12 +229,18 @@ impl UsageLedger {
             .unwrap_or(query.range.end_at_ms);
         let mut statement = connection
             .prepare(
-                "SELECT occurred_at_ms, model, source_kind, provider_id, account_id, source_name,
+                "SELECT occurred_at_ms, model, usage_events.source_kind, usage_events.provider_id,
+                        COALESCE(account_identity_aliases.canonical_account_id, usage_events.account_id),
+                        usage_events.source_name,
                         input_tokens, cached_input_tokens, cache_write_input_tokens,
                         output_tokens, reasoning_output_tokens, total_tokens,
                         cost_status, estimated_cost_microusd, pricing_rule_name,
                         pricing_rule_version
                  FROM usage_events
+                 LEFT JOIN account_identity_aliases
+                   ON account_identity_aliases.source_kind = usage_events.source_kind
+                  AND account_identity_aliases.provider_id IS usage_events.provider_id
+                  AND account_identity_aliases.local_account_id = usage_events.account_id
                 WHERE occurred_at_ms >= ?1 AND occurred_at_ms < ?2
                  ORDER BY occurred_at_ms, event_ordinal",
             )
@@ -289,6 +299,18 @@ impl UsageLedger {
                     })
                 }
             };
+            if query.group_by == UsageGroupBy::Model
+                && (aggregate.source_kind != row.source_kind
+                    || aggregate.provider_id != row.provider_id
+                    || aggregate.account_id != row.account_id)
+            {
+                // “按模型”必须保证一个模型 ID 只出现一次。来源元数据不一致时，
+                // 清除单一来源标识，避免把合并后的用量错误归到第一条事件的账号上。
+                aggregate.source_kind = UsageSourceKind::Unattributed;
+                aggregate.provider_id = None;
+                aggregate.account_id = None;
+                aggregate.source_name = "多个账号/来源".into();
+            }
             add_tokens(&mut aggregate.tokens, &row.tokens);
             aggregate.requests = aggregate.requests.saturating_add(1);
             aggregate.estimated_cost_microusd = aggregate
@@ -470,6 +492,35 @@ impl UsageLedger {
         Ok(id)
     }
 
+    pub(crate) fn sync_official_account_identities(
+        &self,
+        accounts: &[(String, String)],
+    ) -> Result<(), AppError> {
+        let connection = self.open_connection().map_err(AppError::from)?;
+        initialize_schema(&connection).map_err(AppError::from)?;
+        let now = Utc::now().timestamp_millis();
+        for (local_account_id, external_account_id) in accounts {
+            if local_account_id.trim().is_empty() || external_account_id.trim().is_empty() {
+                continue;
+            }
+            let canonical_account_id =
+                crate::models::canonical_official_account_id(external_account_id);
+            connection
+                .execute(
+                    "INSERT INTO account_identity_aliases(
+                        source_kind, provider_id, local_account_id,
+                        canonical_account_id, identity_source, created_at_ms
+                     ) VALUES ('official', NULL, ?1, ?2, 'official_external_id', ?3)
+                     ON CONFLICT(source_kind, provider_id, local_account_id) DO UPDATE SET
+                        canonical_account_id = excluded.canonical_account_id,
+                        identity_source = excluded.identity_source",
+                    params![local_account_id.trim(), canonical_account_id, now],
+                )
+                .map_err(|error| AppError::Internal(format!("保存账号归一化映射失败：{error}")))?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn confirm_activation(&self, id: &str) -> Result<(), AppError> {
         let connection = self.open_connection().map_err(AppError::from)?;
         initialize_schema(&connection).map_err(AppError::from)?;
@@ -536,7 +587,7 @@ impl UsageLedger {
         insert_activation_row(&connection, &id, &activation, "confirmed")
     }
 
-    pub(crate) fn list_pricing_rules(
+    pub(crate) fn usage_list_pricing_rules(
         &self,
         scope: Option<PricingScope>,
     ) -> Result<Vec<PricingRule>, AppError> {
@@ -641,7 +692,7 @@ impl UsageLedger {
         })
     }
 
-    pub(crate) fn save_pricing_rule(
+    pub(crate) fn usage_save_pricing_rule(
         &self,
         input: SavePricingRule,
     ) -> Result<PricingRule, AppError> {
@@ -719,7 +770,7 @@ impl UsageLedger {
         Ok(input)
     }
 
-    pub(crate) fn delete_pricing_rule(&self, id: &str) -> Result<(), AppError> {
+    pub(crate) fn usage_delete_pricing_rule(&self, id: &str) -> Result<(), AppError> {
         let id = id.trim();
         if id.is_empty() {
             return Err(AppError::InvalidConfig("美元价格规则 ID 不能为空。".into()));
@@ -908,6 +959,15 @@ fn initialize_schema(connection: &Connection) -> anyhow::Result<()> {
                key TEXT PRIMARY KEY,
                value TEXT NOT NULL
              );
+             CREATE TABLE IF NOT EXISTS account_identity_aliases (
+               source_kind TEXT NOT NULL,
+               provider_id TEXT,
+               local_account_id TEXT NOT NULL,
+               canonical_account_id TEXT NOT NULL,
+               identity_source TEXT NOT NULL,
+               created_at_ms INTEGER NOT NULL,
+               PRIMARY KEY (source_kind, provider_id, local_account_id)
+             );
              CREATE TABLE IF NOT EXISTS usage_events (
                event_id TEXT PRIMARY KEY,
                rollout_id TEXT NOT NULL,
@@ -953,6 +1013,8 @@ fn initialize_schema(connection: &Connection) -> anyhow::Result<()> {
                  CHECK (usage_boundary_passed IN (0, 1)),
                usage_boundary_state INTEGER NOT NULL DEFAULT 0
                  CHECK (usage_boundary_state IN (0, 1, 2, 3)),
+               subagent_boundary_mode INTEGER NOT NULL DEFAULT 0
+                 CHECK (subagent_boundary_mode IN (0, 1, 2)),
                file_length INTEGER NOT NULL,
                file_modified_at_ms INTEGER,
                updated_at_ms INTEGER NOT NULL
@@ -1003,7 +1065,7 @@ fn initialize_schema(connection: &Connection) -> anyhow::Result<()> {
              );
              CREATE INDEX IF NOT EXISTS official_pricing_catalog_active_idx
                ON official_pricing_catalogs(active, fetched_at_ms DESC);
-             PRAGMA user_version = 4;
+             PRAGMA user_version = 5;
              COMMIT;",
         )?;
     }
@@ -1051,9 +1113,27 @@ fn initialize_schema(connection: &Connection) -> anyhow::Result<()> {
              COMMIT;",
         )?;
     }
+    if version > 0 && version < SCHEMA_VERSION {
+        connection.execute_batch(
+            "BEGIN;
+             ALTER TABLE usage_cursors
+               ADD COLUMN subagent_boundary_mode INTEGER NOT NULL DEFAULT 0
+                 CHECK (subagent_boundary_mode IN (0, 1, 2));
+             COMMIT;",
+        )?;
+    }
     if version < SCHEMA_VERSION {
         connection.execute_batch(
             "BEGIN;
+             CREATE TABLE IF NOT EXISTS account_identity_aliases (
+               source_kind TEXT NOT NULL,
+               provider_id TEXT,
+               local_account_id TEXT NOT NULL,
+               canonical_account_id TEXT NOT NULL,
+               identity_source TEXT NOT NULL,
+               created_at_ms INTEGER NOT NULL,
+               PRIMARY KEY (source_kind, provider_id, local_account_id)
+             );
              CREATE TABLE IF NOT EXISTS official_pricing_catalogs (
                version INTEGER PRIMARY KEY,
                content_sha256 TEXT NOT NULL UNIQUE,
@@ -1066,7 +1146,7 @@ fn initialize_schema(connection: &Connection) -> anyhow::Result<()> {
              );
              CREATE INDEX IF NOT EXISTS official_pricing_catalog_active_idx
                ON official_pricing_catalogs(active, fetched_at_ms DESC);
-             PRAGMA user_version = 4;
+             PRAGMA user_version = 5;
              COMMIT;",
         )?;
     }
@@ -1170,14 +1250,20 @@ fn initialize_collection_epoch(
         else {
             continue;
         };
-        let usage_boundary = if discovered.is_subagent {
-            rollout_boundary_state(path, discovered.boundary_marker_required).map_err(|error| {
+        let replayed_state = if discovered.is_subagent {
+            rollout_state(path, discovered.boundary_marker_required).map_err(|error| {
                 AppError::Internal(format!("初始化本机用量子任务边界失败：{error}"))
             })?
         } else {
+            rollout_state(path, discovered.boundary_marker_required)
+                .map_err(|error| AppError::Internal(format!("初始化本机用量上下文失败：{error}")))?
+        };
+        let usage_boundary = if discovered.is_subagent {
+            replayed_state.usage_boundary
+        } else {
             UsageBoundaryState::Regular
         };
-        let rollout_id = discovered.rollout_id;
+        let rollout_id = discovered.rollout_id.clone();
         let (next_event_ordinal, last_model, last_model_provider) = transaction
             .query_row(
                 "SELECT COALESCE(MAX(event_ordinal), -1) + 1, model, model_provider
@@ -1197,8 +1283,9 @@ fn initialize_collection_epoch(
                 "INSERT INTO usage_cursors(
                     rollout_id, last_path, byte_offset, next_event_ordinal,
                     last_model, last_model_provider, usage_boundary_passed,
-                    usage_boundary_state, file_length, file_modified_at_ms, updated_at_ms
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                    usage_boundary_state, subagent_boundary_mode,
+                    file_length, file_modified_at_ms, updated_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
                  ON CONFLICT(rollout_id) DO UPDATE SET
                    last_path = excluded.last_path,
                    byte_offset = excluded.byte_offset,
@@ -1207,6 +1294,7 @@ fn initialize_collection_epoch(
                    last_model_provider = excluded.last_model_provider,
                    usage_boundary_passed = excluded.usage_boundary_passed,
                    usage_boundary_state = excluded.usage_boundary_state,
+                   subagent_boundary_mode = excluded.subagent_boundary_mode,
                    file_length = excluded.file_length,
                    file_modified_at_ms = excluded.file_modified_at_ms,
                    updated_at_ms = excluded.updated_at_ms",
@@ -1216,11 +1304,17 @@ fn initialize_collection_epoch(
                     i64::try_from(metadata.len()).map_err(|_| {
                         AppError::Internal("会话文件大小超过数据库范围。".into())
                     })?,
-                    next_event_ordinal.max(0),
-                    last_model,
-                    last_model_provider.or(discovered.model_provider),
+                    next_event_ordinal
+                        .max(0)
+                        .max(i64::try_from(replayed_state.next_event_ordinal).unwrap_or(i64::MAX)),
+                    replayed_state.model.or(last_model),
+                    replayed_state
+                        .model_provider
+                        .or(last_model_provider)
+                        .or(discovered.model_provider.clone()),
                     i64::from(usage_boundary_passed(usage_boundary)),
                     usage_boundary_code(usage_boundary),
+                    subagent_boundary_mode(&discovered),
                     i64::try_from(metadata.len()).map_err(|_| {
                         AppError::Internal("会话文件大小超过数据库范围。".into())
                     })?,
@@ -1325,8 +1419,13 @@ fn refresh_file(
     let rollout_id = discovered.rollout_id.clone();
 
     let cursor = load_cursor(connection, &rollout_id)?;
+    let rebuild_rollout = discovered.is_subagent
+        && discovered.boundary_marker_required
+        && cursor
+            .as_ref()
+            .is_some_and(|cursor| cursor.subagent_boundary_mode == 2);
     let (offset, mut state) = match cursor {
-        Some(cursor) if cursor.byte_offset <= metadata.len() => (
+        Some(cursor) if !rebuild_rollout && cursor.byte_offset <= metadata.len() => (
             cursor.byte_offset,
             ParserState {
                 rollout_id: Some(rollout_id.clone()),
@@ -1431,6 +1530,14 @@ fn refresh_file(
     let transaction = connection
         .transaction()
         .map_err(|error| format!("开始保存本机用量事务失败：{error}"))?;
+    if rebuild_rollout {
+        transaction
+            .execute(
+                "DELETE FROM usage_events WHERE rollout_id = ?1",
+                params![rollout_id],
+            )
+            .map_err(|error| format!("重建子任务用量失败：{error}"))?;
+    }
     let mut events_added = 0;
     for event in events {
         if event.occurred_at_ms < collection_epoch {
@@ -1454,8 +1561,9 @@ fn refresh_file(
             "INSERT INTO usage_cursors(
                 rollout_id, last_path, byte_offset, next_event_ordinal,
                 last_model, last_model_provider, usage_boundary_passed,
-                usage_boundary_state, file_length, file_modified_at_ms, updated_at_ms
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                usage_boundary_state, subagent_boundary_mode,
+                file_length, file_modified_at_ms, updated_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
              ON CONFLICT(rollout_id) DO UPDATE SET
                last_path = excluded.last_path,
                byte_offset = excluded.byte_offset,
@@ -1464,6 +1572,7 @@ fn refresh_file(
                last_model_provider = excluded.last_model_provider,
                usage_boundary_passed = excluded.usage_boundary_passed,
                usage_boundary_state = excluded.usage_boundary_state,
+               subagent_boundary_mode = excluded.subagent_boundary_mode,
                file_length = excluded.file_length,
                file_modified_at_ms = excluded.file_modified_at_ms,
                updated_at_ms = excluded.updated_at_ms",
@@ -1477,6 +1586,7 @@ fn refresh_file(
                 state.model_provider,
                 i64::from(usage_boundary_passed(state.usage_boundary)),
                 usage_boundary_code(state.usage_boundary),
+                subagent_boundary_mode(&discovered),
                 i64::try_from(metadata.len()).map_err(|_| "会话文件大小超过数据库范围。")?,
                 file_modified_at_ms,
                 now_utc_ms,
@@ -1510,10 +1620,7 @@ fn refresh_file(
     })
 }
 
-fn rollout_boundary_state(
-    path: &Path,
-    boundary_marker_required: bool,
-) -> Result<UsageBoundaryState, String> {
+fn rollout_state(path: &Path, boundary_marker_required: bool) -> Result<ParserState, String> {
     let file = File::open(path).map_err(|error| format!("无法打开会话文件：{error}"))?;
     let mut reader = BufReader::new(file);
     let mut state = ParserState {
@@ -1527,7 +1634,7 @@ fn rollout_boundary_state(
             .read_until(b'\n', &mut line)
             .map_err(|error| format!("读取子任务边界失败：{error}"))?;
         if bytes_read == 0 {
-            return Ok(state.usage_boundary);
+            return Ok(state);
         }
         if line.len() > MAX_RECORD_LINE_BYTES {
             continue;
@@ -1564,14 +1671,24 @@ fn usage_boundary_passed(value: UsageBoundaryState) -> bool {
     )
 }
 
+fn subagent_boundary_mode(discovered: &DiscoveredRollout) -> i64 {
+    if !discovered.is_subagent {
+        0
+    } else if discovered.boundary_marker_required {
+        1
+    } else {
+        2
+    }
+}
+
 fn discover_rollout(path: &Path) -> Result<Option<DiscoveredRollout>, String> {
     let file = File::open(path).map_err(|error| format!("无法打开会话文件：{error}"))?;
     let mut reader = BufReader::new(file);
-    let mut state = ParserState::default();
+    let mut lines = Vec::<Vec<u8>>::new();
     let mut scanned = 0usize;
     loop {
         if scanned >= MAX_METADATA_SCAN_BYTES {
-            return Ok(None);
+            break;
         }
         let mut line = Vec::new();
         let bytes_read = reader
@@ -1584,29 +1701,34 @@ fn discover_rollout(path: &Path) -> Result<Option<DiscoveredRollout>, String> {
         if !line.ends_with(b"\n") {
             break;
         }
-        let line = line.strip_suffix(b"\n").unwrap_or(&line);
-        let line = line.strip_suffix(b"\r").unwrap_or(line);
-        if let Ok(LineResult::Ignored) = parse_line(line, &mut state) {
-            if let Some(rollout_id) = state.rollout_id.clone() {
-                let is_subagent =
-                    state.usage_boundary == UsageBoundaryState::AwaitingSubagentTaskStart;
-                return Ok(Some(DiscoveredRollout {
-                    rollout_id,
-                    model_provider: state.model_provider.clone(),
-                    is_subagent,
-                    boundary_marker_required: is_subagent,
-                }));
-            }
-        }
+        lines.push(line);
     }
-    Ok(None)
+    let boundary_marker_required = lines.iter().any(|line| is_inter_agent_trigger_line(line));
+    let mut state = ParserState {
+        boundary_marker_required,
+        ..ParserState::default()
+    };
+    for line in lines {
+        let _ = parse_line(&line, &mut state);
+    }
+    let Some(rollout_id) = state.rollout_id else {
+        return Ok(None);
+    };
+    let is_subagent = state.usage_boundary != UsageBoundaryState::Regular;
+    Ok(Some(DiscoveredRollout {
+        rollout_id,
+        model_provider: state.model_provider,
+        is_subagent,
+        boundary_marker_required: is_subagent && boundary_marker_required,
+    }))
 }
 
 fn load_cursor(connection: &Connection, rollout_id: &str) -> Result<Option<StoredCursor>, String> {
     connection
         .query_row(
             "SELECT last_path, byte_offset, next_event_ordinal, last_model,
-                    last_model_provider, usage_boundary_passed, usage_boundary_state
+                    last_model_provider, usage_boundary_passed, usage_boundary_state,
+                    subagent_boundary_mode
              FROM usage_cursors WHERE rollout_id = ?1",
             params![rollout_id],
             |row| {
@@ -1620,6 +1742,7 @@ fn load_cursor(connection: &Connection, rollout_id: &str) -> Result<Option<Store
                     last_model_provider: row.get(4)?,
                     usage_boundary_passed: row.get::<_, i64>(5)? != 0,
                     usage_boundary: row.get(6)?,
+                    subagent_boundary_mode: row.get(7)?,
                 })
             },
         )
@@ -2182,13 +2305,7 @@ fn read_usage_row(row: &Row<'_>, _group_by: UsageGroupBy) -> rusqlite::Result<Db
 
 fn aggregate_key(row: &DbUsageRow, group_by: UsageGroupBy) -> String {
     match group_by {
-        UsageGroupBy::Model => format!(
-            "model:{}:{}:{}:{}",
-            row.model,
-            source_kind_text(row.source_kind),
-            row.provider_id.as_deref().unwrap_or_default(),
-            row.account_id.as_deref().unwrap_or_default()
-        ),
+        UsageGroupBy::Model => format!("model:{}", row.model),
         UsageGroupBy::Account => format!(
             "account:{}:{}:{}",
             source_kind_text(row.source_kind),
@@ -2368,6 +2485,15 @@ mod tests {
         )
     }
 
+    fn rollout_event_later() -> &'static str {
+        concat!(
+            r#"{"type":"turn_context","payload":{"model":"gpt-5.6-sol"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-08-01T10:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100,"cached_input_tokens":20,"cache_write_input_tokens":3,"output_tokens":8,"reasoning_output_tokens":2,"total_tokens":108}}}}"#,
+            "\n",
+        )
+    }
+
     fn provider_switch_event() -> &'static str {
         concat!(
             r#"{"type":"event_msg","payload":{"type":"thread_settings_applied","thread_settings":{"model":"gpt-5.6-luna","model_provider_id":"custom"}}}"#,
@@ -2401,6 +2527,17 @@ mod tests {
             r#"{"timestamp":"2026-08-01T20:00:00Z","type":"turn_context","payload":{"model":"gpt-5.6-luna"}}"#,
             "\n",
             r#"{"timestamp":"2026-08-01T20:00:00Z","type":"inter_agent_communication_metadata","payload":{"trigger_turn":true}}"#,
+            "\n",
+            r#"{"timestamp":"2026-08-01T20:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":11,"output_tokens":4,"total_tokens":15}}}}"#,
+            "\n",
+        )
+    }
+
+    fn subagent_no_marker_event() -> &'static str {
+        concat!(
+            r#"{"timestamp":"2026-08-01T20:00:00Z","type":"event_msg","payload":{"type":"task_started"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-08-01T20:00:00Z","type":"turn_context","payload":{"model":"gpt-5.6-luna","model_provider":"custom"}}"#,
             "\n",
             r#"{"timestamp":"2026-08-01T20:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":11,"output_tokens":4,"total_tokens":15}}}}"#,
             "\n",
@@ -2591,7 +2728,7 @@ mod tests {
 
         // 规则 effective_from = 范围起点（collection_epoch），早于事件时间。
         ledger
-            .save_pricing_rule(SavePricingRule {
+            .usage_save_pricing_rule(SavePricingRule {
                 id: String::new(),
                 version: 0,
                 active: true,
@@ -2710,6 +2847,156 @@ mod tests {
     }
 
     #[test]
+    fn canonical_account_aliases_merge_historical_local_account_ids() {
+        use std::io::Write;
+
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex");
+        let path = write_rollout(&home, rollout_prefix());
+        let ledger = UsageLedger::open(&temp.path().join("app")).unwrap();
+        let collection_epoch = DateTime::parse_from_rfc3339("2026-08-01T09:00:00Z")
+            .unwrap()
+            .timestamp_millis();
+        let first_activation = collection_epoch + 1_000;
+        let second_activation = DateTime::parse_from_rfc3339("2026-08-01T10:00:01.500Z")
+            .unwrap()
+            .timestamp_millis();
+
+        ledger
+            .record_activation(ActivationRecord {
+                effective_at_ms: first_activation,
+                source_kind: UsageSourceKind::Official,
+                provider_id: None,
+                account_id: Some("local-account-a".into()),
+                model_provider: Some("openai".into()),
+                display_name_snapshot: "账号 A".into(),
+                auth_source: Some("openai_oauth".into()),
+            })
+            .unwrap();
+        ledger.refresh(&home, collection_epoch).unwrap();
+        {
+            let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+            file.write_all(rollout_event().as_bytes()).unwrap();
+        }
+        ledger.refresh(&home, collection_epoch + 3_000).unwrap();
+
+        ledger
+            .record_activation(ActivationRecord {
+                effective_at_ms: second_activation,
+                source_kind: UsageSourceKind::Official,
+                provider_id: None,
+                account_id: Some("local-account-b".into()),
+                model_provider: Some("openai".into()),
+                display_name_snapshot: "账号 B".into(),
+                auth_source: Some("openai_oauth".into()),
+            })
+            .unwrap();
+        {
+            let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+            file.write_all(rollout_event_later().as_bytes()).unwrap();
+        }
+        ledger.refresh(&home, collection_epoch + 4_000).unwrap();
+
+        let before = ledger
+            .query(UsageQuery {
+                range: UsageRange {
+                    start_at_ms: collection_epoch,
+                    end_at_ms: collection_epoch + 10_000_000,
+                },
+                group_by: UsageGroupBy::Account,
+            })
+            .unwrap();
+        assert_eq!(before.rows.len(), 2);
+
+        ledger
+            .sync_official_account_identities(&[
+                ("local-account-a".into(), "external-account-x".into()),
+                ("local-account-b".into(), "external-account-x".into()),
+            ])
+            .unwrap();
+        let after = ledger
+            .query(UsageQuery {
+                range: UsageRange {
+                    start_at_ms: collection_epoch,
+                    end_at_ms: collection_epoch + 10_000_000,
+                },
+                group_by: UsageGroupBy::Account,
+            })
+            .unwrap();
+        assert_eq!(after.rows.len(), 1);
+        assert_eq!(after.rows[0].requests, 2);
+        assert_eq!(after.rows[0].tokens.total_tokens, 216);
+    }
+
+    #[test]
+    fn model_grouping_merges_the_same_model_across_accounts() {
+        use std::io::Write;
+
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex");
+        let path = write_rollout(&home, rollout_prefix());
+        let ledger = UsageLedger::open(&temp.path().join("app")).unwrap();
+        let collection_epoch = DateTime::parse_from_rfc3339("2026-08-01T09:00:00Z")
+            .unwrap()
+            .timestamp_millis();
+
+        ledger
+            .record_activation(ActivationRecord {
+                effective_at_ms: collection_epoch + 1_000,
+                source_kind: UsageSourceKind::Official,
+                provider_id: None,
+                account_id: Some("account-a".into()),
+                model_provider: Some("openai".into()),
+                display_name_snapshot: "账号 A".into(),
+                auth_source: Some("openai_oauth".into()),
+            })
+            .unwrap();
+        ledger.refresh(&home, collection_epoch).unwrap();
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(rollout_event().as_bytes())
+            .unwrap();
+        ledger.refresh(&home, collection_epoch + 3_000).unwrap();
+
+        ledger
+            .record_activation(ActivationRecord {
+                effective_at_ms: collection_epoch + 3_500,
+                source_kind: UsageSourceKind::Official,
+                provider_id: None,
+                account_id: Some("account-b".into()),
+                model_provider: Some("openai".into()),
+                display_name_snapshot: "账号 B".into(),
+                auth_source: Some("openai_oauth".into()),
+            })
+            .unwrap();
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(rollout_event_later().as_bytes())
+            .unwrap();
+        ledger.refresh(&home, collection_epoch + 4_000).unwrap();
+
+        let overview = ledger
+            .query(UsageQuery {
+                range: UsageRange {
+                    start_at_ms: collection_epoch,
+                    end_at_ms: collection_epoch + 10_000_000,
+                },
+                group_by: UsageGroupBy::Model,
+            })
+            .unwrap();
+
+        assert_eq!(overview.rows.len(), 1);
+        assert_eq!(overview.rows[0].model, "gpt-5.6-sol");
+        assert_eq!(overview.rows[0].source_name, "多个账号/来源");
+        assert_eq!(overview.rows[0].requests, 2);
+        assert_eq!(overview.rows[0].tokens.total_tokens, 216);
+    }
+
+    #[test]
     fn subagent_inherited_history_is_not_counted() {
         use std::io::Write;
 
@@ -2808,6 +3095,48 @@ mod tests {
         let third = ledger.refresh(&home, collection_epoch + 2_000).unwrap();
         assert_eq!(third.events_added, 1, "warnings: {:?}", third.warnings);
         assert_eq!(query(&ledger).totals.tokens.total_tokens, 15);
+    }
+
+    #[test]
+    fn no_marker_subagent_is_counted_by_incremental_refresh() {
+        use std::io::Write;
+
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex");
+        let path = write_rollout(&home, &format!("{}\n", subagent_metadata()));
+        let ledger = UsageLedger::open(&temp.path().join("app")).unwrap();
+        let collection_epoch = DateTime::parse_from_rfc3339("2026-08-01T19:00:00Z")
+            .unwrap()
+            .timestamp_millis();
+
+        ledger.refresh(&home, collection_epoch).unwrap();
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(
+                format!("{}{}", subagent_prefix_tail(), subagent_no_marker_event()).as_bytes(),
+            )
+            .unwrap();
+
+        let refreshed = ledger.refresh(&home, collection_epoch + 1_000).unwrap();
+        let overview = query(&ledger);
+
+        assert_eq!(
+            refreshed.events_added, 1,
+            "warnings: {:?}",
+            refreshed.warnings
+        );
+        assert_eq!(overview.totals.requests, 1);
+        assert_eq!(overview.totals.tokens.total_tokens, 15);
+        assert_eq!(overview.rows[0].model, "gpt-5.6-luna");
+        assert_eq!(
+            ledger
+                .refresh(&home, collection_epoch + 2_000)
+                .unwrap()
+                .events_added,
+            0
+        );
     }
 
     #[test]

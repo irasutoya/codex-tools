@@ -63,6 +63,17 @@ pub(crate) fn token_local_identity(token: &str) -> String {
     result
 }
 
+/// Stable, non-reversible identity used by usage aggregation.  The external
+/// OpenAI account id is never exposed as the aggregation key returned to the UI.
+pub(crate) fn canonical_official_account_id(external_id: &str) -> String {
+    let digest = Sha256::digest(external_id.trim().as_bytes());
+    let short = digest[..12]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("official-{short}")
+}
+
 pub(crate) fn token_identity(token: &str) -> Option<TokenIdentity> {
     let payload = token.split('.').nth(1)?;
     let bytes = URL_SAFE_NO_PAD.decode(payload).ok()?;
@@ -1022,6 +1033,109 @@ pub struct SettingsOverview {
     pub inspection: ConfigInspection,
     pub diagnostics: serde_json::Value,
     pub can_preview_custom: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SupportDiagnostics {
+    pub schema_version: u32,
+    pub generated_at: String,
+    pub app: SupportAppDiagnostics,
+    pub system: SupportSystemDiagnostics,
+    pub paths: SupportPathDiagnostics,
+    pub configuration: SupportConfigDiagnostics,
+    pub connection: SupportConnectionDiagnostics,
+    pub storage: SupportStorageDiagnostics,
+    pub network: SupportNetworkDiagnostics,
+    pub warnings: Vec<String>,
+    pub privacy: SupportPrivacyDiagnostics,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SupportAppDiagnostics {
+    pub name: String,
+    pub version: String,
+    pub build_profile: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SupportSystemDiagnostics {
+    pub os: String,
+    pub architecture: String,
+    pub family: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SupportPathDiagnostics {
+    pub data_directory: String,
+    pub codex_home: String,
+    pub config_file: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SupportConfigDiagnostics {
+    pub valid: bool,
+    pub active_provider: Option<String>,
+    pub managed_provider_present: bool,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SupportConnectionDiagnostics {
+    pub active_kind: String,
+    pub provider_count: usize,
+    pub official_account_count: usize,
+    pub active_model: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SupportStorageDiagnostics {
+    pub files: Vec<SupportFileDiagnostics>,
+    pub usage_database: SupportUsageDatabaseDiagnostics,
+    pub session_database_count: usize,
+    pub indexed_session_count: usize,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SupportFileDiagnostics {
+    pub name: String,
+    pub exists: bool,
+    pub readable: bool,
+    pub size_bytes: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SupportUsageDatabaseDiagnostics {
+    pub exists: bool,
+    pub size_bytes: Option<u64>,
+    pub schema_version: Option<i64>,
+    pub quick_check: String,
+    pub event_count: Option<u64>,
+    pub cursor_count: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SupportNetworkDiagnostics {
+    pub environment_proxy_configured: bool,
+    pub no_proxy_configured: bool,
+    pub system_proxy_configured: bool,
+    pub tls_backend: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SupportPrivacyDiagnostics {
+    pub home_paths_redacted: bool,
+    pub omitted: Vec<String>,
 }
 
 fn validate_headers(headers: &BTreeMap<String, String>) -> Result<(), AppError> {

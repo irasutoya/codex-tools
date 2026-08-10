@@ -1,10 +1,6 @@
 # Codex Tools
 
 <p align="center">
-  <img src="public/codex-tools.svg" alt="Codex Tools" width="96" height="96" />
-</p>
-
-<p align="center">
   在 Windows 和 macOS 上管理 Codex 的 OpenAI 账号与兼容 Responses API 的第三方服务。
 </p>
 
@@ -23,10 +19,10 @@ Completions 请求转发，其余场景请求仍由 Codex 直连。
 
 - 保存并切换多个 OpenAI Account，使用设备码完成授权。
 - OpenAI 登录、Token 刷新和服务测试自动遵循 Windows/macOS 系统代理，并保留环境变量代理优先级。
-- 管理多个兼容 OpenAI Responses API 或 Chat Completions API 的服务，一个服务对应一个 API Key；保存/编辑服务或**切换服务**时自动静默获取服务端 `/models` 接口返回的可用模型（只保存接口实际返回的模型 id），并用 models.dev（`models.json`）**匹配**补充展示名、上下文窗口与简介——兼容纯模型 id（`deepseek-v4-flash`）、厂商前缀（`deepseek/deepseek-v4-flash`、`deepseek:deepseek-v4-flash`）与大小写差异；「账号与服务」页可对每个服务手动「同步模型」，前台停留时也会每 10 分钟自动同步一次。
+- 管理多个兼容 OpenAI Responses API 或 Chat Completions API 的服务，一个服务对应一个 API Key；保存/编辑服务或**切换服务**时自动静默获取服务端 `/models` 接口返回的可用模型（只保存接口实际返回的模型 id），并用 models.dev（`models.json`）**匹配**补充展示名、上下文窗口与简介——兼容纯模型 id（`deepseek-v4-flash`）、厂商前缀（`deepseek/deepseek-v4-flash`、`deepseek:deepseek-v4-flash`）与大小写差异；连接页可对每个服务手动“同步模型”，前台停留时也会每 10 分钟自动同步一次。
 - 只提供 Chat Completions API 的服务（如 DeepSeek、Moonshot、GLM、Qwen 等）可在编辑服务时选择“Chat Completions 转换”：本应用在本机 `127.0.0.1:27777` 启动转换代理，把 Codex 的 Responses API 请求自动翻译成 Chat 请求转发，再把上游流式/非流式响应翻译回 Responses 格式，支持多轮工具调用、图片输入与思考模式；代理会记住上一轮 `reasoning_content` 并在下一轮请求中回传（DeepSeek 等 thinking 模式的硬性要求）；遇到不支持 `response_format` 结构化输出的上游时自动降级为提示词方式重试；代理固定端口、只监听本机，Codex 侧使用固定 Key，真实的服务商 Key 只保存在本应用、由代理注入上游请求。
 - 只更新受管的 `custom` Provider 字段，保留 MCP、Skills、Hooks、沙箱及未知配置。
-- 通过 Chrome DevTools Protocol (CDP) 解锁 Codex 桌面应用的模型列表：模型目录只包含**当前激活服务商**实际存在的模型（id 与服务 `/models` 接口返回完全一致的可用模型），不注入任何内置模型；生成 `model_catalog_json` 模型目录（`model-catalogs/codex-tools.json`）让 CLI 与应用返回自定义模型；从概览页「打开 Codex（自动解锁）」或设置页重启时以调试模式启动并注入脚本，把选择器白名单补齐为被订阅等级隐藏的当前服务商模型；提示词保持通用、不绑定具体模型版本；注入只作用于内存，不修改安装文件。
+- 通过 Chrome DevTools Protocol (CDP) 解锁 Codex 桌面应用的模型列表：模型目录只包含**当前激活服务商**实际存在的模型（id 与服务 `/models` 接口返回完全一致的可用模型），不注入任何内置模型；生成 `model_catalog_json` 模型目录（`model-catalogs/codex-tools.json`）让 CLI 与应用返回自定义模型；从工作台或设置页点击“以调试模式启动并解锁”后注入脚本，把选择器白名单补齐为被订阅等级隐藏的当前服务商模型；提示词保持通用、不绑定具体模型版本；注入只作用于内存，不修改安装文件。
 - 在官方账号与第三方 API 之间切换时，同步已识别会话的 Provider 元数据。
 - 直接读取 Codex JSONL/SQLite；本机用量索引保存在独立的 `usage.sqlite3`，不保存聊天正文。
 - 支持 Windows 10/11 和 macOS 11+（Apple Silicon）。
@@ -62,11 +58,10 @@ Codex Tools 面向已经安装并使用 Codex 的用户。启动后应用会自�
 
 ## 快速开始
 
-1. 启动 Codex Tools，先在设置页确认检测到的 Codex 路径；未识别到时可点击“手动选择…”指定 Codex 桌面应用（macOS 选 `.app`，Windows 选可执行文件）。
-2. 选择“OpenAI Account”并按设备码提示登录，或添加兼容 Responses API
-   的 Provider、API 地址和 API Key。
-3. 测试第三方连接后，选择要使用的账号并确认配置预览。
-4. 应用切换，然后从概览页点击“打开 Codex（自动解锁）”——会以调试模式启动并自动注入模型解锁脚本；已运行的实例会先退出重启，已解锁的实例直接刷新目录不重启。
+1. 启动 Codex Tools，先在设置页确认检测到的 Codex 路径；未识别到时可点击“手动选择”指定 ChatGPT/Codex 桌面应用（macOS 选 `.app`，Windows 选可执行文件）。
+2. 添加 OpenAI 账号并按设备码提示登录，也可以使用 Cookie 导入，或添加兼容 Responses API / Chat Completions API 的服务。
+3. 测试连接、同步模型并选择当前使用的账号或 API 服务。
+4. 从概览点击“启动 Codex”；如需第三方模型目录，可在设置页使用模型解锁功能。
 
 切换前建议退出正在运行的 Codex 实例。应用会检测预览后发生的并发修改，但仍应
 避免同时用其他工具编辑 `config.toml` 或 `auth.json`。
@@ -122,15 +117,15 @@ Codex 调用 API 的请求，以及服务商后台账单不会出现在这里。
 
 | 平台    | Codex Tools 数据位置                                                     |
 | ------- | ------------------------------------------------------------------------ |
-| Windows | 安装目录或可执行文件同级的 `data/app.yaml`                               |
-| macOS   | `~/Library/Application Support/io.github.irasutoya.codex-tools/app.yaml` |
+| Windows | 安装目录或可执行文件同级的 `data/app.json`                               |
+| macOS   | `~/Library/Application Support/io.github.irasutoya.codex-tools/app.json` |
 
 激活第三方账号后，API Key 还会写入 Codex 的 `auth.json`。Windows 便携目录结构如下：
 
 ```text
 Codex Tools.exe
 data/
-  app.yaml
+  app.json
 ```
 
 可以通过 `CODEX_TOOLS_DATA_DIR` 覆盖应用数据目录。macOS 默认将目录和配置文件
@@ -176,7 +171,7 @@ npm run dist:mac:arm64
 
 项目仍处于早期预览阶段。升级前请阅读 [更新日志](CHANGELOG.md)，并在
 [Issues](https://github.com/irasutoya/codex-tools/issues) 中报告可复现的问题。提交问题时
-请移除 API Key、OAuth token、`auth.json`、`data/app.yaml` 和会话正文。
+请移除 API Key、OAuth token、`auth.json`、`data/credentials.json` 和会话正文。
 
 ## 许可证
 

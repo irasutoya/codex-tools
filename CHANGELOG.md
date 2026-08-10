@@ -4,11 +4,34 @@
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-08-11
+
+### Added
+
+- 新增可复制的隐私脱敏诊断报告，汇总应用、平台、路径探测、存储健康、用量数据库、网络代理和最近错误，便于用户向开发者提交可排查的问题信息。
+- OpenAI 账号同时支持设备授权与 Cookie 导入；ChatGPT/Codex 应用路径支持自动检测、手动输入和原生选择。
+
+### Changed
+
+- 全部桌面界面按 shadcn Base Maia 从零重构为固定 `720 × 520` 的小工具布局，提供概览、连接、用量、会话和设置五个页面，自动跟随系统明暗主题。
+- 概览和用量图表统一展示输入、输出与缓存 Token；OpenAI 账号额度以剩余百分比展示，用量明细支持按模型或账号聚合。
+- 重新设计应用图标，并统一使用 Figtree、Hugeicons、语义色、胶囊按钮、圆角表面和紧凑但可读的交互密度。
+- 本地配置改为分离的 `app.json` 与 `credentials.json`，用量索引继续保存在独立的 `usage.sqlite3`，敏感凭据不会返回 WebView 或出现在诊断报告中。
+- 修复部分 Codex 版本生成的无 `trigger_turn` 子代 rollout 被错误跳过的问题，并在解析器升级时自动重建当前本机统计周期；重建会恢复旧长会话的模型上下文。费用仍是本机估算值，不代表官方账单。
+- 官方账号用量改用稳定的本地 canonical 身份聚合，重新登录或重建本地账号记录后，同一外部账号的历史用量不会继续拆成多行；无法证明相同身份的账号不会仅凭邮箱合并。
+
+### Fixed
+
+- 修复添加账号、Cookie 登录和 API 服务入口无响应，以及长 Sheet、Dialog 和页面无法滚动的问题。
+- 修复模型/账号用量聚合出现重复行、会话搜索保留无效旧页码、接口失败后永久停留在骨架屏的问题。
+- 修复长连接名称把当前连接勾选挤到下一行的问题，并为所有可点击列表补充悬停、按下、禁用和键盘焦点反馈。
+- 修复连接删除和配置应用的异步弹窗状态，失败时保留上下文供重试，成功后正确关闭并刷新数据。
+
 ## [0.4.0] - 2026-08-07
 
 ### Added
 
-- 新增“模型解锁”功能：通过 Chrome DevTools Protocol (CDP) 连接以调试模式启动的 Codex 桌面应用，在渲染进程注入解锁脚本，把模型选择器中被订阅等级隐藏的官方 Codex 模型（GPT-5.6 Sol/Terra/Luna、GPT-5.5/5.4/5.3/5.2、Codex、o4-mini 等）和已配置服务的默认模型一起补齐，并取消隐藏被锁条目。注入前会生成 `model_catalog_json` 模型目录（`~/.codex/model-catalogs/codex-tools.json`）并写入配置，让桌面应用与 CLI 的模型选择器都能列出第三方模型；注入脚本会在 Statsig SDK 初始化前挂上 setter 钩子并周期重试，保证白名单补丁先于应用读取生效，同时修补 `Response.prototype.json` 与 React Query 模型列表。注入只作用于运行中的内存，不修改 Codex 安装文件，重启 Codex 后需重新注入；设置页提供“解锁模型列表”和“以调试模式重启 Codex 并解锁”操作，并显示安装/运行/注入状态与模型目录预览。
+- 新增“模型解锁”功能：通过 Chrome DevTools Protocol (CDP) 连接以调试模式启动的 Codex 桌面应用，在渲染进程注入解锁脚本，把模型选择器中被订阅等级隐藏的官方 Codex 模型（GPT-5.6 Sol/Terra/Luna、GPT-5.5/5.4/5.3/5.2、Codex、o4-mini 等）和已配置服务的默认模型一起补齐，并取消隐藏被锁条目。注入前会生成 `model_catalog_json` 模型目录（`~/.codex/model-catalogs/codex-tools.json`）并写入配置，让桌面应用与 CLI 的模型选择器都能列出第三方模型；注入脚本会在 Statsig SDK 初始化前挂上 setter 钩子并周期重试，保证白名单补丁先于应用读取生效，同时修补 `Response.prototype.json` 与 React Query 模型列表。注入只作用于运行中的内存，不修改 Codex 安装文件，重启 Codex 后需重新注入；设置页提供“解锁模型列表”和“以调试模式启动 Codex 并解锁”操作，并显示安装/运行/注入状态与模型目录预览。
 - 模型目录中的上下文窗口优先使用第三方 `/models` 接口返回的数据（兼容 `context_window`、`context_length`、`max_model_len`、`limits.context_tokens` 等常见字段），没有返回时回退 Codex 默认窗口；加载服务模型列表时会自动保存返回的窗口数据。
 
 - 第三方 API 服务新增“接入方式”：支持直接使用 OpenAI Responses API 的服务，或只提供 Chat Completions API 的服务（如 DeepSeek、Moonshot、GLM、Qwen 等）。选择“Chat Completions 转换”后，本应用会在本机 `127.0.0.1` 启动转换代理，把 Codex 的 Responses API 请求自动翻译成 Chat Completions 请求转发，再把上游流式/非流式响应翻译回 Responses 事件，Codex 无需任何改动即可接入；转换覆盖 `input`/`instructions`、多轮工具调用、图片输入、`tools`/`tool_choice`、`max_output_tokens`、`reasoning.effort` 等字段。代理只监听本机、不保存聊天正文，切换回 OpenAI 账号或删除服务时会自动停止。
@@ -44,6 +67,8 @@
 - 主界面顶栏改为左侧导航、统一控件高度，并移除应用内重复的图标与软件名（系统标题栏已显示）。
 
 ### Fixed
+
+- 模型解锁启动不再自动退出、重启或强制结束 ChatGPT/Codex 进程；检测到普通运行实例时仅提示用户手动退出，避免影响现有会话。
 
 - 修复分享图片复制/保存失败的问题：WebView 下按需内嵌字体容易失败或挂起，导出改为跳过字体内嵌（使用系统字体渲染）、关闭资源缓存查询参数、显式指定尺寸并加 20 秒超时保护，避免复制和保存 PNG 时失败或卡住。
 - 修复已保存 API Key 的服务仍显示“未填写”且“使用/测试连接”按钮一直禁用的问题：服务列表返回的是脱敏数据，此前前端用密钥本身判断是否已填写；现在后端额外返回 `hasApiKey` 布尔标记，前端据此显示状态和启用操作，密钥本身仍不会回传。
@@ -158,7 +183,8 @@
 - 上游密钥和自定义请求头改为 Rust 后端只写、前端脱敏；会话扫描增加大小及并发边界。
 - 删除应用配置版本迁移、废弃协议兼容分支、旧模型字段清理和未使用 IPC；相同配置不再重复写盘，账号切换前不再扫描全部会话。
 
-[Unreleased]: https://github.com/irasutoya/codex-tools/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/irasutoya/codex-tools/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/irasutoya/codex-tools/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/irasutoya/codex-tools/compare/v0.3.4...v0.4.0
 [0.3.4]: https://github.com/irasutoya/codex-tools/compare/v0.3.3...v0.3.4
 [0.3.3]: https://github.com/irasutoya/codex-tools/compare/v0.3.2...v0.3.3

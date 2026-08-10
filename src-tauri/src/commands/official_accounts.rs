@@ -15,7 +15,7 @@ use tauri::State;
 const QUOTA_REFRESH_CONCURRENCY: usize = 4;
 
 #[tauri::command]
-pub(crate) async fn import_proxy_account(
+pub(crate) async fn connections_import_cookie(
     store: State<'_, Store>,
     center: State<'_, AuthCenter>,
     name: Option<String>,
@@ -31,7 +31,7 @@ pub(crate) async fn import_proxy_account(
     {
         imported.account_id = Some(account_id.to_owned());
     }
-    let account = center.import_proxy_account(imported, name).await?;
+    let account = center.connections_import_cookie(imported, name).await?;
     let saved = store.save_official_account(&account)?;
     store.official_account_view(&saved.id)
 }
@@ -80,7 +80,7 @@ async fn refresh_official_quota(
 }
 
 #[tauri::command]
-pub(crate) async fn refresh_official_account_quota(
+pub(crate) async fn connections_refresh_quota(
     store: State<'_, Store>,
     center: State<'_, AuthCenter>,
     client: State<'_, ApiClient>,
@@ -90,15 +90,15 @@ pub(crate) async fn refresh_official_account_quota(
 }
 
 #[tauri::command]
-pub(crate) async fn refresh_all_official_quotas(
+pub(crate) async fn connections_refresh_all_quota(
     store: State<'_, Store>,
     center: State<'_, AuthCenter>,
     client: State<'_, ApiClient>,
 ) -> Result<Vec<QuotaRefreshResult>, AppError> {
-    refresh_all_official_quotas_in_store(&store, &center, &client).await
+    connections_refresh_all_quota_in_store(&store, &center, &client).await
 }
 
-async fn refresh_all_official_quotas_in_store(
+async fn connections_refresh_all_quota_in_store(
     store: &Store,
     center: &AuthCenter,
     client: &ApiClient,
@@ -123,14 +123,14 @@ async fn refresh_all_official_quotas_in_store(
 }
 
 #[tauri::command]
-pub(crate) async fn start_openai_device_auth(
+pub(crate) async fn connections_login_start(
     center: State<'_, AuthCenter>,
 ) -> Result<OpenAiDeviceAuthorization, AppError> {
     center.start_openai().await
 }
 
 #[tauri::command]
-pub(crate) async fn poll_openai_device_auth(
+pub(crate) async fn connections_login_poll(
     store: State<'_, Store>,
     center: State<'_, AuthCenter>,
     manager: State<'_, ConfigManager>,
@@ -156,7 +156,7 @@ pub(crate) async fn poll_openai_device_auth(
 }
 
 #[tauri::command]
-pub(crate) async fn activate_openai_account(
+pub(crate) async fn connections_activate_account(
     store: State<'_, Store>,
     center: State<'_, AuthCenter>,
     manager: State<'_, ConfigManager>,
@@ -175,7 +175,7 @@ pub(crate) async fn activate_openai_account(
 }
 
 #[tauri::command]
-pub(crate) async fn activate_official(
+pub(crate) async fn connections_activate_official(
     store: State<'_, Store>,
     center: State<'_, AuthCenter>,
     manager: State<'_, ConfigManager>,
@@ -210,12 +210,12 @@ pub(crate) async fn activate_official(
 }
 
 #[tauri::command]
-pub(crate) fn delete_openai_account(store: State<Store>, id: String) -> Result<(), AppError> {
+pub(crate) fn connections_delete_account(store: State<Store>, id: String) -> Result<(), AppError> {
     store.delete_official_account(&id)
 }
 
 #[tauri::command]
-pub(crate) fn open_openai_device_page() -> Result<(), AppError> {
+pub(crate) fn connections_open_login_page() -> Result<(), AppError> {
     platform_open()
 }
 
@@ -232,7 +232,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn refresh_all_official_quotas_continues_after_expired_proxy_accounts() {
+    async fn connections_refresh_all_quota_continues_after_expired_proxy_accounts() {
         let temp = tempfile::tempdir().unwrap();
         let store = Store::open(temp.path().join("data")).unwrap();
         for account_id in ["first", "second"] {
@@ -262,7 +262,7 @@ mod tests {
                 .unwrap();
         }
 
-        let results = refresh_all_official_quotas_in_store(
+        let results = connections_refresh_all_quota_in_store(
             &store,
             &AuthCenter::default(),
             &ApiClient::default(),
