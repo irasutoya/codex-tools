@@ -125,11 +125,10 @@ fn replace_file(source: &Path, target: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
-    #[cfg(unix)]
     #[test]
     fn identical_write_keeps_existing_file() {
         use std::os::unix::fs::MetadataExt;
