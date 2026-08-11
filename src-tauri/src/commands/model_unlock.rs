@@ -1,6 +1,7 @@
 use crate::{
     model_unlock,
     models::{AppError, ModelUnlockResult, ModelUnlockStatus},
+    state::ActivationLock,
     storage::Store,
 };
 use tauri::State;
@@ -15,14 +16,16 @@ pub(crate) async fn settings_model_unlock_status(
 #[tauri::command]
 pub(crate) async fn settings_unlock_models(
     store: State<'_, Store>,
+    activation: State<'_, ActivationLock>,
 ) -> Result<ModelUnlockResult, AppError> {
-    model_unlock::unlock(&store).await
+    model_unlock::unlock(&store, &activation).await
 }
 
 /// 以调试模式启动 Codex 并注入解锁脚本；不会退出或重启已有实例。
 #[tauri::command]
 pub(crate) async fn settings_launch_codex_debug(
     store: State<'_, Store>,
+    activation: State<'_, ActivationLock>,
 ) -> Result<ModelUnlockResult, AppError> {
-    model_unlock::launch_with_debug(&store).await
+    model_unlock::launch_with_debug(&store, &activation).await
 }

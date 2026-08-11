@@ -4,6 +4,26 @@
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-08-11
+
+### Added
+
+- 新增统一的“账号与服务”侧栏和批量账号管理窗口，可切换连接、修改本机备注、批量保存备注及原子删除多个非活动账号。
+- API 服务模型列表改为完全来源于服务端 `/models`，保存、刷新、激活和模型目录写入共享同一套来源校验与并发保护。
+
+### Changed
+
+- 统一 Dialog、AlertDialog、Sheet、Dropdown、Select、Tooltip、Toast 与图表提示层的遮罩、模糊、圆角、阴影、滚动结构和动效节奏；侧边 Sheet 统一为 280px，长表单固定标题与页脚，仅滚动正文。
+- 前端页面改为按需加载并缓存稳定渲染，主入口脚本从约 502 kB 降至约 65 kB；连接状态请求跨概览/连接页面复用，会话搜索仅在提交后执行。
+- 将开发 Mock 数据从生产 IPC 入口拆分到独立模块，启用数组索引安全检查，并移除四个未使用的前端依赖。
+- Provider 保存、模型刷新、激活预览及失败回滚改用完整快照 revision 和统一锁序，网络等待不会阻塞连接切换，过期请求也不会覆盖较新的配置。
+
+### Fixed
+
+- 修复嵌套 Dialog/AlertDialog/Sheet 重复叠加深色遮罩与背景模糊、Toast 被窗口遮挡、长内容横向撑宽及底部操作区滚出视口的问题。
+- 修复账号刷新或重复登录覆盖并发备注/额度、活动 Cookie 未及时同步到 Codex，以及批量账号操作可能产生部分更新的问题。
+- 修复 API 服务来源改变后继续使用旧模型缓存、旧网络响应回滚新编辑，以及切回官方账号时误删用户自行配置模型的问题。
+
 ## [0.5.0] - 2026-08-11
 
 ### Added
@@ -183,7 +203,8 @@
 - 上游密钥和自定义请求头改为 Rust 后端只写、前端脱敏；会话扫描增加大小及并发边界。
 - 删除应用配置版本迁移、废弃协议兼容分支、旧模型字段清理和未使用 IPC；相同配置不再重复写盘，账号切换前不再扫描全部会话。
 
-[Unreleased]: https://github.com/irasutoya/codex-tools/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/irasutoya/codex-tools/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/irasutoya/codex-tools/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/irasutoya/codex-tools/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/irasutoya/codex-tools/compare/v0.3.4...v0.4.0
 [0.3.4]: https://github.com/irasutoya/codex-tools/compare/v0.3.3...v0.3.4

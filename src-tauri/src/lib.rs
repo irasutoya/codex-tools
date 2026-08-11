@@ -102,6 +102,7 @@ fn activation_for_official(
     account: &StoredOfficialAccount,
     effective_at_ms: i64,
 ) -> ActivationRecord {
+    let display_name = account.display_name();
     ActivationRecord {
         effective_at_ms,
         source_kind: UsageSourceKind::Official,
@@ -109,8 +110,8 @@ fn activation_for_official(
         account_id: Some(canonical_official_account_id(&account.account_id)),
         model_provider: Some("openai".into()),
         display_name_snapshot: match account.source {
-            OfficialAccountSource::OpenAiOauth => account.name.clone(),
-            OfficialAccountSource::ProxyImport => format!("{} · Cookie / 反代", account.name),
+            OfficialAccountSource::OpenAiOauth => display_name.to_owned(),
+            OfficialAccountSource::ProxyImport => format!("{display_name} · Cookie / 反代"),
         },
         auth_source: Some(
             match account.source {
@@ -194,12 +195,10 @@ pub fn run() {
                 MenuItem::with_id(app, TRAY_SHOW_ID, "显示 Codex Tools", true, None::<&str>)?;
             let exit = MenuItem::with_id(app, TRAY_EXIT_ID, "退出", true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&show, &exit])?;
-            let app_icon = app
-                .default_window_icon()
-                .cloned()
-                .expect("application icon must be configured");
+            let tray_icon =
+                tauri::image::Image::from_bytes(include_bytes!("../../build/tray.png"))?;
             TrayIconBuilder::new()
-                .icon(app_icon)
+                .icon(tray_icon)
                 .menu(&menu)
                 .tooltip("Codex Tools")
                 .show_menu_on_left_click(false)
@@ -243,6 +242,10 @@ pub fn run() {
             commands::official_accounts::connections_login_poll,
             commands::official_accounts::connections_activate_account,
             commands::official_accounts::connections_delete_account,
+            commands::official_accounts::connections_delete_accounts,
+            commands::official_accounts::connections_update_account_remark,
+            commands::official_accounts::connections_update_account_remarks,
+            commands::official_accounts::connections_refresh_login,
             commands::official_accounts::connections_open_login_page,
             commands::providers::connections_test_provider,
             commands::providers::connections_list_models,

@@ -1,7 +1,7 @@
 use crate::{json_store::JsonStore, models::*};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     io::Write,
     path::{Path, PathBuf},
@@ -48,6 +48,45 @@ pub struct Store {
     credentials_path: PathBuf,
     state: RwLock<AppConfig>,
     persist_mutex: Mutex<()>,
+}
+
+/// 标识一次 `/models` 请求所对应的服务源。包含会改变请求目标、鉴权、
+/// 协议或 models.dev 匹配结果的字段；不实现 Debug，避免意外输出密钥/请求头。
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct ProviderSourceFingerprint {
+    id: String,
+    name: String,
+    base_url: String,
+    headers: BTreeMap<String, String>,
+    api_type: ProviderApiType,
+    api_key: Option<String>,
+}
+
+/// Provider 完整持久化快照的不可逆 revision，用于失败回滚 CAS。与 source
+/// fingerprint 不同，它会感知 timeout/enabled/模型缓存等任何后续提交。
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct ProviderSnapshotRevision([u8; 32]);
+
+impl ProviderSourceFingerprint {
+    pub(crate) fn from_provider(provider: &ProviderProfile) -> Self {
+        Self {
+            id: provider.id.clone(),
+            name: provider.name.clone(),
+            base_url: provider.base_url.clone(),
+            headers: provider.headers.clone(),
+            api_type: provider.api_type,
+            api_key: provider.api_key.clone(),
+        }
+    }
+}
+
+impl ProviderSnapshotRevision {
+    pub(crate) fn from_provider(provider: &ProviderProfile) -> Self {
+        use sha2::{Digest, Sha256};
+
+        let serialized = serde_json::to_vec(provider).unwrap_or_default();
+        Self(Sha256::digest(serialized).into())
+    }
 }
 
 impl Store {
@@ -175,28 +214,42 @@ impl Store {
         &self,
         mutate: impl FnOnce(&mut AppConfig) -> Result<T, AppError>,
     ) -> Result<T, AppError> {
+        // 串行化“候选状态 -> 落盘 -> 内存提交”的整个事务，避免并发更新
+        // 从同一旧快照出发。落盘失败时不更换内存状态，调用方收到错误后
+        // 仍能看到与持久化前一致的状态。
+        let _transaction = self
+            .persist_mutex
+            .lock()
+            .map_err(|_| AppError::Internal("暂时无法保存应用数据，请重启应用后再试。".into()))?;
+
+        // 候选状态上的变更和 fsync 都不持有状态写锁，读操作在提交前
+        // 继续看到稳定的旧状态。
+        let current = self.read_state()?.clone();
+        let mut draft = current.clone();
+        let result = mutate(&mut draft)?;
+        if let Err(error) = persist_files(
+            &self.path,
+            &self.connections_path,
+            &self.credentials_path,
+            &draft,
+        ) {
+            // persist_files 依次替换三个 JSON；后续文件失败时，前面的文件
+            // 可能已写入候选状态。在同一持久化锁内尽力恢复当前快照，
+            // 并始终把最初的持久化错误返回给调用方。
+            let _ = persist_files(
+                &self.path,
+                &self.connections_path,
+                &self.credentials_path,
+                &current,
+            );
+            return Err(AppError::Internal(error.to_string()));
+        }
+
         let mut guard = self
             .state
             .write()
             .map_err(|_| AppError::Internal("暂时无法保存应用数据，请重启应用后再试。".into()))?;
-        let mut draft = guard.clone();
-        let result = mutate(&mut draft)?;
         *guard = draft;
-        drop(guard);
-        // 落盘在状态锁之外进行，读操作不会被 fsync 阻塞。拿到持久化锁后
-        // 重新读取最新状态，避免并发更新时较旧快照最后写入、覆盖新数据。
-        let _persisted = self
-            .persist_mutex
-            .lock()
-            .map_err(|_| AppError::Internal("暂时无法保存应用数据，请重启应用后再试。".into()))?;
-        let persisted = self.read_state()?.clone();
-        persist_files(
-            &self.path,
-            &self.connections_path,
-            &self.credentials_path,
-            &persisted,
-        )
-        .map_err(|error| AppError::Internal(error.to_string()))?;
         Ok(result)
     }
 
@@ -212,55 +265,100 @@ impl Store {
         Ok(profile)
     }
 
+    /// 为锁外模型刷新原子捕获持久化 Provider、完整 revision 及开始时的
+    /// active 状态。活跃服务用 revision 提交，避免旧响应覆盖后续同源编辑。
+    pub(crate) fn provider_model_refresh_snapshot(
+        &self,
+        id: &str,
+    ) -> Result<(ProviderProfile, ProviderSnapshotRevision, bool), AppError> {
+        self.read(|state| {
+            let provider = state
+                .providers
+                .iter()
+                .find(|provider| provider.id == id)
+                .cloned()
+                .ok_or_else(|| {
+                    AppError::InvalidConfig("第三方 API 服务不存在，请刷新页面。".into())
+                })?;
+            let revision = ProviderSnapshotRevision::from_provider(&provider);
+            let active = matches!(state.active.kind, ActiveKind::Provider)
+                && state.active.provider_id.as_deref() == Some(id);
+            Ok((provider, revision, active))
+        })?
+    }
+
+    #[cfg(test)]
     pub fn connections_save_provider(
         &self,
-        mut provider: ProviderProfile,
+        provider: ProviderProfile,
     ) -> Result<ProviderProfile, AppError> {
+        self.connections_save_provider_with_previous(provider)
+            .map(|(_, saved)| saved)
+    }
+
+    pub(crate) fn connections_save_provider_with_previous(
+        &self,
+        mut provider: ProviderProfile,
+    ) -> Result<(Option<ProviderProfile>, ProviderProfile), AppError> {
         if provider.id.trim().is_empty() {
             provider.id = uuid::Uuid::new_v4().to_string();
         }
-        let existing = {
-            let state = self.read_state()?;
-            state
+        self.update(move |state| {
+            // existing 查找、脱敏字段合并、模型缓存决策和最终替换必须处于
+            // 同一 Store 事务，不能让锁外旧快照覆盖刚完成的模型 CAS。
+            let existing = state
                 .providers
                 .iter()
                 .find(|value| value.id == provider.id)
-                .cloned()
-        };
-        let is_new = existing.is_none();
-        if let Some(existing) = existing.as_ref() {
-            preserve_redacted_headers(&mut provider.headers, &existing.headers);
-            // 前端返回的是脱敏后的 api_key（None），保留已保存的 Key。
-            if provider
-                .api_key
-                .as_deref()
-                .is_none_or(|value| value.trim().is_empty())
-            {
-                provider.api_key = existing.api_key.clone();
+                .cloned();
+            let is_new = existing.is_none();
+            if let Some(existing) = existing.as_ref() {
+                preserve_redacted_headers(&mut provider.headers, &existing.headers);
+                // 前端返回的是脱敏后的 api_key（None），保留已保存的 Key。
+                if provider
+                    .api_key
+                    .as_deref()
+                    .is_none_or(|value| value.trim().is_empty())
+                {
+                    provider.api_key = existing.api_key.clone();
+                }
             }
-            // 前端可能不回传模型上下文窗口，保留已保存的数据。
-            if provider.model_context_windows.is_empty() {
-                provider.model_context_windows = existing.model_context_windows.clone();
+            // `model` 仅用于兼容旧版 connections.json 的反序列化。模型选择现在
+            // 完全由服务 `/models` 返回的 available_models 和 Codex 当前配置决定。
+            provider.model.clear();
+            provider.normalize_and_validate()?;
+            let model_source_changed = existing.as_ref().is_none_or(|existing| {
+                existing.name != provider.name
+                    || existing.base_url != provider.base_url
+                    || existing.api_key != provider.api_key
+                    || existing.headers != provider.headers
+                    || existing.api_type != provider.api_type
+            });
+            if let Some(existing) = existing.as_ref() {
+                if model_source_changed {
+                    provider.model_context_windows.clear();
+                    provider.available_models.clear();
+                    provider.models_dev_meta.clear();
+                } else {
+                    if provider.model_context_windows.is_empty() {
+                        provider.model_context_windows = existing.model_context_windows.clone();
+                    }
+                    if provider.available_models.is_empty() {
+                        provider.available_models = existing.available_models.clone();
+                    }
+                    if provider.models_dev_meta.is_empty() {
+                        provider.models_dev_meta = existing.models_dev_meta.clone();
+                    }
+                }
             }
-            // 前端不回传可用模型列表，保留已保存的数据（保存时静默抓取）。
-            if provider.available_models.is_empty() {
-                provider.available_models = existing.available_models.clone();
+            let now = chrono::Utc::now().timestamp();
+            if provider.created_at == 0 {
+                provider.created_at = existing.as_ref().map_or(now, |value| value.created_at);
             }
-            // 前端不回传 models.dev 元数据，保留已保存的数据。
-            if provider.models_dev_meta.is_empty() {
-                provider.models_dev_meta = existing.models_dev_meta.clone();
-            }
-        }
-        provider.normalize_and_validate()?;
-        let now = chrono::Utc::now().timestamp();
-        if provider.created_at == 0 {
-            provider.created_at = existing.map_or(now, |value| value.created_at);
-        }
-        provider.updated_at = now;
-        provider.active = false;
-        provider.has_api_key = provider.api_key.is_some();
-        let saved = provider.clone();
-        self.update(|state| {
+            provider.updated_at = now;
+            provider.active = false;
+            provider.has_api_key = provider.api_key.is_some();
+
             if matches!(state.active.kind, ActiveKind::Provider)
                 && state.active.provider_id.as_deref() == Some(provider.id.as_str())
                 && !provider.enabled
@@ -283,9 +381,8 @@ impl Store {
                 }
                 state.providers.push(provider.clone());
             }
-            Ok(())
-        })?;
-        Ok(saved)
+            Ok((existing, provider))
+        })
     }
 
     pub fn connections_delete_provider(&self, id: &str) -> Result<(), AppError> {
@@ -309,25 +406,90 @@ impl Store {
     /// 保存从服务 `/models` 接口读取到的模型上下文窗口，供模型目录使用。
     /// 保存服务 `/models` 接口返回的可用模型、上下文窗口，以及 models.dev
     /// 精确匹配的模型元数据，供模型目录使用。
-    pub fn update_provider_models(
+    pub(crate) fn update_provider_models_if_source_matches(
         &self,
         id: &str,
+        expected_source: &ProviderSourceFingerprint,
+        expected_revision: Option<&ProviderSnapshotRevision>,
         models: Vec<String>,
         windows: BTreeMap<String, u64>,
         meta: BTreeMap<String, ProviderModelsDevMeta>,
-    ) -> Result<(), AppError> {
+    ) -> Result<Option<ProviderSnapshotRevision>, AppError> {
         self.update(|state| {
-            let provider = state
-                .providers
-                .iter_mut()
-                .find(|value| value.id == id)
-                .ok_or_else(|| {
-                    AppError::InvalidConfig("第三方 API 服务不存在，请刷新页面。".into())
-                })?;
+            let Some(provider) = state.providers.iter_mut().find(|value| value.id == id) else {
+                return Ok(None);
+            };
+            if ProviderSourceFingerprint::from_provider(provider) != *expected_source {
+                return Ok(None);
+            }
+            if expected_revision.is_some_and(|revision| {
+                ProviderSnapshotRevision::from_provider(provider) != *revision
+            }) {
+                return Ok(None);
+            }
             provider.available_models = models;
             provider.model_context_windows = windows;
             provider.models_dev_meta = meta;
-            Ok(())
+            // 刷新模型列表时顺带清理尚未经过“保存服务”迁移的旧默认模型。
+            provider.model.clear();
+            Ok(Some(ProviderSnapshotRevision::from_provider(provider)))
+        })
+    }
+
+    pub(crate) fn provider_source_matches(
+        &self,
+        id: &str,
+        expected_source: &ProviderSourceFingerprint,
+    ) -> Result<bool, AppError> {
+        self.read(|state| {
+            state
+                .providers
+                .iter()
+                .find(|provider| provider.id == id)
+                .is_some_and(|provider| {
+                    ProviderSourceFingerprint::from_provider(provider) == *expected_source
+                })
+        })
+    }
+
+    /// active Provider 保存失败时使用的精确回滚路径。它不经过普通保存的
+    /// 合并/清缓存逻辑，完整恢复旧快照；仅当前完整 Provider revision 仍与
+    /// 预期一致时提交，避免较早请求覆盖随后完成的任何编辑或缓存更新。
+    #[cfg(test)]
+    pub(crate) fn provider_snapshot_revision(
+        &self,
+        id: &str,
+    ) -> Result<Option<ProviderSnapshotRevision>, AppError> {
+        self.read(|state| {
+            state
+                .providers
+                .iter()
+                .find(|provider| provider.id == id)
+                .map(ProviderSnapshotRevision::from_provider)
+        })
+    }
+
+    pub(crate) fn restore_provider_snapshot_if_revision_matches(
+        &self,
+        expected_revision: &ProviderSnapshotRevision,
+        previous: &ProviderProfile,
+    ) -> Result<bool, AppError> {
+        self.update(|state| {
+            let Some(current) = state
+                .providers
+                .iter_mut()
+                .find(|provider| provider.id == previous.id)
+            else {
+                return Ok(false);
+            };
+            if ProviderSnapshotRevision::from_provider(current) != *expected_revision {
+                return Ok(false);
+            }
+            let mut restored = previous.clone();
+            restored.active = false;
+            restored.has_api_key = restored.api_key.is_some();
+            *current = restored;
+            Ok(true)
         })
     }
 
@@ -429,6 +591,12 @@ impl Store {
                 let existing = &state.official_accounts[existing_index];
                 incoming.id = existing.id.clone();
                 incoming.created_at = existing.created_at;
+                // Remarks have a dedicated update path. Credential refreshes and
+                // repeated logins must never overwrite a concurrent user edit.
+                incoming.remark = existing.remark.clone();
+                // Credential refreshes and repeated device logins must not clear
+                // the last quota snapshot. Quota has its own dedicated update path.
+                incoming.quota = existing.quota.clone();
                 incoming.updated_at = now;
                 state.official_accounts[existing_index] = incoming.clone();
                 let mut kept_match = false;
@@ -464,6 +632,65 @@ impl Store {
             incoming.updated_at = now;
             state.official_accounts.push(incoming.clone());
             Ok(incoming)
+        })
+    }
+
+    pub fn update_official_account_remark(
+        &self,
+        id: &str,
+        remark: String,
+    ) -> Result<StoredOfficialAccount, AppError> {
+        let mut saved = self.update_official_account_remarks(vec![AccountRemarkUpdate {
+            id: id.to_owned(),
+            remark,
+        }])?;
+        saved
+            .pop()
+            .ok_or_else(|| AppError::Internal("更新 OpenAI 账号备注后未返回账号数据。".into()))
+    }
+
+    pub fn update_official_account_remarks(
+        &self,
+        updates: Vec<AccountRemarkUpdate>,
+    ) -> Result<Vec<StoredOfficialAccount>, AppError> {
+        self.update(|state| {
+            let account_indices = state
+                .official_accounts
+                .iter()
+                .enumerate()
+                .map(|(index, account)| (account.id.clone(), index))
+                .collect::<BTreeMap<_, _>>();
+            let mut seen = BTreeSet::new();
+            let mut normalized = Vec::with_capacity(updates.len());
+
+            // 在修改 draft 前验证整批输入，任意一条失败都不会产生部分更新。
+            for update in updates {
+                let remark = update.remark.trim().to_owned();
+                ensure_char_limit(
+                    &remark,
+                    MAX_ACCOUNT_REMARK_CHARS,
+                    "账号备注不能超过 200 个字符。",
+                )?;
+                if !seen.insert(update.id.clone()) {
+                    return Err(AppError::InvalidConfig(
+                        "同一个 OpenAI 账号不能在一批修改中重复出现。".into(),
+                    ));
+                }
+                let index = account_indices.get(&update.id).copied().ok_or_else(|| {
+                    AppError::InvalidConfig("OpenAI 账号不存在，可能已被删除。".into())
+                })?;
+                normalized.push((index, remark));
+            }
+
+            let now = chrono::Utc::now().timestamp();
+            let mut saved = Vec::with_capacity(normalized.len());
+            for (index, remark) in normalized {
+                let account = &mut state.official_accounts[index];
+                account.remark = remark;
+                account.updated_at = now;
+                saved.push(account.clone());
+            }
+            Ok(saved)
         })
     }
 
@@ -534,21 +761,39 @@ impl Store {
     }
 
     pub fn delete_official_account(&self, id: &str) -> Result<(), AppError> {
+        self.delete_official_accounts(vec![id.to_owned()])
+    }
+
+    pub fn delete_official_accounts(&self, ids: Vec<String>) -> Result<(), AppError> {
         self.update(|state| {
+            let ids = ids.into_iter().collect::<BTreeSet<_>>();
             if matches!(state.active.kind, ActiveKind::Official)
-                && state.active.account_id.as_deref() == Some(id)
+                && state
+                    .active
+                    .account_id
+                    .as_ref()
+                    .is_some_and(|id| ids.contains(id))
             {
                 return Err(AppError::InvalidConfig(
                     "正在使用这个 OpenAI 账号，请先切换后再删除。".into(),
                 ));
             }
-            let before = state.official_accounts.len();
-            state.official_accounts.retain(|account| account.id != id);
-            if before == state.official_accounts.len() {
+
+            // 先确认所有账号都存在，再一次性修改 draft。
+            let existing = state
+                .official_accounts
+                .iter()
+                .map(|account| account.id.as_str())
+                .collect::<BTreeSet<_>>();
+            if ids.iter().any(|id| !existing.contains(id.as_str())) {
                 return Err(AppError::InvalidConfig(
                     "OpenAI 账号不存在，可能已被删除。".into(),
                 ));
             }
+
+            state
+                .official_accounts
+                .retain(|account| !ids.contains(&account.id));
             Ok(())
         })
     }
@@ -557,6 +802,7 @@ impl Store {
 fn normalize_official_account(account: &mut StoredOfficialAccount) -> Result<(), AppError> {
     account.id = account.id.trim().to_owned();
     account.name = account.name.trim().to_owned();
+    account.remark = account.remark.trim().to_owned();
     account.account_id = account.account_id.trim().to_owned();
     account.email = account.email.trim().to_owned();
     if account.name.is_empty() {
@@ -575,6 +821,11 @@ fn normalize_official_account(account: &mut StoredOfficialAccount) -> Result<(),
         &account.name,
         MAX_DISPLAY_NAME_CHARS,
         "账号名称不能超过 100 个字符。",
+    )?;
+    ensure_char_limit(
+        &account.remark,
+        MAX_ACCOUNT_REMARK_CHARS,
+        "账号备注不能超过 200 个字符。",
     )?;
     ensure_char_limit(
         &account.account_id,
@@ -831,6 +1082,7 @@ mod tests {
         StoredOfficialAccount {
             id: String::new(),
             name: format!("OpenAI {suffix}"),
+            remark: String::new(),
             account_id: account_id.into(),
             email: format!("{suffix}@example.test"),
             credential: CodexAuthCredential {
@@ -958,6 +1210,9 @@ mod tests {
             .unwrap();
         store
             .update(|state| {
+                state.official_accounts[0].remark = "保留的备注".into();
+                state.official_accounts[0].quota.status = QuotaStatus::Success;
+                state.official_accounts[0].quota.fetched_at = Some(42);
                 let mut duplicate = state.official_accounts[0].clone();
                 duplicate.id = "duplicate-record".into();
                 state.official_accounts.push(duplicate);
@@ -971,12 +1226,195 @@ mod tests {
         assert_eq!(second.id, first.id);
         assert_eq!(second.created_at, first.created_at);
         assert_eq!(second.name, "OpenAI second");
+        assert_eq!(second.remark, "保留的备注");
+        assert_eq!(second.quota.status, QuotaStatus::Success);
+        assert_eq!(second.quota.fetched_at, Some(42));
         assert_eq!(store.snapshot().unwrap().official_accounts.len(), 1);
         assert!(
             fs::read_to_string(&store.connections_path)
                 .unwrap()
                 .contains("access-secret-second")
         );
+
+        let mut explicitly_annotated = official_account("workspace-1", "third");
+        explicitly_annotated.remark = "新备注".into();
+        explicitly_annotated.quota = ProviderAccountQuota::default();
+        let third = store.save_official_account(&explicitly_annotated).unwrap();
+        assert_eq!(third.remark, "保留的备注");
+        assert_eq!(third.quota.status, QuotaStatus::Success);
+        assert_eq!(third.quota.fetched_at, Some(42));
+    }
+
+    #[test]
+    fn official_account_remark_is_trimmed_validated_and_persisted() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        let store = Store::open(root.clone()).unwrap();
+        let saved = store
+            .save_official_account(&official_account("workspace-1", "person"))
+            .unwrap();
+        store
+            .update(|state| {
+                state.official_accounts[0].updated_at = 1;
+                Ok(())
+            })
+            .unwrap();
+
+        let updated = store
+            .update_official_account_remark(&saved.id, "  工作账号  ".into())
+            .unwrap();
+
+        assert_eq!(updated.remark, "工作账号");
+        assert!(updated.updated_at > 1);
+        assert_eq!(
+            store.official_account_view(&saved.id).unwrap().remark,
+            "工作账号"
+        );
+        assert_eq!(
+            Store::open(root)
+                .unwrap()
+                .official_account(&saved.id)
+                .unwrap()
+                .remark,
+            "工作账号"
+        );
+        assert!(
+            store
+                .update_official_account_remark(
+                    &saved.id,
+                    "备".repeat(MAX_ACCOUNT_REMARK_CHARS + 1),
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn batch_account_remarks_validate_all_inputs_before_updating() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        let store = Store::open(root.clone()).unwrap();
+        let first = store
+            .save_official_account(&official_account("workspace-1", "first"))
+            .unwrap();
+        let second = store
+            .save_official_account(&official_account("workspace-2", "second"))
+            .unwrap();
+
+        let saved = store
+            .update_official_account_remarks(vec![
+                AccountRemarkUpdate {
+                    id: second.id.clone(),
+                    remark: "  第二个  ".into(),
+                },
+                AccountRemarkUpdate {
+                    id: first.id.clone(),
+                    remark: "  第一个  ".into(),
+                },
+            ])
+            .unwrap();
+        assert_eq!(
+            saved
+                .iter()
+                .map(|account| (account.id.as_str(), account.remark.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (second.id.as_str(), "第二个"),
+                (first.id.as_str(), "第一个")
+            ]
+        );
+
+        for invalid in [
+            vec![
+                AccountRemarkUpdate {
+                    id: first.id.clone(),
+                    remark: "不应保存".into(),
+                },
+                AccountRemarkUpdate {
+                    id: "missing".into(),
+                    remark: "missing".into(),
+                },
+            ],
+            vec![
+                AccountRemarkUpdate {
+                    id: first.id.clone(),
+                    remark: "重复一".into(),
+                },
+                AccountRemarkUpdate {
+                    id: first.id.clone(),
+                    remark: "重复二".into(),
+                },
+            ],
+            vec![
+                AccountRemarkUpdate {
+                    id: first.id.clone(),
+                    remark: "不应保存".into(),
+                },
+                AccountRemarkUpdate {
+                    id: second.id.clone(),
+                    remark: "备".repeat(MAX_ACCOUNT_REMARK_CHARS + 1),
+                },
+            ],
+        ] {
+            assert!(store.update_official_account_remarks(invalid).is_err());
+            assert_eq!(store.official_account(&first.id).unwrap().remark, "第一个");
+            assert_eq!(store.official_account(&second.id).unwrap().remark, "第二个");
+        }
+
+        let reopened = Store::open(root).unwrap();
+        assert_eq!(
+            reopened.official_account(&first.id).unwrap().remark,
+            "第一个"
+        );
+        assert_eq!(
+            reopened.official_account(&second.id).unwrap().remark,
+            "第二个"
+        );
+    }
+
+    #[test]
+    fn batch_account_delete_is_deduplicated_prevalidated_and_atomic() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        let store = Store::open(root.clone()).unwrap();
+        let first = store
+            .save_official_account(&official_account("workspace-1", "first"))
+            .unwrap();
+        let second = store
+            .save_official_account(&official_account("workspace-2", "second"))
+            .unwrap();
+        let active = store
+            .save_official_account(&official_account("workspace-3", "active"))
+            .unwrap();
+        store
+            .connections_activate_official_account(&active.id)
+            .unwrap();
+
+        assert!(
+            store
+                .delete_official_accounts(vec![first.id.clone(), "missing".into()])
+                .is_err()
+        );
+        assert!(store.official_account(&first.id).is_ok());
+        assert!(store.official_account(&second.id).is_ok());
+        assert!(
+            store
+                .delete_official_accounts(vec![first.id.clone(), active.id.clone()])
+                .is_err()
+        );
+        assert!(store.official_account(&first.id).is_ok());
+        assert!(store.official_account(&active.id).is_ok());
+
+        store
+            .delete_official_accounts(vec![first.id.clone(), first.id.clone(), second.id.clone()])
+            .unwrap();
+        assert!(store.official_account(&first.id).is_err());
+        assert!(store.official_account(&second.id).is_err());
+        assert!(store.official_account(&active.id).is_ok());
+
+        let reopened = Store::open(root).unwrap();
+        assert!(reopened.official_account(&first.id).is_err());
+        assert!(reopened.official_account(&second.id).is_err());
+        assert!(reopened.official_account(&active.id).is_ok());
     }
 
     #[test]
@@ -997,7 +1435,9 @@ mod tests {
 
         let view = store.official_account_view(&saved.id).unwrap();
         assert!(view.active);
+        assert_eq!(view.remark, "");
         let serialized = serde_json::to_string(&view).unwrap();
+        assert!(serialized.contains("\"remark\":\"\""));
         assert!(!serialized.contains("credential"));
         assert!(!serialized.contains("access-secret"));
         assert!(!serialized.contains("refresh-secret"));
@@ -1128,6 +1568,140 @@ mod tests {
     }
 
     #[test]
+    fn saving_provider_discards_legacy_manual_model() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path().to_path_buf()).unwrap();
+        let mut incoming = provider("legacy-model");
+        incoming.model = "manually-entered-model".into();
+
+        let saved = store.connections_save_provider(incoming).unwrap();
+
+        assert!(saved.model.is_empty());
+        assert!(store.provider("legacy-model").unwrap().model.is_empty());
+    }
+
+    #[test]
+    fn changing_model_source_discards_the_previous_api_catalog() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path().to_path_buf()).unwrap();
+        let mut initial = provider("catalog");
+        initial.available_models = vec!["old-api-model".into()];
+        initial.model_context_windows = BTreeMap::from([("old-api-model".into(), 128_000)]);
+        initial.models_dev_meta =
+            BTreeMap::from([("old-api-model".into(), ProviderModelsDevMeta::default())]);
+        store.connections_save_provider(initial).unwrap();
+
+        let mut edited = store.provider_overview().unwrap().providers[0].clone();
+        edited.base_url = "https://new.example.test/v1".into();
+        let saved = store.connections_save_provider(edited).unwrap();
+
+        assert!(saved.available_models.is_empty());
+        assert!(saved.model_context_windows.is_empty());
+        assert!(saved.models_dev_meta.is_empty());
+    }
+
+    #[test]
+    fn stale_model_fetch_cannot_overwrite_a_new_provider_source() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(Store::open(temp.path().to_path_buf()).unwrap());
+        let saved = store.connections_save_provider(provider("cas")).unwrap();
+        let stale_source = ProviderSourceFingerprint::from_provider(&saved);
+        let release_stale_response = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let stale_store = store.clone();
+        let stale_release = release_stale_response.clone();
+        let stale_update = std::thread::spawn(move || {
+            stale_release.wait();
+            stale_store
+                .update_provider_models_if_source_matches(
+                    "cas",
+                    &stale_source,
+                    None,
+                    vec!["stale-model".into()],
+                    BTreeMap::new(),
+                    BTreeMap::new(),
+                )
+                .unwrap()
+        });
+
+        let mut edited = store.provider_overview().unwrap().providers[0].clone();
+        edited.base_url = "https://new.example.test/v1".into();
+        store.connections_save_provider(edited).unwrap();
+        release_stale_response.wait();
+        let updated = stale_update.join().unwrap();
+
+        assert!(updated.is_none());
+        let current = store.provider("cas").unwrap();
+        assert_eq!(current.base_url, "https://new.example.test/v1");
+        assert!(current.available_models.is_empty());
+    }
+
+    #[test]
+    fn provider_snapshot_restore_is_exact_and_source_guarded() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path().to_path_buf()).unwrap();
+        let mut initial = provider("rollback");
+        initial.available_models = vec!["old-model".into()];
+        initial.model_context_windows = BTreeMap::from([("old-model".into(), 128_000)]);
+        initial.models_dev_meta = BTreeMap::from([(
+            "old-model".into(),
+            ProviderModelsDevMeta {
+                name: Some("Old model".into()),
+                ..ProviderModelsDevMeta::default()
+            },
+        )]);
+        store.connections_save_provider(initial).unwrap();
+        let previous = store.read(|state| state.providers[0].clone()).unwrap();
+
+        let mut changed = store.provider_overview().unwrap().providers[0].clone();
+        changed.base_url = "https://changed.example.test/v1".into();
+        changed.api_key = Some("changed-secret".into());
+        let changed = store.connections_save_provider(changed).unwrap();
+        let changed_source = ProviderSourceFingerprint::from_provider(&changed);
+        assert!(
+            store
+                .update_provider_models_if_source_matches(
+                    &changed.id,
+                    &changed_source,
+                    None,
+                    vec!["new-model".into()],
+                    BTreeMap::from([("new-model".into(), 256_000)]),
+                    BTreeMap::new(),
+                )
+                .unwrap()
+                .is_some()
+        );
+        let changed_revision = store
+            .provider_snapshot_revision(&changed.id)
+            .unwrap()
+            .unwrap();
+
+        assert!(
+            store
+                .restore_provider_snapshot_if_revision_matches(&changed_revision, &previous)
+                .unwrap()
+        );
+        let restored = store.read(|state| state.providers[0].clone()).unwrap();
+        assert_eq!(
+            serde_json::to_value(restored).unwrap(),
+            serde_json::to_value(&previous).unwrap()
+        );
+
+        let restored_revision = store
+            .provider_snapshot_revision("rollback")
+            .unwrap()
+            .unwrap();
+        let mut later = store.provider_overview().unwrap().providers[0].clone();
+        later.timeout_secs = 91;
+        store.connections_save_provider(later).unwrap();
+        assert!(
+            !store
+                .restore_provider_snapshot_if_revision_matches(&restored_revision, &previous)
+                .unwrap()
+        );
+        assert_eq!(store.provider("rollback").unwrap().timeout_secs, 91);
+    }
+
+    #[test]
     fn update_persists_mutated_state_to_disk_for_reopen() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().to_path_buf();
@@ -1146,10 +1720,11 @@ mod tests {
     }
 
     #[test]
-    fn failed_persist_keeps_memory_updated_and_returns_error() {
+    fn failed_persist_leaves_memory_unchanged_and_returns_error() {
         let temp = tempfile::tempdir().unwrap();
         let mut store = Store::open(temp.path().to_path_buf()).unwrap();
         store.connections_save_provider(provider("one")).unwrap();
+        let original_home = store.read(|state| state.codex.home.clone()).unwrap();
         fs::write(temp.path().join("blocked"), b"file").unwrap();
         store.path = temp.path().join("blocked").join("app.json");
 
@@ -1161,7 +1736,32 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(
             store.read(|state| state.codex.home.clone()).unwrap(),
-            "/tmp/alternate"
+            original_home
+        );
+    }
+
+    #[test]
+    fn failed_provider_delete_at_credentials_restores_provider_and_api_key() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        let mut store = Store::open(root.clone()).unwrap();
+        store.connections_save_provider(provider("one")).unwrap();
+        fs::write(temp.path().join("blocked"), b"file").unwrap();
+        store.credentials_path = temp.path().join("blocked").join("credentials.json");
+
+        assert!(store.connections_delete_provider("one").is_err());
+        assert_eq!(
+            store.provider("one").unwrap().api_key.as_deref(),
+            Some("secret")
+        );
+        assert_eq!(
+            Store::open(root)
+                .unwrap()
+                .provider("one")
+                .unwrap()
+                .api_key
+                .as_deref(),
+            Some("secret")
         );
     }
 }

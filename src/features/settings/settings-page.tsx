@@ -18,6 +18,7 @@ import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import {
   Dialog,
+  DialogBody,
   DialogContent,
   DialogDescription,
   DialogFooter,
@@ -47,7 +48,6 @@ import {
 import { Skeleton } from "@/components/ui/skeleton"
 import { Spinner } from "@/components/ui/spinner"
 import { toast } from "@/components/ui/toast"
-import type { SettingsSection } from "@/App"
 import { errorMessage } from "@/lib/format"
 import { call } from "@/lib/ipc"
 import type {
@@ -55,6 +55,7 @@ import type {
   ConfigPatchPreview,
   ModelUnlockStatus,
   SettingsOverview,
+  SettingsSection,
   SupportDiagnostics,
 } from "@/types"
 
@@ -242,14 +243,20 @@ export function SettingsPage({
 
       <Dialog
         open={Boolean(preview)}
-        onOpenChange={(open) => !open && setPreview(undefined)}
+        onOpenChange={(open) => {
+          if (!open && busy === "apply") return
+          setPreview(undefined)
+        }}
       >
-        <DialogContent>
+        <DialogContent
+          showCloseButton={busy !== "apply"}
+          aria-busy={busy === "apply"}
+        >
           <DialogHeader>
             <DialogTitle>配置变更预览</DialogTitle>
             <DialogDescription>{preview?.targetPath}</DialogDescription>
           </DialogHeader>
-          <div className="grid gap-2">
+          <DialogBody className="grid gap-2">
             {preview?.changes.map((change) => (
               <div key={change} className="rounded-2xl bg-muted px-3 py-2">
                 {change}
@@ -258,9 +265,13 @@ export function SettingsPage({
             <pre className="max-h-56 overflow-auto rounded-2xl bg-muted p-3 text-xs whitespace-pre-wrap">
               {preview?.rendered}
             </pre>
-          </div>
+          </DialogBody>
           <DialogFooter>
-            <Button variant="outline" onClick={() => setPreview(undefined)}>
+            <Button
+              variant="outline"
+              disabled={busy === "apply"}
+              onClick={() => setPreview(undefined)}
+            >
               取消
             </Button>
             <Button

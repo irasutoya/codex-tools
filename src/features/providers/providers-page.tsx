@@ -1,9 +1,7 @@
-import { useCallback, useEffect, useMemo, useState } from "react"
+import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import {
   Add01Icon,
   CheckmarkCircle02Icon,
-  Delete02Icon,
-  Edit02Icon,
   Key01Icon,
   Login03Icon,
   Refresh01Icon,
@@ -11,16 +9,6 @@ import {
 } from "@hugeicons/core-free-icons"
 import { HugeiconsIcon } from "@hugeicons/react"
 
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from "@/components/ui/alert-dialog"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import {
@@ -31,37 +19,14 @@ import {
   CardTitle,
 } from "@/components/ui/card"
 import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog"
-import {
   Empty,
   EmptyDescription,
   EmptyHeader,
   EmptyMedia,
   EmptyTitle,
 } from "@/components/ui/empty"
-import {
-  Field,
-  FieldDescription,
-  FieldGroup,
-  FieldLabel,
-} from "@/components/ui/field"
-import { Input } from "@/components/ui/input"
-import {
-  Select,
-  SelectContent,
-  SelectGroup,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select"
 import { Spinner } from "@/components/ui/spinner"
-import { Switch } from "@/components/ui/switch"
+import { Skeleton } from "@/components/ui/skeleton"
 import { toast } from "@/components/ui/toast"
 import { errorMessage, formatDate, quotaWindow } from "@/lib/format"
 import { call } from "@/lib/ipc"
@@ -77,6 +42,11 @@ import {
   AccountLoginDialog,
   type AccountLoginMode,
 } from "./account-login-dialog"
+import {
+  refreshAccountQuota,
+  testProviderConnection,
+} from "./connection-actions"
+import { ProviderEditorDialog } from "./provider-editor-dialog"
 
 export function ProvidersPage({
   connections,
@@ -97,7 +67,20 @@ export function ProvidersPage({
   const [editor, setEditor] = useState<Provider>(emptyProvider())
   const [authorization, setAuthorization] = useState<DeviceAuthorization>()
   const [busy, setBusy] = useState<string>()
-  const [deleteOpen, setDeleteOpen] = useState(false)
+  const busyRef = useRef<string | undefined>(undefined)
+
+  const beginBusy = useCallback((key: string) => {
+    if (busyRef.current) return false
+    busyRef.current = key
+    setBusy(key)
+    return true
+  }, [])
+
+  const endBusy = useCallback((key: string) => {
+    if (busyRef.current !== key) return
+    busyRef.current = undefined
+    setBusy(undefined)
+  }, [])
 
   const selected = useMemo(() => {
     const account = connections?.officialAccounts.find(
@@ -109,7 +92,10 @@ export function ProvidersPage({
     )
     if (provider) return { kind: "provider" as const, value: provider }
     const fallback =
-      connections?.officialAccounts[0] ?? connections?.providers[0]
+      connections?.officialAccounts.find((item) => item.active) ??
+      connections?.providers.find((item) => item.active) ??
+      connections?.officialAccounts[0] ??
+      connections?.providers[0]
     if (!fallback) return undefined
     return "email" in fallback
       ? { kind: "account" as const, value: fallback }
@@ -117,7 +103,9 @@ export function ProvidersPage({
   }, [connections, selectedId])
 
   useEffect(() => {
-    if (!selectedId && selected) onSelectedIdChange(selected.value.id)
+    if (selected && selectedId !== selected.value.id) {
+      onSelectedIdChange(selected.value.id)
+    }
   }, [onSelectedIdChange, selected, selectedId])
 
   const run = async (
@@ -125,7 +113,7 @@ export function ProvidersPage({
     action: () => Promise<unknown>,
     success: string
   ) => {
-    setBusy(key)
+    if (!beginBusy(key)) return false
     try {
       await action()
       toast.add({ title: success, type: "success" })
@@ -139,12 +127,12 @@ export function ProvidersPage({
       })
       return false
     } finally {
-      setBusy(undefined)
+      endBusy(key)
     }
   }
 
   const startLogin = async () => {
-    setBusy("login")
+    if (!beginBusy("login")) return
     setLoginError(undefined)
     try {
       setAuthorization(await call("connections_login_start"))
@@ -156,7 +144,7 @@ export function ProvidersPage({
         type: "error",
       })
     } finally {
-      setBusy(undefined)
+      endBusy("login")
     }
   }
 
@@ -182,7 +170,7 @@ export function ProvidersPage({
 
   const checkLogin = async () => {
     if (!authorization) return
-    setBusy("poll")
+    if (!beginBusy("poll")) return
     try {
       const result = await call("connections_login_poll", {
         operationId: authorization.operationId,
@@ -199,7 +187,7 @@ export function ProvidersPage({
         type: "error",
       })
     } finally {
-      setBusy(undefined)
+      endBusy("poll")
     }
   }
 
@@ -211,6 +199,10 @@ export function ProvidersPage({
     const schedule = () => {
       timer = window.setTimeout(
         () => {
+          if (!beginBusy("poll")) {
+            schedule()
+            return
+          }
           void call("connections_login_poll", {
             operationId: authorization.operationId,
           })
@@ -225,6 +217,7 @@ export function ProvidersPage({
               )
               schedule()
             })
+            .finally(() => endBusy("poll"))
         },
         Math.max(1, authorization.intervalSecs) * 1000
       )
@@ -235,9 +228,10 @@ export function ProvidersPage({
       cancelled = true
       if (timer !== undefined) window.clearTimeout(timer)
     }
-  }, [authorization, finishLoginPoll, loginOpen])
+  }, [authorization, beginBusy, endBusy, finishLoginPoll, loginOpen])
 
   const openAccountLogin = (mode: AccountLoginMode) => {
+    if (busyRef.current) return
     setLoginMode(mode)
     setLoginError(undefined)
     setLoginOpen(true)
@@ -248,7 +242,7 @@ export function ProvidersPage({
     accountId: string | undefined,
     content: string
   ) => {
-    setBusy("import")
+    if (!beginBusy("import")) return
     try {
       const imported = await call("connections_import_cookie", {
         name,
@@ -260,6 +254,7 @@ export function ProvidersPage({
         description: imported.name,
         type: "success",
       })
+      setAuthorization(undefined)
       setLoginOpen(false)
       onSelectedIdChange(imported.id)
       onRefresh()
@@ -271,13 +266,13 @@ export function ProvidersPage({
         type: "error",
       })
     } finally {
-      setBusy(undefined)
+      endBusy("import")
     }
   }
 
   const connectionEditors = (
     <>
-      <ProviderEditor
+      <ProviderEditorDialog
         open={editorOpen}
         onOpenChange={setEditorOpen}
         provider={editor}
@@ -292,6 +287,7 @@ export function ProvidersPage({
         mode={loginMode}
         onModeChange={setLoginMode}
         onOpenChange={(open) => {
+          if (!open && busyRef.current) return
           setLoginOpen(open)
           if (!open && !authorization) setLoginError(undefined)
         }}
@@ -318,6 +314,10 @@ export function ProvidersPage({
     </>
   )
 
+  if (!connections) {
+    return <ProvidersLoading />
+  }
+
   if (!selected) {
     return (
       <div className="min-h-full px-3 pt-1 pb-3">
@@ -333,13 +333,18 @@ export function ProvidersPage({
               </EmptyDescription>
             </EmptyHeader>
             <div className="flex gap-2">
-              <Button type="button" onClick={() => openAccountLogin("browser")}>
+              <Button
+                type="button"
+                disabled={Boolean(busy)}
+                onClick={() => openAccountLogin("browser")}
+              >
                 <HugeiconsIcon icon={Login03Icon} data-icon="inline-start" />
                 添加账号
               </Button>
               <Button
                 type="button"
                 variant="outline"
+                disabled={Boolean(busy)}
                 onClick={() => openAccountLogin("cookie")}
               >
                 <HugeiconsIcon icon={Key01Icon} data-icon="inline-start" />
@@ -348,6 +353,7 @@ export function ProvidersPage({
               <Button
                 type="button"
                 variant="outline"
+                disabled={Boolean(busy)}
                 onClick={() => {
                   setEditor(emptyProvider())
                   setEditorOpen(true)
@@ -369,13 +375,57 @@ export function ProvidersPage({
   const account = isAccount ? (item as OfficialAccountView) : undefined
   const provider = !isAccount ? (item as Provider) : undefined
   const quota = quotaWindow(account?.quota)
+  const displayName = account?.remark || item.name
+  const actionBusy = Boolean(busy)
 
   return (
     <div className="flex min-h-full flex-col gap-3 px-3 pt-1 pb-3">
       <Card size="sm" className="shrink-0">
+        <CardContent className="flex flex-wrap items-center gap-2">
+          <div className="mr-auto flex min-w-40 flex-col gap-0.5">
+            <div className="text-sm font-medium">添加连接</div>
+            <div className="text-xs text-muted-foreground">
+              登录 OpenAI 账号，或添加兼容 API 服务。
+            </div>
+          </div>
+          <Button
+            type="button"
+            size="sm"
+            disabled={actionBusy}
+            onClick={() => openAccountLogin("browser")}
+          >
+            <HugeiconsIcon icon={Login03Icon} data-icon="inline-start" />
+            添加账号
+          </Button>
+          <Button
+            type="button"
+            size="sm"
+            variant="outline"
+            disabled={actionBusy}
+            onClick={() => {
+              setEditor(emptyProvider())
+              setEditorOpen(true)
+            }}
+          >
+            <HugeiconsIcon icon={Add01Icon} data-icon="inline-start" />
+            添加 API 服务
+          </Button>
+          <Button
+            type="button"
+            size="sm"
+            variant="ghost"
+            disabled={actionBusy}
+            onClick={() => openAccountLogin("cookie")}
+          >
+            Cookie 登录
+          </Button>
+        </CardContent>
+      </Card>
+
+      <Card key={item.id} size="sm" className="shrink-0">
         <CardHeader className="border-b">
           <div className="flex items-center gap-2">
-            <CardTitle>{item.name}</CardTitle>
+            <CardTitle>{displayName}</CardTitle>
             {item.active && (
               <Badge>
                 <HugeiconsIcon icon={CheckmarkCircle02Icon} />
@@ -401,14 +451,14 @@ export function ProvidersPage({
                   : "Responses API"
             }
           />
-          <Detail label="默认模型" value={provider?.model || "由 Codex 管理"} />
+          {isAccount && (
+            <Detail label="账号备注" value={account?.remark || "未设置"} />
+          )}
           <Detail
             label="凭据状态"
             value={
               isAccount
-                ? account?.source === "proxy_import"
-                  ? "Cookie 导入"
-                  : "授权有效"
+                ? credentialLabel(account)
                 : provider?.hasApiKey
                   ? "API Key 已保存"
                   : "等待填写 API Key"
@@ -418,13 +468,7 @@ export function ProvidersPage({
           {isAccount && (
             <Detail
               label="额度状态"
-              value={
-                quota
-                  ? `剩余 ${quota.remainingPercent.toFixed(1)}%`
-                  : account?.quota.status === "never"
-                    ? "尚未刷新"
-                    : "暂不支持"
-              }
+              value={quotaLabel(account, quota?.remainingPercent)}
             />
           )}
           {!isAccount && (
@@ -438,12 +482,12 @@ export function ProvidersPage({
           {isAccount ? (
             <>
               <Button
-                disabled={busy === "quota"}
+                disabled={actionBusy}
+                aria-busy={busy === "quota"}
                 onClick={() =>
                   void run(
                     "quota",
-                    () =>
-                      call("connections_refresh_quota", { accountId: item.id }),
+                    () => refreshAccountQuota(item.id),
                     "额度已刷新"
                   )
                 }
@@ -458,30 +502,35 @@ export function ProvidersPage({
                 )}
                 刷新额度
               </Button>
-              {!item.active && (
-                <Button
-                  variant="outline"
-                  onClick={() =>
-                    void run(
-                      "activate",
-                      () =>
-                        call("connections_activate_account", { id: item.id }),
-                      "账号已切换"
-                    )
-                  }
-                >
-                  设为当前
-                </Button>
-              )}
+              <Button
+                variant="outline"
+                disabled={actionBusy}
+                aria-busy={busy === "login-refresh"}
+                onClick={() =>
+                  void run(
+                    "login-refresh",
+                    () => call("connections_refresh_login", { id: item.id }),
+                    "登录状态已刷新"
+                  )
+                }
+              >
+                {busy === "login-refresh" ? (
+                  <Spinner data-icon="inline-start" />
+                ) : (
+                  <HugeiconsIcon icon={Login03Icon} data-icon="inline-start" />
+                )}
+                刷新登录
+              </Button>
             </>
           ) : (
             <>
               <Button
-                disabled={busy === "test"}
+                disabled={actionBusy}
+                aria-busy={busy === "test"}
                 onClick={() =>
                   void run(
                     "test",
-                    () => call("connections_test_provider", { id: item.id }),
+                    () => testProviderConnection(item.id),
                     "连接测试通过"
                   )
                 }
@@ -498,6 +547,8 @@ export function ProvidersPage({
               </Button>
               <Button
                 variant="outline"
+                disabled={actionBusy}
+                aria-busy={busy === "models"}
                 onClick={() =>
                   void run(
                     "models",
@@ -506,112 +557,104 @@ export function ProvidersPage({
                   )
                 }
               >
+                {busy === "models" ? (
+                  <Spinner data-icon="inline-start" />
+                ) : (
+                  <HugeiconsIcon
+                    icon={Refresh01Icon}
+                    data-icon="inline-start"
+                  />
+                )}
                 同步模型
               </Button>
-              <Button
-                variant="outline"
-                onClick={() => {
-                  setEditor({ ...provider! })
-                  setEditorOpen(true)
-                }}
-              >
-                <HugeiconsIcon icon={Edit02Icon} data-icon="inline-start" />
-                编辑
-              </Button>
-              {!item.active && (
-                <Button
-                  variant="outline"
-                  onClick={() =>
-                    void run(
-                      "activate",
-                      () => call("connections_activate", { id: item.id }),
-                      "服务已切换"
-                    )
-                  }
-                >
-                  设为当前
-                </Button>
-              )}
             </>
           )}
-          <Button
-            variant="destructive"
-            className="ml-auto"
-            onClick={() => setDeleteOpen(true)}
-          >
-            <HugeiconsIcon icon={Delete02Icon} data-icon="inline-start" />
-            删除
-          </Button>
         </CardFooter>
       </Card>
 
-      <Card size="sm" className="shrink-0">
-        <CardContent className="flex items-center gap-2">
-          <Button
-            type="button"
-            size="sm"
-            onClick={() => openAccountLogin("browser")}
-          >
-            <HugeiconsIcon icon={Login03Icon} data-icon="inline-start" />
-            添加账号
-          </Button>
-          <Button
-            type="button"
-            size="sm"
-            variant="outline"
-            onClick={() => {
-              setEditor(emptyProvider())
-              setEditorOpen(true)
-            }}
-          >
-            <HugeiconsIcon icon={Add01Icon} data-icon="inline-start" />
-            添加 API 服务
-          </Button>
-          <Button
-            type="button"
-            size="sm"
-            variant="ghost"
-            onClick={() => openAccountLogin("cookie")}
-          >
-            Cookie 登录
-          </Button>
-        </CardContent>
-      </Card>
-
       {connectionEditors}
-
-      <AlertDialog open={deleteOpen} onOpenChange={setDeleteOpen}>
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>删除“{item.name}”？</AlertDialogTitle>
-            <AlertDialogDescription>
-              此操作会移除本地保存的连接信息，无法撤销。
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel>取消</AlertDialogCancel>
-            <AlertDialogAction
-              variant="destructive"
-              disabled={busy === "delete"}
-              onClick={() =>
-                void run(
-                  "delete",
-                  () =>
-                    isAccount
-                      ? call("connections_delete_account", { id: item.id })
-                      : call("connections_delete_provider", { id: item.id }),
-                  "连接已删除"
-                ).then((deleted) => deleted && setDeleteOpen(false))
-              }
-            >
-              {busy === "delete" && <Spinner data-icon="inline-start" />}
-              删除
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
     </div>
   )
+}
+
+function ProvidersLoading() {
+  return (
+    <div
+      className="flex min-h-full flex-col gap-3 px-3 pt-1 pb-3"
+      aria-label="正在读取账号与服务"
+      aria-busy="true"
+    >
+      <Card size="sm" className="shrink-0">
+        <CardContent className="flex items-center gap-3">
+          <div className="flex flex-1 flex-col gap-2">
+            <Skeleton className="h-4 w-24" />
+            <Skeleton className="h-3 w-52" />
+          </div>
+          <Skeleton className="h-8 w-24" />
+          <Skeleton className="h-8 w-28" />
+        </CardContent>
+      </Card>
+      <Card size="sm" className="shrink-0">
+        <CardHeader className="border-b">
+          <Skeleton className="h-5 w-36" />
+          <Skeleton className="h-3.5 w-56" />
+        </CardHeader>
+        <CardContent className="grid grid-cols-2 gap-x-6 gap-y-4">
+          {Array.from({ length: 6 }, (_, index) => (
+            <div key={index} className="flex flex-col gap-1.5">
+              <Skeleton className="h-3 w-16" />
+              <Skeleton className="h-4 w-28" />
+            </div>
+          ))}
+        </CardContent>
+        <CardFooter className="gap-2">
+          <Skeleton className="h-8 w-24" />
+          <Skeleton className="h-8 w-24" />
+        </CardFooter>
+      </Card>
+    </div>
+  )
+}
+
+function quotaLabel(
+  account: OfficialAccountView | undefined,
+  remainingPercent: number | undefined
+) {
+  if (!account) return "—"
+  if (remainingPercent !== undefined) {
+    const refreshed = account.quota.fetchedAt
+      ? ` · ${formatDate(account.quota.fetchedAt, true)}`
+      : ""
+    return `剩余 ${remainingPercent.toFixed(1)}%${refreshed}`
+  }
+  switch (account.quota.status) {
+    case "never":
+      return "尚未刷新"
+    case "unauthorized":
+      return "登录已失效，请刷新登录"
+    case "rate_limited":
+      return "请求频繁，请稍后重试"
+    case "unsupported":
+      return "当前账号暂不支持额度查询"
+    case "error":
+      return account.quota.error || "额度刷新失败"
+    default:
+      return "暂无额度数据"
+  }
+}
+
+function credentialLabel(account: OfficialAccountView | undefined) {
+  if (!account) return "—"
+  if (account.quota.status === "unauthorized") return "登录已失效"
+  if (
+    account.expiresAt != null &&
+    account.expiresAt <= Math.floor(Date.now() / 1000)
+  ) {
+    return "登录已过期"
+  }
+  return account.source === "proxy_import"
+    ? "Cookie 登录有效"
+    : "OAuth 登录有效"
 }
 
 function Detail({ label, value }: { label: string; value: string }) {
@@ -620,137 +663,5 @@ function Detail({ label, value }: { label: string; value: string }) {
       <span className="text-xs text-muted-foreground">{label}</span>
       <span className="truncate font-medium">{value}</span>
     </div>
-  )
-}
-
-function ProviderEditor({
-  open,
-  onOpenChange,
-  provider,
-  onProviderChange,
-  onSaved,
-}: {
-  open: boolean
-  onOpenChange: (open: boolean) => void
-  provider: Provider
-  onProviderChange: (provider: Provider) => void
-  onSaved: () => void
-}) {
-  const [saving, setSaving] = useState(false)
-  const update = <K extends keyof Provider>(key: K, value: Provider[K]) =>
-    onProviderChange({ ...provider, [key]: value })
-  const save = async () => {
-    setSaving(true)
-    try {
-      await call("connections_save_provider", { provider })
-      toast.add({ title: "API 服务已保存", type: "success" })
-      onSaved()
-    } catch (reason) {
-      toast.add({
-        title: "保存失败",
-        description: errorMessage(reason),
-        type: "error",
-      })
-    } finally {
-      setSaving(false)
-    }
-  }
-  return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent>
-        <DialogHeader>
-          <DialogTitle>
-            {provider.id ? "编辑 API 服务" : "添加 API 服务"}
-          </DialogTitle>
-          <DialogDescription>填写与 OpenAI 兼容的接口信息。</DialogDescription>
-        </DialogHeader>
-        <FieldGroup>
-          <Field>
-            <FieldLabel htmlFor="provider-name">名称</FieldLabel>
-            <Input
-              id="provider-name"
-              value={provider.name}
-              onChange={(e) => update("name", e.target.value)}
-            />
-          </Field>
-          <Field>
-            <FieldLabel htmlFor="provider-url">Base URL</FieldLabel>
-            <Input
-              id="provider-url"
-              value={provider.baseUrl}
-              onChange={(e) => update("baseUrl", e.target.value)}
-            />
-          </Field>
-          <Field>
-            <FieldLabel htmlFor="provider-key">API Key</FieldLabel>
-            <Input
-              id="provider-key"
-              type="password"
-              value={provider.apiKey ?? ""}
-              placeholder={provider.hasApiKey ? "留空以保留现有密钥" : "sk-..."}
-              onChange={(e) => update("apiKey", e.target.value)}
-            />
-          </Field>
-          <Field>
-            <FieldLabel>接口类型</FieldLabel>
-            <Select
-              items={[
-                { label: "Responses API", value: "responses" },
-                { label: "Chat Completions", value: "chat" },
-              ]}
-              value={provider.apiType}
-              onValueChange={(value) =>
-                value && update("apiType", value as Provider["apiType"])
-              }
-            >
-              <SelectTrigger className="w-full">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectGroup>
-                  <SelectItem value="responses">Responses API</SelectItem>
-                  <SelectItem value="chat">Chat Completions</SelectItem>
-                </SelectGroup>
-              </SelectContent>
-            </Select>
-          </Field>
-          <Field>
-            <FieldLabel htmlFor="provider-model">默认模型</FieldLabel>
-            <Input
-              id="provider-model"
-              value={provider.model ?? ""}
-              onChange={(e) => update("model", e.target.value)}
-            />
-          </Field>
-          <Field orientation="horizontal">
-            <div>
-              <FieldLabel htmlFor="provider-enabled">启用服务</FieldLabel>
-              <FieldDescription>关闭后不会出现在可切换列表。</FieldDescription>
-            </div>
-            <Switch
-              id="provider-enabled"
-              checked={provider.enabled}
-              onCheckedChange={(checked) => update("enabled", checked)}
-            />
-          </Field>
-        </FieldGroup>
-        <DialogFooter>
-          <Button
-            type="button"
-            variant="outline"
-            onClick={() => onOpenChange(false)}
-          >
-            取消
-          </Button>
-          <Button
-            type="button"
-            disabled={saving || !provider.name || !provider.baseUrl}
-            onClick={() => void save()}
-          >
-            {saving && <Spinner data-icon="inline-start" />}保存
-          </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
   )
 }

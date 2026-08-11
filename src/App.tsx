@@ -1,25 +1,27 @@
-import { useEffect, useMemo, useRef, useState } from "react"
+import {
+  lazy,
+  memo,
+  Suspense,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react"
 import {
   ChartHistogramIcon,
   Clock01Icon,
   FilterIcon,
   Home01Icon,
   InformationCircleIcon,
-  Key01Icon,
   Link01Icon,
   Refresh01Icon,
   Rocket01Icon,
   Search01Icon,
   Settings01Icon,
-  Tick02Icon,
 } from "@hugeicons/core-free-icons"
 import { HugeiconsIcon, type IconSvgElement } from "@hugeicons/react"
 
-import { DashboardPage } from "@/features/dashboard/dashboard-page"
-import { ProvidersPage } from "@/features/providers/providers-page"
-import { SessionsPage } from "@/features/sessions/sessions-page"
-import { SettingsPage } from "@/features/settings/settings-page"
-import { UsagePage } from "@/features/usage/usage-page"
 import { Badge } from "@/components/ui/badge"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
@@ -30,16 +32,8 @@ import {
   InputGroupInput,
 } from "@/components/ui/input-group"
 import {
-  Item,
-  ItemActions,
-  ItemContent,
-  ItemDescription,
-  ItemGroup,
-  ItemMedia,
-  ItemTitle,
-} from "@/components/ui/item"
-import {
   Sheet,
+  SheetBody,
   SheetContent,
   SheetDescription,
   SheetHeader,
@@ -56,7 +50,56 @@ import {
 } from "@/components/ui/tooltip"
 import { errorMessage } from "@/lib/format"
 import { call } from "@/lib/ipc"
-import type { Dashboard, Page, ProviderOverview, UsageGroupBy } from "@/types"
+import type {
+  Dashboard,
+  Page,
+  ProviderOverview,
+  SettingsSection,
+  UsageGroupBy,
+} from "@/types"
+
+const DashboardPage = memo(
+  lazy(() =>
+    import("@/features/dashboard/dashboard-page").then((module) => ({
+      default: module.DashboardPage,
+    }))
+  )
+)
+const ProvidersPage = memo(
+  lazy(() =>
+    import("@/features/providers/providers-page").then((module) => ({
+      default: module.ProvidersPage,
+    }))
+  )
+)
+const UsagePage = memo(
+  lazy(() =>
+    import("@/features/usage/usage-page").then((module) => ({
+      default: module.UsagePage,
+    }))
+  )
+)
+const SessionsPage = memo(
+  lazy(() =>
+    import("@/features/sessions/sessions-page").then((module) => ({
+      default: module.SessionsPage,
+    }))
+  )
+)
+const SettingsPage = memo(
+  lazy(() =>
+    import("@/features/settings/settings-page").then((module) => ({
+      default: module.SettingsPage,
+    }))
+  )
+)
+const ConnectionManagerSheet = memo(
+  lazy(() =>
+    import("@/features/providers/connection-manager-sheet").then((module) => ({
+      default: module.ConnectionManagerSheet,
+    }))
+  )
+)
 
 const navigation: Array<{
   id: Page
@@ -70,12 +113,16 @@ const navigation: Array<{
   { id: "settings", label: "设置", icon: Settings01Icon },
 ]
 
-export type SettingsSection = "config" | "diagnostics" | "app" | "unlock"
+function usesSharedConnectionState(page: Page) {
+  return page === "dashboard" || page === "providers"
+}
 
 export default function App() {
   const mainRef = useRef<HTMLElement>(null)
   const [page, setPage] = useState<Page>("dashboard")
+  const pageRef = useRef<Page>("dashboard")
   const [contextOpen, setContextOpen] = useState(false)
+  const [contextMounted, setContextMounted] = useState(false)
   const [refreshRevision, setRefreshRevision] = useState(0)
   const [dashboard, setDashboard] = useState<Dashboard>()
   const [connections, setConnections] = useState<ProviderOverview>()
@@ -83,13 +130,22 @@ export default function App() {
   const [usageDays, setUsageDays] = useState(7)
   const [usageGroupBy, setUsageGroupBy] = useState<UsageGroupBy>("model")
   const [sessionQuery, setSessionQuery] = useState("")
+  const [sessionQueryDraft, setSessionQueryDraft] = useState("")
   const [settingsSection, setSettingsSection] =
     useState<SettingsSection>("config")
   const [launching, setLaunching] = useState(false)
+  const [stateLoading, setStateLoading] = useState(true)
   const [stateError, setStateError] = useState<string>()
+  const loadedStateRevision = useRef<number | undefined>(undefined)
+  const sharedStateActive = usesSharedConnectionState(page)
 
   useEffect(() => {
-    if (refreshRevision > 0 && page !== "dashboard" && page !== "providers") {
+    if (!sharedStateActive) return
+    if (
+      loadedStateRevision.current === refreshRevision &&
+      dashboard &&
+      connections
+    ) {
       return
     }
     let cancelled = false
@@ -98,14 +154,23 @@ export default function App() {
         if (cancelled) return
         setDashboard(nextDashboard)
         setConnections(nextConnections)
+        loadedStateRevision.current = refreshRevision
         setStateError(undefined)
-        setSelectedConnection(
-          (current) =>
-            current ??
+        setSelectedConnection((current) => {
+          const allConnections = [
+            ...nextConnections.officialAccounts,
+            ...nextConnections.providers,
+          ]
+          if (current && allConnections.some((item) => item.id === current)) {
+            return current
+          }
+          return (
             nextConnections.officialAccounts.find((account) => account.active)
               ?.id ??
-            nextConnections.providers.find((provider) => provider.active)?.id
-        )
+            nextConnections.providers.find((provider) => provider.active)?.id ??
+            allConnections[0]?.id
+          )
+        })
       })
       .catch((reason) => {
         if (cancelled) return
@@ -117,12 +182,20 @@ export default function App() {
           type: "error",
         })
       })
+      .finally(() => {
+        if (!cancelled) setStateLoading(false)
+      })
     return () => {
       cancelled = true
     }
-  }, [page, refreshRevision])
+  }, [connections, dashboard, page, refreshRevision, sharedStateActive])
 
-  const refresh = () => setRefreshRevision((value) => value + 1)
+  const refresh = useCallback(() => {
+    if (usesSharedConnectionState(pageRef.current)) {
+      setStateLoading(true)
+    }
+    setRefreshRevision((value) => value + 1)
+  }, [])
 
   const launch = async () => {
     setLaunching(true)
@@ -157,8 +230,39 @@ export default function App() {
         unlock: "模型解锁",
       }[settingsSection]
     }
-    return dashboard?.activeAccount ?? dashboard?.activeProvider ?? "选择连接"
-  }, [dashboard, page, sessionQuery, settingsSection, usageDays, usageGroupBy])
+    if (page === "providers") {
+      const selectedAccount = connections?.officialAccounts.find(
+        (account) => account.id === selectedConnection
+      )
+      const selectedProvider = connections?.providers.find(
+        (provider) => provider.id === selectedConnection
+      )
+      return (
+        selectedAccount?.remark ||
+        selectedAccount?.name ||
+        selectedProvider?.name ||
+        "选择连接"
+      )
+    }
+    const activeAccount = connections?.officialAccounts.find(
+      (account) => account.active
+    )
+    return (
+      activeAccount?.remark ||
+      dashboard?.activeAccount ||
+      dashboard?.activeProvider ||
+      "选择连接"
+    )
+  }, [
+    connections,
+    dashboard,
+    page,
+    selectedConnection,
+    sessionQuery,
+    settingsSection,
+    usageDays,
+    usageGroupBy,
+  ])
 
   const contextIcon =
     page === "usage"
@@ -190,6 +294,15 @@ export default function App() {
               icon={item.icon}
               label={item.label}
               onClick={() => {
+                pageRef.current = item.id
+                const nextUsesSharedState = usesSharedConnectionState(item.id)
+                if (!nextUsesSharedState) {
+                  setStateLoading(false)
+                } else if (!sharedStateActive) {
+                  setStateLoading(
+                    loadedStateRevision.current !== refreshRevision
+                  )
+                }
                 setPage(item.id)
                 setContextOpen(false)
               }}
@@ -203,20 +316,18 @@ export default function App() {
               variant="outline"
               size="sm"
               className="max-w-48"
-              onClick={() => setContextOpen(true)}
+              onClick={() => {
+                setContextMounted(true)
+                if (page === "sessions") setSessionQueryDraft(sessionQuery)
+                setContextOpen(true)
+              }}
             >
               {contextIcon && (
                 <HugeiconsIcon icon={contextIcon} data-icon="inline-start" />
               )}
               <span className="truncate">{contextLabel}</span>
             </Button>
-            {(page === "dashboard" || page === "providers") &&
-              dashboard?.activeModel && (
-                <Badge variant="outline" className="max-w-36 truncate">
-                  {dashboard.activeModel}
-                </Badge>
-              )}
-            {(page === "dashboard" || page === "providers") && (
+            {sharedStateActive && (
               <Badge variant={stateError ? "destructive" : "secondary"}>
                 {stateError ? "异常" : dashboard ? "正常" : "读取中"}
               </Badge>
@@ -229,11 +340,16 @@ export default function App() {
                       variant="outline"
                       size="icon-sm"
                       aria-label="刷新当前页面"
+                      disabled={stateLoading && sharedStateActive}
                       onClick={refresh}
                     />
                   }
                 >
-                  <HugeiconsIcon icon={Refresh01Icon} />
+                  {stateLoading && sharedStateActive ? (
+                    <Spinner />
+                  ) : (
+                    <HugeiconsIcon icon={Refresh01Icon} />
+                  )}
                 </TooltipTrigger>
                 <TooltipContent side="bottom">刷新</TooltipContent>
               </Tooltip>
@@ -267,58 +383,79 @@ export default function App() {
                   </Alert>
                 </div>
               )}
-            {page === "dashboard" && (!stateError || dashboard) && (
-              <DashboardPage {...sharedProps} dashboard={dashboard} />
-            )}
-            {page === "providers" && (!stateError || connections) && (
-              <ProvidersPage
-                {...sharedProps}
-                connections={connections}
-                selectedId={selectedConnection}
-                onSelectedIdChange={setSelectedConnection}
-              />
-            )}
-            {page === "usage" && (
-              <UsagePage
-                {...sharedProps}
-                days={usageDays}
-                groupBy={usageGroupBy}
-              />
-            )}
-            {page === "sessions" && (
-              <SessionsPage
-                key={sessionQuery}
-                {...sharedProps}
-                query={sessionQuery}
-              />
-            )}
-            {page === "settings" && (
-              <SettingsPage {...sharedProps} section={settingsSection} />
-            )}
+            <Suspense fallback={<PageLoading />}>
+              {page === "dashboard" && (!stateError || dashboard) && (
+                <DashboardPage
+                  dashboard={dashboard}
+                  refreshRevision={refreshRevision}
+                />
+              )}
+              {page === "providers" && (!stateError || connections) && (
+                <ProvidersPage
+                  {...sharedProps}
+                  connections={connections}
+                  selectedId={selectedConnection}
+                  onSelectedIdChange={setSelectedConnection}
+                />
+              )}
+              {page === "usage" && (
+                <UsagePage
+                  {...sharedProps}
+                  days={usageDays}
+                  groupBy={usageGroupBy}
+                />
+              )}
+              {page === "sessions" && (
+                <SessionsPage
+                  key={sessionQuery}
+                  {...sharedProps}
+                  query={sessionQuery}
+                />
+              )}
+              {page === "settings" && (
+                <SettingsPage {...sharedProps} section={settingsSection} />
+              )}
+            </Suspense>
           </main>
         </div>
       </div>
 
-      <ContextSheet
-        open={contextOpen}
-        onOpenChange={setContextOpen}
-        page={page}
-        dashboard={dashboard}
-        connections={connections}
-        selectedConnection={selectedConnection}
-        onSelectedConnectionChange={setSelectedConnection}
-        usageDays={usageDays}
-        onUsageDaysChange={setUsageDays}
-        usageGroupBy={usageGroupBy}
-        onUsageGroupByChange={setUsageGroupBy}
-        sessionQuery={sessionQuery}
-        onSessionQueryChange={setSessionQuery}
-        settingsSection={settingsSection}
-        onSettingsSectionChange={setSettingsSection}
-        onChanged={refresh}
-      />
+      {contextMounted && (
+        <Suspense fallback={null}>
+          <ContextSheet
+            open={contextOpen}
+            onOpenChange={setContextOpen}
+            page={page}
+            connections={connections}
+            selectedConnection={selectedConnection}
+            onSelectedConnectionChange={setSelectedConnection}
+            usageDays={usageDays}
+            onUsageDaysChange={setUsageDays}
+            usageGroupBy={usageGroupBy}
+            onUsageGroupByChange={setUsageGroupBy}
+            sessionQueryDraft={sessionQueryDraft}
+            onSessionQueryDraftChange={setSessionQueryDraft}
+            onSessionQuerySubmit={setSessionQuery}
+            settingsSection={settingsSection}
+            onSettingsSectionChange={setSettingsSection}
+            onChanged={refresh}
+          />
+        </Suspense>
+      )}
       <Toaster timeout={4500} limit={3} />
     </TooltipProvider>
+  )
+}
+
+function PageLoading() {
+  return (
+    <div
+      className="flex h-full min-h-64 items-center justify-center gap-2 text-sm text-muted-foreground"
+      role="status"
+    >
+      <Spinner />
+      <span>正在加载页面</span>
+    </div>
   )
 }
 
@@ -360,7 +497,6 @@ function ContextSheet({
   open,
   onOpenChange,
   page,
-  dashboard,
   connections,
   selectedConnection,
   onSelectedConnectionChange,
@@ -368,8 +504,9 @@ function ContextSheet({
   onUsageDaysChange,
   usageGroupBy,
   onUsageGroupByChange,
-  sessionQuery,
-  onSessionQueryChange,
+  sessionQueryDraft,
+  onSessionQueryDraftChange,
+  onSessionQuerySubmit,
   settingsSection,
   onSettingsSectionChange,
   onChanged,
@@ -377,7 +514,6 @@ function ContextSheet({
   open: boolean
   onOpenChange: (open: boolean) => void
   page: Page
-  dashboard?: Dashboard
   connections?: ProviderOverview
   selectedConnection?: string
   onSelectedConnectionChange: (id: string) => void
@@ -385,89 +521,53 @@ function ContextSheet({
   onUsageDaysChange: (days: number) => void
   usageGroupBy: UsageGroupBy
   onUsageGroupByChange: (groupBy: UsageGroupBy) => void
-  sessionQuery: string
-  onSessionQueryChange: (query: string) => void
+  sessionQueryDraft: string
+  onSessionQueryDraftChange: (query: string) => void
+  onSessionQuerySubmit: (query: string) => void
   settingsSection: SettingsSection
   onSettingsSectionChange: (section: SettingsSection) => void
   onChanged: () => void
 }) {
-  const connectionPage = page === "dashboard" || page === "providers"
+  const applySessionQuery = () => {
+    onSessionQuerySubmit(sessionQueryDraft.trim())
+    onOpenChange(false)
+  }
 
-  const activate = async (kind: "account" | "provider", id: string) => {
-    try {
-      await (kind === "account"
-        ? call("connections_activate_account", { id })
-        : call("connections_activate", { id }))
-      onSelectedConnectionChange(id)
-      onOpenChange(false)
-      onChanged()
-      toast.add({ title: "连接已切换", type: "success" })
-    } catch (reason) {
-      toast.add({
-        title: "无法切换连接",
-        description: errorMessage(reason),
-        type: "error",
-      })
-    }
+  if (usesSharedConnectionState(page)) {
+    return (
+      <ConnectionManagerSheet
+        open={open}
+        onOpenChange={onOpenChange}
+        page={page}
+        connections={connections}
+        selectedId={selectedConnection}
+        onSelectedIdChange={onSelectedConnectionChange}
+        onChanged={onChanged}
+      />
+    )
   }
 
   return (
     <Sheet open={open} onOpenChange={onOpenChange}>
-      <SheetContent side="left" className="w-64 overflow-y-auto">
+      <SheetContent side="left">
         <SheetHeader>
           <SheetTitle>
-            {connectionPage
-              ? "账号与服务"
-              : page === "usage"
-                ? "用量筛选"
-                : page === "sessions"
-                  ? "搜索会话"
-                  : "设置章节"}
+            {page === "usage"
+              ? "用量筛选"
+              : page === "sessions"
+                ? "搜索会话"
+                : "设置章节"}
           </SheetTitle>
           <SheetDescription>
-            {connectionPage
-              ? "选择 Codex 当前使用的连接。"
-              : page === "usage"
-                ? "调整统计范围与汇总方式。"
-                : page === "sessions"
-                  ? "按标题或项目路径搜索。"
-                  : "选择要查看的设置。"}
+            {page === "usage"
+              ? "调整统计范围与汇总方式。"
+              : page === "sessions"
+                ? "按标题或项目路径搜索。"
+                : "选择要查看的设置。"}
           </SheetDescription>
         </SheetHeader>
 
-        <div className="flex flex-col gap-3 px-3 pb-4">
-          {connectionPage && connections && (
-            <>
-              <ConnectionGroup
-                label="OpenAI 账号"
-                items={connections.officialAccounts.map((account) => ({
-                  id: account.id,
-                  title: account.name,
-                  description: account.email || "OpenAI 账号",
-                  active:
-                    account.active || dashboard?.activeAccountId === account.id,
-                  enabled: true,
-                  kind: "account" as const,
-                }))}
-                selectedId={selectedConnection}
-                onSelect={(kind, id) => void activate(kind, id)}
-              />
-              <ConnectionGroup
-                label="API 服务"
-                items={connections.providers.map((provider) => ({
-                  id: provider.id,
-                  title: provider.name,
-                  description: provider.model || provider.baseUrl,
-                  active: provider.active,
-                  enabled: provider.enabled,
-                  kind: "provider" as const,
-                }))}
-                selectedId={selectedConnection}
-                onSelect={(kind, id) => void activate(kind, id)}
-              />
-            </>
-          )}
-
+        <SheetBody className="gap-3">
           {page === "usage" && (
             <FieldGroup>
               <Field>
@@ -503,25 +603,32 @@ function ContextSheet({
           )}
 
           {page === "sessions" && (
-            <FieldGroup>
-              <Field>
-                <FieldLabel htmlFor="session-search">搜索</FieldLabel>
-                <InputGroup>
-                  <InputGroupAddon>
-                    <HugeiconsIcon icon={Search01Icon} />
-                  </InputGroupAddon>
-                  <InputGroupInput
-                    id="session-search"
-                    value={sessionQuery}
-                    placeholder="标题或项目路径"
-                    onChange={(event) =>
-                      onSessionQueryChange(event.target.value)
-                    }
-                  />
-                </InputGroup>
-              </Field>
-              <Button onClick={() => onOpenChange(false)}>应用搜索</Button>
-            </FieldGroup>
+            <form
+              onSubmit={(event) => {
+                event.preventDefault()
+                applySessionQuery()
+              }}
+            >
+              <FieldGroup>
+                <Field>
+                  <FieldLabel htmlFor="session-search">搜索</FieldLabel>
+                  <InputGroup>
+                    <InputGroupAddon>
+                      <HugeiconsIcon icon={Search01Icon} />
+                    </InputGroupAddon>
+                    <InputGroupInput
+                      id="session-search"
+                      value={sessionQueryDraft}
+                      placeholder="标题或项目路径"
+                      onChange={(event) =>
+                        onSessionQueryDraftChange(event.target.value)
+                      }
+                    />
+                  </InputGroup>
+                </Field>
+                <Button type="submit">应用搜索</Button>
+              </FieldGroup>
+            </form>
           )}
 
           {page === "settings" && (
@@ -542,69 +649,8 @@ function ContextSheet({
               <ToggleGroupItem value="unlock">模型解锁</ToggleGroupItem>
             </ToggleGroup>
           )}
-        </div>
+        </SheetBody>
       </SheetContent>
     </Sheet>
-  )
-}
-
-type ConnectionItem = {
-  id: string
-  title: string
-  description: string
-  active: boolean
-  enabled: boolean
-  kind: "account" | "provider"
-}
-
-function ConnectionGroup({
-  label,
-  items,
-  selectedId,
-  onSelect,
-}: {
-  label: string
-  items: ConnectionItem[]
-  selectedId?: string
-  onSelect: (kind: ConnectionItem["kind"], id: string) => void
-}) {
-  return (
-    <div className="flex flex-col gap-1.5">
-      <div className="px-1 text-xs font-medium text-muted-foreground">
-        {label}
-      </div>
-      <ItemGroup>
-        {items.map((item) => (
-          <Item
-            key={item.id}
-            size="xs"
-            className="flex-nowrap"
-            variant={
-              item.id === selectedId || item.active ? "muted" : "default"
-            }
-            render={<button type="button" disabled={!item.enabled} />}
-            aria-current={item.active ? "true" : undefined}
-            onClick={() => onSelect(item.kind, item.id)}
-          >
-            <ItemMedia variant="icon">
-              <HugeiconsIcon
-                icon={item.kind === "account" ? Key01Icon : ChartHistogramIcon}
-              />
-            </ItemMedia>
-            <ItemContent>
-              <ItemTitle className="w-full">{item.title}</ItemTitle>
-              <ItemDescription className="truncate">
-                {item.description}
-              </ItemDescription>
-            </ItemContent>
-            {(item.active || item.id === selectedId) && (
-              <ItemActions className="ml-auto self-center">
-                <HugeiconsIcon icon={Tick02Icon} aria-label="当前连接" />
-              </ItemActions>
-            )}
-          </Item>
-        ))}
-      </ItemGroup>
-    </div>
   )
 }

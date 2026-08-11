@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 pub(crate) const MAX_DISPLAY_NAME_CHARS: usize = 100;
+pub(crate) const MAX_ACCOUNT_REMARK_CHARS: usize = 200;
 pub(crate) const MAX_ACCOUNT_ID_CHARS: usize = 512;
 pub(crate) const MAX_CREDENTIAL_CHARS: usize = 262_144;
 const MAX_API_URL_CHARS: usize = 2_048;
@@ -137,7 +138,8 @@ pub struct ProviderProfile {
     pub enabled: bool,
     #[serde(default)]
     pub active: bool,
-    /// 切换到该服务时写入 Codex 的默认模型；留空则沿用 Codex 默认模型。
+    /// 旧版手工默认模型字段，仅为兼容已有 JSON/IPC 数据保留。
+    /// 保存时会清空，运行时模型只从 `available_models` 中选择。
     #[serde(default)]
     pub model: String,
     /// 从服务 `/models` 接口读取到的模型上下文窗口（token）；
@@ -165,6 +167,51 @@ pub struct ProviderProfile {
     pub created_at: i64,
     #[serde(default)]
     pub updated_at: i64,
+}
+
+/// WebView 保存第三方服务时唯一允许提交的字段。模型目录、模型元数据、
+/// active/hasApiKey 和时间戳全部由后端维护；即使旧前端仍携带这些字段，
+/// serde 也只会读取这里声明的可编辑字段。
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderSaveInput {
+    #[serde(default)]
+    pub id: String,
+    pub name: String,
+    pub base_url: String,
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
+    #[serde(default = "default_timeout_secs")]
+    pub timeout_secs: u64,
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub api_type: ProviderApiType,
+    #[serde(default)]
+    pub api_key: Option<String>,
+}
+
+impl From<ProviderSaveInput> for ProviderProfile {
+    fn from(input: ProviderSaveInput) -> Self {
+        Self {
+            id: input.id,
+            name: input.name,
+            base_url: input.base_url,
+            headers: input.headers,
+            timeout_secs: input.timeout_secs,
+            enabled: input.enabled,
+            active: false,
+            model: String::new(),
+            model_context_windows: BTreeMap::new(),
+            available_models: Vec::new(),
+            models_dev_meta: BTreeMap::new(),
+            api_type: input.api_type,
+            api_key: input.api_key,
+            has_api_key: false,
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
 }
 
 impl ProviderProfile {
@@ -346,6 +393,8 @@ pub struct StoredOfficialAccount {
     #[serde(default)]
     pub id: String,
     pub name: String,
+    #[serde(default)]
+    pub remark: String,
     pub account_id: String,
     pub email: String,
     pub credential: CodexAuthCredential,
@@ -366,6 +415,7 @@ impl fmt::Debug for StoredOfficialAccount {
             .debug_struct("StoredOfficialAccount")
             .field("id", &self.id)
             .field("name", &self.name)
+            .field("remark", &self.remark)
             .field("account_id", &self.account_id)
             .field("email", &self.email)
             .field("credential", &"[REDACTED]")
@@ -376,11 +426,19 @@ impl fmt::Debug for StoredOfficialAccount {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountRemarkUpdate {
+    pub id: String,
+    pub remark: String,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct OfficialAccountView {
     pub id: String,
     pub name: String,
+    pub remark: String,
     pub account_id: String,
     pub email: String,
     pub source: OfficialAccountSource,
@@ -399,10 +457,20 @@ pub struct ProviderOverview {
 }
 
 impl StoredOfficialAccount {
+    pub fn display_name(&self) -> &str {
+        let remark = self.remark.trim();
+        if remark.is_empty() {
+            &self.name
+        } else {
+            remark
+        }
+    }
+
     pub fn view(&self, active: bool) -> OfficialAccountView {
         OfficialAccountView {
             id: self.id.clone(),
             name: self.name.clone(),
+            remark: self.remark.clone(),
             account_id: self.account_id.clone(),
             email: self.email.clone(),
             source: self.source,
@@ -450,7 +518,7 @@ pub struct CodexPreferences {
     /// 正在运行的调试实例。
     #[serde(default)]
     pub last_debug_port: Option<u16>,
-    /// 最近一次由本应用写入 config.toml 的默认模型。切换到 OpenAI 时只清除
+    /// 最近一次由本应用写入 config.toml 的服务模型。切换到 OpenAI 时只清除
     /// 与这条记录一致的模型，避免误删用户手动设置的值。
     #[serde(default)]
     pub last_managed_model: Option<String>,
@@ -1229,6 +1297,41 @@ mod tests {
     use super::*;
 
     #[test]
+    fn provider_save_input_ignores_backend_managed_model_fields() {
+        let input: ProviderSaveInput = serde_json::from_value(serde_json::json!({
+            "id": "provider",
+            "name": "Provider",
+            "baseUrl": "https://example.test/v1",
+            "headers": {"x-tenant": "tenant"},
+            "timeoutSecs": 45,
+            "enabled": true,
+            "apiType": "chat",
+            "apiKey": "secret",
+            "model": "injected-model",
+            "availableModels": ["injected-model"],
+            "modelContextWindows": {"injected-model": 999999},
+            "modelsDevMeta": {"injected-model": {"name": "Injected"}},
+            "active": true,
+            "hasApiKey": true,
+            "createdAt": 1,
+            "updatedAt": 2
+        }))
+        .unwrap();
+
+        let profile = ProviderProfile::from(input);
+
+        assert!(profile.model.is_empty());
+        assert!(profile.available_models.is_empty());
+        assert!(profile.model_context_windows.is_empty());
+        assert!(profile.models_dev_meta.is_empty());
+        assert!(!profile.active);
+        assert!(!profile.has_api_key);
+        assert_eq!(profile.created_at, 0);
+        assert_eq!(profile.updated_at, 0);
+        assert_eq!(profile.api_type, ProviderApiType::Chat);
+    }
+
+    #[test]
     fn redacted_provider_never_serializes_api_key() {
         let provider = ProviderProfile {
             id: "provider".into(),
@@ -1335,6 +1438,7 @@ mod tests {
         StoredOfficialAccount {
             id: "local-account".into(),
             name: "OpenAI".into(),
+            remark: "日常开发".into(),
             account_id: "workspace-account".into(),
             email: "person@example.test".into(),
             credential: CodexAuthCredential {
@@ -1359,6 +1463,7 @@ mod tests {
     #[test]
     fn official_view_and_device_dtos_never_serialize_credentials() {
         let view = official_account().view(true);
+        assert_eq!(serde_json::to_value(&view).unwrap()["remark"], "日常开发");
         let repair = RepairResult::default();
         let values = [
             serde_json::to_value(&view).unwrap(),
@@ -1391,6 +1496,17 @@ mod tests {
             assert!(!serialized.contains("refresh_token"));
             assert!(!serialized.contains("device_auth_id"));
         }
+    }
+
+    #[test]
+    fn stored_official_account_defaults_remark_for_legacy_data() {
+        let mut value = serde_json::to_value(official_account()).unwrap();
+        value.as_object_mut().unwrap().remove("remark");
+
+        let restored: StoredOfficialAccount = serde_json::from_value(value).unwrap();
+
+        assert_eq!(restored.remark, "");
+        assert_eq!(restored.account_id, "workspace-account");
     }
 
     #[test]

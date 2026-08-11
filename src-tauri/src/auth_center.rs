@@ -4,6 +4,7 @@ use crate::models::{
     StoredOfficialAccount, ensure_char_limit, token_identity, token_local_identity,
 };
 use crate::proxy_import::ImportedProxyCredential;
+use crate::storage::Store;
 use futures_util::StreamExt;
 use reqwest::StatusCode;
 use reqwest::header::{HeaderMap, HeaderValue, USER_AGENT};
@@ -100,6 +101,12 @@ struct CompleteTokens {
     access_token: String,
     refresh_token: String,
     expires_in: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AccountRefreshDecision {
+    KeepCurrent,
+    Refresh,
 }
 
 impl Default for AuthCenter {
@@ -212,30 +219,41 @@ impl AuthCenter {
 
     pub async fn refresh_account(
         &self,
-        account: &StoredOfficialAccount,
+        store: &Store,
+        account_id: &str,
     ) -> Result<StoredOfficialAccount, AppError> {
-        if account.expires_at.is_some_and(|expires_at| {
-            expires_at
-                > chrono::Utc::now()
-                    .timestamp()
-                    .saturating_add(ACCESS_TOKEN_REFRESH_WINDOW_SECS)
-        }) {
-            return Ok(account.clone());
-        }
-        if account.credential.tokens.refresh_token.trim().is_empty() {
-            if account
-                .expires_at
-                .is_some_and(|expires_at| expires_at <= chrono::Utc::now().timestamp())
-            {
-                return Err(AppError::InvalidConfig(
-                    "Cookie 账号的 accessToken 已过期，请重新导入。".into(),
-                ));
-            }
-            return Ok(account.clone());
-        }
-        // Refresh tokens can rotate and are single-use. Serializing refreshes prevents
-        // two activations from consuming the same token concurrently.
+        self.refresh_account_with_policy(store, account_id, false)
+            .await
+    }
+
+    /// Explicit login refresh requested by the user. Unlike activation/quota
+    /// refreshes, an available refresh token is always exchanged, even while
+    /// the current access token is still far from expiry.
+    pub async fn refresh_login(
+        &self,
+        store: &Store,
+        account_id: &str,
+    ) -> Result<StoredOfficialAccount, AppError> {
+        self.refresh_account_with_policy(store, account_id, true)
+            .await
+    }
+
+    async fn refresh_account_with_policy(
+        &self,
+        store: &Store,
+        account_id: &str,
+        force: bool,
+    ) -> Result<StoredOfficialAccount, AppError> {
+        // Refresh tokens can rotate and are single-use. Keep the store reload,
+        // exchange, and durable save in one shared critical section so a waiter
+        // never consumes a stale snapshot after another refresh has completed.
         let _guard = self.refresh_lock.lock().await;
+        let account = store.official_account(account_id)?;
+        if refresh_decision(&account, force, chrono::Utc::now().timestamp())?
+            == AccountRefreshDecision::KeepCurrent
+        {
+            return Ok(account);
+        }
         let http = self.client()?;
         let response = http
             .post(TOKEN_URL)
@@ -255,8 +273,9 @@ impl AuthCenter {
         }
         let response = require_success(response, "无法续期 OpenAI 登录")?;
         let refreshed: TokenResponse = read_json_bounded(response, "登录续期结果").await?;
-        let tokens = merge_refreshed_tokens(refreshed, account)?;
-        account_from_tokens(tokens, Some(account))
+        let tokens = merge_refreshed_tokens(refreshed, &account)?;
+        let refreshed = account_from_tokens(tokens, Some(&account))?;
+        store.save_official_account(&refreshed)
     }
 
     pub async fn connections_import_cookie(
@@ -293,6 +312,10 @@ impl AuthCenter {
             )?;
         }
         if imported.access_token.is_none() {
+            // A refresh-token-only import consumes the same rotating credential
+            // as normal login refreshes. Serialize the exchange so no other
+            // auth path can consume that token at the same time.
+            let _guard = self.refresh_lock.lock().await;
             let refresh_token = imported.refresh_token.clone().ok_or_else(|| {
                 AppError::InvalidConfig("Cookie 凭据缺少 accessToken 或 refresh_token。".into())
             })?;
@@ -446,6 +469,39 @@ fn non_empty(value: Option<String>) -> Option<String> {
     value.filter(|value| !value.trim().is_empty())
 }
 
+fn refresh_decision(
+    account: &StoredOfficialAccount,
+    force: bool,
+    now: i64,
+) -> Result<AccountRefreshDecision, AppError> {
+    if account.credential.tokens.refresh_token.trim().is_empty() {
+        if account
+            .expires_at
+            .is_some_and(|expires_at| expires_at <= now)
+        {
+            let message = match account.source {
+                OfficialAccountSource::ProxyImport => {
+                    "Cookie 账号的 accessToken 已过期，请重新导入。"
+                }
+                OfficialAccountSource::OpenAiOauth => {
+                    "OpenAI 登录已过期且缺少 refresh token，请重新登录。"
+                }
+            };
+            return Err(AppError::InvalidConfig(message.into()));
+        }
+        return Ok(AccountRefreshDecision::KeepCurrent);
+    }
+    if force
+        || account.expires_at.is_none_or(|expires_at| {
+            expires_at <= now.saturating_add(ACCESS_TOKEN_REFRESH_WINDOW_SECS)
+        })
+    {
+        Ok(AccountRefreshDecision::Refresh)
+    } else {
+        Ok(AccountRefreshDecision::KeepCurrent)
+    }
+}
+
 fn account_from_tokens(
     tokens: CompleteTokens,
     previous: Option<&StoredOfficialAccount>,
@@ -499,6 +555,7 @@ fn account_from_tokens(
         } else {
             email.clone()
         },
+        remark: previous.map_or_else(String::new, |account| account.remark.clone()),
         account_id,
         email,
         credential,
@@ -544,6 +601,7 @@ fn account_from_imported_tokens(
     let mut account = StoredOfficialAccount {
         id: String::new(),
         name: String::new(),
+        remark: String::new(),
         account_id: account_id.clone(),
         email,
         credential: CodexAuthCredential {
@@ -731,11 +789,42 @@ fn parse_codex_version(output: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::QuotaStatus;
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 
     fn jwt(claims: Value) -> String {
         let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap());
         format!("e30.{payload}.signature")
+    }
+
+    fn refresh_test_account(
+        source: OfficialAccountSource,
+        refresh_token: &str,
+        expires_at: Option<i64>,
+    ) -> StoredOfficialAccount {
+        StoredOfficialAccount {
+            id: "local-id".into(),
+            name: "person@example.test".into(),
+            remark: "主要账号".into(),
+            account_id: "acct-1".into(),
+            email: "person@example.test".into(),
+            credential: CodexAuthCredential {
+                auth_mode: "chatgpt".into(),
+                openai_api_key: None,
+                tokens: CodexAuthTokens {
+                    id_token: jwt(json!({"chatgpt_account_id": "acct-1"})),
+                    access_token: jwt(json!({"chatgpt_account_id": "acct-1"})),
+                    refresh_token: refresh_token.into(),
+                    account_id: "acct-1".into(),
+                },
+                last_refresh: "2026-01-01T00:00:00Z".into(),
+            },
+            source,
+            expires_at,
+            quota: ProviderAccountQuota::default(),
+            created_at: 1,
+            updated_at: 1,
+        }
     }
 
     #[test]
@@ -815,10 +904,91 @@ mod tests {
     }
 
     #[test]
+    fn explicit_login_refresh_forces_an_oauth_token_exchange() {
+        let now: i64 = 1_000_000;
+        let account = refresh_test_account(
+            OfficialAccountSource::OpenAiOauth,
+            "refresh-token",
+            Some(now + 86_400),
+        );
+
+        assert_eq!(
+            refresh_decision(&account, false, now).unwrap(),
+            AccountRefreshDecision::KeepCurrent
+        );
+        assert_eq!(
+            refresh_decision(&account, true, now).unwrap(),
+            AccountRefreshDecision::Refresh
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_login_refresh_accepts_a_valid_cookie_without_refresh_token() {
+        let now = chrono::Utc::now().timestamp();
+        let account = refresh_test_account(
+            OfficialAccountSource::ProxyImport,
+            "",
+            Some(now.saturating_add(3600)),
+        );
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path().join("data")).unwrap();
+        let saved = store.save_official_account(&account).unwrap();
+
+        assert_eq!(
+            refresh_decision(&account, true, now).unwrap(),
+            AccountRefreshDecision::KeepCurrent
+        );
+        assert_eq!(
+            AuthCenter::default()
+                .refresh_login(&store, &saved.id)
+                .await
+                .unwrap(),
+            saved
+        );
+    }
+
+    #[test]
+    fn explicit_login_refresh_rejects_an_expired_cookie_without_refresh_token() {
+        let now: i64 = 1_000_000;
+        let account = refresh_test_account(
+            OfficialAccountSource::ProxyImport,
+            "",
+            Some(now.saturating_sub(1)),
+        );
+
+        let error = refresh_decision(&account, true, now).unwrap_err();
+        assert!(error.to_string().contains("accessToken 已过期"));
+    }
+
+    #[test]
+    fn refreshed_tokens_keep_account_remark_and_quota() {
+        let mut previous = refresh_test_account(
+            OfficialAccountSource::OpenAiOauth,
+            "refresh-old",
+            Some(1_800_000_000),
+        );
+        previous.quota.status = QuotaStatus::Success;
+        previous.quota.fetched_at = Some(42);
+        let tokens = CompleteTokens {
+            id_token: jwt(json!({"chatgpt_account_id": "acct-1"})),
+            access_token: jwt(json!({"chatgpt_account_id": "acct-1"})),
+            refresh_token: "refresh-new".into(),
+            expires_in: Some(3600),
+        };
+
+        let refreshed = account_from_tokens(tokens, Some(&previous)).unwrap();
+
+        assert_eq!(refreshed.remark, "主要账号");
+        assert_eq!(refreshed.quota.status, QuotaStatus::Success);
+        assert_eq!(refreshed.quota.fetched_at, Some(42));
+    }
+
+    #[test]
     fn refresh_cannot_change_account_identity() {
         let previous = StoredOfficialAccount {
             id: "local-id".into(),
             name: "old@example.com".into(),
+            remark: "主要账号".into(),
             account_id: "acct-old".into(),
             email: "old@example.com".into(),
             credential: CodexAuthCredential {

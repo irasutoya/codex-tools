@@ -1,8 +1,6 @@
 export type Page = "dashboard" | "providers" | "usage" | "sessions" | "settings"
 
-export type PageProps = {
-  active: boolean
-}
+export type SettingsSection = "config" | "diagnostics" | "app" | "unlock"
 
 export type Provider = {
   id: string
@@ -12,7 +10,6 @@ export type Provider = {
   timeoutSecs: number
   enabled: boolean
   active: boolean
-  model?: string
   /** 服务接入方式：直连 Responses API，或经本机转换代理接入 Chat Completions API */
   apiType: "responses" | "chat"
   /** 从服务 /models 接口读取的模型上下文窗口（token），写入模型目录时优先使用 */
@@ -26,6 +23,18 @@ export type Provider = {
   createdAt: number
   updatedAt: number
 }
+
+export type ProviderSaveInput = Pick<
+  Provider,
+  | "id"
+  | "name"
+  | "baseUrl"
+  | "headers"
+  | "timeoutSecs"
+  | "enabled"
+  | "apiType"
+  | "apiKey"
+>
 
 export type Dashboard = {
   providerCount: number
@@ -316,10 +325,11 @@ export type RepairResult = {
 export type OfficialAccountView = {
   id: string
   name: string
+  remark: string
   accountId: string
   email: string
   source: "open_ai_oauth" | "proxy_import"
-  expiresAt?: number
+  expiresAt: number | null
   quota: AccountQuota
   active: boolean
   createdAt: number
@@ -478,7 +488,6 @@ export const emptyProvider = (): Provider => ({
   timeoutSecs: 30,
   enabled: true,
   active: false,
-  model: "",
   apiType: "responses",
   apiKey: "",
   hasApiKey: false,

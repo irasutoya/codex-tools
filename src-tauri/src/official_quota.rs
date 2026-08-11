@@ -282,6 +282,7 @@ mod tests {
         StoredOfficialAccount {
             id: "saved-account".into(),
             name: "Account".into(),
+            remark: String::new(),
             account_id: account_id.into(),
             email: String::new(),
             credential: CodexAuthCredential {

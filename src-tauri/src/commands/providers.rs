@@ -4,13 +4,13 @@ use crate::{
         sync_active_openai_credential,
     },
     chat_proxy::ChatProxyRegistry,
-    codex::{self, ConfigManager},
+    codex::{self, AppliedConfigPatch, ConfigManager},
     commands::sessions::repair_home,
     local_usage::UsageLedger,
     models::*,
     models_dev, provider_http, provider_sync,
     state::{ActivationLock, ApiClient},
-    storage::Store,
+    storage::{ProviderSnapshotRevision, ProviderSourceFingerprint, Store},
 };
 use std::collections::BTreeMap;
 use tauri::State;
@@ -27,56 +27,234 @@ pub(crate) async fn connections_save_provider(
     activation: State<'_, ActivationLock>,
     proxy: State<'_, ChatProxyRegistry>,
     client: State<'_, ApiClient>,
-    provider: ProviderProfile,
+    provider: ProviderSaveInput,
 ) -> Result<ProviderProfile, AppError> {
-    // 判断地址或 Key 是否变化：变化时才静默抓取 /models 可用模型，避免每次保存都请求。
-    // 前端回传的是脱敏后的 api_key（为空），因此只有“用户新填了 Key”才算变化；
-    // 否则每次编辑保存都会误判为 Key 变化而触发不必要的模型同步。
-    let (is_new, url_changed, key_changed, saved) = {
+    let _model_transaction = activation.2.lock().await;
+    let provider = ProviderProfile::from(provider);
+    let (previous, saved_source, saved_revision, needs_model_refresh, was_active, saved) = {
         let _guard = activation.0.lock().await;
-        let (is_new, url_changed, key_changed) = store.read(|state| {
-            match state.providers.iter().find(|value| value.id == provider.id) {
-                Some(existing) => (
-                    false,
-                    existing.base_url != provider.base_url,
-                    provider
-                        .api_key
-                        .as_deref()
-                        .is_some_and(|key| !key.trim().is_empty())
-                        && existing.api_key.as_deref() != provider.api_key.as_deref(),
-                ),
-                None => (true, true, true),
-            }
-        })?;
-        let saved = store.connections_save_provider(provider)?;
+        let (previous, saved) = store.connections_save_provider_with_previous(provider)?;
+        let saved_source = ProviderSourceFingerprint::from_provider(&saved);
+        let saved_revision = ProviderSnapshotRevision::from_provider(&saved);
+        let was_active = store.is_active_provider(&saved.id)?;
+        // 新连接、模型源变化和从未成功拉取过模型都会得到空缓存。
+        let needs_model_refresh = saved.available_models.is_empty()
+            && saved
+                .api_key
+                .as_deref()
+                .is_some_and(|key| !key.trim().is_empty());
         // 若正在使用此服务，同步配置时（对 Chat 类型）会自动启动/重启本机转换代理。
-        if store.is_active_provider(&saved.id)? {
-            sync_active_codex_configuration(&store, &manager, &proxy).await?;
+        // 地址/Key/空缓存需要先完成 `/models` 刷新，不能把旧模型写给新服务。
+        if was_active
+            && !needs_model_refresh
+            && let Err(error) = sync_active_codex_configuration(&store, &manager, &proxy).await
+        {
+            let Some(previous) = previous.as_ref() else {
+                return Err(error);
+            };
+            return Err(restore_active_provider_save(
+                &store,
+                &manager,
+                &proxy,
+                &saved_revision,
+                previous,
+                error,
+            )
+            .await);
         }
-        (is_new, url_changed, key_changed, saved)
+        (
+            previous,
+            saved_source,
+            saved_revision,
+            needs_model_refresh,
+            was_active,
+            saved,
+        )
     };
     // 静默获取服务 /models 接口返回的可用模型，并用 models.dev(catalog.json)
     // 精确匹配补充元数据（用户无感知；失败不打扰，保留已有数据）。
     // 放到激活锁之外执行：HTTP 请求可能耗时数秒，不应阻塞其他激活/保存操作。
-    if (is_new || url_changed || key_changed)
-        && saved
-            .api_key
-            .as_deref()
-            .is_some_and(|key| !key.trim().is_empty())
-    {
-        let _ = sync_provider_models(&client.current()?, &store, &saved).await;
+    if needs_model_refresh {
+        let sync_result = match client.current() {
+            Ok(client) => {
+                sync_provider_models(&client, &store, &saved, Some(&saved_revision)).await
+            }
+            Err(error) => Err(error),
+        };
+        match sync_result {
+            Ok(synced) if was_active => {
+                let _guard = activation.0.lock().await;
+                // 刷新期间若用户已切到 OpenAI/其他服务，新 Provider 已是
+                // 普通草稿；保留缓存但绝不能重写当前 Codex 配置。
+                if !store.is_active_provider(&saved.id)? {
+                    return Ok(store.provider(&saved.id)?.redacted());
+                }
+                if !store.provider_source_matches(&saved.id, &saved_source)? {
+                    return Err(AppError::StaleOperation);
+                }
+                if let Err(error) = sync_active_codex_configuration(&store, &manager, &proxy).await
+                {
+                    let Some(previous) = previous.as_ref() else {
+                        return Err(error);
+                    };
+                    return Err(restore_active_provider_save(
+                        &store,
+                        &manager,
+                        &proxy,
+                        &synced.revision,
+                        previous,
+                        error,
+                    )
+                    .await);
+                }
+            }
+            Err(error) if was_active => {
+                let _guard = activation.0.lock().await;
+                // 刷新期间已切走时按未激活草稿处理：保留用户保存的数据，
+                // 后续真正激活时会重新获取模型并在无缓存时明确拒绝。
+                if !store.is_active_provider(&saved.id)? {
+                    return Ok(store.provider(&saved.id)?.redacted());
+                }
+                let Some(previous) = previous.as_ref() else {
+                    return Err(error);
+                };
+                return Err(rollback_active_save_after_model_failure(
+                    &store,
+                    &manager,
+                    &proxy,
+                    &saved_revision,
+                    previous,
+                    error,
+                )
+                .await);
+            }
+            Ok(_) => {}
+            // 未激活的服务允许先保存为草稿；激活时会重试，且无缓存会明确拒绝。
+            Err(_) => {}
+        }
     }
-    Ok(saved.redacted())
+    Ok(store.provider(&saved.id)?.redacted())
+}
+
+async fn rollback_active_save_after_model_failure(
+    store: &Store,
+    manager: &ConfigManager,
+    proxy: &ChatProxyRegistry,
+    saved_revision: &ProviderSnapshotRevision,
+    previous: &ProviderProfile,
+    error: AppError,
+) -> AppError {
+    // 另一个更新已改变 Provider source。旧请求绝不能回滚，否则会
+    // 撤销新来源并覆盖真正的最新保存。
+    if matches!(error, AppError::StaleOperation) {
+        return error;
+    }
+    let failure = AppError::InvalidConfig(format!(
+        "无法从更新后的服务获取模型列表，已保留原连接：{error}"
+    ));
+    restore_active_provider_save(store, manager, proxy, saved_revision, previous, failure).await
+}
+
+/// 在持有 ActivationLock 时恢复 active Provider 的完整旧快照，并把 Codex
+/// 配置同步回旧连接。完整 snapshot revision CAS 失败表示已有更新完成，
+/// 绝不能用旧请求覆盖 timeout/enabled/模型缓存等后续提交。
+async fn restore_active_provider_save(
+    store: &Store,
+    manager: &ConfigManager,
+    proxy: &ChatProxyRegistry,
+    expected_revision: &ProviderSnapshotRevision,
+    previous: &ProviderProfile,
+    original_error: AppError,
+) -> AppError {
+    match store.restore_provider_snapshot_if_revision_matches(expected_revision, previous) {
+        Ok(false) => AppError::StaleOperation,
+        Err(restore) => AppError::Internal(format!(
+            "{original_error}；恢复原服务数据失败，请重新选择连接：{restore}"
+        )),
+        Ok(true) => match sync_active_codex_configuration(store, manager, proxy).await {
+            Ok(()) => original_error,
+            Err(restore) => AppError::Internal(format!(
+                "{original_error}；原服务配置恢复失败，请重新选择连接：{restore}"
+            )),
+        },
+    }
+}
+
+/// 提交第三方配置后立即记录实际写入的 API 模型。记录失败时 Store 仍指向
+/// 原连接，因此可以用统一补偿路径恢复原配置，避免留下无法安全清理的 model。
+async fn apply_provider_configuration_and_record(
+    store: &Store,
+    manager: &ConfigManager,
+    proxy: &ChatProxyRegistry,
+    home: &std::path::Path,
+    operation_id: &str,
+) -> Result<ProviderActivationRollback, AppError> {
+    let previous_managed_model = store.last_managed_model()?;
+    let applied = match manager.apply(operation_id) {
+        Ok(applied) => applied,
+        Err(error) => {
+            return Err(compensate_activation_failure(store, manager, proxy, error).await);
+        }
+    };
+    if let Err(error) = record_written_model(store, home) {
+        let rollback = ProviderActivationRollback {
+            applied,
+            previous_managed_model,
+        };
+        return Err(rollback_provider_activation(store, manager, proxy, rollback, error).await);
+    }
+    Ok(ProviderActivationRollback {
+        applied,
+        previous_managed_model,
+    })
+}
+
+struct ProviderActivationRollback {
+    applied: AppliedConfigPatch,
+    previous_managed_model: Option<String>,
+}
+
+async fn rollback_provider_activation(
+    store: &Store,
+    manager: &ConfigManager,
+    proxy: &ChatProxyRegistry,
+    rollback: ProviderActivationRollback,
+    original_error: AppError,
+) -> AppError {
+    let files = manager.rollback_applied(rollback.applied);
+    let managed_model = store.save_last_managed_model(rollback.previous_managed_model);
+    match (files, managed_model) {
+        (Ok(()), Ok(())) => original_error,
+        (files, managed_model) => {
+            let rollback_error = files
+                .err()
+                .or_else(|| managed_model.err())
+                .unwrap_or_else(|| AppError::Internal("未知回滚错误".into()));
+            compensate_activation_failure(
+                store,
+                manager,
+                proxy,
+                AppError::Internal(format!(
+                    "{original_error}；第三方配置回滚失败，请手动检查 Codex 配置：{rollback_error}"
+                )),
+            )
+            .await
+        }
+    }
 }
 
 #[tauri::command]
 pub(crate) async fn connections_delete_provider(
     store: State<'_, Store>,
+    activation: State<'_, ActivationLock>,
     proxy: State<'_, ChatProxyRegistry>,
     id: String,
 ) -> Result<(), AppError> {
+    let _model_transaction = activation.2.lock().await;
+    let _guard = activation.0.lock().await;
+    store.connections_delete_provider(&id)?;
     proxy.stop(&id).await;
-    store.connections_delete_provider(&id)
+    Ok(())
 }
 
 #[tauri::command]
@@ -136,9 +314,14 @@ pub(crate) async fn connections_test_provider(
 pub(crate) async fn connections_list_models(
     store: State<'_, Store>,
     client: State<'_, ApiClient>,
+    manager: State<'_, ConfigManager>,
+    activation: State<'_, ActivationLock>,
+    proxy: State<'_, ChatProxyRegistry>,
     id: String,
 ) -> Result<Vec<String>, AppError> {
-    let mut provider = store.provider(&id)?;
+    let _model_transaction = activation.2.lock().await;
+    let (mut provider, starting_revision, was_active) =
+        store.provider_model_refresh_snapshot(&id)?;
     provider.normalize_and_validate()?;
     if provider
         .api_key
@@ -150,7 +333,24 @@ pub(crate) async fn connections_list_models(
         ));
     }
     // 抓取 `/models` 可用模型并保存（含 models.dev 精确匹配的元数据）。
-    sync_provider_models(&client.current()?, &store, &provider).await
+    let synced = sync_provider_models(
+        &client.current()?,
+        &store,
+        &provider,
+        was_active.then_some(&starting_revision),
+    )
+    .await?;
+    finish_provider_model_refresh(
+        &store,
+        &manager,
+        &activation,
+        &proxy,
+        was_active,
+        &provider,
+        &synced.revision,
+    )
+    .await?;
+    Ok(synced.models)
 }
 
 /// 手动刷新当前激活服务商的模型列表（第三方 API 更新模型后使用）。
@@ -158,7 +358,11 @@ pub(crate) async fn connections_list_models(
 pub(crate) async fn connections_refresh_models(
     store: State<'_, Store>,
     client: State<'_, ApiClient>,
+    manager: State<'_, ConfigManager>,
+    activation: State<'_, ActivationLock>,
+    proxy: State<'_, ChatProxyRegistry>,
 ) -> Result<Vec<String>, AppError> {
+    let _model_transaction = activation.2.lock().await;
     let active = store.read(|state| state.active.clone())?;
     let provider_id = active
         .provider_id
@@ -166,17 +370,96 @@ pub(crate) async fn connections_refresh_models(
         .ok_or_else(|| {
             AppError::InvalidConfig("当前不是第三方 API 服务，无需刷新模型列表。".into())
         })?;
-    let provider = store.provider(&provider_id)?;
-    sync_provider_models(&client.current()?, &store, &provider).await
+    let (provider, starting_revision, was_active) =
+        store.provider_model_refresh_snapshot(&provider_id)?;
+    let synced = sync_provider_models(
+        &client.current()?,
+        &store,
+        &provider,
+        was_active.then_some(&starting_revision),
+    )
+    .await?;
+    finish_provider_model_refresh(
+        &store,
+        &manager,
+        &activation,
+        &proxy,
+        was_active,
+        &provider,
+        &synced.revision,
+    )
+    .await?;
+    Ok(synced.models)
+}
+
+async fn finish_provider_model_refresh(
+    store: &Store,
+    manager: &ConfigManager,
+    activation: &ActivationLock,
+    proxy: &ChatProxyRegistry,
+    was_active_at_start: bool,
+    previous: &ProviderProfile,
+    refreshed_revision: &ProviderSnapshotRevision,
+) -> Result<(), AppError> {
+    // 从未激活状态开始的刷新只是更新缓存。即使网络等待期间该服务被激活，
+    // 激活事务也会自行刷新/写配置；本请求不得在失败时回滚其已消费的缓存。
+    if !was_active_at_start {
+        return Ok(());
+    }
+    sync_active_provider_configuration(
+        store,
+        manager,
+        activation,
+        proxy,
+        &previous.id,
+        previous,
+        refreshed_revision,
+    )
+    .await
+}
+
+/// 模型列表发生变化后，仅当该服务仍为当前连接时重写 Codex 配置和模型目录。
+/// HTTP 请求在锁外完成，这里只串行化最终状态确认与文件提交。
+async fn sync_active_provider_configuration(
+    store: &Store,
+    manager: &ConfigManager,
+    activation: &ActivationLock,
+    proxy: &ChatProxyRegistry,
+    provider_id: &str,
+    previous: &ProviderProfile,
+    refreshed_revision: &ProviderSnapshotRevision,
+) -> Result<(), AppError> {
+    let _guard = activation.0.lock().await;
+    if store.is_active_provider(provider_id)? {
+        if let Err(error) = sync_active_codex_configuration(store, manager, proxy).await {
+            return match store
+                .restore_provider_snapshot_if_revision_matches(refreshed_revision, previous)
+            {
+                Ok(true) => Err(error),
+                Ok(false) => Err(AppError::StaleOperation),
+                Err(rollback) => Err(AppError::Internal(format!(
+                    "{error}；模型缓存回滚失败，请重新刷新当前服务：{rollback}"
+                ))),
+            };
+        }
+    }
+    Ok(())
 }
 
 /// 抓取服务 `/models` 接口的可用模型，并用 models.dev（catalog.json）**精确
 /// 匹配**（id 完全一致）补充展示名/上下文窗口/简介后保存；返回可用模型列表。
+struct SyncedProviderModels {
+    models: Vec<String>,
+    revision: ProviderSnapshotRevision,
+}
+
 async fn sync_provider_models(
     client: &reqwest::Client,
     store: &Store,
     provider: &ProviderProfile,
-) -> Result<Vec<String>, AppError> {
+    expected_revision: Option<&ProviderSnapshotRevision>,
+) -> Result<SyncedProviderModels, AppError> {
+    let expected_source = ProviderSourceFingerprint::from_provider(provider);
     let details = provider_http::fetch_model_details(client, provider).await?;
     let mut models: Vec<String> = details.iter().map(|detail| detail.id.clone()).collect();
     models.sort();
@@ -225,26 +508,57 @@ async fn sync_provider_models(
             }
         }
     }
-    store.update_provider_models(&provider.id, models.clone(), windows, meta)?;
-    Ok(models)
+    let Some(revision) = store.update_provider_models_if_source_matches(
+        &provider.id,
+        &expected_source,
+        expected_revision,
+        models.clone(),
+        windows,
+        meta,
+    )?
+    else {
+        return Err(AppError::StaleOperation);
+    };
+    Ok(SyncedProviderModels { models, revision })
 }
 
 #[tauri::command]
 pub(crate) async fn settings_preview_activation(
     store: State<'_, Store>,
     manager: State<'_, ConfigManager>,
+    activation: State<'_, ActivationLock>,
     proxy: State<'_, ChatProxyRegistry>,
-    provider_id: Option<String>,
 ) -> Result<ConfigPatchPreview, AppError> {
-    let (home_setting, active_provider_id) =
-        store.read(|state| (state.codex.home.clone(), state.active.provider_id.clone()))?;
+    preview_activation_in_transaction(&store, &manager, &activation, &proxy).await
+}
+
+async fn preview_activation_in_transaction(
+    store: &Store,
+    manager: &ConfigManager,
+    activation: &ActivationLock,
+    proxy: &ChatProxyRegistry,
+) -> Result<ConfigPatchPreview, AppError> {
+    // 与 save/refresh/activate 使用相同锁序。必须先取得两把锁再读取
+    // Provider 和 config/auth/catalog，否则旧 Provider 可能配上新文件快照，
+    // 后续 apply 的文件 CAS 仍会错误通过。
+    let _model_transaction = activation.2.lock().await;
+    let _activation = activation.0.lock().await;
+    let (home_setting, active_provider_id) = store.read(|state| {
+        (
+            state.codex.home.clone(),
+            state
+                .active
+                .provider_id
+                .clone()
+                .filter(|_| matches!(state.active.kind, ActiveKind::Provider)),
+        )
+    })?;
     let home = codex::home(&home_setting);
-    let provider_id = provider_id
+    let provider_id = active_provider_id
         .as_deref()
-        .or(active_provider_id.as_deref())
         .ok_or_else(|| AppError::InvalidConfig("请先添加并启用一个第三方 API 服务。".into()))?;
     let provider = store.provider(provider_id)?;
-    let effective_base_url = crate::chat_proxy::effective_base_url(&provider, &proxy).await?;
+    let effective_base_url = crate::chat_proxy::effective_base_url(&provider, proxy).await?;
     manager.preview_custom(&home, &provider, &effective_base_url)
 }
 
@@ -255,11 +569,32 @@ pub(crate) async fn settings_apply_activation(
     activation: State<'_, ActivationLock>,
     operation_id: String,
 ) -> Result<(), AppError> {
+    let activation_operation = activation.begin_operation();
+    let _model_transaction = activation.2.lock().await;
     let _guard = activation.0.lock().await;
-    manager.apply(&operation_id)?;
-    // 写入成功后记录 config.toml 当前的默认模型，供切换到 OpenAI 时精确清除。
+    if !activation.is_current(activation_operation) {
+        return Err(AppError::StaleOperation);
+    }
+    let previous_managed_model = store.last_managed_model()?;
+    let applied = manager.apply(&operation_id)?;
+    // 写入成功后记录 config.toml 当前的服务模型，供切换到 OpenAI 时精确清除。
     let home = codex::home(&store.codex_home_setting()?);
-    record_written_model(&store, &home)
+    if let Err(error) = record_written_model(&store, &home) {
+        let files = manager.rollback_applied(applied);
+        let managed_model = store.save_last_managed_model(previous_managed_model);
+        return match (files, managed_model) {
+            (Ok(()), Ok(())) => Err(error),
+            (files, managed_model) => Err(AppError::Internal(format!(
+                "{error}；Codex 配置回滚失败：{}",
+                files
+                    .err()
+                    .or_else(|| managed_model.err())
+                    .map(|error| error.to_string())
+                    .unwrap_or_else(|| "未知错误".into())
+            ))),
+        };
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -272,8 +607,50 @@ pub(crate) async fn connections_activate(
     client: State<'_, ApiClient>,
     id: String,
 ) -> Result<RepairResult, AppError> {
+    let activation_operation = activation.begin_operation();
+    let _model_transaction = activation.2.lock().await;
+    if !activation.is_current(activation_operation) {
+        return Err(AppError::StaleOperation);
+    }
+    // 先在激活锁之外刷新模型，避免网络请求阻塞其他切换。短暂网络故障时可
+    // 继续使用之前由 `/models` 成功保存的缓存；从未获取过模型则拒绝激活。
+    let mut candidate = store.provider(&id)?;
+    candidate.normalize_and_validate()?;
+    if !candidate.enabled {
+        return Err(AppError::InvalidConfig(
+            "所选第三方 API 服务已停用，请检查后重试。".into(),
+        ));
+    }
+    if candidate
+        .api_key
+        .as_deref()
+        .is_none_or(|key| key.trim().is_empty())
+    {
+        return Err(AppError::InvalidConfig(
+            "此服务还没有 API Key，请先编辑并填写。".into(),
+        ));
+    }
+    let refresh_error = sync_provider_models(&client.current()?, &store, &candidate, None)
+        .await
+        .err();
+    let refreshed = store.provider(&id)?;
+    if refreshed
+        .available_models
+        .iter()
+        .all(|model| model.trim().is_empty())
+    {
+        let detail = refresh_error
+            .map(|error| format!("：{error}"))
+            .unwrap_or_default();
+        return Err(AppError::InvalidConfig(format!(
+            "此服务没有可用模型，无法激活。请检查 /models 接口后重试{detail}"
+        )));
+    }
     let repair = {
         let _guard = activation.0.lock().await;
+        if !activation.is_current(activation_operation) {
+            return Err(AppError::StaleOperation);
+        }
         let mut provider = store.provider(&id)?;
         provider.normalize_and_validate()?;
         if !provider.enabled {
@@ -291,6 +668,9 @@ pub(crate) async fn connections_activate(
             ));
         }
         let effective_base_url = crate::chat_proxy::effective_base_url(&provider, &proxy).await?;
+        if !activation.is_current(activation_operation) {
+            return Err(AppError::StaleOperation);
+        }
         let home = codex::home(&store.codex_home_setting()?);
         sync_active_openai_credential(&store, &home)?;
         let repair_sessions =
@@ -301,9 +681,19 @@ pub(crate) async fn connections_activate(
             &crate::activation_for_provider(&provider, chrono::Utc::now().timestamp_millis()),
         )?;
         let result = async {
-            manager.apply(&preview.operation_id)?;
+            let rollback = apply_provider_configuration_and_record(
+                &store,
+                &manager,
+                &proxy,
+                &home,
+                &preview.operation_id,
+            )
+            .await?;
             if let Err(error) = store.activate(&id) {
-                return Err(compensate_activation_failure(&store, &manager, &proxy, error).await);
+                return Err(rollback_provider_activation(
+                    &store, &manager, &proxy, rollback, error,
+                )
+                .await);
             }
             // 转换代理保持运行：Codex 会缓存配置里的地址，端口必须在本机会话内
             // 保持稳定，切回其他服务再切回来时才能继续使用同一端口。
@@ -329,11 +719,540 @@ pub(crate) async fn connections_activate(
             }
         }
     }?;
-    // 切换后同步一次该服务商模型列表（/models + models.dev 元数据）。
-    // 放到激活锁之外执行：HTTP 请求可能耗时数秒，不应阻塞其他激活/保存操作；
-    // 失败不影响切换，保留已有数据。
-    if let Ok(provider) = store.provider(&id) {
-        let _ = sync_provider_models(&client.current()?, &store, &provider).await;
-    }
     Ok(repair)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn provider(id: &str, base_url: &str, model: &str) -> ProviderProfile {
+        ProviderProfile {
+            id: id.into(),
+            name: "Provider".into(),
+            base_url: base_url.into(),
+            headers: BTreeMap::new(),
+            timeout_secs: 30,
+            enabled: true,
+            active: false,
+            model: String::new(),
+            model_context_windows: BTreeMap::new(),
+            available_models: vec![model.into()],
+            models_dev_meta: BTreeMap::new(),
+            api_type: ProviderApiType::Responses,
+            api_key: Some("secret".into()),
+            has_api_key: false,
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn active_provider_failure_restores_the_exact_previous_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex-home");
+        std::fs::create_dir_all(&home).unwrap();
+        let store = Store::open(temp.path().join("data")).unwrap();
+        store
+            .update(|state| {
+                state.codex.home = home.display().to_string();
+                Ok(())
+            })
+            .unwrap();
+        let original = store
+            .connections_save_provider(provider(
+                "provider",
+                "https://old.example.test/v1",
+                "old-model",
+            ))
+            .unwrap();
+        store.activate(&original.id).unwrap();
+        let manager = ConfigManager::default();
+        let proxy = ChatProxyRegistry::default();
+        sync_active_codex_configuration(&store, &manager, &proxy)
+            .await
+            .unwrap();
+        let previous = store.read(|state| state.providers[0].clone()).unwrap();
+
+        let changed = store
+            .connections_save_provider(provider(
+                "provider",
+                "https://changed.example.test/v1",
+                "ignored-incoming-model",
+            ))
+            .unwrap();
+        let changed_revision = ProviderSnapshotRevision::from_provider(&changed);
+        let error = restore_active_provider_save(
+            &store,
+            &manager,
+            &proxy,
+            &changed_revision,
+            &previous,
+            AppError::Internal("配置同步失败".into()),
+        )
+        .await;
+
+        assert!(error.to_string().contains("配置同步失败"));
+        let restored = store.read(|state| state.providers[0].clone()).unwrap();
+        assert_eq!(
+            serde_json::to_value(restored).unwrap(),
+            serde_json::to_value(previous).unwrap()
+        );
+        let config = std::fs::read_to_string(home.join("config.toml")).unwrap();
+        assert!(config.contains("https://old.example.test/v1"));
+        assert!(config.contains("model = \"old-model\""));
+    }
+
+    #[tokio::test]
+    async fn direct_provider_apply_records_the_effective_api_model() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex-home");
+        std::fs::create_dir_all(&home).unwrap();
+        let store = Store::open(temp.path().join("data")).unwrap();
+        let provider = provider("provider", "https://provider.example.test/v1", "api-model");
+        let manager = ConfigManager::default();
+        let proxy = ChatProxyRegistry::default();
+        let preview = manager
+            .preview_custom(&home, &provider, &provider.base_url)
+            .unwrap();
+
+        apply_provider_configuration_and_record(
+            &store,
+            &manager,
+            &proxy,
+            &home,
+            &preview.operation_id,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            store.last_managed_model().unwrap().as_deref(),
+            Some("api-model")
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_provider_apply_failure_compensates_to_the_active_connection() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex-home");
+        std::fs::create_dir_all(&home).unwrap();
+        let store = Store::open(temp.path().join("data")).unwrap();
+        store
+            .update(|state| {
+                state.codex.home = home.display().to_string();
+                Ok(())
+            })
+            .unwrap();
+        let original = store
+            .connections_save_provider(provider(
+                "original",
+                "https://original.example.test/v1",
+                "original-model",
+            ))
+            .unwrap();
+        store.activate(&original.id).unwrap();
+        let manager = ConfigManager::default();
+        let proxy = ChatProxyRegistry::default();
+        sync_active_codex_configuration(&store, &manager, &proxy)
+            .await
+            .unwrap();
+
+        let replacement = provider(
+            "replacement",
+            "https://replacement.example.test/v1",
+            "replacement-model",
+        );
+        let preview = manager
+            .preview_custom(&home, &replacement, &replacement.base_url)
+            .unwrap();
+        // 使 operation 过期，模拟 apply 在提交前后任一阶段报告失败；补偿路径
+        // 必须以仍处于 active 的 original Provider 重建配置。
+        std::fs::write(home.join("config.toml"), "model = \"external-change\"\n").unwrap();
+
+        let error = apply_provider_configuration_and_record(
+            &store,
+            &manager,
+            &proxy,
+            &home,
+            &preview.operation_id,
+        )
+        .await
+        .err()
+        .expect("concurrent config change must reject the apply");
+
+        assert!(matches!(error, AppError::StaleOperation));
+        let config = std::fs::read_to_string(home.join("config.toml")).unwrap();
+        assert!(config.contains("https://original.example.test/v1"));
+        assert!(config.contains("model = \"original-model\""));
+    }
+
+    #[tokio::test]
+    async fn first_activation_store_failure_restores_all_codex_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex-home");
+        let catalog_path = home
+            .join(crate::model_unlock::MODEL_CATALOG_DIR)
+            .join(crate::model_unlock::MODEL_CATALOG_FILE);
+        std::fs::create_dir_all(catalog_path.parent().unwrap()).unwrap();
+        let original_config = b"model = \"user-model\"\nuser_setting = true\n";
+        let original_auth = br#"{"auth_mode":"chatgpt","token":"official-secret"}"#;
+        let original_catalog = br#"{"models":[{"slug":"user-model"}]}"#;
+        std::fs::write(home.join("config.toml"), original_config).unwrap();
+        std::fs::write(home.join("auth.json"), original_auth).unwrap();
+        std::fs::write(&catalog_path, original_catalog).unwrap();
+
+        let store = Store::open(temp.path().join("data")).unwrap();
+        store
+            .update(|state| {
+                state.codex.home = home.display().to_string();
+                state.codex.last_managed_model = Some("previous-managed".into());
+                Ok(())
+            })
+            .unwrap();
+        assert!(matches!(
+            store.snapshot().unwrap().active.kind,
+            ActiveKind::None
+        ));
+
+        let provider = provider(
+            "candidate",
+            "https://candidate.example.test/v1",
+            "candidate-model",
+        );
+        let manager = ConfigManager::default();
+        let proxy = ChatProxyRegistry::default();
+        let preview = manager
+            .preview_custom(&home, &provider, &provider.base_url)
+            .unwrap();
+        let rollback = apply_provider_configuration_and_record(
+            &store,
+            &manager,
+            &proxy,
+            &home,
+            &preview.operation_id,
+        )
+        .await
+        .unwrap();
+
+        let store_error = store.activate("missing-provider").unwrap_err();
+        let error =
+            rollback_provider_activation(&store, &manager, &proxy, rollback, store_error).await;
+
+        assert!(error.to_string().contains("不存在"));
+        assert_eq!(
+            std::fs::read(home.join("config.toml")).unwrap(),
+            original_config
+        );
+        assert_eq!(
+            std::fs::read(home.join("auth.json")).unwrap(),
+            original_auth
+        );
+        assert_eq!(std::fs::read(catalog_path).unwrap(), original_catalog);
+        assert_eq!(
+            store.last_managed_model().unwrap().as_deref(),
+            Some("previous-managed")
+        );
+        assert!(matches!(
+            store.snapshot().unwrap().active.kind,
+            ActiveKind::None
+        ));
+    }
+
+    #[tokio::test]
+    async fn active_model_refresh_config_failure_restores_previous_cache() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex-home");
+        std::fs::create_dir_all(&home).unwrap();
+        let store = Store::open(temp.path().join("data")).unwrap();
+        store
+            .update(|state| {
+                state.codex.home = home.display().to_string();
+                Ok(())
+            })
+            .unwrap();
+        let saved = store
+            .connections_save_provider(provider(
+                "provider",
+                "https://provider.example.test/v1",
+                "old-model",
+            ))
+            .unwrap();
+        store.activate(&saved.id).unwrap();
+        let manager = ConfigManager::default();
+        let proxy = ChatProxyRegistry::default();
+        sync_active_codex_configuration(&store, &manager, &proxy)
+            .await
+            .unwrap();
+        let (previous, starting_revision, was_active) =
+            store.provider_model_refresh_snapshot(&saved.id).unwrap();
+        assert!(was_active);
+        let source = ProviderSourceFingerprint::from_provider(&previous);
+        let refreshed_revision = store
+            .update_provider_models_if_source_matches(
+                &saved.id,
+                &source,
+                Some(&starting_revision),
+                vec!["new-model".into()],
+                BTreeMap::new(),
+                BTreeMap::new(),
+            )
+            .unwrap()
+            .unwrap();
+
+        // 模拟刷新提交缓存后，Codex 配置在最终同步阶段无法解析。
+        std::fs::write(home.join("config.toml"), "model = [\n").unwrap();
+        let error = sync_active_provider_configuration(
+            &store,
+            &manager,
+            &ActivationLock::default(),
+            &proxy,
+            &saved.id,
+            &previous,
+            &refreshed_revision,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("配置"));
+        assert_eq!(
+            store.provider(&saved.id).unwrap().available_models,
+            vec!["old-model"]
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_started_inactive_never_rolls_back_after_later_activation() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex-home");
+        std::fs::create_dir_all(&home).unwrap();
+        let store = Store::open(temp.path().join("data")).unwrap();
+        store
+            .update(|state| {
+                state.codex.home = home.display().to_string();
+                Ok(())
+            })
+            .unwrap();
+        let saved = store
+            .connections_save_provider(provider(
+                "provider",
+                "https://provider.example.test/v1",
+                "old-model",
+            ))
+            .unwrap();
+        let (previous, _, was_active) = store.provider_model_refresh_snapshot(&saved.id).unwrap();
+        assert!(!was_active);
+        let source = ProviderSourceFingerprint::from_provider(&previous);
+        let refreshed_revision = store
+            .update_provider_models_if_source_matches(
+                &saved.id,
+                &source,
+                None,
+                vec!["new-model".into()],
+                BTreeMap::new(),
+                BTreeMap::new(),
+            )
+            .unwrap()
+            .unwrap();
+        store.activate(&saved.id).unwrap();
+        std::fs::write(home.join("config.toml"), "model = [\n").unwrap();
+
+        finish_provider_model_refresh(
+            &store,
+            &ConfigManager::default(),
+            &ActivationLock::default(),
+            &ChatProxyRegistry::default(),
+            was_active,
+            &previous,
+            &refreshed_revision,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            store.provider(&saved.id).unwrap().available_models,
+            vec!["new-model"]
+        );
+        assert_eq!(
+            std::fs::read_to_string(home.join("config.toml")).unwrap(),
+            "model = [\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_active_save_fetch_never_rolls_back_a_newer_source() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path().join("data")).unwrap();
+        let previous = store
+            .connections_save_provider(provider(
+                "provider",
+                "https://old.example.test/v1",
+                "old-model",
+            ))
+            .unwrap();
+        store.activate(&previous.id).unwrap();
+
+        let first_save = store
+            .connections_save_provider(provider(
+                "provider",
+                "https://first.example.test/v1",
+                "ignored",
+            ))
+            .unwrap();
+        let first_revision = ProviderSnapshotRevision::from_provider(&first_save);
+        let newer = store
+            .connections_save_provider(provider(
+                "provider",
+                "https://newer.example.test/v1",
+                "ignored",
+            ))
+            .unwrap();
+
+        let error = rollback_active_save_after_model_failure(
+            &store,
+            &ConfigManager::default(),
+            &ChatProxyRegistry::default(),
+            &first_revision,
+            &previous,
+            AppError::StaleOperation,
+        )
+        .await;
+
+        assert!(matches!(error, AppError::StaleOperation));
+        let current = store.provider(&previous.id).unwrap();
+        assert_eq!(current.base_url, newer.base_url);
+        assert_ne!(current.base_url, previous.base_url);
+    }
+
+    #[tokio::test]
+    async fn active_save_model_commit_rejects_a_newer_same_source_edit() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path().join("data")).unwrap();
+        let previous = store
+            .connections_save_provider(provider(
+                "provider",
+                "https://old.example.test/v1",
+                "old-model",
+            ))
+            .unwrap();
+        store.activate(&previous.id).unwrap();
+
+        let first_save = store
+            .connections_save_provider(provider(
+                "provider",
+                "https://new.example.test/v1",
+                "ignored",
+            ))
+            .unwrap();
+        let first_revision = ProviderSnapshotRevision::from_provider(&first_save);
+        let first_source = ProviderSourceFingerprint::from_provider(&first_save);
+        let mut later_edit = first_save.clone();
+        later_edit.timeout_secs = 91;
+        let later_edit = store.connections_save_provider(later_edit).unwrap();
+
+        let committed = store
+            .update_provider_models_if_source_matches(
+                &first_save.id,
+                &first_source,
+                Some(&first_revision),
+                vec!["late-model".into()],
+                BTreeMap::new(),
+                BTreeMap::new(),
+            )
+            .unwrap();
+        assert!(committed.is_none());
+
+        let error = rollback_active_save_after_model_failure(
+            &store,
+            &ConfigManager::default(),
+            &ChatProxyRegistry::default(),
+            &first_revision,
+            &previous,
+            AppError::StaleOperation,
+        )
+        .await;
+        assert!(matches!(error, AppError::StaleOperation));
+        let current = store.provider(&previous.id).unwrap();
+        assert_eq!(current.base_url, later_edit.base_url);
+        assert_eq!(current.timeout_secs, 91);
+        assert!(current.available_models.is_empty());
+    }
+
+    #[tokio::test]
+    async fn activation_preview_rereads_provider_and_files_after_transaction_wait() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex-home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(
+            home.join("config.toml"),
+            "model = \"old-file-model\"\nuser_setting = \"old-files\"\n",
+        )
+        .unwrap();
+        let store = std::sync::Arc::new(Store::open(temp.path().join("data")).unwrap());
+        store
+            .update(|state| {
+                state.codex.home = home.display().to_string();
+                Ok(())
+            })
+            .unwrap();
+        let saved = store
+            .connections_save_provider(provider(
+                "provider",
+                "https://old.example.test/v1",
+                "old-model",
+            ))
+            .unwrap();
+        store.activate(&saved.id).unwrap();
+
+        let manager = std::sync::Arc::new(ConfigManager::default());
+        let activation = std::sync::Arc::new(ActivationLock::default());
+        let proxy = std::sync::Arc::new(ChatProxyRegistry::default());
+        let model_transaction = activation.2.lock().await;
+        let activation_guard = activation.0.lock().await;
+        let waiting_store = store.clone();
+        let waiting_manager = manager.clone();
+        let waiting_activation = activation.clone();
+        let waiting_proxy = proxy.clone();
+        let preview = tokio::spawn(async move {
+            preview_activation_in_transaction(
+                &waiting_store,
+                &waiting_manager,
+                &waiting_activation,
+                &waiting_proxy,
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+
+        // 模拟先持锁的保存事务同时提交新 Provider 与新 Codex 文件。
+        store
+            .update(|state| {
+                let provider = state
+                    .providers
+                    .iter_mut()
+                    .find(|provider| provider.id == saved.id)
+                    .unwrap();
+                provider.base_url = "https://new.example.test/v1".into();
+                provider.available_models = vec!["new-model".into()];
+                provider.model_context_windows.clear();
+                provider.models_dev_meta.clear();
+                Ok(())
+            })
+            .unwrap();
+        std::fs::write(
+            home.join("config.toml"),
+            "model = \"new-model\"\nuser_setting = \"new-files\"\n",
+        )
+        .unwrap();
+        drop(activation_guard);
+        drop(model_transaction);
+
+        let preview = preview.await.unwrap().unwrap();
+        manager.apply(&preview.operation_id).unwrap();
+        let written = std::fs::read_to_string(home.join("config.toml")).unwrap();
+        assert!(written.contains("https://new.example.test/v1"));
+        assert!(written.contains("model = \"new-model\""));
+        assert!(written.contains("user_setting = \"new-files\""));
+        assert!(!written.contains("https://old.example.test/v1"));
+    }
 }

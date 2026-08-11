@@ -33,6 +33,9 @@ pub(crate) fn sync_active_openai_credential(
     {
         credential.tokens.account_id = saved.account_id.clone();
     }
+    let untimestamped_personal_access_token = credential.last_refresh.trim().is_empty()
+        && saved.source == crate::models::OfficialAccountSource::ProxyImport
+        && crate::models::is_personal_access_token_credential(&credential);
     if credential.last_refresh.trim().is_empty() {
         credential.last_refresh = if saved.credential.last_refresh.trim().is_empty() {
             chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
@@ -40,15 +43,27 @@ pub(crate) fn sync_active_openai_credential(
             saved.credential.last_refresh.clone()
         };
     }
-    if saved.account_id == credential.tokens.account_id && saved.credential != credential {
+    if saved.account_id == credential.tokens.account_id
+        && saved.credential != credential
+        && (untimestamped_personal_access_token
+            || credential_is_strictly_newer(&credential, &saved.credential))
+    {
         store.sync_official_credential(&record_id, &credential, saved.expires_at)?;
     }
     Ok(())
 }
 
-/// 记录 config.toml 当前的默认模型（读取实际文件内容，而不是 Provider 记录：
-/// Provider 没有默认模型时 apply 会保留 config 中的旧值，该旧值同样是本应用
-/// 写入的，需要继续跟踪，切回 OpenAI 时才能精确清除）。
+fn credential_is_strictly_newer(
+    candidate: &crate::models::CodexAuthCredential,
+    current: &crate::models::CodexAuthCredential,
+) -> bool {
+    let candidate = chrono::DateTime::parse_from_rfc3339(candidate.last_refresh.trim());
+    let current = chrono::DateTime::parse_from_rfc3339(current.last_refresh.trim());
+    matches!((candidate, current), (Ok(candidate), Ok(current)) if candidate > current)
+}
+
+/// 记录本次写入 config.toml 的服务模型。模型来自服务 `/models`，记录实际
+/// 文件值是为了切回 OpenAI 时只清理由本应用管理的值。
 pub(crate) fn record_written_model(store: &Store, home: &std::path::Path) -> Result<(), AppError> {
     let model = fs::read_to_string(home.join("config.toml"))
         .ok()
@@ -98,7 +113,7 @@ pub(crate) async fn sync_active_codex_configuration(
             })?;
             let account = store.official_account(account_id)?;
             // 启动修复路径：active 已指向 OpenAI，但 config.toml 可能仍残留
-            // 本应用上次写入的第三方默认模型；只有与最近一次写入记录一致
+            // 本应用上次写入的第三方服务模型；只有与最近一次写入记录一致
             // 才清除（用户手动设置的模型不受影响）。
             let managed_model = managed_model_to_remove(store, &home)?;
             codex::connections_activate_official_account(
@@ -126,8 +141,24 @@ pub(crate) async fn sync_active_codex_configuration(
 
     let effective_base_url = crate::chat_proxy::effective_base_url(&provider, proxy).await?;
     let preview = manager.preview_custom(&home, &provider, &effective_base_url)?;
-    manager.apply(&preview.operation_id)?;
-    record_written_model(store, &home)
+    let previous_managed_model = store.last_managed_model()?;
+    let applied = manager.apply(&preview.operation_id)?;
+    if let Err(error) = record_written_model(store, &home) {
+        let files = manager.rollback_applied(applied);
+        let managed_model = store.save_last_managed_model(previous_managed_model);
+        return match (files, managed_model) {
+            (Ok(()), Ok(())) => Err(error),
+            (files, managed_model) => Err(AppError::Internal(format!(
+                "{error}；Codex 配置回滚失败：{}",
+                files
+                    .err()
+                    .or_else(|| managed_model.err())
+                    .map(|error| error.to_string())
+                    .unwrap_or_else(|| "未知错误".into())
+            ))),
+        };
+    }
+    Ok(())
 }
 
 pub(crate) async fn activate_openai_record(
@@ -139,7 +170,7 @@ pub(crate) async fn activate_openai_record(
 ) -> Result<RepairResult, AppError> {
     let home = codex::home(&store.codex_home_setting()?);
     let repair_sessions = provider_sync::configured_provider(&home) == codex::MANAGED_PROVIDER_ID;
-    // 切换前计算本应用写入的默认模型，切回 OpenAI 时把它一并清除，
+    // 切换前计算本应用写入的服务模型，切回 OpenAI 时把它一并清除，
     // 避免 Codex 用第三方模型名去请求官方账号；只有与最近一次写入记录
     // 一致才清除（用户手动设置的模型不受影响）。
     let managed_model = managed_model_to_remove(store, &home)?;
@@ -172,7 +203,7 @@ pub(crate) async fn activate_openai_record(
     match result {
         Ok(mut repair) => {
             crate::confirm_pending(ledger, &pending_id, &mut repair);
-            // 已切回官方：不再存在本应用写入的第三方默认模型。
+            // 已切回官方：不再存在本应用写入的第三方服务模型。
             store.save_last_managed_model(None)?;
             Ok(repair)
         }
@@ -230,7 +261,7 @@ mod tests {
                 model: String::new(),
 
                 model_context_windows: Default::default(),
-                available_models: Default::default(),
+                available_models: vec!["api-model".into()],
                 models_dev_meta: Default::default(),
                 api_type: ProviderApiType::Responses,
                 api_key: Some("secret".into()),
@@ -289,6 +320,7 @@ mod tests {
             .save_official_account(&StoredOfficialAccount {
                 id: String::new(),
                 name: "OpenAI".into(),
+                remark: String::new(),
                 account_id: "workspace".into(),
                 email: "person@example.test".into(),
                 credential: credential.clone(),
@@ -335,6 +367,82 @@ mod tests {
         assert_eq!(repaired, credential);
     }
 
+    #[test]
+    fn active_sync_only_accepts_a_strictly_newer_oauth_credential() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex-home");
+        fs::create_dir_all(&home).unwrap();
+        let store = Store::open(temp.path().join("data")).unwrap();
+        let current = CodexAuthCredential {
+            auth_mode: "chatgpt".into(),
+            openai_api_key: None,
+            tokens: CodexAuthTokens {
+                id_token: "id-current".into(),
+                access_token: "access-current".into(),
+                refresh_token: "refresh-current".into(),
+                account_id: "workspace".into(),
+            },
+            last_refresh: "2026-08-01T00:00:00Z".into(),
+        };
+        let saved = store
+            .save_official_account(&StoredOfficialAccount {
+                id: String::new(),
+                name: "OpenAI".into(),
+                remark: String::new(),
+                account_id: "workspace".into(),
+                email: "person@example.test".into(),
+                credential: current.clone(),
+                source: OfficialAccountSource::OpenAiOauth,
+                expires_at: None,
+                quota: ProviderAccountQuota::default(),
+                created_at: 0,
+                updated_at: 0,
+            })
+            .unwrap();
+        store
+            .connections_activate_official_account(&saved.id)
+            .unwrap();
+        let mut candidate = CodexAuthCredential {
+            tokens: CodexAuthTokens {
+                id_token: "id-candidate".into(),
+                access_token: "access-candidate".into(),
+                refresh_token: "refresh-candidate".into(),
+                account_id: "workspace".into(),
+            },
+            last_refresh: "2026-07-31T23:59:59Z".into(),
+            ..current.clone()
+        };
+        for last_refresh in ["2026-07-31T23:59:59Z", "2026-08-01T00:00:00Z", "invalid"] {
+            candidate.last_refresh = last_refresh.into();
+            fs::write(
+                home.join("auth.json"),
+                serde_json::to_vec_pretty(&candidate).unwrap(),
+            )
+            .unwrap();
+
+            sync_active_openai_credential(&store, &home).unwrap();
+
+            assert_eq!(
+                store.official_account(&saved.id).unwrap().credential,
+                current
+            );
+        }
+
+        candidate.last_refresh = "2026-08-01T00:00:01Z".into();
+        fs::write(
+            home.join("auth.json"),
+            serde_json::to_vec_pretty(&candidate).unwrap(),
+        )
+        .unwrap();
+
+        sync_active_openai_credential(&store, &home).unwrap();
+
+        assert_eq!(
+            store.official_account(&saved.id).unwrap().credential,
+            candidate
+        );
+    }
+
     #[tokio::test]
     async fn proxy_personal_token_syncs_external_credential_into_store() {
         let temp = tempfile::tempdir().unwrap();
@@ -363,6 +471,7 @@ mod tests {
             .save_official_account(&StoredOfficialAccount {
                 id: String::new(),
                 name: "Cookie".into(),
+                remark: String::new(),
                 account_id: account_id.clone(),
                 email: String::new(),
                 credential: credential.clone(),

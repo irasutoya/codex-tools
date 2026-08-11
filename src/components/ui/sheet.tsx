@@ -5,6 +5,11 @@ import { Dialog as SheetPrimitive } from "@base-ui/react/dialog"
 
 import { cn } from "@/lib/utils"
 import { Button } from "@/components/ui/button"
+import {
+  overlayBackdropStyles,
+  overlaySurfaceStyles,
+  sheetMotionStyles,
+} from "@/components/ui/overlay-styles"
 import { HugeiconsIcon } from "@hugeicons/react"
 import { Cancel01Icon } from "@hugeicons/core-free-icons"
 
@@ -28,10 +33,7 @@ function SheetOverlay({ className, ...props }: SheetPrimitive.Backdrop.Props) {
   return (
     <SheetPrimitive.Backdrop
       data-slot="sheet-overlay"
-      className={cn(
-        "fixed inset-0 z-50 bg-black/80 transition-opacity duration-150 data-ending-style:opacity-0 data-starting-style:opacity-0 supports-backdrop-filter:backdrop-blur-xs",
-        className
-      )}
+      className={cn(overlayBackdropStyles, className)}
       {...props}
     />
   )
@@ -42,19 +44,23 @@ function SheetContent({
   children,
   side = "right",
   showCloseButton = true,
+  overlayClassName,
   ...props
 }: SheetPrimitive.Popup.Props & {
   side?: "top" | "right" | "bottom" | "left"
   showCloseButton?: boolean
+  overlayClassName?: string
 }) {
   return (
     <SheetPortal>
-      <SheetOverlay />
+      <SheetOverlay className={overlayClassName} />
       <SheetPrimitive.Popup
         data-slot="sheet-content"
         data-side={side}
         className={cn(
-          "fixed z-50 flex min-h-0 [scrollbar-gutter:stable] flex-col overflow-y-auto overscroll-contain bg-popover bg-clip-padding text-sm text-popover-foreground shadow-lg transition duration-200 ease-in-out data-ending-style:opacity-0 data-starting-style:opacity-0 data-[side=bottom]:inset-x-0 data-[side=bottom]:bottom-0 data-[side=bottom]:max-h-[calc(100dvh-0.5rem)] data-[side=bottom]:border-t data-[side=bottom]:data-ending-style:translate-y-[2.5rem] data-[side=bottom]:data-starting-style:translate-y-[2.5rem] data-[side=left]:inset-y-0 data-[side=left]:left-0 data-[side=left]:h-full data-[side=left]:w-64 data-[side=left]:max-w-64 data-[side=left]:border-r data-[side=left]:data-ending-style:translate-x-[-2.5rem] data-[side=left]:data-starting-style:translate-x-[-2.5rem] data-[side=right]:inset-y-0 data-[side=right]:right-0 data-[side=right]:h-full data-[side=right]:w-64 data-[side=right]:max-w-64 data-[side=right]:border-l data-[side=right]:data-ending-style:translate-x-[2.5rem] data-[side=right]:data-starting-style:translate-x-[2.5rem] data-[side=top]:inset-x-0 data-[side=top]:top-0 data-[side=top]:max-h-[calc(100dvh-0.5rem)] data-[side=top]:border-b data-[side=top]:data-ending-style:translate-y-[-2.5rem] data-[side=top]:data-starting-style:translate-y-[-2.5rem]",
+          "fixed z-50 flex min-h-0 max-w-[calc(100vw-1rem)] flex-col gap-4 overflow-hidden rounded-3xl p-5 text-sm outline-none data-[side=bottom]:inset-x-2 data-[side=bottom]:bottom-2 data-[side=bottom]:max-h-[calc(100dvh-1rem)] data-[side=left]:inset-y-2 data-[side=left]:left-2 data-[side=left]:w-70 data-[side=right]:inset-y-2 data-[side=right]:right-2 data-[side=right]:w-70 data-[side=top]:inset-x-2 data-[side=top]:top-2 data-[side=top]:max-h-[calc(100dvh-1rem)]",
+          overlaySurfaceStyles,
+          sheetMotionStyles,
           className
         )}
         {...props}
@@ -66,13 +72,13 @@ function SheetContent({
             render={
               <Button
                 variant="ghost"
-                className="absolute top-3 right-3"
+                className="absolute top-3 right-3 z-10"
                 size="icon-sm"
               />
             }
           >
             <HugeiconsIcon icon={Cancel01Icon} strokeWidth={2} />
-            <span className="sr-only">Close</span>
+            <span className="sr-only">关闭</span>
           </SheetPrimitive.Close>
         )}
       </SheetPrimitive.Popup>
@@ -84,7 +90,20 @@ function SheetHeader({ className, ...props }: React.ComponentProps<"div">) {
   return (
     <div
       data-slot="sheet-header"
-      className={cn("flex shrink-0 flex-col gap-1 p-4", className)}
+      className={cn("flex shrink-0 flex-col gap-1 pr-8", className)}
+      {...props}
+    />
+  )
+}
+
+function SheetBody({ className, ...props }: React.ComponentProps<"div">) {
+  return (
+    <div
+      data-slot="sheet-body"
+      className={cn(
+        "flex min-h-0 w-full min-w-0 flex-1 [scrollbar-gutter:stable] flex-col overflow-y-auto overscroll-contain",
+        className
+      )}
       {...props}
     />
   )
@@ -94,7 +113,10 @@ function SheetFooter({ className, ...props }: React.ComponentProps<"div">) {
   return (
     <div
       data-slot="sheet-footer"
-      className={cn("mt-auto flex flex-col gap-1.5 p-4", className)}
+      className={cn(
+        "mt-auto flex shrink-0 flex-wrap items-center justify-end gap-2 border-t pt-4",
+        className
+      )}
       {...props}
     />
   )
@@ -104,7 +126,7 @@ function SheetTitle({ className, ...props }: SheetPrimitive.Title.Props) {
   return (
     <SheetPrimitive.Title
       data-slot="sheet-title"
-      className={cn("text-base font-medium text-foreground", className)}
+      className={cn("text-base leading-snug font-medium", className)}
       {...props}
     />
   )
@@ -117,7 +139,7 @@ function SheetDescription({
   return (
     <SheetPrimitive.Description
       data-slot="sheet-description"
-      className={cn("text-sm text-muted-foreground", className)}
+      className={cn("text-sm leading-relaxed text-muted-foreground", className)}
       {...props}
     />
   )
@@ -128,6 +150,7 @@ export {
   SheetTrigger,
   SheetClose,
   SheetContent,
+  SheetBody,
   SheetHeader,
   SheetFooter,
   SheetTitle,

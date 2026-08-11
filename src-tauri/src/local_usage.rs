@@ -29,7 +29,7 @@ use std::{
 };
 use uuid::Uuid;
 
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 const MAX_ROLLOUT_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_METADATA_SCAN_BYTES: usize = 4 * 1024 * 1024;
 const MAX_RECORD_LINE_BYTES: usize = 8 * 1024 * 1024;
@@ -1042,7 +1042,7 @@ fn initialize_schema(connection: &Connection) -> anyhow::Result<()> {
                account_id TEXT,
                model_pattern TEXT NOT NULL,
                match_kind TEXT NOT NULL CHECK (match_kind IN ('exact', 'prefix')),
-               billing_mode TEXT NOT NULL CHECK (billing_mode IN ('token', 'subscription', 'unpriced')),
+               billing_mode TEXT NOT NULL CHECK (billing_mode IN ('token', 'unpriced')),
                input_microusd_per_million INTEGER,
                cached_read_microusd_per_million INTEGER,
                cache_write_microusd_per_million INTEGER,
@@ -1065,9 +1065,10 @@ fn initialize_schema(connection: &Connection) -> anyhow::Result<()> {
              );
              CREATE INDEX IF NOT EXISTS official_pricing_catalog_active_idx
                ON official_pricing_catalogs(active, fetched_at_ms DESC);
-             PRAGMA user_version = 5;
+             PRAGMA user_version = 6;
              COMMIT;",
         )?;
+        return Ok(());
     }
     // 旧版数据库（v1–v3）按序迁移到 v4，保留用户已有的用量历史与定价规则，
     // 而不是让用户删除数据库重新采集。
@@ -1113,7 +1114,10 @@ fn initialize_schema(connection: &Connection) -> anyhow::Result<()> {
              COMMIT;",
         )?;
     }
-    if version > 0 && version < SCHEMA_VERSION {
+    // subagent_boundary_mode was introduced in v5. Keep this condition tied to
+    // that migration instead of SCHEMA_VERSION so opening a v5 database during
+    // later upgrades does not try to add the existing column again.
+    if version > 0 && version < 5 {
         connection.execute_batch(
             "BEGIN;
              ALTER TABLE usage_cursors
@@ -1122,7 +1126,7 @@ fn initialize_schema(connection: &Connection) -> anyhow::Result<()> {
              COMMIT;",
         )?;
     }
-    if version < SCHEMA_VERSION {
+    if version < 5 {
         connection.execute_batch(
             "BEGIN;
              CREATE TABLE IF NOT EXISTS account_identity_aliases (
@@ -1147,6 +1151,52 @@ fn initialize_schema(connection: &Connection) -> anyhow::Result<()> {
              CREATE INDEX IF NOT EXISTS official_pricing_catalog_active_idx
                ON official_pricing_catalogs(active, fetched_at_ms DESC);
              PRAGMA user_version = 5;
+             COMMIT;",
+        )?;
+    }
+    if version > 0 && version < 6 {
+        connection.execute_batch(
+            "BEGIN;
+             ALTER TABLE pricing_rules RENAME TO pricing_rules_v5;
+             CREATE TABLE pricing_rules (
+               id TEXT PRIMARY KEY,
+               version INTEGER NOT NULL,
+               active INTEGER NOT NULL,
+               scope_kind TEXT NOT NULL CHECK (scope_kind IN ('account_model', 'provider_model', 'global_model', 'provider_default')),
+               provider_id TEXT,
+               account_id TEXT,
+               model_pattern TEXT NOT NULL,
+               match_kind TEXT NOT NULL CHECK (match_kind IN ('exact', 'prefix')),
+               billing_mode TEXT NOT NULL CHECK (billing_mode IN ('token', 'unpriced')),
+               input_microusd_per_million INTEGER,
+               cached_read_microusd_per_million INTEGER,
+               cache_write_microusd_per_million INTEGER,
+               output_microusd_per_million INTEGER,
+               request_fee_microusd INTEGER,
+               cache_write_included_in_input INTEGER NOT NULL,
+               effective_from_ms INTEGER NOT NULL,
+               created_at_ms INTEGER NOT NULL,
+               updated_at_ms INTEGER NOT NULL
+             );
+             INSERT INTO pricing_rules(
+               id, version, active, scope_kind, provider_id, account_id,
+               model_pattern, match_kind, billing_mode,
+               input_microusd_per_million, cached_read_microusd_per_million,
+               cache_write_microusd_per_million, output_microusd_per_million,
+               request_fee_microusd, cache_write_included_in_input,
+               effective_from_ms, created_at_ms, updated_at_ms
+             )
+             SELECT
+               id, version, active, scope_kind, provider_id, account_id,
+               model_pattern, match_kind,
+               CASE billing_mode WHEN 'subscription' THEN 'unpriced' ELSE billing_mode END,
+               input_microusd_per_million, cached_read_microusd_per_million,
+               cache_write_microusd_per_million, output_microusd_per_million,
+               request_fee_microusd, cache_write_included_in_input,
+               effective_from_ms, created_at_ms, updated_at_ms
+             FROM pricing_rules_v5;
+             DROP TABLE pricing_rules_v5;
+             PRAGMA user_version = 6;
              COMMIT;",
         )?;
     }
@@ -1866,6 +1916,11 @@ fn normalize_pricing_input(
     mut input: SavePricingRule,
     now: i64,
 ) -> Result<(PricingRule, PricingRuleRecord), AppError> {
+    if input.billing_mode == BillingMode::Subscription {
+        return Err(AppError::InvalidConfig(
+            "订阅制价格规则已不再支持，请选择按 Token 计价或不计价。".into(),
+        ));
+    }
     input.model_pattern = input.model_pattern.trim().to_owned();
     if input.scope_kind == PricingScopeKind::ProviderDefault {
         input.model_pattern = "*".into();
@@ -2459,7 +2514,7 @@ fn u64_db(value: u64) -> Result<i64, String> {
 mod tests {
     use super::{ActivationSnapshot, UsageLedger};
     use crate::models::{
-        ActivationRecord, BillingMode, CostStatus, PricingMatchKind, PricingScopeKind,
+        ActivationRecord, AppError, BillingMode, CostStatus, PricingMatchKind, PricingScopeKind,
         SavePricingRule, UsageGroupBy, UsageQuery, UsageRange, UsageSourceKind,
     };
     use crate::official_pricing::build_catalog;
@@ -2570,6 +2625,135 @@ mod tests {
         ledger
             .save_official_pricing_catalog(&catalog, 20260801)
             .unwrap();
+    }
+
+    #[test]
+    fn migrates_v5_subscription_rules_to_unpriced_without_readding_cursor_column() {
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE usage_cursors (
+                   rollout_id TEXT PRIMARY KEY,
+                   subagent_boundary_mode INTEGER NOT NULL DEFAULT 0
+                     CHECK (subagent_boundary_mode IN (0, 1, 2))
+                 );
+                 CREATE TABLE pricing_rules (
+                   id TEXT PRIMARY KEY,
+                   version INTEGER NOT NULL,
+                   active INTEGER NOT NULL,
+                   scope_kind TEXT NOT NULL CHECK (scope_kind IN ('account_model', 'provider_model', 'global_model', 'provider_default')),
+                   provider_id TEXT,
+                   account_id TEXT,
+                   model_pattern TEXT NOT NULL,
+                   match_kind TEXT NOT NULL CHECK (match_kind IN ('exact', 'prefix')),
+                   billing_mode TEXT NOT NULL CHECK (billing_mode IN ('token', 'subscription', 'unpriced')),
+                   input_microusd_per_million INTEGER,
+                   cached_read_microusd_per_million INTEGER,
+                   cache_write_microusd_per_million INTEGER,
+                   output_microusd_per_million INTEGER,
+                   request_fee_microusd INTEGER,
+                   cache_write_included_in_input INTEGER NOT NULL,
+                   effective_from_ms INTEGER NOT NULL,
+                   created_at_ms INTEGER NOT NULL,
+                   updated_at_ms INTEGER NOT NULL
+                 );
+                 INSERT INTO pricing_rules VALUES (
+                   'legacy-subscription', 1, 1, 'global_model', NULL, NULL,
+                   'gpt-subscription', 'exact', 'subscription',
+                   NULL, NULL, NULL, NULL, NULL, 1, 0, 1, 1
+                 );
+                 INSERT INTO pricing_rules VALUES (
+                   'legacy-token', 1, 1, 'global_model', NULL, NULL,
+                   'gpt-token', 'exact', 'token',
+                   1000000, NULL, NULL, 2000000, NULL, 1, 0, 1, 1
+                 );
+                 PRAGMA user_version = 5;",
+            )
+            .unwrap();
+
+        super::initialize_schema(&connection).unwrap();
+
+        let version: i64 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 6);
+        let migrated_mode: String = connection
+            .query_row(
+                "SELECT billing_mode FROM pricing_rules WHERE id = 'legacy-subscription'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(migrated_mode, "unpriced");
+        let token_mode: String = connection
+            .query_row(
+                "SELECT billing_mode FROM pricing_rules WHERE id = 'legacy-token'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(token_mode, "token");
+        let cursor_column_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('usage_cursors')
+                 WHERE name = 'subagent_boundary_mode'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(cursor_column_count, 1);
+        assert!(
+            connection
+                .execute(
+                    "UPDATE pricing_rules SET billing_mode = 'subscription'
+                     WHERE id = 'legacy-subscription'",
+                    [],
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn rejects_saving_subscription_pricing_rules() {
+        let temp = tempfile::tempdir().unwrap();
+        let ledger = UsageLedger::open(&temp.path().join("app")).unwrap();
+
+        let error = ledger
+            .usage_save_pricing_rule(SavePricingRule {
+                id: String::new(),
+                version: 0,
+                active: true,
+                scope_kind: PricingScopeKind::GlobalModel,
+                provider_id: None,
+                account_id: None,
+                model_pattern: "gpt-subscription".into(),
+                match_kind: PricingMatchKind::Exact,
+                billing_mode: BillingMode::Subscription,
+                input_usd_per_million: None,
+                cached_read_usd_per_million: None,
+                cache_write_usd_per_million: None,
+                output_usd_per_million: None,
+                request_fee_usd: None,
+                cache_write_included_in_input: true,
+                effective_from_ms: 0,
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            })
+            .unwrap_err();
+
+        match error {
+            AppError::InvalidConfig(message) => {
+                assert!(message.contains("订阅制"));
+                assert!(message.contains("Token"));
+            }
+            other => panic!("expected invalid configuration error, got {other:?}"),
+        }
+        assert!(ledger.usage_list_pricing_rules(None).unwrap().is_empty());
+        let connection = ledger.open_connection().unwrap();
+        let version: i64 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 6);
     }
 
     #[test]

@@ -40,7 +40,6 @@ export function DashboardPage({
 }: {
   dashboard?: Dashboard
   refreshRevision: number
-  onRefresh: () => void
 }) {
   const [usage, setUsage] = useState<UsageOverview>()
   const [error, setError] = useState<string>()

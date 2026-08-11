@@ -23,6 +23,7 @@ import {
 } from "@/components/ui/chart"
 import {
   Dialog,
+  DialogBody,
   DialogContent,
   DialogDescription,
   DialogFooter,
@@ -53,25 +54,19 @@ import {
   ItemGroup,
   ItemTitle,
 } from "@/components/ui/item"
-import {
-  Select,
-  SelectContent,
-  SelectGroup,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select"
+import { Skeleton } from "@/components/ui/skeleton"
 import {
   Sheet,
+  SheetBody,
   SheetContent,
   SheetDescription,
   SheetHeader,
   SheetTitle,
 } from "@/components/ui/sheet"
-import { Skeleton } from "@/components/ui/skeleton"
 import { Spinner } from "@/components/ui/spinner"
 import { Switch } from "@/components/ui/switch"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
+import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group"
 import { toast } from "@/components/ui/toast"
 import {
   cacheHitRate,
@@ -388,7 +383,9 @@ export function UsagePage({
                       <ItemContent>
                         <ItemTitle>
                           {rule.modelPattern}
-                          <Badge variant="secondary">{rule.billingMode}</Badge>
+                          <Badge variant="secondary">
+                            {billingModeLabel(rule.billingMode)}
+                          </Badge>
                         </ItemTitle>
                         <ItemDescription>
                           {pricingSummary(rule)}
@@ -530,7 +527,7 @@ function UsageDetail({
   ] as const
   return (
     <Sheet open onOpenChange={onOpenChange}>
-      <SheetContent className="w-64 overflow-y-auto">
+      <SheetContent>
         <SheetHeader>
           <SheetTitle>
             {groupBy === "model" ? row.model : row.sourceName}
@@ -539,7 +536,7 @@ function UsageDetail({
             {groupBy === "model" ? "模型" : "账号"}汇总的 Token 构成
           </SheetDescription>
         </SheetHeader>
-        <div className="grid gap-2 px-3 pb-3">
+        <SheetBody className="grid content-start gap-2">
           <Progress
             value={hitRate ?? 0}
             className="rounded-2xl bg-muted/40 p-3"
@@ -566,7 +563,7 @@ function UsageDetail({
               {formatInteger(row.tokens.totalTokens)}
             </span>
           </div>
-        </div>
+        </SheetBody>
       </SheetContent>
     </Sheet>
   )
@@ -582,7 +579,8 @@ function PricingEditor({
   onSaved: () => void
 }) {
   const [pattern, setPattern] = useState("")
-  const [billingMode, setBillingMode] = useState<BillingMode>("token")
+  const [billingMode, setBillingMode] =
+    useState<Extract<BillingMode, "token" | "unpriced">>("token")
   const [input, setInput] = useState("2.50")
   const [cachedRead, setCachedRead] = useState("0.25")
   const [cacheWrite, setCacheWrite] = useState("3.00")
@@ -625,117 +623,128 @@ function PricingEditor({
     }
   }
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent>
+    <Dialog
+      open={open}
+      onOpenChange={(nextOpen) => {
+        if (!nextOpen && busy) return
+        onOpenChange(nextOpen)
+      }}
+    >
+      <DialogContent showCloseButton={!busy} aria-busy={busy}>
         <DialogHeader>
           <DialogTitle>添加价格规则</DialogTitle>
           <DialogDescription>
-            价格按每百万 Token 的美元金额填写。
+            选择不计价，或按每百万 Token 的美元金额计价。
           </DialogDescription>
         </DialogHeader>
-        <FieldGroup>
-          <Field>
-            <FieldLabel htmlFor="price-model">模型</FieldLabel>
-            <Input
-              id="price-model"
-              value={pattern}
-              placeholder="gpt-5.6"
-              onChange={(e) => setPattern(e.target.value)}
-            />
-          </Field>
-          <Field>
-            <FieldLabel>计费方式</FieldLabel>
-            <Select
-              items={[
-                { label: "按 Token", value: "token" },
-                { label: "订阅内", value: "subscription" },
-                { label: "不计价", value: "unpriced" },
-              ]}
-              value={billingMode}
-              onValueChange={(value) =>
-                value && setBillingMode(value as BillingMode)
-              }
-            >
-              <SelectTrigger className="w-full">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectGroup>
-                  <SelectItem value="token">按 Token</SelectItem>
-                  <SelectItem value="subscription">订阅内</SelectItem>
-                  <SelectItem value="unpriced">不计价</SelectItem>
-                </SelectGroup>
-              </SelectContent>
-            </Select>
-          </Field>
-          {billingMode === "token" && (
-            <FieldGroup className="grid grid-cols-2 gap-3">
-              <Field>
-                <FieldLabel htmlFor="price-input">普通输入</FieldLabel>
-                <Input
-                  id="price-input"
-                  inputMode="decimal"
-                  value={input}
-                  onChange={(e) => setInput(e.target.value)}
-                />
-              </Field>
-              <Field>
-                <FieldLabel htmlFor="price-cached-read">缓存读取</FieldLabel>
-                <Input
-                  id="price-cached-read"
-                  inputMode="decimal"
-                  value={cachedRead}
-                  onChange={(e) => setCachedRead(e.target.value)}
-                />
-              </Field>
-              <Field>
-                <FieldLabel htmlFor="price-cache-write">缓存写入</FieldLabel>
-                <Input
-                  id="price-cache-write"
-                  inputMode="decimal"
-                  value={cacheWrite}
-                  onChange={(e) => setCacheWrite(e.target.value)}
-                />
-              </Field>
-              <Field>
-                <FieldLabel htmlFor="price-output">输出</FieldLabel>
-                <Input
-                  id="price-output"
-                  inputMode="decimal"
-                  value={output}
-                  onChange={(e) => setOutput(e.target.value)}
-                />
-              </Field>
-            </FieldGroup>
-          )}
-          {billingMode === "token" && (
-            <Field orientation="horizontal">
-              <FieldContent>
-                <FieldLabel htmlFor="price-cache-write-included">
-                  输入总量包含缓存写入
-                </FieldLabel>
-                <FieldDescription>
-                  开启后，普通输入计费会扣除缓存读取和缓存写入 Token。
-                </FieldDescription>
-              </FieldContent>
-              <Switch
-                id="price-cache-write-included"
-                checked={cacheWriteIncluded}
-                onCheckedChange={setCacheWriteIncluded}
+        <DialogBody>
+          <FieldGroup>
+            <Field>
+              <FieldLabel htmlFor="price-model">模型</FieldLabel>
+              <Input
+                id="price-model"
+                value={pattern}
+                placeholder="gpt-5.6"
+                onChange={(e) => setPattern(e.target.value)}
               />
             </Field>
-          )}
-          <Field orientation="horizontal">
-            <FieldLabel htmlFor="price-active">立即启用</FieldLabel>
-            <Switch
-              id="price-active"
-              checked={active}
-              onCheckedChange={setActive}
-            />
-          </Field>
-        </FieldGroup>
+            <Field>
+              <FieldLabel>计费方式</FieldLabel>
+              <ToggleGroup
+                variant="outline"
+                spacing={0}
+                className="w-full"
+                value={[billingMode]}
+                onValueChange={(value) => {
+                  if (value[0] === "token" || value[0] === "unpriced") {
+                    setBillingMode(value[0])
+                  }
+                }}
+              >
+                <ToggleGroupItem className="flex-1" value="token">
+                  按 Token 计价
+                </ToggleGroupItem>
+                <ToggleGroupItem className="flex-1" value="unpriced">
+                  不计价
+                </ToggleGroupItem>
+              </ToggleGroup>
+              <FieldDescription>
+                不计价规则会保留 Token 用量，但不估算费用。
+              </FieldDescription>
+            </Field>
+            {billingMode === "token" && (
+              <FieldGroup className="grid grid-cols-2 gap-3">
+                <Field>
+                  <FieldLabel htmlFor="price-input">普通输入</FieldLabel>
+                  <Input
+                    id="price-input"
+                    inputMode="decimal"
+                    value={input}
+                    onChange={(e) => setInput(e.target.value)}
+                  />
+                </Field>
+                <Field>
+                  <FieldLabel htmlFor="price-cached-read">缓存读取</FieldLabel>
+                  <Input
+                    id="price-cached-read"
+                    inputMode="decimal"
+                    value={cachedRead}
+                    onChange={(e) => setCachedRead(e.target.value)}
+                  />
+                </Field>
+                <Field>
+                  <FieldLabel htmlFor="price-cache-write">缓存写入</FieldLabel>
+                  <Input
+                    id="price-cache-write"
+                    inputMode="decimal"
+                    value={cacheWrite}
+                    onChange={(e) => setCacheWrite(e.target.value)}
+                  />
+                </Field>
+                <Field>
+                  <FieldLabel htmlFor="price-output">输出</FieldLabel>
+                  <Input
+                    id="price-output"
+                    inputMode="decimal"
+                    value={output}
+                    onChange={(e) => setOutput(e.target.value)}
+                  />
+                </Field>
+              </FieldGroup>
+            )}
+            {billingMode === "token" && (
+              <Field orientation="horizontal">
+                <FieldContent>
+                  <FieldLabel htmlFor="price-cache-write-included">
+                    输入总量包含缓存写入
+                  </FieldLabel>
+                  <FieldDescription>
+                    开启后，普通输入计费会扣除缓存读取和缓存写入 Token。
+                  </FieldDescription>
+                </FieldContent>
+                <Switch
+                  id="price-cache-write-included"
+                  checked={cacheWriteIncluded}
+                  onCheckedChange={setCacheWriteIncluded}
+                />
+              </Field>
+            )}
+            <Field orientation="horizontal">
+              <FieldLabel htmlFor="price-active">立即启用</FieldLabel>
+              <Switch
+                id="price-active"
+                checked={active}
+                onCheckedChange={setActive}
+              />
+            </Field>
+          </FieldGroup>
+        </DialogBody>
         <DialogFooter>
-          <Button variant="outline" onClick={() => onOpenChange(false)}>
+          <Button
+            variant="outline"
+            disabled={busy}
+            onClick={() => onOpenChange(false)}
+          >
             取消
           </Button>
           <Button disabled={busy || !pattern} onClick={() => void save()}>
@@ -748,8 +757,16 @@ function PricingEditor({
 }
 
 function pricingSummary(rule: PricingRule) {
-  if (rule.billingMode === "subscription") return `${rule.scopeKind} · 订阅内`
+  if (rule.billingMode === "subscription") {
+    return `${rule.scopeKind} · 旧版订阅规则（将按不计价迁移）`
+  }
   if (rule.billingMode === "unpriced") return `${rule.scopeKind} · 不计价`
   const price = (value?: string) => (value ? `$${value}` : "未设置")
   return `${rule.scopeKind} · 输入 ${price(rule.inputUsdPerMillion)} · 缓存读取 ${price(rule.cachedReadUsdPerMillion)} · 缓存写入 ${price(rule.cacheWriteUsdPerMillion)} · 输出 ${price(rule.outputUsdPerMillion)} / 1M`
+}
+
+function billingModeLabel(mode: BillingMode) {
+  if (mode === "token") return "按 Token"
+  if (mode === "unpriced") return "不计价"
+  return "旧版订阅规则"
 }

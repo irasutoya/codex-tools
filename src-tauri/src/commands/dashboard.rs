@@ -1,6 +1,6 @@
 use crate::{
     codex, commands::usage::local_today_range, local_usage::UsageLedger, model_unlock, models::*,
-    network, platform, session_index::SessionIndex, storage::Store,
+    network, platform, session_index::SessionIndex, state::ActivationLock, storage::Store,
 };
 use std::{fs, path::Path};
 use tauri::State;
@@ -13,7 +13,6 @@ struct ActiveProjection {
     active_kind: ActiveKind,
     active_account_id: Option<String>,
     active_account: Option<String>,
-    active_model: Option<String>,
     active_quota: Option<ProviderAccountQuota>,
 }
 
@@ -36,24 +35,35 @@ fn project_active(state: &AppConfig) -> ActiveProjection {
         });
     let active_provider = active_stored_provider
         .map(|provider| provider.name.clone())
-        .or_else(|| active_official_account.map(|account| format!("OpenAI · {}", account.name)))
+        .or_else(|| {
+            active_official_account.map(|account| format!("OpenAI · {}", account.display_name()))
+        })
         .or_else(|| {
             matches!(state.active.kind, ActiveKind::Official).then(|| "OpenAI 账号".into())
         });
-    let active_model = active_stored_provider.and_then(|provider| {
-        let model = provider.model.trim();
-        (!model.is_empty()).then(|| model.to_owned())
-    });
     ActiveProjection {
         home: state.codex.home.clone(),
         provider_count: state.providers.len(),
         active_provider,
         active_kind: state.active.kind,
         active_account_id: active_official_account.map(|account| account.id.clone()),
-        active_account: active_official_account.map(|account| account.name.clone()),
-        active_model,
+        active_account: active_official_account.map(|account| account.display_name().to_owned()),
         active_quota: active_official_account.map(|account| account.quota.clone()),
     }
+}
+
+fn configured_model(home: &Path) -> Option<String> {
+    fs::read_to_string(home.join("config.toml"))
+        .ok()
+        .and_then(|text| text.parse::<toml_edit::DocumentMut>().ok())
+        .and_then(|document| {
+            document
+                .get("model")
+                .and_then(toml_edit::Item::as_str)
+                .map(str::trim)
+                .filter(|model| !model.is_empty())
+                .map(str::to_owned)
+        })
 }
 
 #[tauri::command]
@@ -64,6 +74,9 @@ pub(crate) async fn dashboard_get(
 ) -> Result<Dashboard, AppError> {
     let projection = store.read(project_active)?;
     let home = codex::home(&projection.home);
+    let active_model = matches!(projection.active_kind, ActiveKind::Provider)
+        .then(|| configured_model(&home))
+        .flatten();
     let index = index.inner().clone();
     let scan_home = home.clone();
     let session_task =
@@ -87,7 +100,7 @@ pub(crate) async fn dashboard_get(
         active_kind: projection.active_kind,
         active_account_id: projection.active_account_id,
         active_account: projection.active_account,
-        active_model: projection.active_model,
+        active_model,
         active_quota: projection.active_quota,
         codex_home: home.display().to_string(),
         database_count,
@@ -131,26 +144,20 @@ pub(crate) async fn settings_get_diagnostics(
     store: State<'_, Store>,
     index: State<'_, SessionIndex>,
 ) -> Result<SupportDiagnostics, AppError> {
-    let (home_setting, active_kind, provider_count, official_account_count, active_model) =
+    let (home_setting, active_kind, provider_count, official_account_count) =
         store.read(|state| {
-            let active_model = state
-                .active
-                .provider_id
-                .as_deref()
-                .and_then(|id| state.providers.iter().find(|provider| provider.id == id))
-                .map(|provider| provider.model.trim())
-                .filter(|model| !model.is_empty())
-                .map(str::to_owned);
             (
                 state.codex.home.clone(),
                 state.active.kind,
                 state.providers.len(),
                 state.official_accounts.len(),
-                active_model,
             )
         })?;
     let root = store.root().to_path_buf();
     let home = codex::home(&home_setting);
+    let active_model = matches!(active_kind, ActiveKind::Provider)
+        .then(|| configured_model(&home))
+        .flatten();
     let index = index.inner().clone();
     tokio::task::spawn_blocking(move || {
         build_support_diagnostics(
@@ -346,8 +353,9 @@ fn redact_home_text(value: &str) -> String {
 #[tauri::command]
 pub(crate) async fn dashboard_launch(
     store: State<'_, Store>,
+    activation: State<'_, ActivationLock>,
 ) -> Result<ModelUnlockResult, AppError> {
-    model_unlock::launch_with_debug(&store).await
+    model_unlock::launch_with_debug(&store, &activation).await
 }
 
 /// 读取 Codex 应用路径设置（手动配置 + 实际检测结果）。
@@ -450,8 +458,15 @@ mod tests {
         assert_eq!(projection.active_provider.as_deref(), Some("Provider"));
         assert_eq!(projection.active_account_id, None);
         assert_eq!(projection.active_account, None);
-        assert_eq!(projection.active_model.as_deref(), Some("gpt-5.6-luna"));
         assert!(projection.active_quota.is_none());
+    }
+
+    #[test]
+    fn dashboard_model_is_read_from_actual_codex_config() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("config.toml"), "model = \"api-model\"\n").unwrap();
+
+        assert_eq!(configured_model(temp.path()).as_deref(), Some("api-model"));
     }
 
     #[test]
@@ -462,6 +477,7 @@ mod tests {
             .save_official_account(&StoredOfficialAccount {
                 id: String::new(),
                 name: "工作日账号".into(),
+                remark: "工作账号备注".into(),
                 account_id: "workspace".into(),
                 email: "person@example.test".into(),
                 credential: CodexAuthCredential {
@@ -491,13 +507,13 @@ mod tests {
         assert!(matches!(projection.active_kind, ActiveKind::Official));
         assert_eq!(
             projection.active_provider.as_deref(),
-            Some("OpenAI · 工作日账号")
+            Some("OpenAI · 工作账号备注")
         );
         assert_eq!(
             projection.active_account_id.as_deref(),
             Some(saved.id.as_str())
         );
-        assert_eq!(projection.active_account.as_deref(), Some("工作日账号"));
+        assert_eq!(projection.active_account.as_deref(), Some("工作账号备注"));
         assert!(projection.active_quota.is_some());
     }
 }

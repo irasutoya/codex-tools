@@ -20,6 +20,7 @@ use toml_edit::{DocumentMut, Item, Table, Value, value};
 pub const MANAGED_PROVIDER_ID: &str = "custom";
 const MAX_CODEX_CONFIG_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_CODEX_AUTH_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_MODEL_CATALOG_BYTES: u64 = 16 * 1024 * 1024;
 
 /// 序列化模型目录内容；没有可用模型时返回 `None`（应用时跳过写目录，
 /// 避免用空目录覆盖正在使用的模型目录）。
@@ -35,27 +36,100 @@ fn catalog_bytes(catalog: &[crate::models::CodexModelInfo]) -> Option<Vec<u8>> {
 
 #[derive(Clone)]
 struct PendingPatch {
-    base_hash: String,
-    auth_base_hash: String,
     target: PathBuf,
     rendered: String,
     auth_rendered: Vec<u8>,
     /// 模型目录文件内容（`{"models": [...]}`）；为空表示没有可用模型，
     /// 应用时跳过写目录，避免用空目录覆盖正在使用的目录。
     catalog: Option<Vec<u8>>,
+    original: CodexFilesSnapshot,
     created_at: Instant,
+}
+
+#[derive(Clone)]
+struct OptionalFileSnapshot {
+    path: PathBuf,
+    contents: Option<Vec<u8>>,
+}
+
+#[derive(Clone)]
+struct CodexFilesSnapshot {
+    config: OptionalFileSnapshot,
+    auth: OptionalFileSnapshot,
+    catalog: OptionalFileSnapshot,
+}
+
+/// 成功 apply 后由调用方暂时持有的精确文件回滚句柄。只有在 Store active
+/// 状态也提交成功后才应丢弃；不序列化、不暴露文件内容到 WebView。
+pub(crate) struct AppliedConfigPatch {
+    original: CodexFilesSnapshot,
 }
 
 struct PatchDraft<'a> {
     target: PathBuf,
     original: &'a str,
-    original_auth: &'a [u8],
     rendered: String,
     auth_rendered: Vec<u8>,
     catalog: Option<Vec<u8>>,
+    original_files: CodexFilesSnapshot,
     public_preview: String,
     changes: Vec<String>,
     api_key: &'a str,
+}
+
+impl OptionalFileSnapshot {
+    fn capture(
+        path: PathBuf,
+        limit: u64,
+        oversized_message: &'static str,
+    ) -> Result<Self, AppError> {
+        let contents = match fs::metadata(&path) {
+            Ok(metadata) if metadata.len() > limit => {
+                return Err(AppError::InvalidConfig(oversized_message.into()));
+            }
+            Ok(_) => {
+                let bytes = fs::read(&path)?;
+                if bytes.len() as u64 > limit {
+                    return Err(AppError::InvalidConfig(oversized_message.into()));
+                }
+                Some(bytes)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
+        Ok(Self { path, contents })
+    }
+
+    fn text(&self) -> Result<String, AppError> {
+        match self.contents.as_deref() {
+            None => Ok(String::new()),
+            Some(bytes) => String::from_utf8(bytes.to_vec()).map_err(|_| {
+                AppError::InvalidConfig(
+                    "Codex 配置文件不是有效的 UTF-8 文本，请手动修复后再试。".into(),
+                )
+            }),
+        }
+    }
+}
+
+fn restore_optional_file(snapshot: &OptionalFileSnapshot) -> Result<(), AppError> {
+    match snapshot.contents.as_deref() {
+        Some(contents) => atomic_write(&snapshot.path, contents).map_err(AppError::from),
+        None => match fs::remove_file(&snapshot.path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        },
+    }
+}
+
+/// 以安全提交顺序恢复 config/auth/catalog：先中和当前凭据，再恢复目录和配置，
+/// 最后恢复原凭据，避免失败中途把某个服务的密钥配给另一个端点。
+fn restore_codex_files(snapshot: &CodexFilesSnapshot) -> Result<(), AppError> {
+    atomic_write(&snapshot.auth.path, b"{}\n").map_err(AppError::from)?;
+    restore_optional_file(&snapshot.catalog)?;
+    restore_optional_file(&snapshot.config)?;
+    restore_optional_file(&snapshot.auth)
 }
 
 #[derive(Default)]
@@ -71,8 +145,26 @@ impl ConfigManager {
         effective_base_url: &str,
     ) -> Result<ConfigPatchPreview, AppError> {
         let path = codex_home.join("config.toml");
-        let original = read_optional(&path)?;
-        let original_auth = read_optional_bytes(&path.with_file_name("auth.json"))?;
+        let auth_path = path.with_file_name("auth.json");
+        let catalog_path = codex_home.join(MODEL_CATALOG_DIR).join(MODEL_CATALOG_FILE);
+        let original_files = CodexFilesSnapshot {
+            config: OptionalFileSnapshot::capture(
+                path.clone(),
+                MAX_CODEX_CONFIG_BYTES,
+                "Codex 配置文件超过 2 MB，程序已停止读取以避免占用过多内存。",
+            )?,
+            auth: OptionalFileSnapshot::capture(
+                auth_path,
+                MAX_CODEX_AUTH_BYTES,
+                "Codex 登录文件超过 4 MB，程序已停止读取以避免占用过多内存。",
+            )?,
+            catalog: OptionalFileSnapshot::capture(
+                catalog_path,
+                MAX_MODEL_CATALOG_BYTES,
+                "Codex 模型目录超过 16 MB，程序已停止读取以避免占用过多内存。",
+            )?,
+        };
+        let original = original_files.config.text()?;
         let api_key = provider
             .api_key
             .as_deref()
@@ -91,46 +183,75 @@ impl ConfigManager {
         let catalog =
             catalog_bytes(&model_unlock::build_model_catalog_with_windows_for_provider(provider));
         let mut document = parse_config_document(&original)?;
+        let effective_model = effective_provider_model(&document, &provider.available_models)?;
         apply_custom_fields(
             &mut document,
             &provider.name,
             effective_base_url,
             &headers,
-            &provider.model,
+            &effective_model,
         )?;
         let rendered = document.to_string();
         let auth_rendered = render_api_key_auth(auth_key)?;
         let public_preview = managed_custom_preview(&document, auth_key, &headers);
         let changes = describe_changes(
-            &provider.model,
+            &effective_model,
             matches!(provider.api_type, ProviderApiType::Chat),
         );
         self.remember(PatchDraft {
             target: path,
             original: &original,
-            original_auth: &original_auth,
             rendered,
             auth_rendered,
             catalog,
+            original_files,
             public_preview,
             changes,
             api_key: auth_key,
         })
     }
 
-    pub fn apply(&self, operation_id: &str) -> Result<(), AppError> {
+    pub(crate) fn apply(&self, operation_id: &str) -> Result<AppliedConfigPatch, AppError> {
+        self.apply_with_writer(operation_id, |path, bytes| {
+            atomic_write(path, bytes).map_err(AppError::from)
+        })
+    }
+
+    fn apply_with_writer(
+        &self,
+        operation_id: &str,
+        mut write: impl FnMut(&Path, &[u8]) -> Result<(), AppError>,
+    ) -> Result<AppliedConfigPatch, AppError> {
         let pending = self
             .pending
             .lock()
             .map_err(|_| AppError::Internal("配置预览暂时不可用，请重启应用后再试。".into()))?
             .remove(operation_id)
             .ok_or(AppError::StaleOperation)?;
-        let current = read_optional(&pending.target)?;
-        if digest(&current) != pending.base_hash {
-            return Err(AppError::StaleOperation);
-        }
-        let auth = read_optional_bytes(&pending.target.with_file_name("auth.json"))?;
-        if digest_bytes(&auth) != pending.auth_base_hash {
+        let current_config = OptionalFileSnapshot::capture(
+            pending.target.clone(),
+            MAX_CODEX_CONFIG_BYTES,
+            "Codex 配置文件超过 2 MB，程序已停止读取以避免占用过多内存。",
+        )?;
+        let current_auth = OptionalFileSnapshot::capture(
+            pending.target.with_file_name("auth.json"),
+            MAX_CODEX_AUTH_BYTES,
+            "Codex 登录文件超过 4 MB，程序已停止读取以避免占用过多内存。",
+        )?;
+        let current_catalog = OptionalFileSnapshot::capture(
+            pending
+                .target
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join(MODEL_CATALOG_DIR)
+                .join(MODEL_CATALOG_FILE),
+            MAX_MODEL_CATALOG_BYTES,
+            "Codex 模型目录超过 16 MB，程序已停止读取以避免占用过多内存。",
+        )?;
+        if current_config.contents != pending.original.config.contents
+            || current_auth.contents != pending.original.auth.contents
+            || current_catalog.contents != pending.original.catalog.contents
+        {
             return Err(AppError::StaleOperation);
         }
         let _: DocumentMut = pending.rendered.parse().map_err(|error| {
@@ -138,37 +259,50 @@ impl ConfigManager {
         })?;
         let _: serde_json::Map<String, serde_json::Value> =
             parse_auth_object(&pending.auth_rendered)?;
-        // 先写模型目录文件，再写 config.toml，保证 model_catalog_json 指向
-        // 的内容在配置生效前已就绪；目录为空时不覆盖现有文件。
-        if let Some(catalog) = pending.catalog.as_deref()
-            && let Some(parent) = pending.target.parent()
-        {
-            let catalog_path = parent.join(MODEL_CATALOG_DIR).join(MODEL_CATALOG_FILE);
-            atomic_write(&catalog_path, catalog).map_err(AppError::from)?;
+        let apply_result = (|| {
+            // 先写模型目录文件，再写 config.toml，保证 model_catalog_json 指向
+            // 的内容在配置生效前已就绪；目录为空时不覆盖现有文件。
+            if let Some(catalog) = pending.catalog.as_deref() {
+                write(&pending.original.catalog.path, catalog)?;
+            }
+            commit_codex_files(
+                &pending.target,
+                pending.rendered.as_bytes(),
+                &pending.auth_rendered,
+                |path, bytes| write(path, bytes),
+            )
+        })();
+        match apply_result {
+            Ok(()) => Ok(AppliedConfigPatch {
+                original: pending.original,
+            }),
+            Err(error) => match restore_codex_files(&pending.original) {
+                Ok(()) => Err(error),
+                Err(rollback) => Err(AppError::Internal(format!(
+                    "{error}；Codex 原配置回滚失败，请手动检查配置文件：{rollback}"
+                ))),
+            },
         }
-        commit_codex_files(
-            &pending.target,
-            pending.rendered.as_bytes(),
-            &pending.auth_rendered,
-            |path, bytes| atomic_write(path, bytes).map_err(AppError::from),
-        )
+    }
+
+    pub(crate) fn rollback_applied(&self, applied: AppliedConfigPatch) -> Result<(), AppError> {
+        restore_codex_files(&applied.original)
     }
 
     fn remember(&self, draft: PatchDraft<'_>) -> Result<ConfigPatchPreview, AppError> {
         let PatchDraft {
             target,
             original,
-            original_auth,
             rendered,
             auth_rendered,
             catalog,
+            original_files,
             public_preview,
             changes,
             api_key,
         } = draft;
         let operation_id = uuid::Uuid::new_v4().to_string();
         let base_hash = digest(original);
-        let auth_base_hash = digest_bytes(original_auth);
         let target_path = target.display().to_string();
         let mut pending = self
             .pending
@@ -186,12 +320,11 @@ impl ConfigManager {
         pending.insert(
             operation_id.clone(),
             PendingPatch {
-                base_hash: base_hash.clone(),
-                auth_base_hash,
                 target,
                 rendered,
                 auth_rendered,
                 catalog,
+                original: original_files,
                 created_at: Instant::now(),
             },
         );
@@ -345,11 +478,16 @@ fn apply_custom_fields(
     headers: &BTreeMap<String, String>,
     model: &str,
 ) -> Result<(), AppError> {
-    update_managed_model_provider_fields(document, MANAGED_PROVIDER_ID);
-    // 设置默认模型，让 Codex 直接调用第三方模型；留空时保留 Codex 默认模型。
-    if !model.trim().is_empty() {
-        document["model"] = value(model.trim());
+    let model = model.trim();
+    if model.is_empty() {
+        return Err(AppError::InvalidConfig(
+            "此服务没有可用模型，请先刷新模型列表后再激活。".into(),
+        ));
     }
+    update_managed_model_provider_fields(document, MANAGED_PROVIDER_ID);
+    // 模型必须来自服务 `/models`。调用方会优先保留 Codex 当前仍然可用的
+    // 模型，否则选择接口列表首项；这里始终显式覆盖，避免继承其他服务的模型。
+    document["model"] = value(model);
     normalize_inline_model_providers(document);
     if document.get("model_providers").is_none() {
         document["model_providers"] = Item::Table(Table::new());
@@ -378,6 +516,36 @@ fn apply_custom_fields(
     // 能列出自定义模型；目录文件在预览/应用时写入。
     document["model_catalog_json"] = value(format!("{}/{}", MODEL_CATALOG_DIR, MODEL_CATALOG_FILE));
     Ok(())
+}
+
+/// 从服务 `/models` 缓存中选择本次配置要使用的模型。Codex 当前模型仍在
+/// 列表中时保持不变，否则使用稳定排序后的首项。标准 `/models` 不声明
+/// “默认模型”，因此首项只是保证首次请求可用的确定性回退。
+fn effective_provider_model(
+    document: &DocumentMut,
+    available_models: &[String],
+) -> Result<String, AppError> {
+    let current = document
+        .get("model")
+        .and_then(Item::as_str)
+        .map(str::trim)
+        .filter(|model| !model.is_empty());
+    if let Some(current) = current
+        && available_models
+            .iter()
+            .map(|model| model.trim())
+            .any(|model| model == current)
+    {
+        return Ok(current.to_owned());
+    }
+    available_models
+        .iter()
+        .map(|model| model.trim())
+        .find(|model| !model.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            AppError::InvalidConfig("此服务没有可用模型，请先刷新模型列表后再激活。".into())
+        })
 }
 
 fn render_api_key_auth(api_key: &str) -> Result<Vec<u8>, AppError> {
@@ -564,24 +732,6 @@ fn read_optional(path: &Path) -> Result<String, AppError> {
     }
 }
 
-fn read_optional_bytes(path: &Path) -> Result<Vec<u8>, AppError> {
-    reject_oversized_file(
-        path,
-        MAX_CODEX_AUTH_BYTES,
-        "Codex 登录文件超过 4 MB，程序已停止读取以避免占用过多内存。",
-    )?;
-    match fs::read(path) {
-        Ok(value) if value.len() as u64 <= MAX_CODEX_AUTH_BYTES => Ok(value),
-        Ok(_) => Err(AppError::InvalidConfig(
-            "Codex 登录文件超过 4 MB，程序已停止读取以避免占用过多内存。".into(),
-        )),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
-        Err(error) => Err(AppError::Internal(format!(
-            "无法读取 Codex 登录文件，请检查文件权限：{error}"
-        ))),
-    }
-}
-
 fn reject_oversized_file(path: &Path, limit: u64, message: &'static str) -> Result<(), AppError> {
     match fs::metadata(path) {
         Ok(metadata) if metadata.len() > limit => Err(AppError::InvalidConfig(message.into())),
@@ -612,11 +762,9 @@ fn describe_changes(model: &str, chat_proxy: bool) -> Vec<String> {
         },
         "更新 Codex 使用的 API Key".into(),
     ];
-    if !model.trim().is_empty() {
-        changes.push(format!("默认模型设为 {}", model.trim()));
-    }
+    changes.push(format!("使用服务 API 返回的模型 {}", model.trim()));
     changes.push(format!(
-        "写入模型目录 {MODEL_CATALOG_DIR}/{MODEL_CATALOG_FILE}，供模型选择器列出官方与自定义模型"
+        "写入模型目录 {MODEL_CATALOG_DIR}/{MODEL_CATALOG_FILE}，供模型选择器列出服务 API 返回的模型"
     ));
     changes
 }
@@ -722,7 +870,7 @@ mod tests {
             model: String::new(),
 
             model_context_windows: Default::default(),
-            available_models: Default::default(),
+            available_models: vec!["api-model".into()],
             models_dev_meta: Default::default(),
             api_type: ProviderApiType::Responses,
             api_key: Some("sk-direct-secret-value".into()),
@@ -767,13 +915,13 @@ settings = { model_provider = "old-inline", rules = [{ model_provider = "old-arr
             "Direct Responses",
             "https://responses.example.test/v1",
             &BTreeMap::from([("x-tenant".into(), "tenant-1".into())]),
-            "",
+            "api-model",
         )
         .unwrap();
         let text = document.to_string();
         let parsed: DocumentMut = text.parse().unwrap();
         let custom = parsed["model_providers"]["custom"].as_table().unwrap();
-        assert_eq!(parsed["model"].as_str(), Some("old-model"));
+        assert_eq!(parsed["model"].as_str(), Some("api-model"));
         assert_eq!(parsed["user_setting"].as_str(), Some("keep"));
         assert_eq!(parsed["model_provider"].as_str(), Some("custom"));
         assert_eq!(
@@ -957,6 +1105,43 @@ private_setting = "must-also-not-enter-webview"
     }
 
     #[test]
+    fn failed_apply_restores_config_auth_and_catalog_exactly() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex");
+        let catalog_path = home.join(MODEL_CATALOG_DIR).join(MODEL_CATALOG_FILE);
+        prepare_home(&home);
+        let original_config = b"model = \"original-model\"\ncustom_setting = true\n";
+        let original_auth = br#"{"auth_mode":"chatgpt","token":"original-secret"}"#;
+        fs::write(home.join("config.toml"), original_config).unwrap();
+        fs::write(home.join("auth.json"), original_auth).unwrap();
+        assert!(!catalog_path.exists());
+
+        let manager = ConfigManager::default();
+        let preview = manager
+            .preview_custom(&home, &provider(), provider().base_url.as_str())
+            .unwrap();
+        let mut writes = 0;
+        let error = manager
+            .apply_with_writer(&preview.operation_id, |path, bytes| {
+                writes += 1;
+                if writes == 2 {
+                    return Err(AppError::Internal("simulated config failure".into()));
+                }
+                atomic_write(path, bytes).map_err(AppError::from)
+            })
+            .err()
+            .expect("injected failure must abort the apply transaction");
+
+        assert!(error.to_string().contains("simulated config failure"));
+        assert_eq!(fs::read(home.join("config.toml")).unwrap(), original_config);
+        assert_eq!(fs::read(home.join("auth.json")).unwrap(), original_auth);
+        assert!(
+            !catalog_path.exists(),
+            "a catalog created before the injected failure must be removed"
+        );
+    }
+
+    #[test]
     fn chat_proxy_activation_writes_fixed_key_and_proxy_url() {
         let temp = tempfile::tempdir().unwrap();
         let home = temp.path().join("codex");
@@ -972,7 +1157,7 @@ private_setting = "must-also-not-enter-webview"
             model: String::new(),
 
             model_context_windows: Default::default(),
-            available_models: Default::default(),
+            available_models: vec!["deepseek-chat".into()],
             models_dev_meta: Default::default(),
             api_type: ProviderApiType::Chat,
             api_key: Some("sk-real-provider-key".into()),
@@ -1196,7 +1381,7 @@ model_providers = "invalid"
             "Custom",
             "https://custom.example.test/v1",
             &BTreeMap::new(),
-            "",
+            "api-model",
         )
         .unwrap();
 
@@ -1208,36 +1393,27 @@ model_providers = "invalid"
             document["model_providers"]["custom"]["base_url"].as_str(),
             Some("https://custom.example.test/v1")
         );
+        assert_eq!(document["model"].as_str(), Some("api-model"));
     }
 
     #[test]
-    fn custom_activation_writes_and_preserves_the_default_model() {
-        let mut document = r#"model = "user-kept"
-model_providers = { other = { base_url = "https://other.example.test/v1" } }
-"#
-        .parse::<DocumentMut>()
-        .unwrap();
+    fn effective_model_preserves_current_api_model_or_uses_first_fallback() {
+        let current = r#"model = "api-b""#.parse::<DocumentMut>().unwrap();
+        let models = vec!["api-a".into(), "api-b".into()];
+        assert_eq!(
+            effective_provider_model(&current, &models).unwrap(),
+            "api-b"
+        );
 
-        apply_custom_fields(
-            &mut document,
-            "Custom",
-            "https://custom.example.test/v1",
-            &BTreeMap::new(),
-            "gpt-5.6-luna",
-        )
-        .unwrap();
-        assert_eq!(document["model"].as_str(), Some("gpt-5.6-luna"));
+        let stale = r#"model = "other-provider-model""#.parse::<DocumentMut>().unwrap();
+        assert_eq!(effective_provider_model(&stale, &models).unwrap(), "api-a");
+    }
 
-        // 留空时不覆盖用户已设置的模型。
-        apply_custom_fields(
-            &mut document,
-            "Custom",
-            "https://custom.example.test/v1",
-            &BTreeMap::new(),
-            "",
-        )
-        .unwrap();
-        assert_eq!(document["model"].as_str(), Some("gpt-5.6-luna"));
+    #[test]
+    fn effective_model_rejects_an_empty_api_catalog() {
+        let document = DocumentMut::new();
+        let error = effective_provider_model(&document, &[]).unwrap_err();
+        assert!(error.to_string().contains("没有可用模型"));
     }
 
     #[test]

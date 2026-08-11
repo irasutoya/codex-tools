@@ -53,6 +53,9 @@
   color-scheme: light;
   --font-code: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
   --radius: 0.625rem;
+  --motion-ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+  --overlay-backdrop: oklch(0 0 0 / 44%);
+  --overlay-blur: 6px;
   --background: oklch(0.985 0 0);
   --foreground: oklch(0.145 0 0);
   --card: oklch(1 0 0);
@@ -88,6 +91,7 @@
 
 .dark {
   color-scheme: dark;
+  --overlay-backdrop: oklch(0 0 0 / 64%);
   --background: oklch(0.115 0 0);
   --foreground: oklch(0.965 0 0);
   --card: oklch(0.16 0 0);
@@ -152,6 +156,20 @@
   pre {
     @apply font-mono;
   }
+}
+
+/* Only the topmost modal layer owns the backdrop. Without this rule, opening
+   a dialog from a sheet (or a confirmation from a dialog) compounds both the
+   tint and blur, making otherwise identical windows look unrelated. */
+body:has([data-slot="alert-dialog-content"][data-open])
+  :is([data-slot="dialog-overlay"], [data-slot="sheet-overlay"]),
+body:not(:has([data-slot="alert-dialog-content"][data-open])):has(
+    [data-slot="dialog-content"][data-open]
+  )
+  [data-slot="sheet-overlay"] {
+  pointer-events: none;
+  opacity: 0;
+  backdrop-filter: none;
 }
 
 @media (prefers-reduced-motion: reduce) {

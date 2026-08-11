@@ -26,6 +26,7 @@ use crate::{
         ProviderProfile, ReasoningLevelInfo,
     },
     platform,
+    state::ActivationLock,
     storage::Store,
 };
 use futures_util::{SinkExt, StreamExt};
@@ -41,6 +42,7 @@ use std::{
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
+    sync::MutexGuard,
 };
 use tokio_tungstenite::tungstenite::Message;
 
@@ -91,7 +93,6 @@ const CODEX_BASE_INSTRUCTIONS: &str =
 /// 数据来源（均来自该服务商本身，不内置任何模型）：
 /// 1. 服务 `/models` 接口返回的可用模型（保存服务时静默获取，`available_models`）；
 /// 2. 服务 `/models` 接口返回的模型上下文窗口（`model_context_windows`）；
-/// 3. 服务默认模型。
 ///
 /// 未启用第三方服务（官方 OpenAI 或无激活服务）时返回空目录：官方账号的
 /// 模型选择器由订阅等级控制，不注入默认 GPT 模型。
@@ -105,6 +106,31 @@ pub(crate) fn model_catalog(store: &Store) -> Result<Vec<CodexModelInfo>, AppErr
     };
     let provider = store.provider(&provider_id)?;
     Ok(build_provider_catalog(&provider))
+}
+
+/// 所有会写模型目录或注入页面的入口都通过这个上下文统一采用
+/// model transaction → activation 的锁序，并在拿到两把锁后重新读取 active。
+struct ModelCatalogWriteContext<'a> {
+    _model_transaction: MutexGuard<'a, ()>,
+    _activation: MutexGuard<'a, ()>,
+    active_kind: ActiveKind,
+    catalog: Vec<CodexModelInfo>,
+}
+
+async fn model_catalog_write_context<'a>(
+    store: &Store,
+    activation: &'a ActivationLock,
+) -> Result<ModelCatalogWriteContext<'a>, AppError> {
+    let model_transaction = activation.2.lock().await;
+    let activation_guard = activation.0.lock().await;
+    let active_kind = store.read(|state| state.active.kind)?;
+    let catalog = model_catalog(store)?;
+    Ok(ModelCatalogWriteContext {
+        _model_transaction: model_transaction,
+        _activation: activation_guard,
+        active_kind,
+        catalog,
+    })
 }
 
 /// 用单个服务的模型记录构建目录（只含该服务实际存在的模型）。
@@ -145,26 +171,6 @@ fn build_provider_catalog(provider: &ProviderProfile) -> Vec<CodexModelInfo> {
                 false,
             ),
         );
-    }
-    // 服务默认模型（用户显式设置；不在 API 列表时也保留，供切换使用）。
-    let default_model = provider.model.trim();
-    if !default_model.is_empty() {
-        let meta = provider.models_dev_meta.get(default_model);
-        let context_window = provider
-            .model_context_windows
-            .get(default_model)
-            .copied()
-            .or_else(|| meta.and_then(|meta| meta.context_window))
-            .unwrap_or(DEFAULT_CONTEXT_WINDOW);
-        by_slug.entry(default_model.to_string()).or_insert_with(|| {
-            catalog_entry(
-                default_model,
-                default_model,
-                context_window,
-                meta.and_then(|meta| meta.description.clone()),
-                false,
-            )
-        });
     }
     by_slug.into_values().collect()
 }
@@ -277,18 +283,26 @@ pub(crate) async fn status(store: &Store) -> Result<ModelUnlockStatus, AppError>
 }
 
 /// 向已开启调试端口的 Codex 实例注入模型目录与解锁脚本。
-pub(crate) async fn unlock(store: &Store) -> Result<ModelUnlockResult, AppError> {
-    unlock_on(store, &debug_probe_ports(store)).await
+pub(crate) async fn unlock(
+    store: &Store,
+    activation: &ActivationLock,
+) -> Result<ModelUnlockResult, AppError> {
+    unlock_on(store, activation, &debug_probe_ports(store)).await
 }
 
-async fn unlock_on(store: &Store, ports: &[u16]) -> Result<ModelUnlockResult, AppError> {
+async fn unlock_on(
+    store: &Store,
+    activation: &ActivationLock,
+    ports: &[u16],
+) -> Result<ModelUnlockResult, AppError> {
+    let context = model_catalog_write_context(store, activation).await?;
     let port = find_codex_debug_port_on(ports).await.ok_or_else(|| {
         AppError::InvalidConfig(
             "未找到带调试端口的 Codex 实例，请先用“以调试模式启动 Codex 并解锁”打开。".into(),
         )
     })?;
-    let active_kind = store.read(|state| state.active.kind)?;
-    let catalog = model_catalog(store)?;
+    let active_kind = context.active_kind;
+    let catalog = context.catalog;
     if catalog.is_empty() {
         return Ok(ModelUnlockResult {
             port,
@@ -318,9 +332,13 @@ async fn unlock_on(store: &Store, ports: &[u16]) -> Result<ModelUnlockResult, Ap
 /// 启动前确保 `model_catalog_json` 指向的目录文件已写入（让 CLI 的
 /// `list-models-for-host` 返回自定义模型），并尽快注入（让 Statsig 补丁先于
 /// 应用读取白名单配置）。
-pub(crate) async fn launch_with_debug(store: &Store) -> Result<ModelUnlockResult, AppError> {
-    let active_kind = store.read(|state| state.active.kind)?;
-    let catalog = model_catalog(store)?;
+pub(crate) async fn launch_with_debug(
+    store: &Store,
+    activation: &ActivationLock,
+) -> Result<ModelUnlockResult, AppError> {
+    let context = model_catalog_write_context(store, activation).await?;
+    let active_kind = context.active_kind;
+    let catalog = context.catalog;
     let configured = store.codex_app_setting()?;
     let empty_message = |active_kind| match active_kind {
         ActiveKind::Official => {
@@ -813,6 +831,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::io::{Read, Write};
     use std::net::TcpListener;
+    use std::sync::Arc;
 
     fn provider(id: &str, model: &str) -> ProviderProfile {
         ProviderProfile {
@@ -825,7 +844,11 @@ mod tests {
             active: false,
             model: model.into(),
             model_context_windows: Default::default(),
-            available_models: Default::default(),
+            available_models: if model.trim().is_empty() {
+                Vec::new()
+            } else {
+                vec![model.to_string()]
+            },
             models_dev_meta: Default::default(),
             api_type: ProviderApiType::Responses,
             api_key: Some("secret".into()),
@@ -845,7 +868,7 @@ mod tests {
     fn built_catalog_is_valid_for_codex_cli_schema() {
         let catalog =
             build_model_catalog_with_windows_for_provider(&provider("provider", "deepseek-v4-pro"));
-        // 只含当前服务商默认模型，不含任何内置模型。
+        // 只含当前服务商 `/models` 返回的模型，不含任何内置模型。
         assert_eq!(catalog.len(), 1);
         let deepseek = &catalog[0];
         assert_eq!(deepseek.slug, "deepseek-v4-pro");
@@ -968,7 +991,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_catalog_default_model_uses_stored_window() {
+    fn provider_catalog_api_model_uses_stored_window() {
         let mut provider =
             provider_with_models("provider", "deepseek-v4-pro", &["deepseek-v4-pro"]);
         provider.model_context_windows = BTreeMap::from([("deepseek-v4-pro".into(), 1_000_000u64)]);
@@ -976,6 +999,14 @@ mod tests {
         let catalog = build_model_catalog_with_windows_for_provider(&provider);
         assert_eq!(catalog.len(), 1);
         assert_eq!(catalog[0].context_window, Some(1_000_000));
+    }
+
+    #[test]
+    fn legacy_default_model_never_creates_a_catalog_entry() {
+        let mut provider = provider("provider", "legacy-manual-model");
+        provider.available_models.clear();
+
+        assert!(build_model_catalog_with_windows_for_provider(&provider).is_empty());
     }
 
     #[test]
@@ -997,6 +1028,48 @@ mod tests {
         assert!(!slugs.contains(&"kimi-k2"));
         assert!(!slugs.contains(&"gpt-5.6-sol"));
         assert!(!slugs.contains(&"codex-latest"));
+    }
+
+    #[tokio::test]
+    async fn catalog_writer_rereads_active_after_waiting_for_transaction_locks() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(temp.path().join("data")).unwrap());
+        store
+            .connections_save_provider(provider("provider-a", "model-a"))
+            .unwrap();
+        store
+            .connections_save_provider(provider("provider-b", "model-b"))
+            .unwrap();
+        store.activate("provider-a").unwrap();
+        let activation = Arc::new(ActivationLock::default());
+
+        // 模拟激活事务持有统一锁并切到 B；目录写入口已开始排队，但只能在
+        // 激活提交并释放锁后读取，因此不能携带旧的 A 目录继续写入。
+        let model_transaction = activation.2.lock().await;
+        let activation_guard = activation.0.lock().await;
+        let waiting_store = store.clone();
+        let waiting_activation = activation.clone();
+        let writer = tokio::spawn(async move {
+            let context = model_catalog_write_context(&waiting_store, &waiting_activation)
+                .await
+                .unwrap();
+            (
+                context.active_kind,
+                context
+                    .catalog
+                    .into_iter()
+                    .map(|model| model.slug)
+                    .collect::<Vec<_>>(),
+            )
+        });
+        tokio::task::yield_now().await;
+        store.activate("provider-b").unwrap();
+        drop(activation_guard);
+        drop(model_transaction);
+
+        let (kind, models) = writer.await.unwrap();
+        assert!(matches!(kind, ActiveKind::Provider));
+        assert_eq!(models, vec!["model-b"]);
     }
 
     #[test]
@@ -1246,7 +1319,7 @@ mod tests {
             .unwrap();
 
         // 端口 1 通常不可连接，用来验证“未找到调试端口”的错误提示。
-        let result = runtime.block_on(unlock_on(&store, &[1]));
+        let result = runtime.block_on(unlock_on(&store, &ActivationLock::default(), &[1]));
 
         assert!(result.is_err());
         let message = result.unwrap_err().to_string();

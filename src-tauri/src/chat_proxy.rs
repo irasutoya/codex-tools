@@ -245,11 +245,10 @@ impl ProxyClient {
             .cached
             .lock()
             .map_err(|_| AppError::Internal("本机转换代理的网络客户端锁已损坏。".into()))?;
-        if cached
-            .as_ref()
-            .is_some_and(|(cached_snapshot, _)| cached_snapshot == &snapshot)
+        if let Some((cached_snapshot, client)) = cached.as_ref()
+            && cached_snapshot == &snapshot
         {
-            return Ok(cached.as_ref().expect("刚刚检查过").1.clone());
+            return Ok(client.clone());
         }
         let client = ClientCache::build_standalone(None).map_err(|error| {
             AppError::Internal(format!(
