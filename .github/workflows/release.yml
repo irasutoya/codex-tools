@@ -92,6 +92,15 @@ jobs:
         with:
           path: release-artifacts
           merge-multiple: true
+      - name: Normalize artifact names
+        working-directory: release-artifacts
+        run: |
+          for file in *; do
+            safe_name="${file// /.}"
+            if [[ "$file" != "$safe_name" ]]; then
+              mv -- "$file" "$safe_name"
+            fi
+          done
       - name: Generate checksums
         working-directory: release-artifacts
         run: sha256sum * > SHA256SUMS.txt
