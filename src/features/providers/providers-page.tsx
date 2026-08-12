@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react"
+import { useCallback, useEffect, useMemo, useState } from "react"
 import {
   Add01Icon,
   CheckmarkCircle02Icon,
@@ -29,6 +29,7 @@ import { Spinner } from "@/components/ui/spinner"
 import { Skeleton } from "@/components/ui/skeleton"
 import { toast } from "@/components/ui/toast"
 import { errorMessage, formatDate, quotaWindow } from "@/lib/format"
+import { useAsyncAction } from "@/hooks/use-async-action"
 import { call } from "@/lib/ipc"
 import type {
   DeviceAuthorization,
@@ -36,7 +37,7 @@ import type {
   Provider,
   ProviderOverview,
 } from "@/types"
-import { emptyProvider } from "@/types"
+import { emptyProvider } from "./connection-utils"
 
 import {
   AccountLoginDialog,
@@ -46,6 +47,7 @@ import {
   refreshAccountQuota,
   testProviderConnection,
 } from "./connection-actions"
+import { accountIsExpired, quotaStatusText } from "./connection-utils"
 import { ProviderEditorDialog } from "./provider-editor-dialog"
 
 export function ProvidersPage({
@@ -66,21 +68,7 @@ export function ProvidersPage({
   const [loginError, setLoginError] = useState<string>()
   const [editor, setEditor] = useState<Provider>(emptyProvider())
   const [authorization, setAuthorization] = useState<DeviceAuthorization>()
-  const [busy, setBusy] = useState<string>()
-  const busyRef = useRef<string | undefined>(undefined)
-
-  const beginBusy = useCallback((key: string) => {
-    if (busyRef.current) return false
-    busyRef.current = key
-    setBusy(key)
-    return true
-  }, [])
-
-  const endBusy = useCallback((key: string) => {
-    if (busyRef.current !== key) return
-    busyRef.current = undefined
-    setBusy(undefined)
-  }, [])
+  const { busy, begin, end, run } = useAsyncAction<string>()
 
   const selected = useMemo(() => {
     const account = connections?.officialAccounts.find(
@@ -108,31 +96,8 @@ export function ProvidersPage({
     }
   }, [onSelectedIdChange, selected, selectedId])
 
-  const run = async (
-    key: string,
-    action: () => Promise<unknown>,
-    success: string
-  ) => {
-    if (!beginBusy(key)) return false
-    try {
-      await action()
-      toast.add({ title: success, type: "success" })
-      onRefresh()
-      return true
-    } catch (reason) {
-      toast.add({
-        title: "操作失败",
-        description: errorMessage(reason),
-        type: "error",
-      })
-      return false
-    } finally {
-      endBusy(key)
-    }
-  }
-
   const startLogin = async () => {
-    if (!beginBusy("login")) return
+    if (!begin("login")) return
     setLoginError(undefined)
     try {
       setAuthorization(await call("connections_login_start"))
@@ -144,7 +109,7 @@ export function ProvidersPage({
         type: "error",
       })
     } finally {
-      endBusy("login")
+      end("login")
     }
   }
 
@@ -170,7 +135,7 @@ export function ProvidersPage({
 
   const checkLogin = async () => {
     if (!authorization) return
-    if (!beginBusy("poll")) return
+    if (!begin("poll")) return
     try {
       const result = await call("connections_login_poll", {
         operationId: authorization.operationId,
@@ -187,7 +152,7 @@ export function ProvidersPage({
         type: "error",
       })
     } finally {
-      endBusy("poll")
+      end("poll")
     }
   }
 
@@ -199,7 +164,7 @@ export function ProvidersPage({
     const schedule = () => {
       timer = window.setTimeout(
         () => {
-          if (!beginBusy("poll")) {
+          if (!begin("poll")) {
             schedule()
             return
           }
@@ -217,7 +182,7 @@ export function ProvidersPage({
               )
               schedule()
             })
-            .finally(() => endBusy("poll"))
+            .finally(() => end("poll"))
         },
         Math.max(1, authorization.intervalSecs) * 1000
       )
@@ -228,10 +193,10 @@ export function ProvidersPage({
       cancelled = true
       if (timer !== undefined) window.clearTimeout(timer)
     }
-  }, [authorization, beginBusy, endBusy, finishLoginPoll, loginOpen])
+  }, [authorization, begin, end, finishLoginPoll, loginOpen])
 
   const openAccountLogin = (mode: AccountLoginMode) => {
-    if (busyRef.current) return
+    if (busy) return
     setLoginMode(mode)
     setLoginError(undefined)
     setLoginOpen(true)
@@ -242,7 +207,7 @@ export function ProvidersPage({
     accountId: string | undefined,
     content: string
   ) => {
-    if (!beginBusy("import")) return
+    if (!begin("import")) return
     try {
       const imported = await call("connections_import_cookie", {
         name,
@@ -266,7 +231,7 @@ export function ProvidersPage({
         type: "error",
       })
     } finally {
-      endBusy("import")
+      end("import")
     }
   }
 
@@ -283,11 +248,12 @@ export function ProvidersPage({
         }}
       />
       <AccountLoginDialog
+        key={loginOpen ? "login-open" : "login-closed"}
         open={loginOpen}
         mode={loginMode}
         onModeChange={setLoginMode}
         onOpenChange={(open) => {
-          if (!open && busyRef.current) return
+          if (!open && busy) return
           setLoginOpen(open)
           if (!open && !authorization) setLoginError(undefined)
         }}
@@ -485,11 +451,10 @@ export function ProvidersPage({
                 disabled={actionBusy}
                 aria-busy={busy === "quota"}
                 onClick={() =>
-                  void run(
-                    "quota",
-                    () => refreshAccountQuota(item.id),
-                    "额度已刷新"
-                  )
+                  void run("quota", () => refreshAccountQuota(item.id), {
+                    success: "额度已刷新",
+                    onSuccess: onRefresh,
+                  })
                 }
               >
                 {busy === "quota" ? (
@@ -510,7 +475,7 @@ export function ProvidersPage({
                   void run(
                     "login-refresh",
                     () => call("connections_refresh_login", { id: item.id }),
-                    "登录状态已刷新"
+                    { success: "登录状态已刷新", onSuccess: onRefresh }
                   )
                 }
               >
@@ -528,11 +493,10 @@ export function ProvidersPage({
                 disabled={actionBusy}
                 aria-busy={busy === "test"}
                 onClick={() =>
-                  void run(
-                    "test",
-                    () => testProviderConnection(item.id),
-                    "连接测试通过"
-                  )
+                  void run("test", () => testProviderConnection(item.id), {
+                    success: "连接测试通过",
+                    onSuccess: onRefresh,
+                  })
                 }
               >
                 {busy === "test" ? (
@@ -553,7 +517,7 @@ export function ProvidersPage({
                   void run(
                     "models",
                     () => call("connections_list_models", { id: item.id }),
-                    "模型已同步"
+                    { success: "模型已同步", onSuccess: onRefresh }
                   )
                 }
               >
@@ -621,37 +585,13 @@ function quotaLabel(
   remainingPercent: number | undefined
 ) {
   if (!account) return "—"
-  if (remainingPercent !== undefined) {
-    const refreshed = account.quota.fetchedAt
-      ? ` · ${formatDate(account.quota.fetchedAt, true)}`
-      : ""
-    return `剩余 ${remainingPercent.toFixed(1)}%${refreshed}`
-  }
-  switch (account.quota.status) {
-    case "never":
-      return "尚未刷新"
-    case "unauthorized":
-      return "登录已失效，请刷新登录"
-    case "rate_limited":
-      return "请求频繁，请稍后重试"
-    case "unsupported":
-      return "当前账号暂不支持额度查询"
-    case "error":
-      return account.quota.error || "额度刷新失败"
-    default:
-      return "暂无额度数据"
-  }
+  return quotaStatusText(account, remainingPercent)
 }
 
 function credentialLabel(account: OfficialAccountView | undefined) {
   if (!account) return "—"
   if (account.quota.status === "unauthorized") return "登录已失效"
-  if (
-    account.expiresAt != null &&
-    account.expiresAt <= Math.floor(Date.now() / 1000)
-  ) {
-    return "登录已过期"
-  }
+  if (accountIsExpired(account)) return "登录已过期"
   return account.source === "proxy_import"
     ? "Cookie 登录有效"
     : "OAuth 登录有效"

@@ -25,6 +25,7 @@ import { HugeiconsIcon, type IconSvgElement } from "@hugeicons/react"
 import { Badge } from "@/components/ui/badge"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
+import { ErrorBoundary } from "@/components/error-boundary"
 import { Field, FieldGroup, FieldLabel } from "@/components/ui/field"
 import {
   InputGroup,
@@ -113,6 +114,13 @@ const navigation: Array<{
   { id: "settings", label: "设置", icon: Settings01Icon },
 ]
 
+const settingsSectionLabels: Record<SettingsSection, string> = {
+  config: "当前配置",
+  diagnostics: "诊断信息",
+  app: "启动程序",
+  unlock: "模型解锁",
+}
+
 function usesSharedConnectionState(page: Page) {
   return page === "dashboard" || page === "providers"
 }
@@ -141,13 +149,7 @@ export default function App() {
 
   useEffect(() => {
     if (!sharedStateActive) return
-    if (
-      loadedStateRevision.current === refreshRevision &&
-      dashboard &&
-      connections
-    ) {
-      return
-    }
+    if (loadedStateRevision.current === refreshRevision) return
     let cancelled = false
     void Promise.all([call("dashboard_get"), call("connections_list")])
       .then(([nextDashboard, nextConnections]) => {
@@ -188,7 +190,7 @@ export default function App() {
     return () => {
       cancelled = true
     }
-  }, [connections, dashboard, page, refreshRevision, sharedStateActive])
+  }, [page, refreshRevision, sharedStateActive])
 
   const refresh = useCallback(() => {
     if (usesSharedConnectionState(pageRef.current)) {
@@ -223,12 +225,7 @@ export default function App() {
       return `最近 ${usageDays} 天 · ${usageGroupBy === "model" ? "按模型" : "按账号"}`
     if (page === "sessions") return sessionQuery || "全部会话"
     if (page === "settings") {
-      return {
-        config: "当前配置",
-        diagnostics: "诊断信息",
-        app: "启动程序",
-        unlock: "模型解锁",
-      }[settingsSection]
+      return settingsSectionLabels[settingsSection]
     }
     if (page === "providers") {
       const selectedAccount = connections?.officialAccounts.find(
@@ -271,10 +268,10 @@ export default function App() {
         ? Search01Icon
         : undefined
 
-  const sharedProps = {
-    refreshRevision,
-    onRefresh: refresh,
-  }
+  const sharedProps = useMemo(
+    () => ({ refreshRevision, onRefresh: refresh }),
+    [refreshRevision, refresh]
+  )
 
   useEffect(() => {
     mainRef.current?.scrollTo({ top: 0 })
@@ -384,37 +381,42 @@ export default function App() {
                 </div>
               )}
             <Suspense fallback={<PageLoading />}>
-              {page === "dashboard" && (!stateError || dashboard) && (
-                <DashboardPage
-                  dashboard={dashboard}
-                  refreshRevision={refreshRevision}
-                />
-              )}
-              {page === "providers" && (!stateError || connections) && (
-                <ProvidersPage
-                  {...sharedProps}
-                  connections={connections}
-                  selectedId={selectedConnection}
-                  onSelectedIdChange={setSelectedConnection}
-                />
-              )}
-              {page === "usage" && (
-                <UsagePage
-                  {...sharedProps}
-                  days={usageDays}
-                  groupBy={usageGroupBy}
-                />
-              )}
-              {page === "sessions" && (
-                <SessionsPage
-                  key={sessionQuery}
-                  {...sharedProps}
-                  query={sessionQuery}
-                />
-              )}
-              {page === "settings" && (
-                <SettingsPage {...sharedProps} section={settingsSection} />
-              )}
+              <ErrorBoundary
+                key={page}
+                label={`页面「${contextLabel}」渲染出错`}
+              >
+                {page === "dashboard" && (!stateError || dashboard) && (
+                  <DashboardPage
+                    dashboard={dashboard}
+                    refreshRevision={refreshRevision}
+                  />
+                )}
+                {page === "providers" && (!stateError || connections) && (
+                  <ProvidersPage
+                    {...sharedProps}
+                    connections={connections}
+                    selectedId={selectedConnection}
+                    onSelectedIdChange={setSelectedConnection}
+                  />
+                )}
+                {page === "usage" && (
+                  <UsagePage
+                    {...sharedProps}
+                    days={usageDays}
+                    groupBy={usageGroupBy}
+                  />
+                )}
+                {page === "sessions" && (
+                  <SessionsPage
+                    key={sessionQuery}
+                    {...sharedProps}
+                    query={sessionQuery}
+                  />
+                )}
+                {page === "settings" && (
+                  <SettingsPage {...sharedProps} section={settingsSection} />
+                )}
+              </ErrorBoundary>
             </Suspense>
           </main>
         </div>
@@ -422,24 +424,26 @@ export default function App() {
 
       {contextMounted && (
         <Suspense fallback={null}>
-          <ContextSheet
-            open={contextOpen}
-            onOpenChange={setContextOpen}
-            page={page}
-            connections={connections}
-            selectedConnection={selectedConnection}
-            onSelectedConnectionChange={setSelectedConnection}
-            usageDays={usageDays}
-            onUsageDaysChange={setUsageDays}
-            usageGroupBy={usageGroupBy}
-            onUsageGroupByChange={setUsageGroupBy}
-            sessionQueryDraft={sessionQueryDraft}
-            onSessionQueryDraftChange={setSessionQueryDraft}
-            onSessionQuerySubmit={setSessionQuery}
-            settingsSection={settingsSection}
-            onSettingsSectionChange={setSettingsSection}
-            onChanged={refresh}
-          />
+          <ErrorBoundary label="上下文面板渲染出错">
+            <MemoizedContextSheet
+              open={contextOpen}
+              onOpenChange={setContextOpen}
+              page={page}
+              connections={connections}
+              selectedConnection={selectedConnection}
+              onSelectedConnectionChange={setSelectedConnection}
+              usageDays={usageDays}
+              onUsageDaysChange={setUsageDays}
+              usageGroupBy={usageGroupBy}
+              onUsageGroupByChange={setUsageGroupBy}
+              sessionQueryDraft={sessionQueryDraft}
+              onSessionQueryDraftChange={setSessionQueryDraft}
+              onSessionQuerySubmit={setSessionQuery}
+              settingsSection={settingsSection}
+              onSettingsSectionChange={setSettingsSection}
+              onChanged={refresh}
+            />
+          </ErrorBoundary>
         </Suspense>
       )}
       <Toaster timeout={4500} limit={3} />
@@ -643,10 +647,15 @@ function ContextSheet({
                 onOpenChange(false)
               }}
             >
-              <ToggleGroupItem value="config">当前配置</ToggleGroupItem>
-              <ToggleGroupItem value="diagnostics">诊断信息</ToggleGroupItem>
-              <ToggleGroupItem value="app">启动程序</ToggleGroupItem>
-              <ToggleGroupItem value="unlock">模型解锁</ToggleGroupItem>
+              {(
+                Object.entries(settingsSectionLabels) as Array<
+                  [SettingsSection, string]
+                >
+              ).map(([value, label]) => (
+                <ToggleGroupItem key={value} value={value}>
+                  {label}
+                </ToggleGroupItem>
+              ))}
             </ToggleGroup>
           )}
         </SheetBody>
@@ -654,3 +663,5 @@ function ContextSheet({
     </Sheet>
   )
 }
+
+const MemoizedContextSheet = memo(ContextSheet)

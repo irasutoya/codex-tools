@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react"
+import { useCallback, useMemo } from "react"
 import { InformationCircleIcon } from "@hugeicons/core-free-icons"
 import { HugeiconsIcon } from "@hugeicons/react"
 import { CartesianGrid, Line, LineChart, XAxis, YAxis } from "recharts"
@@ -11,12 +11,10 @@ import {
   ChartLegendContent,
   ChartTooltip,
   ChartTooltipContent,
-  type ChartConfig,
 } from "@/components/ui/chart"
 import { Progress, ProgressLabel } from "@/components/ui/progress"
 import { Skeleton } from "@/components/ui/skeleton"
 import {
-  errorMessage,
   formatDate,
   formatInteger,
   formatTokens,
@@ -25,14 +23,14 @@ import {
   todayRange,
   tokenInput,
 } from "@/lib/format"
+import {
+  tokenTickFormatter,
+  trendPointsToSeries,
+  usageChartConfig,
+} from "@/lib/chart"
+import { useAsync } from "@/hooks/use-async"
 import { call } from "@/lib/ipc"
-import type { Dashboard, UsageOverview } from "@/types"
-
-const chartConfig = {
-  input: { label: "输入 Token", color: "var(--chart-1)" },
-  output: { label: "输出 Token", color: "var(--chart-2)" },
-  cache: { label: "缓存 Token", color: "var(--chart-3)" },
-} satisfies ChartConfig
+import type { Dashboard } from "@/types"
 
 export function DashboardPage({
   dashboard,
@@ -41,24 +39,24 @@ export function DashboardPage({
   dashboard?: Dashboard
   refreshRevision: number
 }) {
-  const [usage, setUsage] = useState<UsageOverview>()
-  const [error, setError] = useState<string>()
+  const fetchUsage = useCallback(
+    () =>
+      call("usage_get_overview", {
+        query: { range: todayRange(7), groupBy: "model" },
+      }),
+    []
+  )
+  const { data: usage, error } = useAsync(
+    fetchUsage,
+    undefined,
+    refreshRevision
+  )
 
-  useEffect(() => {
-    let cancelled = false
-    void call("usage_get_overview", {
-      query: { range: todayRange(7), groupBy: "model" },
-    })
-      .then((nextUsage) => {
-        if (cancelled) return
-        setUsage(nextUsage)
-        setError(undefined)
-      })
-      .catch((reason) => !cancelled && setError(errorMessage(reason)))
-    return () => {
-      cancelled = true
-    }
-  }, [refreshRevision])
+  const points = useMemo(
+    () => trendPointsToSeries(usage?.trendPoints ?? []),
+    [usage]
+  )
+  const quota = quotaWindow(dashboard?.activeQuota)
 
   if (!dashboard || (!usage && !error)) {
     return (
@@ -81,14 +79,6 @@ export function DashboardPage({
     )
   }
 
-  const points = usage.trendPoints.map((point) => ({
-    date: formatDate(point.dayStartMs),
-    input: tokenInput(point.tokens),
-    output: point.tokens.outputTokens + point.tokens.reasoningOutputTokens,
-    cache: point.tokens.cachedInputTokens + point.tokens.cacheWriteInputTokens,
-  }))
-  const quota = quotaWindow(dashboard.activeQuota)
-
   return (
     <div className="flex min-h-full flex-col gap-3 px-3 pt-1 pb-3">
       {error && (
@@ -106,7 +96,7 @@ export function DashboardPage({
         </CardHeader>
         <CardContent className="flex min-h-0 flex-1">
           <ChartContainer
-            config={chartConfig}
+            config={usageChartConfig}
             className="aspect-auto min-h-0 w-full flex-1"
             initialDimension={{ width: 620, height: 220 }}
           >
@@ -126,7 +116,7 @@ export function DashboardPage({
                 tickLine={false}
                 axisLine={false}
                 tickMargin={8}
-                tickFormatter={(value) => formatTokens(Number(value))}
+                tickFormatter={tokenTickFormatter}
               />
               <ChartTooltip
                 cursor={false}

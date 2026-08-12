@@ -13,6 +13,10 @@
 //! `reasoning.effort` → `reasoning_effort`；流式输出按
 //! `response.output_item.added` / `response.output_text.delta` /
 //! `response.function_call_arguments.delta` / `response.completed` 事件还原。
+//!
+//! 健壮性：非流式请求按服务配置整体超时，流式请求只约束首字节到达时间；
+//! 上游流停滞过久转成明确的 response.failed 事件；上游忽略 stream=true
+//! 直接返回 JSON 时合成等价的 SSE 流；下游长时间无事件时发送心跳注释行保活。
 
 use crate::{
     models::{AppError, ProviderApiType, ProviderProfile},
@@ -50,6 +54,12 @@ const MAX_REQUEST_BODY_BYTES: usize = 64 * 1024 * 1024;
 pub(crate) const PROXY_FIXED_API_KEY: &str = "codex-tools";
 /// 写入 Codex 配置的本机代理地址路径。
 pub(crate) const PROXY_BASE_PATH: &str = "/v1";
+/// 下游（Codex 侧）SSE 心跳间隔：上游长时间不产生事件时发送注释行，
+/// 防止系统代理或客户端的空闲超时把长思考中的连接掐断。
+const DOWNSTREAM_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+/// 上游流式响应的停滞上限：超过该时长完全没有字节到达说明连接很可能
+/// 已死亡（半开的 TCP 连接无法被及时发现），转成明确的 response.failed 事件。
+const UPSTREAM_STALL_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// 本机转换代理的完整根地址。
 pub(crate) fn proxy_base_url() -> String {
@@ -89,7 +99,7 @@ impl ChatProxyRegistry {
         let mut single = self.single.lock().await;
         if let Some(running) = single.as_mut() {
             if running.fingerprint != fingerprint {
-                *running.config.current.write().await = config;
+                *running.config.current.write().await = Arc::new(config);
                 running.fingerprint = fingerprint;
                 running.owner = provider.id.clone();
             }
@@ -113,7 +123,7 @@ impl ChatProxyRegistry {
         if let Some(running) = single.as_mut()
             && running.owner == provider_id
         {
-            *running.config.current.write().await = ProxyConfig::disabled();
+            *running.config.current.write().await = Arc::new(ProxyConfig::disabled());
             running.fingerprint.clear();
             running.owner.clear();
         }
@@ -145,7 +155,12 @@ fn proxy_fingerprint(provider: &ProviderProfile) -> String {
 struct ProxyConfig {
     upstream_base: String,
     api_key: String,
-    headers: Vec<(String, String)>,
+    /// 服务商自定义请求头：配置切换时一次性构建好，请求热路径只克隆引用，
+    /// 不再逐请求重复校验与组装。
+    headers: reqwest::header::HeaderMap,
+    /// 单次上游请求的超时（来自服务配置）：非流式请求覆盖连接与整个响应体，
+    /// 流式请求只约束首字节（响应头）到达时间。
+    timeout: Duration,
 }
 
 impl ProxyConfig {
@@ -153,7 +168,8 @@ impl ProxyConfig {
         Self {
             upstream_base: provider.base_url.trim_end_matches('/').to_owned(),
             api_key: provider.api_key.clone().unwrap_or_default(),
-            headers: provider.headers.clone().into_iter().collect(),
+            headers: build_upstream_headers(provider.headers.clone()),
+            timeout: Duration::from_secs(provider.timeout_secs.max(1)),
         }
     }
 
@@ -162,7 +178,8 @@ impl ProxyConfig {
         Self {
             upstream_base: String::new(),
             api_key: String::new(),
-            headers: Vec::new(),
+            headers: reqwest::header::HeaderMap::new(),
+            timeout: Duration::from_secs(30),
         }
     }
 
@@ -171,15 +188,34 @@ impl ProxyConfig {
     }
 }
 
+/// 把服务配置里的自定义请求头组装成 HeaderMap。保存时已经过 validate_headers
+/// 校验，这里即使遇到异常值也只跳过错误项，避免本机代理因请求头问题拒绝转发。
+fn build_upstream_headers(
+    pairs: impl IntoIterator<Item = (String, String)>,
+) -> reqwest::header::HeaderMap {
+    let mut headers = reqwest::header::HeaderMap::new();
+    for (name, value) in pairs {
+        let Ok(name) = reqwest::header::HeaderName::from_bytes(name.as_bytes()) else {
+            continue;
+        };
+        let Ok(value) = reqwest::header::HeaderValue::from_str(&value) else {
+            continue;
+        };
+        headers.insert(name, value);
+    }
+    headers
+}
+
 /// 共享配置槽：切换/编辑服务时在端口不变的前提下原地替换上游参数。
+/// 配置用 Arc 共享，请求热路径只复制引用而不是深拷贝整份配置。
 struct ProxyConfigSlot {
-    current: tokio::sync::RwLock<ProxyConfig>,
+    current: tokio::sync::RwLock<Arc<ProxyConfig>>,
 }
 
 impl ProxyConfigSlot {
     fn new(config: ProxyConfig) -> Arc<Self> {
         Arc::new(Self {
-            current: tokio::sync::RwLock::new(config),
+            current: tokio::sync::RwLock::new(Arc::new(config)),
         })
     }
 }
@@ -334,13 +370,89 @@ fn apply_upstream_headers(
     mut request: reqwest::RequestBuilder,
     config: &ProxyConfig,
 ) -> reqwest::RequestBuilder {
-    request = request.bearer_auth(&config.api_key);
-    // 服务商自定义头在保存时已经过 validate_headers 校验，这里即使遇到
-    // 异常值也只跳过错误项，避免本机代理因请求头问题拒绝转发。
-    if let Ok(headers) = crate::provider_http::headers_from_pairs(config.headers.clone()) {
-        request = request.headers(headers);
+    if !config.api_key.is_empty() {
+        request = request.bearer_auth(&config.api_key);
+    }
+    if !config.headers.is_empty() {
+        request = request.headers(config.headers.clone());
     }
     request
+}
+
+/// 发送上游 Chat Completions 请求，并把连接/超时错误翻译成给 Codex 的错误响应。
+///
+/// 转换代理的网络客户端为了长时间流式响应特意不设总超时，这里按请求类型补偿：
+/// - 非流式：设置整体超时（连接 + 读完响应体），上游挂起时不会无限等待；
+/// - 流式：只约束首字节（响应头）到达时间，响应出流后时长由内容决定，不再受限。
+async fn send_chat_request(
+    client: &reqwest::Client,
+    url: &str,
+    config: &ProxyConfig,
+    body: &Value,
+    stream: bool,
+) -> Result<reqwest::Response, Response> {
+    let request = apply_upstream_headers(client.post(url), config).json(body);
+    let result = if stream {
+        match tokio::time::timeout(config.timeout, request.send()).await {
+            Ok(result) => result,
+            Err(_) => {
+                return Err(error_response(
+                    StatusCode::GATEWAY_TIMEOUT,
+                    &format!(
+                        "等待上游服务返回响应超时（{} 秒）。",
+                        config.timeout.as_secs()
+                    ),
+                ));
+            }
+        }
+    } else {
+        request.timeout(config.timeout).send().await
+    };
+    result.map_err(|error| {
+        if error.is_timeout() {
+            error_response(
+                StatusCode::GATEWAY_TIMEOUT,
+                &format!("等待上游服务响应超时（{} 秒）。", config.timeout.as_secs()),
+            )
+        } else {
+            error_response(
+                StatusCode::BAD_GATEWAY,
+                &format!("无法连接上游服务：{error}"),
+            )
+        }
+    })
+}
+
+/// 读取上游错误响应的响应体；读取失败/超时时返回空串，由调用方兜底文案。
+async fn read_error_body(response: reqwest::Response, config: &ProxyConfig) -> String {
+    match tokio::time::timeout(config.timeout, response.text()).await {
+        Ok(Ok(text)) => text,
+        _ => String::new(),
+    }
+}
+
+/// 判断上游响应是否为 SSE 流。Content-Type 缺失时按 SSE 处理（宽容），
+/// 只有明确不是 SSE 时才走非流式兜底，避免误伤忘记设置响应头的服务。
+fn is_event_stream(response: &reqwest::Response) -> bool {
+    response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_none_or(|value| value.to_ascii_lowercase().contains("text/event-stream"))
+}
+
+/// 给 Codex 的 SSE 响应统一入口：禁用一切缓冲，保证事件逐条实时到达。
+fn sse_response(
+    stream: impl futures_util::Stream<Item = Result<Event, std::convert::Infallible>> + Send + 'static,
+) -> Response {
+    let mut response = Sse::new(stream).into_response();
+    response
+        .headers_mut()
+        .insert("Cache-Control", HeaderValue::from_static("no-cache"));
+    response
+        .headers_mut()
+        .insert("X-Accel-Buffering", HeaderValue::from_static("no"));
+    response
 }
 
 fn error_response(status: StatusCode, message: &str) -> Response {
@@ -387,8 +499,7 @@ async fn handle_models(State(state): State<Arc<ProxyState>>, headers: HeaderMap)
     let url = crate::provider_http::endpoint_for(&config.upstream_base, "models");
     // /models 是非流式请求，需要整体超时：转换代理的网络客户端为了
     // 长时间流式响应特意不设总超时，若不在这里兜底，上游建连后一直
-    // 不返回会让 Codex 侧的模型列表请求无限悬挂。
-    const UPSTREAM_MODELS_TIMEOUT: Duration = Duration::from_secs(30);
+    // 不返回会让 Codex 侧的模型列表请求无限悬挂。超时沿用服务配置。
     let fetch = async {
         let response = apply_upstream_headers(client.get(&url), &config)
             .send()
@@ -401,7 +512,7 @@ async fn handle_models(State(state): State<Arc<ProxyState>>, headers: HeaderMap)
             .map_err(|_| "上游服务返回的模型列表不是有效 JSON。".to_string())?;
         Ok::<_, String>((status, body))
     };
-    match tokio::time::timeout(UPSTREAM_MODELS_TIMEOUT, fetch).await {
+    match tokio::time::timeout(config.timeout, fetch).await {
         Ok(Ok((status, body))) => (status, Json(body)).into_response(),
         Ok(Err(message)) => error_response(StatusCode::BAD_GATEWAY, &message),
         Err(_) => error_response(
@@ -444,47 +555,30 @@ async fn handle_responses(
         Err(error) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
     };
     let url = crate::provider_http::endpoint_for(&config.upstream_base, "chat/completions");
-    let mut response = match apply_upstream_headers(client.post(&url), &config)
-        .json(&chat_body)
-        .send()
-        .await
-    {
-        Ok(response) => response,
-        Err(error) => {
-            return error_response(
-                StatusCode::BAD_GATEWAY,
-                &format!("无法连接上游服务：{error}"),
-            );
-        }
-    };
-    let mut status = response.status();
-    if !status.is_success() {
-        let detail = response.text().await.unwrap_or_default();
+    let mut response =
+        match send_chat_request(&client, &url, &config, &chat_body, stream_requested).await {
+            Ok(response) => response,
+            Err(error_response) => return error_response,
+        };
+    if !response.status().is_success() {
+        let status = response.status();
+        let detail = read_error_body(response, &config).await;
         // 部分第三方 API 不支持 response_format（json_schema）结构化输出，
         // 此时降级为“把 JSON Schema 写进系统提示词”的方式重试一次，
         // 让自动审查等依赖结构化输出的功能在第三方模型上也能工作。
         if chat_body.get("response_format").is_some() && looks_like_structured_output_error(&detail)
         {
             let degraded = degrade_structured_output(&chat_body);
-            match apply_upstream_headers(client.post(&url), &config)
-                .json(&degraded)
-                .send()
-                .await
-            {
+            match send_chat_request(&client, &url, &config, &degraded, stream_requested).await {
                 Ok(retry) => {
-                    response = retry;
-                    status = response.status();
-                    if !status.is_success() {
-                        let retry_detail = response.text().await.unwrap_or_default();
+                    if !retry.status().is_success() {
+                        let status = retry.status();
+                        let retry_detail = read_error_body(retry, &config).await;
                         return upstream_error_response(status, &retry_detail);
                     }
+                    response = retry;
                 }
-                Err(error) => {
-                    return error_response(
-                        StatusCode::BAD_GATEWAY,
-                        &format!("无法连接上游服务：{error}"),
-                    );
-                }
+                Err(error_response) => return error_response,
             }
         } else {
             return upstream_error_response(status, &detail);
@@ -498,21 +592,22 @@ async fn handle_responses(
     let response_id = format!("resp_{}", uuid::Uuid::new_v4().simple());
     let created_at = chrono::Utc::now().timestamp();
     if stream_requested {
-        let stream = translate_stream(
-            response,
-            response_id,
-            model,
-            created_at,
-            reasoning_store.clone(),
-        );
-        let mut sse_response = Sse::new(stream).into_response();
-        sse_response
-            .headers_mut()
-            .insert("Cache-Control", HeaderValue::from_static("no-cache"));
-        sse_response
-            .headers_mut()
-            .insert("X-Accel-Buffering", HeaderValue::from_static("no"));
-        sse_response
+        // 上游忽略了 stream=true、直接返回完整 JSON（部分第三方网关在流式
+        // 请求出错时也会用 200 + JSON 报错）：按内容兜底，保证 Codex 侧始终
+        // 收到符合协议的 SSE 流或明确的错误。
+        if !is_event_stream(&response) {
+            return fallback_non_sse_stream(
+                response,
+                &config,
+                response_id,
+                model,
+                created_at,
+                reasoning_store,
+            )
+            .await;
+        }
+        let stream = translate_stream(response, response_id, model, created_at, reasoning_store);
+        sse_response(stream)
     } else {
         let chat_response = match response.json::<Value>().await {
             Ok(value) => value,
@@ -532,6 +627,112 @@ async fn handle_responses(
         ))
         .into_response()
     }
+}
+
+/// 上游对流式请求返回了非 SSE 响应时的兜底：
+/// - 完整 JSON 补全（上游忽略 stream=true）：合成为等价的 Responses SSE 事件流；
+/// - JSON 错误（网关用 200 报错）：转成明确的错误响应；
+/// - 其他内容：返回 502，不伪装成正常响应。
+async fn fallback_non_sse_stream(
+    response: reqwest::Response,
+    config: &ProxyConfig,
+    response_id: String,
+    model: String,
+    created_at: i64,
+    store: Arc<std::sync::Mutex<ReasoningStore>>,
+) -> Response {
+    let text = match tokio::time::timeout(config.timeout, response.text()).await {
+        Ok(Ok(text)) => text,
+        _ => {
+            return error_response(StatusCode::BAD_GATEWAY, "读取上游服务响应失败。");
+        }
+    };
+    let value: Value = match serde_json::from_str(&text) {
+        Ok(value) => value,
+        Err(_) => {
+            return error_response(
+                StatusCode::BAD_GATEWAY,
+                &format!("上游服务返回了无法识别的响应：{}", truncate(&text, 200)),
+            );
+        }
+    };
+    if value.get("error").is_some() {
+        return upstream_error_response(StatusCode::BAD_GATEWAY, &text);
+    }
+    if value.get("choices").is_none() {
+        return error_response(
+            StatusCode::BAD_GATEWAY,
+            "上游服务返回的响应既不是 SSE 流也不是补全结果。",
+        );
+    }
+    let mut translator = StreamTranslator::new(&response_id, &model, created_at);
+    let mut pending = vec![
+        sse_event(
+            "response.created",
+            &translator.stub("response.created", "in_progress"),
+        ),
+        sse_event(
+            "response.in_progress",
+            &translator.stub("response.in_progress", "in_progress"),
+        ),
+    ];
+    // 把一次性补全结果包装成单个分片，复用同一套翻译逻辑生成完整事件序列。
+    let chunk = completion_to_chunk(&value);
+    translator.push_chunk(&chunk, &mut pending);
+    translator.finish(&mut pending, &store);
+    pending.push(PendingEvent {
+        event_type: "done",
+        data: "[DONE]".into(),
+    });
+    let stream = futures_util::stream::iter(
+        pending
+            .into_iter()
+            .map(|event| Ok::<_, std::convert::Infallible>(into_axum_event(event))),
+    );
+    sse_response(stream)
+}
+
+/// 把非流式 Chat Completions 补全结果包装成流式分片形状，
+/// 供 StreamTranslator 复用同一套事件生成逻辑。
+/// 非流式的 tool_calls 不带 index，这里按位置补上，避免多个调用被折叠成一个。
+fn completion_to_chunk(completion: &Value) -> Value {
+    let message = completion
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|choices| choices.first())
+        .and_then(|choice| choice.get("message"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let mut delta = Map::new();
+    delta.insert("role".into(), Value::String("assistant".into()));
+    if let Some(content) = message.get("content").filter(|content| !content.is_null()) {
+        delta.insert("content".into(), content.clone());
+    }
+    if let Some(reasoning) = message
+        .get("reasoning_content")
+        .filter(|value| !value.is_null())
+    {
+        delta.insert("reasoning_content".into(), reasoning.clone());
+    }
+    if let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array) {
+        let indexed = tool_calls
+            .iter()
+            .enumerate()
+            .map(|(index, call)| {
+                let mut call = call.clone();
+                if let Some(map) = call.as_object_mut() {
+                    map.insert("index".into(), json!(index));
+                }
+                call
+            })
+            .collect::<Vec<_>>();
+        delta.insert("tool_calls".into(), Value::Array(indexed));
+    }
+    let mut chunk = json!({"choices": [{"index": 0, "delta": Value::Object(delta)}]});
+    if let Some(usage) = completion.get("usage") {
+        chunk["usage"] = usage.clone();
+    }
+    chunk
 }
 
 /// 上游返回非成功状态时，尽量把 Chat 风格的错误原样带回给 Codex。
@@ -668,7 +869,19 @@ fn translate_stream(
         let mut stream = response.bytes_stream();
         let mut failed = false;
         let mut done = false;
-        while let Some(chunk) = stream.next().await {
+        let mut failure_message = "读取上游流式响应失败，连接可能已中断。";
+        loop {
+            // 停滞检测：上游长时间没有任何字节到达，视为连接已死亡，
+            // 转成明确的失败事件而不是无限悬挂。
+            let chunk = match tokio::time::timeout(UPSTREAM_STALL_TIMEOUT, stream.next()).await {
+                Ok(Some(chunk)) => chunk,
+                Ok(None) => break,
+                Err(_) => {
+                    failed = true;
+                    failure_message = "上游服务长时间没有返回数据，连接已超时中断。";
+                    break;
+                }
+            };
             match chunk {
                 Ok(bytes) => buffer.extend_from_slice(&bytes),
                 Err(_) => {
@@ -677,18 +890,15 @@ fn translate_stream(
                 }
             }
             let mut start = 0usize;
-            let mut scan = 0usize;
-            while let Some(relative) = buffer[scan..].iter().position(|&byte| byte == b'\n') {
-                let position = scan + relative;
-                if let Some(data) =
-                    parser.push_line(utf8_lossy_slice(&buffer[start..position]).as_ref())
+            while let Some(relative) = buffer[start..].iter().position(|&byte| byte == b'\n') {
+                let position = start + relative;
+                let line = utf8_lossy_slice(&buffer[start..position]);
+                start = position + 1;
+                if let Some(data) = parser.push_line(line.as_ref())
                     && dispatch_data(&mut translator, &data, &mut pending, &mut failed, &mut done)
                 {
-                    start = position + 1;
                     break;
                 }
-                start = position + 1;
-                scan = start;
             }
             if !done && !failed && start > 0 {
                 // 已消费的行一次性移除（每块只搬运一次剩余部分）；
@@ -703,10 +913,10 @@ fn translate_stream(
         if !done && !failed {
             // 上游没有发送 [DONE] 就断开：先把残留的未换行行喂给解析器，
             // 再分发解析器里累积的数据，保证最后一个事件不丢失。
-            if !buffer.is_empty() {
-                if let Some(data) = parser.push_line(utf8_lossy_slice(&buffer).as_ref()) {
-                    dispatch_data(&mut translator, &data, &mut pending, &mut failed, &mut done);
-                }
+            if !buffer.is_empty()
+                && let Some(data) = parser.push_line(utf8_lossy_slice(&buffer).as_ref())
+            {
+                dispatch_data(&mut translator, &data, &mut pending, &mut failed, &mut done);
             }
             if let Some(data) = parser.finish() {
                 dispatch_data(&mut translator, &data, &mut pending, &mut failed, &mut done);
@@ -715,7 +925,7 @@ fn translate_stream(
         if failed {
             // 上游已在流中报告错误（fail 事件已发出）或连接中断。
             if !translator.has_failed_event {
-                translator.fail(&mut pending, "读取上游流式响应失败，连接可能已中断。");
+                translator.fail(&mut pending, failure_message);
             }
         } else {
             translator.finish(&mut pending, &store);
@@ -729,13 +939,26 @@ fn translate_stream(
             .await;
         // 发送端随任务结束被丢弃，接收端流随之结束。
     });
-    futures_util::stream::unfold(rx, |mut rx| async move {
-        rx.recv().await.map(|event| {
-            (
-                Ok::<Event, std::convert::Infallible>(into_axum_event(event)),
-                rx,
-            )
-        })
+    let keepalive = tokio::time::interval_at(
+        tokio::time::Instant::now() + DOWNSTREAM_KEEPALIVE_INTERVAL,
+        DOWNSTREAM_KEEPALIVE_INTERVAL,
+    );
+    futures_util::stream::unfold((rx, keepalive), |(mut rx, mut keepalive)| async move {
+        // 优先转发真实事件；长时间没有事件时发送 SSE 注释行心跳，
+        // 防止任何一层的空闲超时掐断长思考中的连接。
+        tokio::select! {
+            biased;
+            event = rx.recv() => event.map(|event| {
+                (
+                    Ok::<Event, std::convert::Infallible>(into_axum_event(event)),
+                    (rx, keepalive),
+                )
+            }),
+            _ = keepalive.tick() => Some((
+                Ok(Event::default().comment("keep-alive")),
+                (rx, keepalive),
+            )),
+        }
     })
 }
 
@@ -2957,5 +3180,184 @@ mod tests {
         let url = effective_base_url(&responses, &registry).await.unwrap();
         assert_eq!(url, "https://api.deepseek.com/v1");
         registry.stop_all().await;
+    }
+
+    #[test]
+    fn upstream_headers_skip_invalid_entries() {
+        // 异常请求头只跳过错误项，不影响其余有效头（保存时已校验，这里是兜底）。
+        let headers = build_upstream_headers(vec![
+            ("X-Custom".into(), "ok".into()),
+            ("invalid header".into(), "x".into()),
+            ("X-Other".into(), "bad\nvalue".into()),
+        ]);
+        assert_eq!(
+            headers
+                .get("x-custom")
+                .and_then(|value| value.to_str().ok()),
+            Some("ok")
+        );
+        assert_eq!(headers.len(), 1);
+    }
+
+    #[test]
+    fn completion_to_chunk_indexes_multiple_tool_calls() {
+        // 非流式补全的 tool_calls 不带 index，必须按位置补上，
+        // 否则多个工具调用会被折叠成一个。
+        let chunk = completion_to_chunk(&json!({
+            "choices": [{"message": {"role": "assistant", "content": null, "tool_calls": [
+                {"id": "call_1", "type": "function", "function": {"name": "a", "arguments": "{}"}},
+                {"id": "call_2", "type": "function", "function": {"name": "b", "arguments": "{}"}}
+            ]}}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3}
+        }));
+        let delta = &chunk["choices"][0]["delta"];
+        let calls = delta["tool_calls"].as_array().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0]["index"], 0);
+        assert_eq!(calls[1]["index"], 1);
+        // content 为 null（纯工具调用）时不写入 delta，避免产生空文本事件。
+        assert!(delta.get("content").is_none());
+        assert_eq!(chunk["usage"]["prompt_tokens"], 1);
+    }
+
+    #[tokio::test]
+    async fn proxy_synthesizes_sse_when_upstream_ignores_stream_request() {
+        // 上游忽略 stream=true，直接返回完整 JSON 补全：
+        // 代理必须合成等价的 SSE 事件流，保证 Codex 侧协议一致。
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let upstream = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request);
+            let body = r#"{"id":"chatcmpl-9","object":"chat.completion","created":1700000000,"model":"deepseek-chat","choices":[{"index":0,"message":{"role":"assistant","content":"一次性结果","tool_calls":[{"id":"call_1","type":"function","function":{"name":"f","arguments":"{\"a\":1}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":4,"completion_tokens":6,"total_tokens":10}}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        });
+        let provider = provider("p", &format!("http://{address}"));
+        let (port, _shutdown, _slot) = start_proxy(ProxyConfig::from_provider(&provider))
+            .await
+            .unwrap();
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let response = client
+            .post(format!("http://127.0.0.1:{port}/v1/responses"))
+            .bearer_auth(PROXY_FIXED_API_KEY)
+            .json(&json!({"model": "deepseek-chat", "input": "hi", "stream": true}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response
+                .headers()
+                .get("content-type")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default(),
+            "text/event-stream"
+        );
+        let text = response.text().await.unwrap();
+        let values = text
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter_map(|data| serde_json::from_str::<Value>(data).ok())
+            .collect::<Vec<_>>();
+        let completed = values
+            .iter()
+            .find(|value| value["type"] == "response.completed")
+            .expect("兜底流必须以 response.completed 收尾");
+        let output = completed["response"]["output"].as_array().unwrap();
+        assert_eq!(output[0]["content"][0]["text"], "一次性结果");
+        let call = output
+            .iter()
+            .find(|item| item["type"] == "function_call")
+            .expect("工具调用必须出现在合成流的输出里");
+        assert_eq!(call["call_id"], "call_1");
+        assert_eq!(call["arguments"], "{\"a\":1}");
+        assert_eq!(completed["response"]["usage"]["input_tokens"], 4);
+        assert_eq!(completed["response"]["usage"]["output_tokens"], 6);
+        assert!(text.contains("data: [DONE]"));
+        upstream.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn proxy_surfaces_json_error_when_stream_request_gets_non_sse_error() {
+        // 部分网关流式请求失败时返回 200 + JSON 错误，必须转成明确的错误响应。
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let upstream = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request);
+            let body = r#"{"error":{"message":"bad model","type":"invalid_request_error"}}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        });
+        let provider = provider("p", &format!("http://{address}"));
+        let (port, _shutdown, _slot) = start_proxy(ProxyConfig::from_provider(&provider))
+            .await
+            .unwrap();
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let response = client
+            .post(format!("http://127.0.0.1:{port}/v1/responses"))
+            .bearer_auth(PROXY_FIXED_API_KEY)
+            .json(&json!({"model": "bad", "input": "hi", "stream": true}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status().as_u16(), 502);
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["error"]["message"], "bad model");
+        upstream.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn proxy_times_out_when_upstream_stalls_before_responding() {
+        // 上游接受连接但永远不返回任何数据：非流式按整体超时、
+        // 流式按首字节超时，都必须以 504 收尾而不是无限悬挂。
+        for stream in [false, true] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let upstream = std::thread::spawn(move || {
+                use std::io::Read;
+                let (mut stream, _) = listener.accept().unwrap();
+                // 保持连接但不返回任何数据：持续读到 EOF（代理超时断开）为止。
+                let mut buf = [0_u8; 1024];
+                while stream.read(&mut buf).map(|read| read > 0).unwrap_or(false) {}
+            });
+            let mut provider = provider("p", &format!("http://{address}"));
+            provider.timeout_secs = 1;
+            let (port, _shutdown, _slot) = start_proxy(ProxyConfig::from_provider(&provider))
+                .await
+                .unwrap();
+            let client = reqwest::Client::builder().no_proxy().build().unwrap();
+            let response = client
+                .post(format!("http://127.0.0.1:{port}/v1/responses"))
+                .bearer_auth(PROXY_FIXED_API_KEY)
+                .json(&json!({"model": "m", "input": "hi", "stream": stream}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status().as_u16(), 504, "stream={stream}");
+            let body: Value = response.json().await.unwrap();
+            assert!(
+                body["error"]["message"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("超时"),
+                "stream={stream} 应返回明确的超时提示"
+            );
+            upstream.join().unwrap();
+        }
     }
 }

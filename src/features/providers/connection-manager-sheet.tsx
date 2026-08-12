@@ -1,11 +1,6 @@
-import { useMemo, useRef, useState } from "react"
+import { useMemo, useState } from "react"
 import {
-  ApiIcon,
-  Delete02Icon,
-  Edit02Icon,
-  Key01Icon,
   Login03Icon,
-  MoreHorizontalIcon,
   Refresh01Icon,
   TestTube01Icon,
   UserMultipleIcon,
@@ -22,7 +17,6 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog"
-import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import {
   Dialog,
@@ -34,29 +28,13 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog"
 import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuGroup,
-  DropdownMenuItem,
-  DropdownMenuTrigger,
-} from "@/components/ui/dropdown-menu"
-import {
   Field,
   FieldDescription,
   FieldGroup,
   FieldLabel,
 } from "@/components/ui/field"
 import { Input } from "@/components/ui/input"
-import {
-  Item,
-  ItemActions,
-  ItemContent,
-  ItemDescription,
-  ItemFooter,
-  ItemGroup,
-  ItemMedia,
-  ItemTitle,
-} from "@/components/ui/item"
+import { ItemGroup } from "@/components/ui/item"
 import {
   Sheet,
   SheetBody,
@@ -69,42 +47,38 @@ import { Skeleton } from "@/components/ui/skeleton"
 import { Spinner } from "@/components/ui/spinner"
 import { hiddenOverlayStyles } from "@/components/ui/overlay-styles"
 import { toast } from "@/components/ui/toast"
-import {
-  Tooltip,
-  TooltipContent,
-  TooltipTrigger,
-} from "@/components/ui/tooltip"
-import { errorMessage, quotaWindow } from "@/lib/format"
+import { errorMessage } from "@/lib/format"
+import { useAsyncAction } from "@/hooks/use-async-action"
 import { call } from "@/lib/ipc"
 import type { OfficialAccountView, Provider, ProviderOverview } from "@/types"
-import { emptyProvider } from "@/types"
 
 import { AccountManagerDialog } from "./account-manager-dialog"
+import {
+  accountDescription,
+  accountIsExpired,
+  buildFallbackCandidates,
+  emptyProvider,
+  switchActiveConnection,
+  type ConnectionKind,
+} from "./connection-utils"
+import {
+  ConnectionItem,
+  EmptyConnectionItem,
+  type PendingAction,
+} from "./connection-item"
 import {
   refreshAccountQuota,
   testProviderConnection,
 } from "./connection-actions"
 import { ProviderEditorDialog } from "./provider-editor-dialog"
 
-type ConnectionKind = "account" | "provider"
 type ConnectionPage = "dashboard" | "providers"
-
-type PendingAction = {
-  action:
-    "activate" | "delete" | "quota" | "login" | "test" | "models" | "remark"
-  id: string
-}
 
 type DeleteTarget = {
   active: boolean
   id: string
   kind: ConnectionKind
   name: string
-}
-
-type FallbackCandidate = {
-  id: string
-  kind: ConnectionKind
 }
 
 const EMPTY_ACCOUNTS: OfficialAccountView[] = []
@@ -127,8 +101,7 @@ export function ConnectionManagerSheet({
   onSelectedIdChange: (id: string) => void
   onChanged: () => void
 }) {
-  const [pending, setPending] = useState<PendingAction>()
-  const pendingRef = useRef<PendingAction | undefined>(undefined)
+  const { busy: pending, begin, end } = useAsyncAction<PendingAction>()
   const [remarkAccount, setRemarkAccount] = useState<OfficialAccountView>()
   const [remarkDraft, setRemarkDraft] = useState("")
   const [providerDraft, setProviderDraft] = useState<Provider>(emptyProvider())
@@ -143,36 +116,20 @@ export function ConnectionManagerSheet({
     remarkAccount || providerEditorOpen || deleteTarget || accountManagerOpen
   )
 
-  const beginAction = (action: PendingAction["action"], id: string) => {
-    if (pendingRef.current) return false
-    const next = { action, id }
-    pendingRef.current = next
-    setPending(next)
-    return true
-  }
-
-  const endAction = (action: PendingAction["action"], id: string) => {
-    if (pendingRef.current?.action !== action || pendingRef.current.id !== id) {
-      return
-    }
-    pendingRef.current = undefined
-    setPending(undefined)
-  }
-
   const runAction = async (
     action: PendingAction["action"],
     id: string,
     task: () => Promise<unknown>,
     success: string
   ) => {
-    if (!beginAction(action, id)) return false
+    const key: PendingAction = { action, id }
+    if (!begin(key)) return false
     try {
       await task()
       onChanged()
       toast.add({ title: success, type: "success" })
       return true
     } catch (reason) {
-      onChanged()
       toast.add({
         title: "操作失败",
         description: errorMessage(reason),
@@ -180,7 +137,7 @@ export function ConnectionManagerSheet({
       })
       return false
     } finally {
-      endAction(action, id)
+      end(key)
     }
   }
 
@@ -189,7 +146,7 @@ export function ConnectionManagerSheet({
       kind === "account"
         ? accounts.find((account) => account.id === id)
         : providers.find((provider) => provider.id === id)
-    if (!item || item.active || pendingRef.current) return
+    if (!item || item.active || pending) return
     const activated = await runAction(
       "activate",
       id,
@@ -203,7 +160,7 @@ export function ConnectionManagerSheet({
   }
 
   const editAccount = (account: OfficialAccountView) => {
-    if (pendingRef.current) return
+    if (pending) return
     setRemarkAccount(account)
     setRemarkDraft(account.remark)
   }
@@ -224,7 +181,7 @@ export function ConnectionManagerSheet({
   }
 
   const editProvider = (provider: Provider) => {
-    if (pendingRef.current) return
+    if (pending) return
     setProviderDraft({
       ...provider,
       headers: { ...provider.headers },
@@ -233,44 +190,20 @@ export function ConnectionManagerSheet({
     setProviderEditorOpen(true)
   }
 
-  const fallbackCandidates = (target: DeleteTarget) => {
-    const remainingAccounts = accounts.filter(
-      (account) => !(target.kind === "account" && account.id === target.id)
-    )
-    const healthyAccounts = remainingAccounts.filter(
-      (account) =>
-        account.quota.status !== "unauthorized" && !accountIsExpired(account)
-    )
-    const healthyIds = new Set(healthyAccounts.map((account) => account.id))
-    const otherAccounts = remainingAccounts.filter(
-      (account) => !healthyIds.has(account.id)
-    )
-    const enabledProviders = providers.filter(
-      (provider) =>
-        !(target.kind === "provider" && provider.id === target.id) &&
-        provider.enabled &&
-        provider.hasApiKey
-    )
-
-    return [
-      ...healthyAccounts.map((account): FallbackCandidate => ({
-        kind: "account",
-        id: account.id,
-      })),
-      ...enabledProviders.map((provider): FallbackCandidate => ({
-        kind: "provider",
-        id: provider.id,
-      })),
-      ...otherAccounts.map((account): FallbackCandidate => ({
-        kind: "account",
-        id: account.id,
-      })),
-    ]
-  }
+  const excludedIdsFor = (target: DeleteTarget) =>
+    target.kind === "account" ? new Set([target.id]) : new Set<string>()
 
   const requestDelete = (target: DeleteTarget) => {
-    if (pendingRef.current) return
-    if (target.active && fallbackCandidates(target).length === 0) {
+    if (pending) return
+    const excludedProviderId =
+      target.kind === "provider" ? target.id : undefined
+    const candidates = buildFallbackCandidates(
+      accounts,
+      providers,
+      excludedIdsFor(target),
+      excludedProviderId
+    )
+    if (target.active && candidates.length === 0) {
       toast.add({
         title: `无法删除“${target.name}”`,
         description: "至少保留一个可用连接，才能删除当前连接。",
@@ -283,23 +216,26 @@ export function ConnectionManagerSheet({
 
   const deleteConnection = async () => {
     const target = deleteTarget
-    if (!target || !beginAction("delete", target.id)) return
+    if (!target) return
+    const key: PendingAction = { action: "delete", id: target.id }
+    if (!begin(key)) return
 
     let switchedId: string | undefined
     let lastSwitchError: unknown
     try {
       if (target.active) {
-        for (const candidate of fallbackCandidates(target)) {
-          try {
-            await (candidate.kind === "account"
-              ? call("connections_activate_account", { id: candidate.id })
-              : call("connections_activate", { id: candidate.id }))
-            switchedId = candidate.id
-            break
-          } catch (reason) {
-            lastSwitchError = reason
-          }
-        }
+        const excludedProviderId =
+          target.kind === "provider" ? target.id : undefined
+        const switchResult = await switchActiveConnection(
+          buildFallbackCandidates(
+            accounts,
+            providers,
+            excludedIdsFor(target),
+            excludedProviderId
+          )
+        )
+        switchedId = switchResult.switchedId
+        lastSwitchError = switchResult.error
 
         if (!switchedId) {
           onChanged()
@@ -350,17 +286,17 @@ export function ConnectionManagerSheet({
       })
       setDeleteTarget(undefined)
     } finally {
-      endAction("delete", target.id)
+      end(key)
     }
   }
 
   const requestSheetOpenChange = (nextOpen: boolean) => {
-    if (!nextOpen && pendingRef.current) return
+    if (!nextOpen && pending) return
     onOpenChange(nextOpen)
   }
 
   const openBatchManager = () => {
-    if (pendingRef.current || accounts.length === 0) return
+    if (pending || accounts.length === 0) return
     onOpenChange(false)
     setAccountManagerOpen(true)
   }
@@ -583,7 +519,7 @@ export function ConnectionManagerSheet({
       <Dialog
         open={Boolean(remarkAccount)}
         onOpenChange={(nextOpen) => {
-          if (!nextOpen && pendingRef.current) return
+          if (!nextOpen && pending) return
           if (!nextOpen) setRemarkAccount(undefined)
         }}
       >
@@ -650,7 +586,7 @@ export function ConnectionManagerSheet({
       <AlertDialog
         open={Boolean(deleteTarget)}
         onOpenChange={(nextOpen) => {
-          if (!nextOpen && pendingRef.current) return
+          if (!nextOpen && pending) return
           if (!nextOpen) setDeleteTarget(undefined)
         }}
       >
@@ -694,196 +630,6 @@ export function ConnectionManagerSheet({
         onRefresh={onChanged}
       />
     </>
-  )
-}
-
-type MoreAction = {
-  icon: Parameters<typeof HugeiconsIcon>[0]["icon"]
-  label: string
-  onSelect: () => void
-}
-
-function ConnectionItem({
-  kind,
-  id,
-  name,
-  description,
-  active,
-  canView,
-  selected,
-  unavailable,
-  unavailableLabel,
-  activateDisabled = false,
-  frozen,
-  pending,
-  onView,
-  onActivate,
-  onEdit,
-  onDelete,
-  moreActions,
-}: {
-  kind: ConnectionKind
-  id: string
-  name: string
-  description: string
-  active: boolean
-  canView: boolean
-  selected: boolean
-  unavailable: boolean
-  unavailableLabel: string
-  activateDisabled?: boolean
-  frozen: boolean
-  pending?: PendingAction
-  onView: () => void
-  onActivate: () => void
-  onEdit: () => void
-  onDelete: () => void
-  moreActions: MoreAction[]
-}) {
-  const activating = pending?.action === "activate" && pending.id === id
-  const rowPending = pending?.id === id
-
-  return (
-    <Item
-      size="sm"
-      variant={active || selected ? "muted" : "outline"}
-      aria-label={`${kind === "account" ? "账号" : "API 服务"} ${name}`}
-    >
-      <ItemMedia variant="icon">
-        <HugeiconsIcon icon={kind === "account" ? Key01Icon : ApiIcon} />
-      </ItemMedia>
-      <ItemContent title={description}>
-        <ItemTitle className="w-full">{name}</ItemTitle>
-        <ItemDescription className="truncate">{description}</ItemDescription>
-      </ItemContent>
-      <ItemActions className="max-w-full flex-wrap justify-end gap-1 self-start">
-        {active && <Badge>当前</Badge>}
-        {selected && <Badge variant="secondary">已选</Badge>}
-        {unavailable && <Badge variant="destructive">{unavailableLabel}</Badge>}
-      </ItemActions>
-      <ItemFooter className="justify-end gap-1.5">
-        {canView && !selected && (
-          <Button
-            type="button"
-            size="xs"
-            variant="ghost"
-            className="mr-auto"
-            disabled={frozen}
-            onClick={onView}
-          >
-            查看
-          </Button>
-        )}
-        <Button
-          type="button"
-          size="xs"
-          variant="outline"
-          disabled={frozen || active || activateDisabled}
-          aria-busy={activating}
-          onClick={onActivate}
-        >
-          {activating && <Spinner data-icon="inline-start" />}
-          设为当前
-        </Button>
-        <Tooltip>
-          <TooltipTrigger
-            render={
-              <Button
-                type="button"
-                size="icon-xs"
-                variant="outline"
-                aria-label={`编辑${kind === "account" ? "账号" : "服务"}：${name}`}
-                disabled={frozen}
-                onClick={onEdit}
-              />
-            }
-          >
-            <HugeiconsIcon icon={Edit02Icon} />
-          </TooltipTrigger>
-          <TooltipContent>编辑</TooltipContent>
-        </Tooltip>
-        <Tooltip>
-          <TooltipTrigger
-            render={
-              <Button
-                type="button"
-                size="icon-xs"
-                variant="destructive"
-                aria-label={`删除${kind === "account" ? "账号" : "服务"}：${name}`}
-                disabled={frozen}
-                onClick={onDelete}
-              />
-            }
-          >
-            <HugeiconsIcon icon={Delete02Icon} />
-          </TooltipTrigger>
-          <TooltipContent>删除</TooltipContent>
-        </Tooltip>
-        <DropdownMenu>
-          <DropdownMenuTrigger
-            render={
-              <Button
-                type="button"
-                size="icon-xs"
-                variant="ghost"
-                aria-label={`更多管理操作：${name}`}
-                title={`更多管理操作：${name}`}
-                disabled={frozen}
-              />
-            }
-          >
-            {rowPending && !activating && pending?.action !== "delete" ? (
-              <Spinner />
-            ) : (
-              <HugeiconsIcon icon={MoreHorizontalIcon} />
-            )}
-          </DropdownMenuTrigger>
-          <DropdownMenuContent align="end">
-            <DropdownMenuGroup>
-              {moreActions.map((action) => (
-                <DropdownMenuItem
-                  key={action.label}
-                  disabled={frozen}
-                  onClick={action.onSelect}
-                >
-                  <HugeiconsIcon icon={action.icon} />
-                  {action.label}
-                </DropdownMenuItem>
-              ))}
-            </DropdownMenuGroup>
-          </DropdownMenuContent>
-        </DropdownMenu>
-      </ItemFooter>
-    </Item>
-  )
-}
-
-function EmptyConnectionItem({ label }: { label: string }) {
-  return (
-    <Item size="xs" variant="outline">
-      <ItemContent>
-        <ItemDescription>{label}</ItemDescription>
-      </ItemContent>
-    </Item>
-  )
-}
-
-function accountDescription(account: OfficialAccountView) {
-  const quota = quotaWindow(account.quota)
-  const quotaText = quota
-    ? `剩余 ${quota.remainingPercent.toFixed(1)}%`
-    : account.quota.status === "never"
-      ? "额度未刷新"
-      : account.quota.status === "unauthorized"
-        ? "登录已失效"
-        : "额度不可用"
-  return `${quotaText} · ${account.email || account.name || "OpenAI 账号"}`
-}
-
-function accountIsExpired(account: OfficialAccountView) {
-  return (
-    account.expiresAt != null &&
-    account.expiresAt <= Math.floor(Date.now() / 1000)
   )
 }
 

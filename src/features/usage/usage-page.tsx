@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react"
+import { useCallback, useMemo, useState } from "react"
 import {
   Add01Icon,
   Database02Icon,
@@ -19,17 +19,7 @@ import {
   ChartLegendContent,
   ChartTooltip,
   ChartTooltipContent,
-  type ChartConfig,
 } from "@/components/ui/chart"
-import {
-  Dialog,
-  DialogBody,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog"
 import {
   Empty,
   EmptyDescription,
@@ -37,15 +27,6 @@ import {
   EmptyMedia,
   EmptyTitle,
 } from "@/components/ui/empty"
-import {
-  Field,
-  FieldContent,
-  FieldDescription,
-  FieldGroup,
-  FieldLabel,
-} from "@/components/ui/field"
-import { Input } from "@/components/ui/input"
-import { Progress, ProgressLabel } from "@/components/ui/progress"
 import {
   Item,
   ItemActions,
@@ -55,23 +36,12 @@ import {
   ItemTitle,
 } from "@/components/ui/item"
 import { Skeleton } from "@/components/ui/skeleton"
-import {
-  Sheet,
-  SheetBody,
-  SheetContent,
-  SheetDescription,
-  SheetHeader,
-  SheetTitle,
-} from "@/components/ui/sheet"
 import { Spinner } from "@/components/ui/spinner"
-import { Switch } from "@/components/ui/switch"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
-import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group"
 import { toast } from "@/components/ui/toast"
 import {
   cacheHitRate,
   errorMessage,
-  formatDate,
   formatInteger,
   formatPercent,
   formatRange,
@@ -79,20 +49,18 @@ import {
   formatUsd,
   todayRange,
 } from "@/lib/format"
+import {
+  tokenTickFormatter,
+  trendPointsToSeries,
+  usageChartConfig,
+} from "@/lib/chart"
+import { useAsync } from "@/hooks/use-async"
 import { call } from "@/lib/ipc"
-import type {
-  BillingMode,
-  PricingRule,
-  UsageGroupBy,
-  UsageOverview,
-  UsageRow,
-} from "@/types"
+import type { UsageGroupBy, UsageRow } from "@/types"
 
-const chartConfig = {
-  input: { label: "输入 Token", color: "var(--chart-1)" },
-  output: { label: "输出 Token", color: "var(--chart-2)" },
-  cache: { label: "缓存 Token", color: "var(--chart-3)" },
-} satisfies ChartConfig
+import { PricingEditor } from "./pricing-editor-dialog"
+import { billingModeLabel, pricingSummary } from "./pricing"
+import { UsageDetail } from "./usage-detail-sheet"
 
 export function UsagePage({
   refreshRevision,
@@ -105,56 +73,39 @@ export function UsagePage({
   days: number
   groupBy: UsageGroupBy
 }) {
-  const [overview, setOverview] = useState<UsageOverview>()
-  const [rules, setRules] = useState<PricingRule[]>([])
   const [tab, setTab] = useState("details")
   const [selected, setSelected] = useState<UsageRow>()
   const [ruleOpen, setRuleOpen] = useState(false)
   const [busy, setBusy] = useState(false)
-  const [overviewError, setOverviewError] = useState<string>()
-  const [rulesError, setRulesError] = useState<string>()
 
   const query = useMemo(
     () => ({ range: todayRange(days), groupBy }),
     [days, groupBy]
   )
 
-  useEffect(() => {
-    let cancelled = false
-    void call("usage_get_overview", { query })
-      .then((nextOverview) => {
-        if (cancelled) return
-        setOverview(nextOverview)
-        setOverviewError(undefined)
-      })
-      .catch((reason) => !cancelled && setOverviewError(errorMessage(reason)))
-    return () => {
-      cancelled = true
-    }
-  }, [query, refreshRevision])
+  const fetchOverview = useCallback(
+    () => call("usage_get_overview", { query }),
+    [query]
+  )
+  const {
+    data: overview,
+    error: overviewError,
+    mutate: setOverview,
+  } = useAsync(fetchOverview, undefined, refreshRevision)
 
-  useEffect(() => {
-    let cancelled = false
-    void call("usage_list_pricing_rules", {})
-      .then((nextRules) => {
-        if (cancelled) return
-        setRules(nextRules)
-        setRulesError(undefined)
-      })
-      .catch((reason) => !cancelled && setRulesError(errorMessage(reason)))
-    return () => {
-      cancelled = true
-    }
-  }, [refreshRevision])
+  const fetchRules = useCallback(() => call("usage_list_pricing_rules", {}), [])
+  const {
+    data: rules,
+    error: rulesError,
+    mutate: setRules,
+  } = useAsync(fetchRules, undefined, refreshRevision)
 
   const refreshUsage = async () => {
     setBusy(true)
     try {
       setOverview(await call("usage_refresh", { query }))
-      setOverviewError(undefined)
       toast.add({ title: "用量已刷新", type: "success" })
     } catch (reason) {
-      setOverviewError(errorMessage(reason))
       toast.add({
         title: "刷新失败",
         description: errorMessage(reason),
@@ -164,6 +115,34 @@ export function UsagePage({
       setBusy(false)
     }
   }
+
+  const deleteRule = async (id: string) => {
+    try {
+      await call("usage_delete_pricing_rule", { id })
+      setRules((current) => (current ?? []).filter((rule) => rule.id !== id))
+      toast.add({ title: "价格规则已删除", type: "success" })
+    } catch (reason) {
+      toast.add({
+        title: "删除失败",
+        description: errorMessage(reason),
+        type: "error",
+      })
+    }
+  }
+
+  const points = useMemo(
+    () => trendPointsToSeries(overview?.trendPoints ?? []),
+    [overview]
+  )
+  const cacheRows = useMemo(
+    () =>
+      overview?.rows.filter(
+        (row) =>
+          row.tokens.cachedInputTokens > 0 ||
+          row.tokens.cacheWriteInputTokens > 0
+      ) ?? [],
+    [overview]
+  )
 
   if (!overview && overviewError)
     return (
@@ -183,17 +162,6 @@ export function UsagePage({
         <Skeleton className="rounded-2xl" />
       </div>
     )
-
-  const points = overview.trendPoints.map((point) => ({
-    date: formatDate(point.dayStartMs),
-    input: point.tokens.inputTokens,
-    output: point.tokens.outputTokens + point.tokens.reasoningOutputTokens,
-    cache: point.tokens.cachedInputTokens + point.tokens.cacheWriteInputTokens,
-  }))
-  const cacheRows = overview.rows.filter(
-    (row) =>
-      row.tokens.cachedInputTokens > 0 || row.tokens.cacheWriteInputTokens > 0
-  )
 
   return (
     <div className="flex min-h-full flex-col gap-3 px-3 pt-1 pb-3">
@@ -235,7 +203,7 @@ export function UsagePage({
         </CardHeader>
         <CardContent className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3">
           <ChartContainer
-            config={chartConfig}
+            config={usageChartConfig}
             className="aspect-auto h-28 w-full"
             initialDimension={{ width: 450, height: 112 }}
           >
@@ -250,7 +218,7 @@ export function UsagePage({
                 tickLine={false}
                 axisLine={false}
                 tickMargin={8}
-                tickFormatter={(value) => formatTokens(Number(value))}
+                tickFormatter={tokenTickFormatter}
               />
               <ChartTooltip
                 cursor={false}
@@ -371,7 +339,7 @@ export function UsagePage({
               )}
             </TabsContent>
             <TabsContent value="pricing" className="mt-0">
-              {rules.length ? (
+              {rules?.length ? (
                 <ItemGroup>
                   {rules.map((rule) => (
                     <Item
@@ -482,20 +450,6 @@ export function UsagePage({
       />
     </div>
   )
-
-  async function deleteRule(id: string) {
-    try {
-      await call("usage_delete_pricing_rule", { id })
-      setRules((value) => value.filter((rule) => rule.id !== id))
-      toast.add({ title: "价格规则已删除", type: "success" })
-    } catch (reason) {
-      toast.add({
-        title: "删除失败",
-        description: errorMessage(reason),
-        type: "error",
-      })
-    }
-  }
 }
 
 function Metric({ label, value }: { label: string; value: string }) {
@@ -505,268 +459,4 @@ function Metric({ label, value }: { label: string; value: string }) {
       <div className="mt-0.5 text-base font-medium tabular-nums">{value}</div>
     </div>
   )
-}
-
-function UsageDetail({
-  row,
-  groupBy,
-  onOpenChange,
-}: {
-  row?: UsageRow
-  groupBy: UsageGroupBy
-  onOpenChange: (open: boolean) => void
-}) {
-  if (!row) return null
-  const hitRate = cacheHitRate(row.tokens)
-  const details = [
-    ["普通输入", row.tokens.inputTokens],
-    ["缓存输入", row.tokens.cachedInputTokens],
-    ["缓存写入", row.tokens.cacheWriteInputTokens],
-    ["普通输出", row.tokens.outputTokens],
-    ["推理输出", row.tokens.reasoningOutputTokens],
-  ] as const
-  return (
-    <Sheet open onOpenChange={onOpenChange}>
-      <SheetContent>
-        <SheetHeader>
-          <SheetTitle>
-            {groupBy === "model" ? row.model : row.sourceName}
-          </SheetTitle>
-          <SheetDescription>
-            {groupBy === "model" ? "模型" : "账号"}汇总的 Token 构成
-          </SheetDescription>
-        </SheetHeader>
-        <SheetBody className="grid content-start gap-2">
-          <Progress
-            value={hitRate ?? 0}
-            className="rounded-2xl bg-muted/40 p-3"
-          >
-            <ProgressLabel>缓存命中率</ProgressLabel>
-            <span className="ml-auto text-sm text-muted-foreground tabular-nums">
-              {formatPercent(hitRate)}
-            </span>
-          </Progress>
-          {details.map(([label, value]) => (
-            <div
-              key={label}
-              className="flex items-center justify-between rounded-2xl bg-muted px-3 py-2"
-            >
-              <span className="text-muted-foreground">{label}</span>
-              <span className="font-medium tabular-nums">
-                {formatInteger(value)}
-              </span>
-            </div>
-          ))}
-          <div className="flex items-center justify-between border-t pt-4">
-            <span className="font-medium">合计</span>
-            <span className="text-lg font-medium tabular-nums">
-              {formatInteger(row.tokens.totalTokens)}
-            </span>
-          </div>
-        </SheetBody>
-      </SheetContent>
-    </Sheet>
-  )
-}
-
-function PricingEditor({
-  open,
-  onOpenChange,
-  onSaved,
-}: {
-  open: boolean
-  onOpenChange: (open: boolean) => void
-  onSaved: () => void
-}) {
-  const [pattern, setPattern] = useState("")
-  const [billingMode, setBillingMode] =
-    useState<Extract<BillingMode, "token" | "unpriced">>("token")
-  const [input, setInput] = useState("2.50")
-  const [cachedRead, setCachedRead] = useState("0.25")
-  const [cacheWrite, setCacheWrite] = useState("3.00")
-  const [output, setOutput] = useState("10.00")
-  const [cacheWriteIncluded, setCacheWriteIncluded] = useState(true)
-  const [active, setActive] = useState(true)
-  const [busy, setBusy] = useState(false)
-  const save = async () => {
-    setBusy(true)
-    const now = Date.now()
-    const rule: PricingRule = {
-      id: `rule-${now}`,
-      version: 1,
-      active,
-      scopeKind: "global_model",
-      modelPattern: pattern,
-      matchKind: "exact",
-      billingMode,
-      inputUsdPerMillion: billingMode === "token" ? input : undefined,
-      cachedReadUsdPerMillion: billingMode === "token" ? cachedRead : undefined,
-      cacheWriteUsdPerMillion: billingMode === "token" ? cacheWrite : undefined,
-      outputUsdPerMillion: billingMode === "token" ? output : undefined,
-      cacheWriteIncludedInInput: cacheWriteIncluded,
-      effectiveFromMs: now,
-      createdAtMs: now,
-      updatedAtMs: now,
-    }
-    try {
-      await call("usage_save_pricing_rule", { input: rule })
-      toast.add({ title: "价格规则已保存", type: "success" })
-      onSaved()
-    } catch (reason) {
-      toast.add({
-        title: "保存失败",
-        description: errorMessage(reason),
-        type: "error",
-      })
-    } finally {
-      setBusy(false)
-    }
-  }
-  return (
-    <Dialog
-      open={open}
-      onOpenChange={(nextOpen) => {
-        if (!nextOpen && busy) return
-        onOpenChange(nextOpen)
-      }}
-    >
-      <DialogContent showCloseButton={!busy} aria-busy={busy}>
-        <DialogHeader>
-          <DialogTitle>添加价格规则</DialogTitle>
-          <DialogDescription>
-            选择不计价，或按每百万 Token 的美元金额计价。
-          </DialogDescription>
-        </DialogHeader>
-        <DialogBody>
-          <FieldGroup>
-            <Field>
-              <FieldLabel htmlFor="price-model">模型</FieldLabel>
-              <Input
-                id="price-model"
-                value={pattern}
-                placeholder="gpt-5.6"
-                onChange={(e) => setPattern(e.target.value)}
-              />
-            </Field>
-            <Field>
-              <FieldLabel>计费方式</FieldLabel>
-              <ToggleGroup
-                variant="outline"
-                spacing={0}
-                className="w-full"
-                value={[billingMode]}
-                onValueChange={(value) => {
-                  if (value[0] === "token" || value[0] === "unpriced") {
-                    setBillingMode(value[0])
-                  }
-                }}
-              >
-                <ToggleGroupItem className="flex-1" value="token">
-                  按 Token 计价
-                </ToggleGroupItem>
-                <ToggleGroupItem className="flex-1" value="unpriced">
-                  不计价
-                </ToggleGroupItem>
-              </ToggleGroup>
-              <FieldDescription>
-                不计价规则会保留 Token 用量，但不估算费用。
-              </FieldDescription>
-            </Field>
-            {billingMode === "token" && (
-              <FieldGroup className="grid grid-cols-2 gap-3">
-                <Field>
-                  <FieldLabel htmlFor="price-input">普通输入</FieldLabel>
-                  <Input
-                    id="price-input"
-                    inputMode="decimal"
-                    value={input}
-                    onChange={(e) => setInput(e.target.value)}
-                  />
-                </Field>
-                <Field>
-                  <FieldLabel htmlFor="price-cached-read">缓存读取</FieldLabel>
-                  <Input
-                    id="price-cached-read"
-                    inputMode="decimal"
-                    value={cachedRead}
-                    onChange={(e) => setCachedRead(e.target.value)}
-                  />
-                </Field>
-                <Field>
-                  <FieldLabel htmlFor="price-cache-write">缓存写入</FieldLabel>
-                  <Input
-                    id="price-cache-write"
-                    inputMode="decimal"
-                    value={cacheWrite}
-                    onChange={(e) => setCacheWrite(e.target.value)}
-                  />
-                </Field>
-                <Field>
-                  <FieldLabel htmlFor="price-output">输出</FieldLabel>
-                  <Input
-                    id="price-output"
-                    inputMode="decimal"
-                    value={output}
-                    onChange={(e) => setOutput(e.target.value)}
-                  />
-                </Field>
-              </FieldGroup>
-            )}
-            {billingMode === "token" && (
-              <Field orientation="horizontal">
-                <FieldContent>
-                  <FieldLabel htmlFor="price-cache-write-included">
-                    输入总量包含缓存写入
-                  </FieldLabel>
-                  <FieldDescription>
-                    开启后，普通输入计费会扣除缓存读取和缓存写入 Token。
-                  </FieldDescription>
-                </FieldContent>
-                <Switch
-                  id="price-cache-write-included"
-                  checked={cacheWriteIncluded}
-                  onCheckedChange={setCacheWriteIncluded}
-                />
-              </Field>
-            )}
-            <Field orientation="horizontal">
-              <FieldLabel htmlFor="price-active">立即启用</FieldLabel>
-              <Switch
-                id="price-active"
-                checked={active}
-                onCheckedChange={setActive}
-              />
-            </Field>
-          </FieldGroup>
-        </DialogBody>
-        <DialogFooter>
-          <Button
-            variant="outline"
-            disabled={busy}
-            onClick={() => onOpenChange(false)}
-          >
-            取消
-          </Button>
-          <Button disabled={busy || !pattern} onClick={() => void save()}>
-            {busy && <Spinner data-icon="inline-start" />}保存
-          </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
-  )
-}
-
-function pricingSummary(rule: PricingRule) {
-  if (rule.billingMode === "subscription") {
-    return `${rule.scopeKind} · 旧版订阅规则（将按不计价迁移）`
-  }
-  if (rule.billingMode === "unpriced") return `${rule.scopeKind} · 不计价`
-  const price = (value?: string) => (value ? `$${value}` : "未设置")
-  return `${rule.scopeKind} · 输入 ${price(rule.inputUsdPerMillion)} · 缓存读取 ${price(rule.cachedReadUsdPerMillion)} · 缓存写入 ${price(rule.cacheWriteUsdPerMillion)} · 输出 ${price(rule.outputUsdPerMillion)} / 1M`
-}
-
-function billingModeLabel(mode: BillingMode) {
-  if (mode === "token") return "按 Token"
-  if (mode === "unpriced") return "不计价"
-  return "旧版订阅规则"
 }

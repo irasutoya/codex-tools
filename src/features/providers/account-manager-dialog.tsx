@@ -37,9 +37,15 @@ import {
   TableRow,
 } from "@/components/ui/table"
 import { toast } from "@/components/ui/toast"
+import { useAsyncAction } from "@/hooks/use-async-action"
 import { errorMessage } from "@/lib/format"
 import { call } from "@/lib/ipc"
 import type { OfficialAccountView, Provider } from "@/types"
+
+import {
+  buildFallbackCandidates,
+  switchActiveConnection,
+} from "./connection-utils"
 
 const MAX_REMARK_LENGTH = 200
 
@@ -54,10 +60,6 @@ type AccountManagerDialogProps = {
   onRefresh: () => void
 }
 
-type FallbackCandidate =
-  | { kind: "account"; id: string; label: string }
-  | { kind: "provider"; id: string; label: string }
-
 export function AccountManagerDialog({
   open,
   onOpenChange,
@@ -70,10 +72,13 @@ export function AccountManagerDialog({
 }: AccountManagerDialogProps) {
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
   const [drafts, setDrafts] = useState<Record<string, string>>({})
-  const [busy, setBusy] = useState<"saving" | "deleting">()
   const [deleteOpen, setDeleteOpen] = useState(false)
-  const busyRef = useRef<"saving" | "deleting" | undefined>(undefined)
   const wasOpenRef = useRef(false)
+  const {
+    busy,
+    begin: beginBusy,
+    end: endBusy,
+  } = useAsyncAction<"saving" | "deleting">()
 
   useEffect(() => {
     if (!open) {
@@ -126,19 +131,6 @@ export function AccountManagerDialog({
   )
   const frozen = Boolean(busy)
 
-  const beginBusy = (action: "saving" | "deleting") => {
-    if (busyRef.current) return false
-    busyRef.current = action
-    setBusy(action)
-    return true
-  }
-
-  const endBusy = (action: "saving" | "deleting") => {
-    if (busyRef.current !== action) return
-    busyRef.current = undefined
-    setBusy(undefined)
-  }
-
   const close = () => {
     setDeleteOpen(false)
     setSelectedIds(new Set())
@@ -147,7 +139,7 @@ export function AccountManagerDialog({
   }
 
   const requestOpenChange = (nextOpen: boolean) => {
-    if (!nextOpen && busyRef.current) return
+    if (!nextOpen && busy) return
     if (!nextOpen) {
       setDeleteOpen(false)
       setSelectedIds(new Set())
@@ -157,7 +149,7 @@ export function AccountManagerDialog({
   }
 
   const toggleAccount = (id: string, checked: boolean) => {
-    if (busyRef.current) return
+    if (busy) return
     setSelectedIds((current) => {
       const next = new Set(current)
       if (checked) next.add(id)
@@ -166,44 +158,11 @@ export function AccountManagerDialog({
     })
   }
 
-  const fallbackCandidates = () => {
-    const remainingAccounts = accounts.filter(
-      (account) => !selectedIds.has(account.id)
-    )
-    const nowSeconds = Math.floor(Date.now() / 1000)
-    const healthyAccounts = remainingAccounts.filter(
-      (account) =>
-        account.quota.status !== "unauthorized" &&
-        (account.expiresAt == null || account.expiresAt > nowSeconds)
-    )
-    const otherAccounts = remainingAccounts.filter(
-      (account) => !healthyAccounts.some((healthy) => healthy.id === account.id)
-    )
-    const enabledProviders = providers.filter(
-      (provider) => provider.enabled && provider.hasApiKey
-    )
-
-    return [
-      ...healthyAccounts.map((account): FallbackCandidate => ({
-        kind: "account",
-        id: account.id,
-        label: account.remark || account.name,
-      })),
-      ...enabledProviders.map((provider): FallbackCandidate => ({
-        kind: "provider",
-        id: provider.id,
-        label: provider.name,
-      })),
-      ...otherAccounts.map((account): FallbackCandidate => ({
-        kind: "account",
-        id: account.id,
-        label: account.remark || account.name,
-      })),
-    ]
-  }
+  const fallbackCandidates = () =>
+    buildFallbackCandidates(accounts, providers, selectedIds)
 
   const requestDelete = () => {
-    if (!selectedCount || busyRef.current) return
+    if (!selectedCount || busy) return
     if (changedUpdates.length > 0) {
       toast.add({
         title: "请先保存账号备注",
@@ -251,17 +210,9 @@ export function AccountManagerDialog({
 
     try {
       if (activeSelected) {
-        for (const candidate of fallbackCandidates()) {
-          try {
-            await (candidate.kind === "account"
-              ? call("connections_activate_account", { id: candidate.id })
-              : call("connections_activate", { id: candidate.id }))
-            switchedId = candidate.id
-            break
-          } catch (reason) {
-            lastSwitchError = reason
-          }
-        }
+        const switchResult = await switchActiveConnection(fallbackCandidates())
+        switchedId = switchResult.switchedId
+        lastSwitchError = switchResult.error
 
         if (!switchedId) {
           onRefresh()
@@ -350,7 +301,7 @@ export function AccountManagerDialog({
                         indeterminate={someSelected}
                         disabled={frozen || accounts.length === 0}
                         onCheckedChange={(checked) => {
-                          if (busyRef.current) return
+                          if (busy) return
                           setSelectedIds(
                             checked
                               ? new Set(accounts.map((account) => account.id))
@@ -408,7 +359,7 @@ export function AccountManagerDialog({
                             placeholder="未设置备注"
                             value={drafts[account.id] ?? account.remark}
                             onChange={(event) => {
-                              if (busyRef.current) return
+                              if (busy) return
                               setDrafts((current) => ({
                                 ...current,
                                 [account.id]: event.target.value,
@@ -460,7 +411,7 @@ export function AccountManagerDialog({
       <AlertDialog
         open={deleteOpen}
         onOpenChange={(nextOpen) => {
-          if (!nextOpen && busyRef.current) return
+          if (!nextOpen && busy) return
           setDeleteOpen(nextOpen)
         }}
       >

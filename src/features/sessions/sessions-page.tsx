@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react"
+import { useCallback, useRef, useState } from "react"
 import {
   Database01Icon,
   Folder01Icon,
@@ -54,8 +54,9 @@ import { Skeleton } from "@/components/ui/skeleton"
 import { Spinner } from "@/components/ui/spinner"
 import { toast } from "@/components/ui/toast"
 import { errorMessage, formatDate, formatInteger } from "@/lib/format"
+import { useAsync } from "@/hooks/use-async"
 import { call } from "@/lib/ipc"
-import type { PageResult, RepairScan, RepairTarget, Session } from "@/types"
+import type { RepairTarget } from "@/types"
 
 const pageSize = 6
 
@@ -69,67 +70,45 @@ export function SessionsPage({
   query: string
 }) {
   const [page, setPage] = useState(1)
-  const [result, setResult] = useState<PageResult<Session>>()
-  const [scan, setScan] = useState<RepairScan>()
   const [repairTarget, setRepairTarget] = useState<RepairTarget>()
   const [busy, setBusy] = useState(false)
-  const [listError, setListError] = useState<string>()
-  const [scanError, setScanError] = useState<string>()
   const loadedRefreshRevision = useRef(refreshRevision)
 
-  useEffect(() => {
-    let cancelled = false
+  const fetchList = useCallback(() => {
     const forceRefresh = refreshRevision !== loadedRefreshRevision.current
     loadedRefreshRevision.current = refreshRevision
-    void call("sessions_list", {
+    return call("sessions_list", {
       query,
       page,
       pageSize,
       refresh: forceRefresh,
     })
-      .then((nextResult) => {
-        if (cancelled) return
-        setResult(nextResult)
-        if (nextResult.page !== page) setPage(nextResult.page)
-        setListError(undefined)
-      })
-      .catch((reason) => {
-        if (cancelled) return
-        const message = errorMessage(reason)
-        setListError(message)
-        toast.add({
-          title: "无法读取会话列表",
-          description: message,
-          type: "error",
-        })
-      })
-    return () => {
-      cancelled = true
-    }
   }, [page, query, refreshRevision])
+  const { data: result, error: listError } = useAsync(fetchList, {
+    onError: (message) =>
+      toast.add({
+        title: "无法读取会话列表",
+        description: message,
+        type: "error",
+      }),
+    onSuccess: (nextResult) => {
+      if (nextResult.page !== page) setPage(nextResult.page)
+    },
+  })
 
-  useEffect(() => {
-    let cancelled = false
-    void call("sessions_scan")
-      .then((nextScan) => {
-        if (cancelled) return
-        setScan(nextScan)
-        setScanError(undefined)
-      })
-      .catch((reason) => {
-        if (cancelled) return
-        const message = errorMessage(reason)
-        setScanError(message)
+  const fetchScan = useCallback(() => call("sessions_scan"), [])
+  const { data: scan, error: scanError } = useAsync(
+    fetchScan,
+    {
+      onError: (message) =>
         toast.add({
           title: "无法扫描会话",
           description: message,
           type: "error",
-        })
-      })
-    return () => {
-      cancelled = true
-    }
-  }, [refreshRevision])
+        }),
+    },
+    refreshRevision
+  )
 
   const repair = async () => {
     if (!repairTarget) return

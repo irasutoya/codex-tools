@@ -164,42 +164,6 @@ export type TokenRates = {
   output?: number
 }
 
-export type UsageShareAccount = {
-  key: string
-  displayName: string
-  maskedName: string
-  sourceKind: UsageSourceKind
-  totalTokens: number
-  estimatedCostMicrousd: number
-  unpricedTokens: number
-  partialTokens: number
-  requests: number
-  costStatus: CostStatus
-  models: UsageShareAccountModel[]
-}
-
-export type UsageShareAccountModel = {
-  key: string
-  model: string
-  totalTokens: number
-  estimatedCostMicrousd: number
-  unpricedTokens: number
-  partialTokens: number
-  requests: number
-  costStatus: CostStatus
-}
-
-export type UsageShareData = {
-  dateLabel: string
-  timezone: string
-  totalTokens: number
-  estimatedCostMicrousd: number
-  unpricedTokens: number
-  partialTokens: number
-  requests: number
-  accounts: UsageShareAccount[]
-}
-
 export type RepriceResult = {
   eventsRepriced: number
   estimatedCostMicrousd: number
@@ -479,18 +443,3 @@ export type ModelUnlockResult = {
   modelCount: number
   message: string
 }
-
-export const emptyProvider = (): Provider => ({
-  id: "",
-  name: "",
-  baseUrl: "https://api.openai.com/v1",
-  headers: {},
-  timeoutSecs: 30,
-  enabled: true,
-  active: false,
-  apiType: "responses",
-  apiKey: "",
-  hasApiKey: false,
-  createdAt: 0,
-  updatedAt: 0,
-})

@@ -49,6 +49,7 @@ import { Skeleton } from "@/components/ui/skeleton"
 import { Spinner } from "@/components/ui/spinner"
 import { toast } from "@/components/ui/toast"
 import { errorMessage } from "@/lib/format"
+import { useAsyncAction } from "@/hooks/use-async-action"
 import { call } from "@/lib/ipc"
 import type {
   CodexAppSetting,
@@ -73,7 +74,7 @@ export function SettingsPage({
   const [unlock, setUnlock] = useState<ModelUnlockStatus>()
   const [diagnostics, setDiagnostics] = useState<SupportDiagnostics>()
   const [preview, setPreview] = useState<ConfigPatchPreview>()
-  const [busy, setBusy] = useState<string>()
+  const { busy, begin, end, run } = useAsyncAction()
   const [loadError, setLoadError] = useState<{
     section: SettingsSection
     message: string
@@ -124,26 +125,18 @@ export function SettingsPage({
     }
   }, [refreshRevision, section])
 
-  const run = async (
-    key: string,
-    action: () => Promise<unknown>,
-    message: string
-  ) => {
-    setBusy(key)
+  const onPreview = async () => {
+    if (!begin("preview")) return
     try {
-      await action()
-      toast.add({ title: message, type: "success" })
-      onRefresh()
-      return true
+      setPreview(await call("settings_preview_activation"))
     } catch (reason) {
       toast.add({
-        title: "操作失败",
+        title: "无法生成预览",
         description: errorMessage(reason),
         type: "error",
       })
-      return false
     } finally {
-      setBusy(undefined)
+      end("preview")
     }
   }
 
@@ -179,26 +172,12 @@ export function SettingsPage({
         <ConfigSection
           overview={overview!}
           busy={busy}
-          onPreview={async () => {
-            setBusy("preview")
-            try {
-              setPreview(await call("settings_preview_activation"))
-            } catch (reason) {
-              toast.add({
-                title: "无法生成预览",
-                description: errorMessage(reason),
-                type: "error",
-              })
-            } finally {
-              setBusy(undefined)
-            }
-          }}
+          onPreview={onPreview}
           onOfficial={() =>
-            void run(
-              "official",
-              () => call("connections_activate_official"),
-              "已切换为 OpenAI 官方配置"
-            )
+            void run("official", () => call("connections_activate_official"), {
+              success: "已切换为 OpenAI 官方配置",
+              onSuccess: onRefresh,
+            })
           }
         />
       )}
@@ -214,7 +193,7 @@ export function SettingsPage({
             void run(
               "app",
               () => call("settings_save_codex_app_path", { path }),
-              "桌面应用路径已保存"
+              { success: "桌面应用路径已保存", onSuccess: onRefresh }
             )
           }
         />
@@ -225,18 +204,16 @@ export function SettingsPage({
           busy={busy}
           onRefresh={onRefresh}
           onUnlock={() =>
-            void run(
-              "unlock",
-              () => call("settings_unlock_models"),
-              "模型已注入 Codex"
-            )
+            void run("unlock", () => call("settings_unlock_models"), {
+              success: "模型已注入 Codex",
+              onSuccess: onRefresh,
+            })
           }
           onDebug={() =>
-            void run(
-              "debug",
-              () => call("settings_launch_codex_debug"),
-              "Codex 调试实例已启动"
-            )
+            void run("debug", () => call("settings_launch_codex_debug"), {
+              success: "Codex 调试实例已启动",
+              onSuccess: onRefresh,
+            })
           }
         />
       )}
@@ -283,8 +260,14 @@ export function SettingsPage({
                     call("settings_apply_activation", {
                       operationId: preview.operationId,
                     }),
-                  "配置已应用"
-                ).then((saved) => saved && setPreview(undefined))
+                  {
+                    success: "配置已应用",
+                    onSuccess: () => {
+                      onRefresh()
+                      setPreview(undefined)
+                    },
+                  }
+                )
               }
             >
               {busy === "apply" && <Spinner data-icon="inline-start" />}应用配置

@@ -5,30 +5,60 @@ const compactNumber = new Intl.NumberFormat("zh-CN", {
   maximumFractionDigits: 1,
 })
 
+const integerFormatter = new Intl.NumberFormat("zh-CN")
+
+const usdFormatterPrecise = new Intl.NumberFormat("zh-CN", {
+  style: "currency",
+  currency: "USD",
+  minimumFractionDigits: 4,
+  maximumFractionDigits: 4,
+})
+
+const usdFormatterCompact = new Intl.NumberFormat("zh-CN", {
+  style: "currency",
+  currency: "USD",
+  minimumFractionDigits: 2,
+  maximumFractionDigits: 4,
+})
+
+const dateFormatter = new Intl.DateTimeFormat("zh-CN", {
+  month: "2-digit",
+  day: "2-digit",
+})
+
+const dateTimeFormatter = new Intl.DateTimeFormat("zh-CN", {
+  month: "2-digit",
+  day: "2-digit",
+  hour: "2-digit",
+  minute: "2-digit",
+})
+
+const percentFormatter = new Intl.NumberFormat("zh-CN", {
+  style: "percent",
+  minimumFractionDigits: 1,
+  maximumFractionDigits: 1,
+})
+
 export function formatTokens(value = 0) {
   return compactNumber.format(value)
 }
 
 export function formatInteger(value = 0) {
-  return new Intl.NumberFormat("zh-CN").format(value)
+  return integerFormatter.format(value)
 }
 
 export function formatUsd(microusd = 0) {
-  return new Intl.NumberFormat("zh-CN", {
-    style: "currency",
-    currency: "USD",
-    minimumFractionDigits: microusd >= 100_000 ? 2 : 4,
-    maximumFractionDigits: 4,
-  }).format(microusd / 1_000_000)
+  const formatter =
+    microusd >= 100_000 ? usdFormatterCompact : usdFormatterPrecise
+  return formatter.format(microusd / 1_000_000)
 }
 
 export function formatDate(value?: number, includeTime = false) {
   if (!value) return "—"
-  return new Intl.DateTimeFormat("zh-CN", {
-    month: "2-digit",
-    day: "2-digit",
-    ...(includeTime ? { hour: "2-digit", minute: "2-digit" } : {}),
-  }).format(new Date(value > 10_000_000_000 ? value : value * 1000))
+  const formatter = includeTime ? dateTimeFormatter : dateFormatter
+  return formatter.format(
+    new Date(value > 10_000_000_000 ? value : value * 1000)
+  )
 }
 
 export function formatRange(range: UsageRange) {
@@ -55,13 +85,7 @@ export function cacheHitRate(tokens?: TokenBreakdown) {
 }
 
 export function formatPercent(value?: number) {
-  return value === undefined
-    ? "—"
-    : new Intl.NumberFormat("zh-CN", {
-        style: "percent",
-        minimumFractionDigits: 1,
-        maximumFractionDigits: 1,
-      }).format(value / 100)
+  return value === undefined ? "—" : percentFormatter.format(value / 100)
 }
 
 export function quotaWindow(quota?: AccountQuota) {
