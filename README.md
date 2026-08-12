@@ -1,6 +1,10 @@
 # Codex Tools
 
 <p align="center">
+  <img alt="Codex Tools" src="assets/app-icon-master.png" width="96" />
+</p>
+
+<p align="center">
   在 Windows 和 macOS 上管理 Codex 的 OpenAI 账号与兼容 Responses API 的第三方服务。
 </p>
 
