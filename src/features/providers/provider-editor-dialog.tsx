@@ -10,13 +10,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog"
-import {
-  Field,
-  FieldContent,
-  FieldDescription,
-  FieldGroup,
-  FieldLabel,
-} from "@/components/ui/field"
+import { Field, FieldGroup, FieldLabel } from "@/components/ui/field"
 import { Input } from "@/components/ui/input"
 import {
   Select,
@@ -27,7 +21,6 @@ import {
   SelectValue,
 } from "@/components/ui/select"
 import { Spinner } from "@/components/ui/spinner"
-import { Switch } from "@/components/ui/switch"
 import { toast } from "@/components/ui/toast"
 import { errorMessage } from "@/lib/format"
 import { call } from "@/lib/ipc"
@@ -150,20 +143,6 @@ export function ProviderEditorDialog({
                   </SelectGroup>
                 </SelectContent>
               </Select>
-            </Field>
-            <Field orientation="horizontal" data-disabled={saving}>
-              <FieldContent>
-                <FieldLabel htmlFor="provider-enabled">启用服务</FieldLabel>
-                <FieldDescription>
-                  关闭后不会出现在可切换列表。
-                </FieldDescription>
-              </FieldContent>
-              <Switch
-                id="provider-enabled"
-                disabled={saving}
-                checked={provider.enabled}
-                onCheckedChange={(checked) => update("enabled", checked)}
-              />
             </Field>
           </FieldGroup>
         </DialogBody>

@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useState } from "react"
+import { useCallback, useEffect, useMemo, useState } from "react"
 import {
   Add01Icon,
   Database02Icon,
@@ -42,6 +42,7 @@ import { toast } from "@/components/ui/toast"
 import {
   cacheHitRate,
   errorMessage,
+  formatDate,
   formatInteger,
   formatPercent,
   formatRange,
@@ -56,7 +57,7 @@ import {
 } from "@/lib/chart"
 import { useAsync } from "@/hooks/use-async"
 import { call } from "@/lib/ipc"
-import type { UsageGroupBy, UsageRow } from "@/types"
+import type { OfficialPricingCatalog, UsageGroupBy, UsageRow } from "@/types"
 
 import { PricingEditor } from "./pricing-editor-dialog"
 import { billingModeLabel, pricingSummary } from "./pricing"
@@ -77,6 +78,9 @@ export function UsagePage({
   const [selected, setSelected] = useState<UsageRow>()
   const [ruleOpen, setRuleOpen] = useState(false)
   const [busy, setBusy] = useState(false)
+  const [officialCatalog, setOfficialCatalog] =
+    useState<OfficialPricingCatalog>()
+  const [syncing, setSyncing] = useState(false)
 
   const query = useMemo(
     () => ({ range: todayRange(days), groupBy }),
@@ -99,6 +103,38 @@ export function UsagePage({
     error: rulesError,
     mutate: setRules,
   } = useAsync(fetchRules, undefined, refreshRevision)
+
+  const syncOfficialPricing = useCallback(async () => {
+    setSyncing(true)
+    try {
+      const catalog = await call("usage_refresh_official_pricing")
+      setOfficialCatalog(catalog)
+      toast.add({ title: "官方价格已同步", type: "success" })
+      return catalog
+    } catch (reason) {
+      toast.add({
+        title: "官方价格同步失败",
+        description: errorMessage(reason),
+        type: "error",
+      })
+      return undefined
+    } finally {
+      setSyncing(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    let cancelled = false
+    void call("usage_refresh_official_pricing")
+      .then((catalog) => {
+        if (cancelled) return
+        setOfficialCatalog(catalog)
+      })
+      .catch(() => undefined)
+    return () => {
+      cancelled = true
+    }
+  }, [])
 
   const refreshUsage = async () => {
     setBusy(true)
@@ -339,6 +375,41 @@ export function UsagePage({
               )}
             </TabsContent>
             <TabsContent value="pricing" className="mt-0">
+              <div className="mb-3 flex items-center gap-3 rounded-xl border border-border/50 bg-muted/40 px-3 py-2.5">
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center gap-1.5 text-xs font-medium">
+                    OpenAI 官方参考价格
+                    <Badge variant="secondary">
+                      {officialCatalog
+                        ? officialCatalog.status === "waiting"
+                          ? "待同步"
+                          : `${officialCatalog.modelCount} 个模型`
+                        : "读取中"}
+                    </Badge>
+                  </div>
+                  <div className="mt-0.5 truncate text-xs text-muted-foreground">
+                    {officialCatalog?.fetchedAtMs
+                      ? `上次同步 ${formatDate(officialCatalog.fetchedAtMs, true)}`
+                      : "进入用量页会自动同步，也可手动刷新。"}
+                  </div>
+                </div>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  disabled={syncing}
+                  onClick={() => void syncOfficialPricing()}
+                >
+                  {syncing ? (
+                    <Spinner data-icon="inline-start" />
+                  ) : (
+                    <HugeiconsIcon
+                      icon={Refresh01Icon}
+                      data-icon="inline-start"
+                    />
+                  )}
+                  同步
+                </Button>
+              </div>
               {rules?.length ? (
                 <ItemGroup>
                   {rules.map((rule) => (

@@ -43,7 +43,6 @@ export function PricingEditor({
   const [cacheWrite, setCacheWrite] = useState("3.00")
   const [output, setOutput] = useState("10.00")
   const [cacheWriteIncluded, setCacheWriteIncluded] = useState(true)
-  const [active, setActive] = useState(true)
   const [busy, setBusy] = useState(false)
 
   const save = async () => {
@@ -52,7 +51,7 @@ export function PricingEditor({
     const rule: PricingRule = {
       id: `rule-${now}`,
       version: 1,
-      active,
+      active: true,
       scopeKind: "global_model",
       modelPattern: pattern,
       matchKind: "exact",
@@ -188,14 +187,6 @@ export function PricingEditor({
                 />
               </Field>
             )}
-            <Field orientation="horizontal">
-              <FieldLabel htmlFor="price-active">立即启用</FieldLabel>
-              <Switch
-                id="price-active"
-                checked={active}
-                onCheckedChange={setActive}
-              />
-            </Field>
           </FieldGroup>
         </DialogBody>
         <DialogFooter>
