@@ -4,6 +4,13 @@
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-08-13
+
+### Changed
+
+- 概览与用量页面的趋势图改用轻量自绘 SVG 组件替代 recharts：包体从约 350 kB 降到几 kB，仪表盘首屏不再加载重型图表依赖，并保留网格、坐标轴、悬浮提示、图例与明暗主题跟随。
+- Windows 下 `tasklist` 进程检测改用 `CREATE_NO_WINDOW` 静默执行，不再闪现控制台窗口（与 `codex --version` 检测一致）。
+
 ## [0.6.2] - 2026-08-12
 
 ### Changed
