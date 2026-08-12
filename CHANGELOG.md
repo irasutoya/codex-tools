@@ -4,6 +4,20 @@
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-08-12
+
+### Added
+
+- 新增全局错误边界：页面或组件渲染异常时显示可恢复的错误界面，不再整页白屏。
+
+### Changed
+
+- 本机转换代理健壮性增强：非流式请求按服务配置整体超时，流式请求只约束首字节到达时间；上游流式响应停滞超过 5 分钟转成明确的 `response.failed` 事件；上游忽略 `stream=true` 直接返回 JSON 时合成等价的 SSE 流；下游长时间无事件时发送心跳注释行保活，避免系统代理或客户端空闲超时掐断长思考连接。
+- 转换代理自定义请求头改为配置切换时一次性预构建，请求热路径只复制引用，不再逐请求重复校验与组装。
+- 弹窗、抽屉、菜单与提示层动效支持“减弱动态效果”（`motion-reduce`）系统偏好。
+- 页面数据加载统一改用共享的异步 hooks，概览/用量图表收敛到公共图表工具，刻度与数值格式化保持一致。
+- 前端代码按功能域拆分目录，连接切换、价格规则、用量明细等逻辑提取为独立模块，并清理未使用的类型与重复实现。
+
 ## [0.6.0] - 2026-08-11
 
 ### Added
@@ -203,7 +217,8 @@
 - 上游密钥和自定义请求头改为 Rust 后端只写、前端脱敏；会话扫描增加大小及并发边界。
 - 删除应用配置版本迁移、废弃协议兼容分支、旧模型字段清理和未使用 IPC；相同配置不再重复写盘，账号切换前不再扫描全部会话。
 
-[Unreleased]: https://github.com/irasutoya/codex-tools/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/irasutoya/codex-tools/compare/v0.6.1...HEAD
+[0.6.1]: https://github.com/irasutoya/codex-tools/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/irasutoya/codex-tools/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/irasutoya/codex-tools/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/irasutoya/codex-tools/compare/v0.3.4...v0.4.0
