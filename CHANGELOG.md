@@ -4,6 +4,13 @@
 
 ## [Unreleased]
 
+## [0.6.2] - 2026-08-12
+
+### Changed
+
+- “账号与服务”侧边抽屉加宽（280px → 384px），账号与 API 服务的名称、备注、地址等信息可展示更长内容。
+- 全局隐藏滚动条但保留滚动能力，列表与表单内容超长时不再被滚动条占位挤窄。
+
 ## [0.6.1] - 2026-08-12
 
 ### Added
@@ -217,7 +224,8 @@
 - 上游密钥和自定义请求头改为 Rust 后端只写、前端脱敏；会话扫描增加大小及并发边界。
 - 删除应用配置版本迁移、废弃协议兼容分支、旧模型字段清理和未使用 IPC；相同配置不再重复写盘，账号切换前不再扫描全部会话。
 
-[Unreleased]: https://github.com/irasutoya/codex-tools/compare/v0.6.1...HEAD
+[Unreleased]: https://github.com/irasutoya/codex-tools/compare/v0.6.2...HEAD
+[0.6.2]: https://github.com/irasutoya/codex-tools/compare/v0.6.1...v0.6.2
 [0.6.1]: https://github.com/irasutoya/codex-tools/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/irasutoya/codex-tools/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/irasutoya/codex-tools/compare/v0.4.0...v0.5.0
