@@ -1,10 +1,17 @@
 import { useCallback, useMemo } from "react"
 import { InformationCircleIcon } from "@hugeicons/core-free-icons"
 import { HugeiconsIcon } from "@hugeicons/react"
+import { CartesianGrid, Line, LineChart, XAxis, YAxis } from "recharts"
 
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
-import { TrendChart } from "@/components/ui/trend-chart"
+import {
+  ChartContainer,
+  ChartLegend,
+  ChartLegendContent,
+  ChartTooltip,
+  ChartTooltipContent,
+} from "@/components/ui/chart"
 import { Progress, ProgressLabel } from "@/components/ui/progress"
 import { Skeleton } from "@/components/ui/skeleton"
 import {
@@ -16,7 +23,11 @@ import {
   todayRange,
   tokenInput,
 } from "@/lib/format"
-import { trendPointsToSeries } from "@/lib/chart"
+import {
+  tokenTickFormatter,
+  trendPointsToSeries,
+  usageChartConfig,
+} from "@/lib/chart"
 import { useAsync } from "@/hooks/use-async"
 import { call } from "@/lib/ipc"
 import type { Dashboard } from "@/types"
@@ -84,11 +95,61 @@ export function DashboardPage({
           <span className="text-xs text-muted-foreground">按本地日期</span>
         </CardHeader>
         <CardContent className="flex min-h-0 flex-1">
-          <TrendChart
-            points={points}
-            showDots
-            className="min-h-0 w-full flex-1"
-          />
+          <ChartContainer
+            config={usageChartConfig}
+            className="aspect-auto min-h-0 w-full flex-1"
+            initialDimension={{ width: 620, height: 220 }}
+          >
+            <LineChart
+              data={points}
+              margin={{ left: 8, right: 10, top: 4, bottom: 0 }}
+            >
+              <CartesianGrid vertical={false} strokeDasharray="4 4" />
+              <XAxis
+                dataKey="date"
+                tickLine={false}
+                axisLine={false}
+                tickMargin={8}
+              />
+              <YAxis
+                width={56}
+                tickLine={false}
+                axisLine={false}
+                tickMargin={8}
+                tickFormatter={tokenTickFormatter}
+              />
+              <ChartTooltip
+                cursor={false}
+                content={<ChartTooltipContent indicator="line" />}
+              />
+              <ChartLegend content={<ChartLegendContent />} />
+              <Line
+                dataKey="input"
+                type="linear"
+                stroke="var(--color-input)"
+                strokeWidth={2.5}
+                dot={{ r: 3, fill: "var(--color-input)" }}
+                activeDot={{ r: 4 }}
+              />
+              <Line
+                dataKey="output"
+                type="linear"
+                stroke="var(--color-output)"
+                strokeWidth={2.5}
+                dot={{ r: 3, fill: "var(--color-output)" }}
+                activeDot={{ r: 4 }}
+              />
+              <Line
+                dataKey="cache"
+                type="linear"
+                stroke="var(--color-cache)"
+                strokeWidth={2}
+                strokeDasharray="5 4"
+                dot={{ r: 2.5, fill: "var(--color-cache)" }}
+                activeDot={{ r: 4 }}
+              />
+            </LineChart>
+          </ChartContainer>
         </CardContent>
       </Card>
 

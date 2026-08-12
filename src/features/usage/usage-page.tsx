@@ -7,12 +7,19 @@ import {
   Refresh01Icon,
 } from "@hugeicons/core-free-icons"
 import { HugeiconsIcon } from "@hugeicons/react"
+import { CartesianGrid, Line, LineChart, XAxis, YAxis } from "recharts"
 
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
-import { TrendChart } from "@/components/ui/trend-chart"
+import {
+  ChartContainer,
+  ChartLegend,
+  ChartLegendContent,
+  ChartTooltip,
+  ChartTooltipContent,
+} from "@/components/ui/chart"
 import {
   Empty,
   EmptyDescription,
@@ -42,7 +49,11 @@ import {
   formatUsd,
   todayRange,
 } from "@/lib/format"
-import { trendPointsToSeries } from "@/lib/chart"
+import {
+  tokenTickFormatter,
+  trendPointsToSeries,
+  usageChartConfig,
+} from "@/lib/chart"
 import { useAsync } from "@/hooks/use-async"
 import { call } from "@/lib/ipc"
 import type { UsageGroupBy, UsageRow } from "@/types"
@@ -191,7 +202,53 @@ export function UsagePage({
           </Button>
         </CardHeader>
         <CardContent className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3">
-          <TrendChart points={points} className="h-28 w-full" />
+          <ChartContainer
+            config={usageChartConfig}
+            className="aspect-auto h-28 w-full"
+            initialDimension={{ width: 450, height: 112 }}
+          >
+            <LineChart
+              data={points}
+              margin={{ left: 4, right: 8, top: 4, bottom: 0 }}
+            >
+              <CartesianGrid vertical={false} strokeDasharray="4 4" />
+              <XAxis dataKey="date" tickLine={false} axisLine={false} />
+              <YAxis
+                width={56}
+                tickLine={false}
+                axisLine={false}
+                tickMargin={8}
+                tickFormatter={tokenTickFormatter}
+              />
+              <ChartTooltip
+                cursor={false}
+                content={<ChartTooltipContent indicator="line" />}
+              />
+              <ChartLegend content={<ChartLegendContent />} />
+              <Line
+                dataKey="input"
+                type="linear"
+                stroke="var(--color-input)"
+                strokeWidth={2}
+                dot={false}
+              />
+              <Line
+                dataKey="output"
+                type="linear"
+                stroke="var(--color-output)"
+                strokeWidth={2}
+                dot={false}
+              />
+              <Line
+                dataKey="cache"
+                type="linear"
+                stroke="var(--color-cache)"
+                strokeWidth={1.75}
+                strokeDasharray="5 4"
+                dot={false}
+              />
+            </LineChart>
+          </ChartContainer>
           <div className="grid min-w-44 grid-cols-2 gap-x-4 gap-y-3">
             <Metric
               label="总 Token"
