@@ -325,8 +325,13 @@ fn windows_codex_exe() -> Option<PathBuf> {
 
 #[cfg(windows)]
 fn process_named_running(name: &str) -> bool {
+    use std::os::windows::process::CommandExt;
+    // tasklist 是控制台程序：GUI 应用直接拉起会闪现一个控制台窗口，
+    // 用 CREATE_NO_WINDOW 让它在后台静默运行（与 codex --version 检测一致）。
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     Command::new("tasklist")
         .args(["/FI", &format!("IMAGENAME eq {name}"), "/NH"])
+        .creation_flags(CREATE_NO_WINDOW)
         .output()
         .ok()
         .is_some_and(|output| String::from_utf8_lossy(&output.stdout).contains(name))
