@@ -15,6 +15,12 @@ Codex Tools 是一个轻量的 Tauri 2 + Rust 桌面应用。它直接更新 Cod
 `127.0.0.1:27777` 启动一个转换代理，把 Responses API 请求翻译成 Chat
 Completions 请求转发，其余场景请求仍由 Codex 直连。
 
+## 界面预览
+
+<p align="center">
+  <img alt="Codex Tools 截图" src="assets/screenshot.png" width="90%" />
+</p>
+
 ## 主要功能
 
 - 保存并切换多个 OpenAI Account，使用设备码完成授权。
