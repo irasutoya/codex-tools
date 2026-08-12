@@ -317,6 +317,7 @@ export function ConnectionManagerSheet({
           side="left"
           showCloseButton={!frozen}
           overlayClassName={childOverlayOpen ? hiddenOverlayStyles : undefined}
+          className="data-[side=left]:w-96!"
           aria-busy={frozen}
         >
           <SheetHeader>

@@ -367,7 +367,7 @@ export default function App() {
 
           <main
             ref={mainRef}
-            className="min-h-0 flex-1 [scrollbar-gutter:stable] overflow-y-auto overscroll-contain"
+            className="min-h-0 flex-1 overflow-y-auto overscroll-contain"
           >
             {stateError &&
               ((page === "dashboard" && !dashboard) ||

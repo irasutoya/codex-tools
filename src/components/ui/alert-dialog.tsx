@@ -54,7 +54,7 @@ function AlertDialogContent({
         data-slot="alert-dialog-content"
         data-size={size}
         className={cn(
-          "group/alert-dialog-content fixed top-1/2 left-1/2 z-50 grid max-h-[calc(100dvh-1rem)] w-[calc(100%-2rem)] -translate-x-1/2 -translate-y-1/2 [scrollbar-gutter:stable] gap-4 overflow-y-auto overscroll-contain rounded-3xl p-5 outline-none data-[size=default]:max-w-md data-[size=sm]:max-w-sm",
+          "group/alert-dialog-content fixed top-1/2 left-1/2 z-50 grid max-h-[calc(100dvh-1rem)] w-[calc(100%-2rem)] -translate-x-1/2 -translate-y-1/2 gap-4 overflow-y-auto overscroll-contain rounded-3xl p-5 outline-none data-[size=default]:max-w-md data-[size=sm]:max-w-sm",
           overlaySurfaceStyles,
           modalMotionStyles,
           className
