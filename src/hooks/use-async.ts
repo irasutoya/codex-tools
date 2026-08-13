@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react"
+import { useCallback, useEffect, useEffectEvent, useState } from "react"
 
 import { errorMessage } from "@/lib/format"
 
@@ -14,31 +14,27 @@ export function useAsync<T>(
 ) {
   const [data, setData] = useState<T>()
   const [error, setError] = useState<string>()
-  const optionsRef = useRef(options)
-  const fetcherRef = useRef(fetcher)
-
-  useEffect(() => {
-    optionsRef.current = options
+  const notifySuccess = useEffectEvent((next: T) => {
+    options?.onSuccess?.(next)
   })
-  useEffect(() => {
-    fetcherRef.current = fetcher
+  const notifyError = useEffectEvent((message: string) => {
+    options?.onError?.(message)
   })
 
   useEffect(() => {
     let cancelled = false
-    void fetcherRef
-      .current()
+    void fetcher()
       .then((next) => {
         if (cancelled) return
         setData(next)
         setError(undefined)
-        optionsRef.current?.onSuccess?.(next)
+        notifySuccess(next)
       })
       .catch((reason) => {
         if (cancelled) return
         const message = errorMessage(reason)
         setError(message)
-        optionsRef.current?.onError?.(message)
+        notifyError(message)
       })
     return () => {
       cancelled = true

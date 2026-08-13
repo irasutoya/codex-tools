@@ -4,6 +4,12 @@
 
 ## [Unreleased]
 
+## [0.6.5] - 2026-08-13
+
+### Changed
+
+- 异步数据加载 Hook 改用 React 19 Effect Event 保持回调为最新值，移除每次渲染时同步 ref 的额外 Effect，简化请求成功与失败处理。
+
 ## [0.6.4] - 2026-08-13
 
 ### Added
