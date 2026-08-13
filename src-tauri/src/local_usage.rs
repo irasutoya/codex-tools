@@ -3756,7 +3756,9 @@ mod tests {
         let original_modified = original_metadata.modified().unwrap();
         let replacement = rollout_event().replace("108", "109");
         fs::write(&path, format!("{}{}", rollout_prefix(), replacement)).unwrap();
-        fs::File::open(&path)
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
             .unwrap()
             .set_times(fs::FileTimes::new().set_modified(original_modified))
             .unwrap();
