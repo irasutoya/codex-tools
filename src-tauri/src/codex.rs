@@ -142,7 +142,7 @@ impl ConfigManager {
         &self,
         codex_home: &Path,
         provider: &ProviderProfile,
-        effective_base_url: &str,
+        target: &crate::chat_proxy::ActivationTarget,
     ) -> Result<ConfigPatchPreview, AppError> {
         let path = codex_home.join("config.toml");
         let auth_path = path.with_file_name("auth.json");
@@ -170,13 +170,7 @@ impl ConfigManager {
             .as_deref()
             .filter(|key| !key.trim().is_empty())
             .ok_or_else(|| AppError::InvalidConfig("API Key 为空，请重新填写。".into()))?;
-        // Chat 类型服务经本机转换代理接入：写入 Codex auth.json 的是固定的
-        // 占位 Key，真实的服务商 Key 只保存在本应用，由转换代理注入上游请求。
-        let auth_key = if matches!(provider.api_type, ProviderApiType::Chat) {
-            crate::chat_proxy::PROXY_FIXED_API_KEY
-        } else {
-            api_key
-        };
+        let auth_key = target.proxy_api_key.as_deref().unwrap_or(api_key);
         let headers = merged_headers(provider);
         // 准备模型目录内容，但不在此写入磁盘：预览是只读操作，目录文件在
         // 真正应用时才落盘，避免未应用的预览覆盖正在使用的模型目录。
@@ -187,7 +181,7 @@ impl ConfigManager {
         apply_custom_fields(
             &mut document,
             &provider.name,
-            effective_base_url,
+            &target.base_url,
             &headers,
             &effective_model,
         )?;
@@ -880,6 +874,13 @@ mod tests {
         }
     }
 
+    fn direct_target(base_url: &str) -> crate::chat_proxy::ActivationTarget {
+        crate::chat_proxy::ActivationTarget {
+            base_url: base_url.into(),
+            proxy_api_key: None,
+        }
+    }
+
     #[test]
     fn custom_config_updates_managed_fields_and_preserves_unknown_toml() {
         let mut document = r#"model = "old-model"
@@ -992,7 +993,7 @@ settings = { model_provider = "old-inline", rules = [{ model_provider = "old-arr
         )
         .unwrap();
         let first = manager
-            .preview_custom(&home, &provider(), provider().base_url.as_str())
+            .preview_custom(&home, &provider(), &direct_target(&provider().base_url))
             .unwrap();
         assert!(!first.rendered.contains("sk-direct-secret-value"));
         assert!(!first.rendered.contains("provider-secret"));
@@ -1012,7 +1013,7 @@ settings = { model_provider = "old-inline", rules = [{ model_provider = "old-arr
         assert!(!written.contains("sk-direct-secret-value"));
         assert!(written.contains("requires_openai_auth = true"));
         let second = manager
-            .preview_custom(&home, &provider(), provider().base_url.as_str())
+            .preview_custom(&home, &provider(), &direct_target(&provider().base_url))
             .unwrap();
         fs::write(home.join("config.toml"), "model = \"external\"\n").unwrap();
         assert!(matches!(
@@ -1065,7 +1066,7 @@ private_setting = "must-also-not-enter-webview"
 
         let manager = ConfigManager::default();
         let preview = manager
-            .preview_custom(&home, &provider(), provider().base_url.as_str())
+            .preview_custom(&home, &provider(), &direct_target(&provider().base_url))
             .unwrap();
 
         assert!(!preview.rendered.contains("must-not-enter-webview"));
@@ -1089,7 +1090,7 @@ private_setting = "must-also-not-enter-webview"
         fs::write(home.join("auth.json"), b"{\"before\":true}").unwrap();
         let manager = ConfigManager::default();
         let preview = manager
-            .preview_custom(&home, &provider(), provider().base_url.as_str())
+            .preview_custom(&home, &provider(), &direct_target(&provider().base_url))
             .unwrap();
         fs::write(home.join("auth.json"), b"{\"concurrent\":true}").unwrap();
 
@@ -1118,7 +1119,7 @@ private_setting = "must-also-not-enter-webview"
 
         let manager = ConfigManager::default();
         let preview = manager
-            .preview_custom(&home, &provider(), provider().base_url.as_str())
+            .preview_custom(&home, &provider(), &direct_target(&provider().base_url))
             .unwrap();
         let mut writes = 0;
         let error = manager
@@ -1141,8 +1142,8 @@ private_setting = "must-also-not-enter-webview"
         );
     }
 
-    #[test]
-    fn chat_proxy_activation_writes_fixed_key_and_proxy_url() {
+    #[tokio::test]
+    async fn chat_proxy_activation_writes_runtime_key_and_proxy_url() {
         let temp = tempfile::tempdir().unwrap();
         let home = temp.path().join("codex");
         prepare_home(&home);
@@ -1165,33 +1166,40 @@ private_setting = "must-also-not-enter-webview"
             created_at: 0,
             updated_at: 0,
         };
-        let effective = format!("http://127.0.0.1:{}/v1", crate::chat_proxy::PROXY_PORT);
-        let manager = ConfigManager::default();
-        let preview = manager
-            .preview_custom(&home, &provider, &effective)
+        let registry = crate::chat_proxy::ChatProxyRegistry::default();
+        let target = crate::chat_proxy::effective_base_url(&provider, &registry)
+            .await
             .unwrap();
+        let proxy_api_key = target.proxy_api_key.clone().unwrap();
+        let manager = ConfigManager::default();
+        let preview = manager.preview_custom(&home, &provider, &target).unwrap();
         // 预览绝不泄露真实的服务商 Key。
         assert!(!preview.rendered.contains("sk-real-provider-key"));
         manager.apply(&preview.operation_id).unwrap();
         let config = fs::read_to_string(home.join("config.toml")).unwrap();
-        assert!(config.contains(&effective));
+        assert!(config.contains(&target.base_url));
         assert!(config.contains("wire_api = \"responses\""));
         let auth: serde_json::Value =
             serde_json::from_slice(&fs::read(home.join("auth.json")).unwrap()).unwrap();
-        assert_eq!(
-            auth["OPENAI_API_KEY"],
-            crate::chat_proxy::PROXY_FIXED_API_KEY
-        );
+        assert_eq!(auth["OPENAI_API_KEY"], proxy_api_key);
 
         // 直连 Responses 类型的服务仍然写入真实 Key。
         provider.api_type = ProviderApiType::Responses;
         let direct = manager
-            .preview_custom(&home, &provider, "https://api.deepseek.com/v1")
+            .preview_custom(
+                &home,
+                &provider,
+                &crate::chat_proxy::ActivationTarget {
+                    base_url: "https://api.deepseek.com/v1".into(),
+                    proxy_api_key: None,
+                },
+            )
             .unwrap();
         manager.apply(&direct.operation_id).unwrap();
         let auth: serde_json::Value =
             serde_json::from_slice(&fs::read(home.join("auth.json")).unwrap()).unwrap();
         assert_eq!(auth["OPENAI_API_KEY"], "sk-real-provider-key");
+        registry.stop_all().await;
     }
 
     #[test]
@@ -1205,7 +1213,7 @@ private_setting = "must-also-not-enter-webview"
 
         assert!(
             manager
-                .preview_custom(&home, &provider(), provider().base_url.as_str())
+                .preview_custom(&home, &provider(), &direct_target(&provider().base_url))
                 .is_err()
         );
         assert_eq!(fs::read(home.join("config.toml")).unwrap(), invalid_config);
@@ -1214,7 +1222,7 @@ private_setting = "must-also-not-enter-webview"
         let invalid_auth = b"{ invalid json";
         fs::write(home.join("auth.json"), invalid_auth).unwrap();
         let preview = manager
-            .preview_custom(&home, &provider(), provider().base_url.as_str())
+            .preview_custom(&home, &provider(), &direct_target(&provider().base_url))
             .unwrap();
         manager.apply(&preview.operation_id).unwrap();
         let auth: serde_json::Value =

@@ -167,7 +167,14 @@ export function SettingsPage({
     )
 
   return (
-    <div className="min-h-full px-3 pt-1 pb-3">
+    <div className="flex min-h-full flex-col gap-3 px-3 pt-1 pb-3">
+      {sectionError && (
+        <Alert variant="destructive">
+          <HugeiconsIcon icon={InformationCircleIcon} />
+          <AlertTitle>设置刷新失败</AlertTitle>
+          <AlertDescription>{sectionError}</AlertDescription>
+        </Alert>
+      )}
       {section === "config" && (
         <ConfigSection
           overview={overview!}

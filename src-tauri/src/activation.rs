@@ -139,8 +139,8 @@ pub(crate) async fn sync_active_codex_configuration(
         ));
     }
 
-    let effective_base_url = crate::chat_proxy::effective_base_url(&provider, proxy).await?;
-    let preview = manager.preview_custom(&home, &provider, &effective_base_url)?;
+    let target = crate::chat_proxy::effective_base_url(&provider, proxy).await?;
+    let preview = manager.preview_custom(&home, &provider, &target)?;
     let previous_managed_model = store.last_managed_model()?;
     let applied = manager.apply(&preview.operation_id)?;
     if let Err(error) = record_written_model(store, &home) {

@@ -4,6 +4,22 @@
 
 ## [Unreleased]
 
+## [0.6.6] - 2026-08-14
+
+### Changed
+
+- 本机 Chat Completions 转换代理改用每次运行随机生成的访问凭证，不再使用公开固定占位 Key；真实服务商 API Key 仍只保存在应用后端。
+- 用量数据库升级到 schema v7，为 rollout 游标持久化前缀指纹；旧数据库会自动迁移，无需手动重建。
+- 版本与发布脚本现在严格校验 SemVer、Cargo 锁文件、Changelog 内容和精确版本标题，并补齐最新版本比较链接。
+
+### Fixed
+
+- 修复会话归属修复到错误目标、设置刷新失败被旧数据掩盖，以及价格规则读取失败时误显示空状态的问题。
+- 修复用量查询、用户扫描和官方价格同步之间的竞态；后台更新不再覆盖扫描结果或使页面永久停留在骨架屏，组件卸载后也不会继续更新状态。
+- 修复官方价格目录重复激活和价格规则保存缺少事务的问题，失败时不再停用原有规则，重新计价后概览会及时刷新。
+- 修复 rollout 文件被同长度、加长、截短或保留修改时间替换后漏采新事件、保留旧事件的问题，并保持归档移动后的增量读取。
+- 为模型列表、非流式响应、错误响应和 SSE 缓冲增加大小上限；无效或超限 SSE 会明确失败，上游响应体超时正确返回 504。
+
 ## [0.6.5] - 2026-08-13
 
 ### Changed
@@ -246,7 +262,11 @@
 - 上游密钥和自定义请求头改为 Rust 后端只写、前端脱敏；会话扫描增加大小及并发边界。
 - 删除应用配置版本迁移、废弃协议兼容分支、旧模型字段清理和未使用 IPC；相同配置不再重复写盘，账号切换前不再扫描全部会话。
 
-[Unreleased]: https://github.com/irasutoya/codex-tools/compare/v0.6.2...HEAD
+[Unreleased]: https://github.com/irasutoya/codex-tools/compare/v0.6.6...HEAD
+[0.6.6]: https://github.com/irasutoya/codex-tools/compare/v0.6.5...v0.6.6
+[0.6.5]: https://github.com/irasutoya/codex-tools/compare/v0.6.4...v0.6.5
+[0.6.4]: https://github.com/irasutoya/codex-tools/compare/v0.6.3...v0.6.4
+[0.6.3]: https://github.com/irasutoya/codex-tools/compare/v0.6.2...v0.6.3
 [0.6.2]: https://github.com/irasutoya/codex-tools/compare/v0.6.1...v0.6.2
 [0.6.1]: https://github.com/irasutoya/codex-tools/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/irasutoya/codex-tools/compare/v0.5.0...v0.6.0

@@ -111,11 +111,11 @@ export function SessionsPage({
   )
 
   const repair = async () => {
-    if (!repairTarget) return
+    if (!repairTarget || !scan) return
     setBusy(true)
     try {
       const response = await call("sessions_repair", {
-        targetProvider: repairTarget.id,
+        targetProvider: scan.currentProvider,
       })
       toast.add({
         title: "会话归属已修复",

@@ -558,8 +558,8 @@ async fn preview_activation_in_transaction(
         .as_deref()
         .ok_or_else(|| AppError::InvalidConfig("请先添加并启用一个第三方 API 服务。".into()))?;
     let provider = store.provider(provider_id)?;
-    let effective_base_url = crate::chat_proxy::effective_base_url(&provider, proxy).await?;
-    manager.preview_custom(&home, &provider, &effective_base_url)
+    let target = crate::chat_proxy::effective_base_url(&provider, proxy).await?;
+    manager.preview_custom(&home, &provider, &target)
 }
 
 #[tauri::command]
@@ -667,7 +667,7 @@ pub(crate) async fn connections_activate(
                 "此服务还没有 API Key，请先编辑并填写。".into(),
             ));
         }
-        let effective_base_url = crate::chat_proxy::effective_base_url(&provider, &proxy).await?;
+        let target = crate::chat_proxy::effective_base_url(&provider, &proxy).await?;
         if !activation.is_current(activation_operation) {
             return Err(AppError::StaleOperation);
         }
@@ -675,7 +675,7 @@ pub(crate) async fn connections_activate(
         sync_active_openai_credential(&store, &home)?;
         let repair_sessions =
             provider_sync::configured_provider(&home) != codex::MANAGED_PROVIDER_ID;
-        let preview = manager.preview_custom(&home, &provider, &effective_base_url)?;
+        let preview = manager.preview_custom(&home, &provider, &target)?;
         let pending_id = crate::begin_activation(
             &ledger,
             &crate::activation_for_provider(&provider, chrono::Utc::now().timestamp_millis()),
@@ -747,6 +747,13 @@ mod tests {
         }
     }
 
+    fn direct_target(base_url: &str) -> crate::chat_proxy::ActivationTarget {
+        crate::chat_proxy::ActivationTarget {
+            base_url: base_url.into(),
+            proxy_api_key: None,
+        }
+    }
+
     #[tokio::test]
     async fn active_provider_failure_restores_the_exact_previous_snapshot() {
         let temp = tempfile::tempdir().unwrap();
@@ -813,7 +820,7 @@ mod tests {
         let manager = ConfigManager::default();
         let proxy = ChatProxyRegistry::default();
         let preview = manager
-            .preview_custom(&home, &provider, &provider.base_url)
+            .preview_custom(&home, &provider, &direct_target(&provider.base_url))
             .unwrap();
 
         apply_provider_configuration_and_record(
@@ -864,7 +871,7 @@ mod tests {
             "replacement-model",
         );
         let preview = manager
-            .preview_custom(&home, &replacement, &replacement.base_url)
+            .preview_custom(&home, &replacement, &direct_target(&replacement.base_url))
             .unwrap();
         // 使 operation 过期，模拟 apply 在提交前后任一阶段报告失败；补偿路径
         // 必须以仍处于 active 的 original Provider 重建配置。
@@ -923,7 +930,7 @@ mod tests {
         let manager = ConfigManager::default();
         let proxy = ChatProxyRegistry::default();
         let preview = manager
-            .preview_custom(&home, &provider, &provider.base_url)
+            .preview_custom(&home, &provider, &direct_target(&provider.base_url))
             .unwrap();
         let rollback = apply_provider_configuration_and_record(
             &store,

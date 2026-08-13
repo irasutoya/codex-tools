@@ -18,18 +18,18 @@ use crate::{
     },
 };
 use chrono::{Local, TimeZone, Utc};
-use rusqlite::{Connection, OptionalExtension, Row, params};
+use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, btree_map::Entry},
     fs::{self, File},
-    io::{BufRead, BufReader, Seek, SeekFrom},
+    io::{BufRead, BufReader, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
 use uuid::Uuid;
 
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 const MAX_ROLLOUT_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_METADATA_SCAN_BYTES: usize = 4 * 1024 * 1024;
 const MAX_RECORD_LINE_BYTES: usize = 8 * 1024 * 1024;
@@ -75,7 +75,7 @@ struct RepriceEvent {
 
 #[derive(Debug, Clone)]
 struct StoredCursor {
-    _last_path: String,
+    last_path: String,
     byte_offset: u64,
     next_event_ordinal: u64,
     last_model: Option<String>,
@@ -83,6 +83,9 @@ struct StoredCursor {
     usage_boundary_passed: bool,
     usage_boundary: i64,
     subagent_boundary_mode: i64,
+    file_length: u64,
+    file_modified_at_ms: Option<i64>,
+    prefix_sha256: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -624,7 +627,10 @@ impl UsageLedger {
             .map_err(|error| AppError::Internal(format!("序列化官方价格目录失败：{error}")))?;
         let mut connection = self.open_connection().map_err(AppError::from)?;
         initialize_schema(&connection).map_err(AppError::from)?;
-        let existing = connection
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| AppError::Internal(format!("开始保存官方价格目录失败：{error}")))?;
+        let existing = transaction
             .query_row(
                 "SELECT version FROM official_pricing_catalogs
                  WHERE content_sha256 = ?1 LIMIT 1",
@@ -634,17 +640,20 @@ impl UsageLedger {
             .optional()
             .map_err(|error| AppError::Internal(format!("检查官方价格目录版本失败：{error}")))?;
         if let Some(existing_version) = existing {
-            connection
+            transaction
+                .execute("UPDATE official_pricing_catalogs SET active = 0", [])
+                .map_err(|error| AppError::Internal(format!("停用旧官方价格目录失败：{error}")))?;
+            transaction
                 .execute(
                     "UPDATE official_pricing_catalogs SET active = 1 WHERE version = ?1",
                     params![existing_version],
                 )
                 .map_err(|error| AppError::Internal(format!("激活官方价格目录失败：{error}")))?;
+            transaction
+                .commit()
+                .map_err(|error| AppError::Internal(format!("提交官方价格目录失败：{error}")))?;
             return Ok(false);
         }
-        let transaction = connection
-            .transaction()
-            .map_err(|error| AppError::Internal(format!("开始保存官方价格目录失败：{error}")))?;
         transaction
             .execute("UPDATE official_pricing_catalogs SET active = 0", [])
             .map_err(|error| AppError::Internal(format!("停用旧官方价格目录失败：{error}")))?;
@@ -698,9 +707,12 @@ impl UsageLedger {
     ) -> Result<PricingRule, AppError> {
         let now = Utc::now().timestamp_millis();
         let (mut input, mut internal) = normalize_pricing_input(input, now)?;
-        let connection = self.open_connection().map_err(AppError::from)?;
+        let mut connection = self.open_connection().map_err(AppError::from)?;
         initialize_schema(&connection).map_err(AppError::from)?;
-        let version: i64 = connection
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| AppError::Internal(format!("开始保存美元价格规则失败：{error}")))?;
+        let version: i64 = transaction
             .query_row(
                 "SELECT COALESCE(MAX(version), 0) + 1 FROM pricing_rules
                  WHERE scope_kind = ?1 AND provider_id IS ?2 AND account_id IS ?3
@@ -716,7 +728,7 @@ impl UsageLedger {
             )
             .map_err(|error| AppError::Internal(format!("读取美元价格规则版本失败：{error}")))?;
         if !input.id.trim().is_empty() {
-            connection
+            transaction
                 .execute(
                     "UPDATE pricing_rules SET active = 0, updated_at_ms = ?1 WHERE id = ?2",
                     params![now, input.id.trim()],
@@ -726,7 +738,7 @@ impl UsageLedger {
         internal.id = Uuid::new_v4().to_string();
         internal.version = version;
         internal.active = true;
-        connection
+        transaction
             .execute(
                 "INSERT INTO pricing_rules(
                     id, version, active, scope_kind, provider_id, account_id,
@@ -762,6 +774,9 @@ impl UsageLedger {
                 ],
             )
             .map_err(|error| AppError::Internal(format!("保存美元价格规则失败：{error}")))?;
+        transaction
+            .commit()
+            .map_err(|error| AppError::Internal(format!("提交美元价格规则失败：{error}")))?;
         input.id = internal.id.clone();
         input.version = u64::try_from(internal.version).unwrap_or_default();
         input.active = true;
@@ -1015,9 +1030,10 @@ fn initialize_schema(connection: &Connection) -> anyhow::Result<()> {
                  CHECK (usage_boundary_state IN (0, 1, 2, 3)),
                subagent_boundary_mode INTEGER NOT NULL DEFAULT 0
                  CHECK (subagent_boundary_mode IN (0, 1, 2)),
-               file_length INTEGER NOT NULL,
-               file_modified_at_ms INTEGER,
-               updated_at_ms INTEGER NOT NULL
+                file_length INTEGER NOT NULL,
+                file_modified_at_ms INTEGER,
+                prefix_sha256 TEXT,
+                updated_at_ms INTEGER NOT NULL
              );
              CREATE TABLE IF NOT EXISTS activation_history (
                id TEXT PRIMARY KEY,
@@ -1065,7 +1081,7 @@ fn initialize_schema(connection: &Connection) -> anyhow::Result<()> {
              );
              CREATE INDEX IF NOT EXISTS official_pricing_catalog_active_idx
                ON official_pricing_catalogs(active, fetched_at_ms DESC);
-             PRAGMA user_version = 6;
+              PRAGMA user_version = 7;
              COMMIT;",
         )?;
         return Ok(());
@@ -1200,6 +1216,14 @@ fn initialize_schema(connection: &Connection) -> anyhow::Result<()> {
              COMMIT;",
         )?;
     }
+    if version > 0 && version < 7 {
+        connection.execute_batch(
+            "BEGIN;
+             ALTER TABLE usage_cursors ADD COLUMN prefix_sha256 TEXT;
+             PRAGMA user_version = 7;
+             COMMIT;",
+        )?;
+    }
     Ok(())
 }
 
@@ -1314,6 +1338,9 @@ fn initialize_collection_epoch(
             UsageBoundaryState::Regular
         };
         let rollout_id = discovered.rollout_id.clone();
+        let prefix_sha256 = rollout_prefix_hasher(path, metadata.len())
+            .map_err(|error| AppError::Internal(format!("初始化会话文件指纹失败：{error}")))?
+            .finalize_hex();
         let (next_event_ordinal, last_model, last_model_provider) = transaction
             .query_row(
                 "SELECT COALESCE(MAX(event_ordinal), -1) + 1, model, model_provider
@@ -1334,8 +1361,8 @@ fn initialize_collection_epoch(
                     rollout_id, last_path, byte_offset, next_event_ordinal,
                     last_model, last_model_provider, usage_boundary_passed,
                     usage_boundary_state, subagent_boundary_mode,
-                    file_length, file_modified_at_ms, updated_at_ms
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                    file_length, file_modified_at_ms, prefix_sha256, updated_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
                  ON CONFLICT(rollout_id) DO UPDATE SET
                    last_path = excluded.last_path,
                    byte_offset = excluded.byte_offset,
@@ -1347,6 +1374,7 @@ fn initialize_collection_epoch(
                    subagent_boundary_mode = excluded.subagent_boundary_mode,
                    file_length = excluded.file_length,
                    file_modified_at_ms = excluded.file_modified_at_ms,
+                   prefix_sha256 = excluded.prefix_sha256,
                    updated_at_ms = excluded.updated_at_ms",
                 params![
                     rollout_id,
@@ -1373,6 +1401,7 @@ fn initialize_collection_epoch(
                         .ok()
                         .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
                         .and_then(|value| i64::try_from(value.as_millis()).ok()),
+                    prefix_sha256,
                     now_utc_ms,
                 ],
             )
@@ -1469,11 +1498,48 @@ fn refresh_file(
     let rollout_id = discovered.rollout_id.clone();
 
     let cursor = load_cursor(connection, &rollout_id)?;
-    let rebuild_rollout = discovered.is_subagent
+    let file_modified_at_ms = file_modified_at_ms(&metadata);
+    let mut rebuild_rollout = discovered.is_subagent
         && discovered.boundary_marker_required
         && cursor
             .as_ref()
             .is_some_and(|cursor| cursor.subagent_boundary_mode == 2);
+    let mut prefix_hasher = Sha256::new();
+    if !rebuild_rollout {
+        rebuild_rollout = match cursor.as_ref() {
+            Some(cursor) if cursor.byte_offset <= metadata.len() => {
+                prefix_hasher = rollout_prefix_hasher(path, cursor.byte_offset)?;
+                match cursor.prefix_sha256.as_deref() {
+                    Some(expected) => prefix_hasher.clone().finalize_hex() != expected,
+                    None => !committed_prefix_matches(
+                        connection,
+                        path,
+                        &discovered,
+                        cursor,
+                        collection_epoch,
+                    )?,
+                }
+            }
+            Some(_) => true,
+            None => false,
+        };
+    }
+    if !rebuild_rollout
+        && cursor.as_ref().is_some_and(|cursor| {
+            cursor.last_path == path.display().to_string()
+                && cursor.file_length == metadata.len()
+                && cursor.byte_offset == metadata.len()
+                && cursor.file_modified_at_ms == file_modified_at_ms
+                && cursor.prefix_sha256.is_some()
+        })
+    {
+        return Ok(FileRefreshResult {
+            events_added: 0,
+            events_skipped: 0,
+            partial_lines: 0,
+            warnings: vec![],
+        });
+    }
     let (offset, mut state) = match cursor {
         Some(cursor) if !rebuild_rollout && cursor.byte_offset <= metadata.len() => (
             cursor.byte_offset,
@@ -1490,21 +1556,10 @@ fn refresh_file(
                 boundary_marker_required: discovered.boundary_marker_required,
             },
         ),
-        _ => (
-            0,
-            ParserState {
-                rollout_id: Some(rollout_id.clone()),
-                model_provider: discovered.model_provider.clone(),
-                model: None,
-                next_event_ordinal: 0,
-                usage_boundary: if discovered.is_subagent {
-                    UsageBoundaryState::AwaitingSubagentTaskStart
-                } else {
-                    UsageBoundaryState::Regular
-                },
-                boundary_marker_required: discovered.boundary_marker_required,
-            },
-        ),
+        _ => {
+            prefix_hasher = Sha256::new();
+            (0, initial_parser_state(&discovered))
+        }
     };
 
     let file = File::open(path).map_err(|error| format!("无法打开会话文件：{error}"))?;
@@ -1533,6 +1588,7 @@ fn refresh_file(
             partial_lines += 1;
             break;
         }
+        prefix_hasher.update(&line);
         current_offset = current_offset.saturating_add(bytes_read as u64);
         let trimmed = line.strip_suffix(b"\n").unwrap_or(&line);
         let trimmed = trimmed.strip_suffix(b"\r").unwrap_or(trimmed);
@@ -1572,11 +1628,6 @@ fn refresh_file(
         }
     }
 
-    let file_modified_at_ms = metadata
-        .modified()
-        .ok()
-        .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
-        .and_then(|value| i64::try_from(value.as_millis()).ok());
     let transaction = connection
         .transaction()
         .map_err(|error| format!("开始保存本机用量事务失败：{error}"))?;
@@ -1586,7 +1637,7 @@ fn refresh_file(
                 "DELETE FROM usage_events WHERE rollout_id = ?1",
                 params![rollout_id],
             )
-            .map_err(|error| format!("重建子任务用量失败：{error}"))?;
+            .map_err(|error| format!("重建会话用量失败：{error}"))?;
     }
     let mut events_added = 0;
     for event in events {
@@ -1612,8 +1663,8 @@ fn refresh_file(
                 rollout_id, last_path, byte_offset, next_event_ordinal,
                 last_model, last_model_provider, usage_boundary_passed,
                 usage_boundary_state, subagent_boundary_mode,
-                file_length, file_modified_at_ms, updated_at_ms
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                file_length, file_modified_at_ms, prefix_sha256, updated_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
              ON CONFLICT(rollout_id) DO UPDATE SET
                last_path = excluded.last_path,
                byte_offset = excluded.byte_offset,
@@ -1625,6 +1676,7 @@ fn refresh_file(
                subagent_boundary_mode = excluded.subagent_boundary_mode,
                file_length = excluded.file_length,
                file_modified_at_ms = excluded.file_modified_at_ms,
+               prefix_sha256 = excluded.prefix_sha256,
                updated_at_ms = excluded.updated_at_ms",
             params![
                 rollout_id,
@@ -1639,6 +1691,7 @@ fn refresh_file(
                 subagent_boundary_mode(&discovered),
                 i64::try_from(metadata.len()).map_err(|_| "会话文件大小超过数据库范围。")?,
                 file_modified_at_ms,
+                prefix_hasher.finalize_hex(),
                 now_utc_ms,
             ],
         )
@@ -1668,6 +1721,118 @@ fn refresh_file(
         partial_lines,
         warnings,
     })
+}
+
+fn file_modified_at_ms(metadata: &fs::Metadata) -> Option<i64> {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
+        .and_then(|value| i64::try_from(value.as_millis()).ok())
+}
+
+trait Sha256Hex {
+    fn finalize_hex(self) -> String;
+}
+
+impl Sha256Hex for Sha256 {
+    fn finalize_hex(self) -> String {
+        format!("{:x}", self.finalize())
+    }
+}
+
+fn rollout_prefix_hasher(path: &Path, length: u64) -> Result<Sha256, String> {
+    let file = File::open(path).map_err(|error| format!("无法打开会话文件：{error}"))?;
+    let mut reader = file.take(length);
+    let mut hasher = Sha256::new();
+    let copied = std::io::copy(&mut reader, &mut hasher)
+        .map_err(|error| format!("验证会话文件前缀失败：{error}"))?;
+    if copied != length {
+        return Err("验证会话文件前缀时文件长度发生变化。".into());
+    }
+    Ok(hasher)
+}
+
+fn initial_parser_state(discovered: &DiscoveredRollout) -> ParserState {
+    ParserState {
+        rollout_id: Some(discovered.rollout_id.clone()),
+        model_provider: discovered.model_provider.clone(),
+        model: None,
+        next_event_ordinal: 0,
+        usage_boundary: if discovered.is_subagent {
+            UsageBoundaryState::AwaitingSubagentTaskStart
+        } else {
+            UsageBoundaryState::Regular
+        },
+        boundary_marker_required: discovered.boundary_marker_required,
+    }
+}
+
+fn committed_prefix_matches(
+    connection: &Connection,
+    path: &Path,
+    discovered: &DiscoveredRollout,
+    cursor: &StoredCursor,
+    collection_epoch: i64,
+) -> Result<bool, String> {
+    let file = File::open(path).map_err(|error| format!("无法打开会话文件：{error}"))?;
+    let mut reader = BufReader::new(file);
+    let mut state = initial_parser_state(discovered);
+    let mut offset = 0u64;
+    let mut expected_events = Vec::new();
+
+    while offset < cursor.byte_offset {
+        let mut line = Vec::new();
+        let bytes_read = reader
+            .read_until(b'\n', &mut line)
+            .map_err(|error| format!("验证会话文件前缀失败：{error}"))?;
+        if bytes_read == 0
+            || !line.ends_with(b"\n")
+            || offset.saturating_add(bytes_read as u64) > cursor.byte_offset
+        {
+            return Ok(false);
+        }
+        offset = offset.saturating_add(bytes_read as u64);
+        let trimmed = line.strip_suffix(b"\n").unwrap_or(&line);
+        let trimmed = trimmed.strip_suffix(b"\r").unwrap_or(trimmed);
+        if trimmed.is_empty() || trimmed.len() > MAX_RECORD_LINE_BYTES {
+            continue;
+        }
+        if let Ok(LineResult::Event(event)) = parse_line(trimmed, &mut state)
+            && event.occurred_at_ms >= collection_epoch
+        {
+            expected_events.push((event.ordinal, event_id(&discovered.rollout_id, &event)));
+        }
+    }
+
+    let expected_boundary = if discovered.is_subagent {
+        usage_boundary_from_cursor(cursor.usage_boundary, cursor.usage_boundary_passed)
+    } else {
+        UsageBoundaryState::Regular
+    };
+    if state.rollout_id.as_deref() != Some(discovered.rollout_id.as_str())
+        || state.model != cursor.last_model
+        || state.model_provider != cursor.last_model_provider
+        || state.next_event_ordinal != cursor.next_event_ordinal
+        || state.usage_boundary != expected_boundary
+    {
+        return Ok(false);
+    }
+
+    let mut statement = connection
+        .prepare(
+            "SELECT event_ordinal, event_id FROM usage_events
+             WHERE rollout_id = ?1 ORDER BY event_ordinal",
+        )
+        .map_err(|error| format!("读取待验证会话用量失败：{error}"))?;
+    let stored_events = statement
+        .query_map(params![discovered.rollout_id], |row| {
+            Ok((i64_to_u64(row.get(0)?)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|error| format!("验证会话用量失败：{error}"))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|error| format!("验证会话用量失败：{error}"))?;
+    Ok(expected_events == stored_events)
 }
 
 fn rollout_state(path: &Path, boundary_marker_required: bool) -> Result<ParserState, String> {
@@ -1778,14 +1943,14 @@ fn load_cursor(connection: &Connection, rollout_id: &str) -> Result<Option<Store
         .query_row(
             "SELECT last_path, byte_offset, next_event_ordinal, last_model,
                     last_model_provider, usage_boundary_passed, usage_boundary_state,
-                    subagent_boundary_mode
+                    subagent_boundary_mode, file_length, file_modified_at_ms, prefix_sha256
              FROM usage_cursors WHERE rollout_id = ?1",
             params![rollout_id],
             |row| {
                 let byte_offset = i64_to_u64(row.get::<_, i64>(1)?)?;
                 let next_event_ordinal = i64_to_u64(row.get::<_, i64>(2)?)?;
                 Ok(StoredCursor {
-                    _last_path: row.get(0)?,
+                    last_path: row.get(0)?,
                     byte_offset,
                     next_event_ordinal,
                     last_model: row.get(3)?,
@@ -1793,6 +1958,9 @@ fn load_cursor(connection: &Connection, rollout_id: &str) -> Result<Option<Store
                     usage_boundary_passed: row.get::<_, i64>(5)? != 0,
                     usage_boundary: row.get(6)?,
                     subagent_boundary_mode: row.get(7)?,
+                    file_length: i64_to_u64(row.get::<_, i64>(8)?)?,
+                    file_modified_at_ms: row.get(9)?,
+                    prefix_sha256: row.get(10)?,
                 })
             },
         )
@@ -2512,7 +2680,7 @@ fn u64_db(value: u64) -> Result<i64, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ActivationSnapshot, UsageLedger};
+    use super::{ActivationSnapshot, UsageLedger, file_modified_at_ms};
     use crate::models::{
         ActivationRecord, AppError, BillingMode, CostStatus, PricingMatchKind, PricingScopeKind,
         SavePricingRule, UsageGroupBy, UsageQuery, UsageRange, UsageSourceKind,
@@ -2628,6 +2796,40 @@ mod tests {
     }
 
     #[test]
+    fn reactivating_official_catalog_keeps_exactly_one_active() {
+        let temp = tempfile::tempdir().unwrap();
+        let ledger = UsageLedger::open(&temp.path().join("app")).unwrap();
+        let catalog_a = build_catalog(
+            "# Pricing\n\n### Standard pricing data\n\n| Model | Short context input | Short context output |\n| --- | --- | --- |\n| model-a | $1 | $2 |",
+            1,
+            None,
+            None,
+        )
+        .unwrap();
+        let catalog_b = build_catalog(
+            "# Pricing\n\n### Standard pricing data\n\n| Model | Short context input | Short context output |\n| --- | --- | --- |\n| model-b | $2 | $3 |",
+            2,
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert!(ledger.save_official_pricing_catalog(&catalog_a, 1).unwrap());
+        assert!(ledger.save_official_pricing_catalog(&catalog_b, 2).unwrap());
+        assert!(!ledger.save_official_pricing_catalog(&catalog_a, 3).unwrap());
+
+        let connection = ledger.open_connection().unwrap();
+        let active: Vec<i64> = connection
+            .prepare("SELECT version FROM official_pricing_catalogs WHERE active = 1")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(active, vec![catalog_a.version]);
+    }
+
+    #[test]
     fn migrates_v5_subscription_rules_to_unpriced_without_readding_cursor_column() {
         let connection = rusqlite::Connection::open_in_memory().unwrap();
         connection
@@ -2676,7 +2878,7 @@ mod tests {
         let version: i64 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 6);
+        assert_eq!(version, 7);
         let migrated_mode: String = connection
             .query_row(
                 "SELECT billing_mode FROM pricing_rules WHERE id = 'legacy-subscription'",
@@ -2702,6 +2904,15 @@ mod tests {
             )
             .unwrap();
         assert_eq!(cursor_column_count, 1);
+        let prefix_hash_column_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('usage_cursors')
+                 WHERE name = 'prefix_sha256'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(prefix_hash_column_count, 1);
         assert!(
             connection
                 .execute(
@@ -2753,7 +2964,56 @@ mod tests {
         let version: i64 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 6);
+        assert_eq!(version, 7);
+    }
+
+    #[test]
+    fn failed_pricing_rule_insert_does_not_deactivate_old_rule() {
+        let temp = tempfile::tempdir().unwrap();
+        let ledger = UsageLedger::open(&temp.path().join("app")).unwrap();
+        let input = SavePricingRule {
+            id: String::new(),
+            version: 0,
+            active: true,
+            scope_kind: PricingScopeKind::GlobalModel,
+            provider_id: None,
+            account_id: None,
+            model_pattern: "gpt-test".into(),
+            match_kind: PricingMatchKind::Exact,
+            billing_mode: BillingMode::Token,
+            input_usd_per_million: Some("1".into()),
+            cached_read_usd_per_million: None,
+            cache_write_usd_per_million: None,
+            output_usd_per_million: Some("2".into()),
+            request_fee_usd: None,
+            cache_write_included_in_input: true,
+            effective_from_ms: 0,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+        };
+        let saved = ledger.usage_save_pricing_rule(input.clone()).unwrap();
+        let connection = ledger.open_connection().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TRIGGER fail_pricing_insert BEFORE INSERT ON pricing_rules
+                 BEGIN SELECT RAISE(ABORT, 'forced insert failure'); END;",
+            )
+            .unwrap();
+        drop(connection);
+
+        let mut replacement = input;
+        replacement.id = saved.id.clone();
+        assert!(ledger.usage_save_pricing_rule(replacement).is_err());
+
+        let connection = ledger.open_connection().unwrap();
+        let active: i64 = connection
+            .query_row(
+                "SELECT active FROM pricing_rules WHERE id = ?1",
+                rusqlite::params![saved.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(active, 1);
     }
 
     #[test]
@@ -3405,6 +3665,8 @@ mod tests {
 
     #[test]
     fn moving_a_rollout_to_archived_sessions_does_not_duplicate_events() {
+        use std::io::Write;
+
         let temp = tempfile::tempdir().unwrap();
         let home = temp.path().join("codex");
         let path = write_rollout(&home, rollout_prefix());
@@ -3430,6 +3692,123 @@ mod tests {
             0
         );
         assert_eq!(query(&ledger).totals.requests, 1);
+
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&archived)
+            .unwrap()
+            .write_all(rollout_event_later().as_bytes())
+            .unwrap();
+        assert_eq!(
+            ledger
+                .refresh(&home, 1_754_121_003_000)
+                .unwrap()
+                .events_added,
+            1
+        );
+        assert_eq!(query(&ledger).totals.requests, 2);
+    }
+
+    fn assert_rollout_replacement(old_event: &str, replacement: &str, expected_total: u64) {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex");
+        let path = write_rollout(&home, rollout_prefix());
+        let ledger = UsageLedger::open(&temp.path().join("app")).unwrap();
+
+        ledger.refresh(&home, 1_754_121_000_000).unwrap();
+        fs::write(&path, format!("{}{}", rollout_prefix(), old_event)).unwrap();
+        ledger.refresh(&home, 1_785_624_001_000).unwrap();
+        assert_eq!(query(&ledger).totals.requests, 1);
+
+        fs::write(&path, format!("{}{}", rollout_prefix(), replacement)).unwrap();
+        let refreshed = ledger.refresh(&home, 1_785_624_002_000).unwrap();
+        let overview = query(&ledger);
+
+        assert_eq!(
+            refreshed.events_added, 1,
+            "warnings: {:?}",
+            refreshed.warnings
+        );
+        assert_eq!(overview.totals.requests, 1);
+        assert_eq!(overview.totals.tokens.total_tokens, expected_total);
+    }
+
+    #[test]
+    fn same_length_rollout_replacement_rebuilds_events() {
+        let replacement = rollout_event().replace("108", "109");
+        assert_eq!(replacement.len(), rollout_event().len());
+        assert_rollout_replacement(rollout_event(), &replacement, 109);
+    }
+
+    #[test]
+    fn same_length_same_mtime_replacement_rebuilds_after_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex");
+        let path = write_rollout(&home, rollout_prefix());
+        let app = temp.path().join("app");
+        let ledger = UsageLedger::open(&app).unwrap();
+        ledger.refresh(&home, 1_754_121_000_000).unwrap();
+        fs::write(&path, format!("{}{}", rollout_prefix(), rollout_event())).unwrap();
+        ledger.refresh(&home, 1_785_624_001_000).unwrap();
+        assert_eq!(query(&ledger).totals.tokens.total_tokens, 108);
+
+        let original_metadata = fs::metadata(&path).unwrap();
+        let original_modified = original_metadata.modified().unwrap();
+        let replacement = rollout_event().replace("108", "109");
+        fs::write(&path, format!("{}{}", rollout_prefix(), replacement)).unwrap();
+        fs::File::open(&path)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(original_modified))
+            .unwrap();
+        let replacement_metadata = fs::metadata(&path).unwrap();
+        assert_eq!(replacement_metadata.len(), original_metadata.len());
+        assert_eq!(
+            file_modified_at_ms(&replacement_metadata),
+            file_modified_at_ms(&original_metadata)
+        );
+
+        drop(ledger);
+        let reopened = UsageLedger::open(&app).unwrap();
+        let refreshed = reopened.refresh(&home, 1_785_624_002_000).unwrap();
+
+        assert_eq!(
+            refreshed.events_added, 1,
+            "warnings: {:?}",
+            refreshed.warnings
+        );
+        let overview = query(&reopened);
+        assert_eq!(overview.totals.requests, 1);
+        assert_eq!(overview.totals.tokens.total_tokens, 109);
+    }
+
+    #[test]
+    fn longer_rollout_replacement_rebuilds_events() {
+        let replacement = rollout_event().replace("108", "1008");
+        assert!(replacement.len() > rollout_event().len());
+        assert_rollout_replacement(rollout_event(), &replacement, 1008);
+    }
+
+    #[test]
+    fn truncated_rollout_replacement_removes_old_events() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex");
+        let path = write_rollout(&home, rollout_prefix());
+        let ledger = UsageLedger::open(&temp.path().join("app")).unwrap();
+
+        ledger.refresh(&home, 1_754_121_000_000).unwrap();
+        fs::write(&path, format!("{}{}", rollout_prefix(), rollout_event())).unwrap();
+        ledger.refresh(&home, 1_785_624_001_000).unwrap();
+        assert_eq!(query(&ledger).totals.requests, 1);
+
+        fs::write(&path, rollout_prefix()).unwrap();
+        let refreshed = ledger.refresh(&home, 1_785_624_002_000).unwrap();
+
+        assert_eq!(
+            refreshed.events_added, 0,
+            "warnings: {:?}",
+            refreshed.warnings
+        );
+        assert_eq!(query(&ledger).totals.requests, 0);
     }
 
     #[test]

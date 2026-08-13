@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react"
+import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import {
   Add01Icon,
   Database02Icon,
@@ -57,11 +57,31 @@ import {
 } from "@/lib/chart"
 import { useAsync } from "@/hooks/use-async"
 import { call } from "@/lib/ipc"
-import type { OfficialPricingCatalog, UsageGroupBy, UsageRow } from "@/types"
+import { createRequestGate } from "@/lib/request-gate"
+import type {
+  OfficialPricingCatalog,
+  UsageGroupBy,
+  UsageQuery,
+  UsageRow,
+} from "@/types"
 
 import { PricingEditor } from "./pricing-editor-dialog"
 import { billingModeLabel, pricingSummary } from "./pricing"
 import { UsageDetail } from "./usage-detail-sheet"
+
+let automaticOfficialPricingSync: Promise<OfficialPricingCatalog> | undefined
+
+function refreshOfficialPricingOnce() {
+  if (!automaticOfficialPricingSync) {
+    const shared = call("usage_refresh_official_pricing").finally(() => {
+      if (automaticOfficialPricingSync === shared) {
+        automaticOfficialPricingSync = undefined
+      }
+    })
+    automaticOfficialPricingSync = shared
+  }
+  return automaticOfficialPricingSync
+}
 
 export function UsagePage({
   refreshRevision,
@@ -80,12 +100,31 @@ export function UsagePage({
   const [busy, setBusy] = useState(false)
   const [officialCatalog, setOfficialCatalog] =
     useState<OfficialPricingCatalog>()
+  const [officialPricingError, setOfficialPricingError] = useState<string>()
   const [syncing, setSyncing] = useState(false)
+  const [overviewRequestGate] = useState(createRequestGate)
+  const mounted = useRef(true)
+  const currentScan = useRef<
+    ReturnType<typeof overviewRequestGate.begin> | undefined
+  >(undefined)
+
+  useEffect(() => {
+    mounted.current = true
+    return () => {
+      mounted.current = false
+      overviewRequestGate.invalidate()
+    }
+  }, [overviewRequestGate])
 
   const query = useMemo(
     () => ({ range: todayRange(days), groupBy }),
     [days, groupBy]
   )
+  const activeQuery = useRef(query)
+  useEffect(() => {
+    activeQuery.current = query
+    overviewRequestGate.invalidate()
+  }, [overviewRequestGate, query])
 
   const fetchOverview = useCallback(
     () => call("usage_get_overview", { query }),
@@ -95,7 +134,11 @@ export function UsagePage({
     data: overview,
     error: overviewError,
     mutate: setOverview,
-  } = useAsync(fetchOverview, undefined, refreshRevision)
+  } = useAsync(
+    fetchOverview,
+    { requestGate: overviewRequestGate },
+    refreshRevision
+  )
 
   const fetchRules = useCallback(() => call("usage_list_pricing_rules", {}), [])
   const {
@@ -104,51 +147,128 @@ export function UsagePage({
     mutate: setRules,
   } = useAsync(fetchRules, undefined, refreshRevision)
 
+  const reloadOverview = useCallback(
+    async (requestedQuery: UsageQuery) => {
+      while (mounted.current && activeQuery.current === requestedQuery) {
+        const request = overviewRequestGate.begin("background")
+        if (!overviewRequestGate.isCurrent(request)) {
+          await overviewRequestGate.waitForChange()
+          continue
+        }
+
+        try {
+          const next = await call("usage_get_overview", {
+            query: requestedQuery,
+          })
+          if (
+            mounted.current &&
+            overviewRequestGate.isCurrent(request) &&
+            activeQuery.current === requestedQuery
+          ) {
+            setOverview(next)
+            return
+          }
+        } catch (reason) {
+          if (overviewRequestGate.isCurrent(request)) throw reason
+        } finally {
+          overviewRequestGate.finish(request)
+        }
+      }
+    },
+    [overviewRequestGate, setOverview]
+  )
+
   const syncOfficialPricing = useCallback(async () => {
     setSyncing(true)
+    setOfficialPricingError(undefined)
     try {
-      const catalog = await call("usage_refresh_official_pricing")
+      const catalog = await refreshOfficialPricingOnce()
+      if (!mounted.current) return undefined
       setOfficialCatalog(catalog)
       toast.add({ title: "官方价格已同步", type: "success" })
+      try {
+        await reloadOverview(activeQuery.current)
+      } catch (reason) {
+        if (!mounted.current) return catalog
+        toast.add({
+          title: "无法更新费用概览",
+          description: errorMessage(reason),
+          type: "error",
+        })
+      }
       return catalog
     } catch (reason) {
+      if (!mounted.current) return undefined
+      const message = errorMessage(reason)
+      setOfficialPricingError(message)
       toast.add({
         title: "官方价格同步失败",
-        description: errorMessage(reason),
+        description: message,
         type: "error",
       })
       return undefined
     } finally {
-      setSyncing(false)
+      if (mounted.current) setSyncing(false)
     }
-  }, [])
+  }, [reloadOverview])
 
   useEffect(() => {
     let cancelled = false
-    void call("usage_refresh_official_pricing")
-      .then((catalog) => {
+    void (async () => {
+      try {
+        const cached = await call("usage_get_official_pricing")
+        if (!cancelled) setOfficialCatalog(cached)
+      } catch {
+        // The network refresh below can still recover when no cache is present.
+      }
+
+      try {
+        const catalog = await refreshOfficialPricingOnce()
         if (cancelled) return
         setOfficialCatalog(catalog)
-      })
-      .catch(() => undefined)
+        setOfficialPricingError(undefined)
+        try {
+          await reloadOverview(activeQuery.current)
+        } catch {
+          // The catalog is still valid; the normal overview request can recover.
+        }
+      } catch (reason) {
+        if (!cancelled) setOfficialPricingError(errorMessage(reason))
+      }
+    })()
     return () => {
       cancelled = true
     }
-  }, [])
+  }, [reloadOverview])
 
   const refreshUsage = async () => {
+    const requestedQuery = query
+    const request = overviewRequestGate.begin("scan")
+    currentScan.current = request
     setBusy(true)
     try {
-      setOverview(await call("usage_refresh", { query }))
+      const next = await call("usage_refresh", { query: requestedQuery })
+      if (
+        !mounted.current ||
+        !overviewRequestGate.isCurrent(request) ||
+        activeQuery.current !== requestedQuery
+      )
+        return
+      setOverview(next)
       toast.add({ title: "用量已刷新", type: "success" })
     } catch (reason) {
+      if (!mounted.current || !overviewRequestGate.isCurrent(request)) return
       toast.add({
         title: "刷新失败",
         description: errorMessage(reason),
         type: "error",
       })
     } finally {
-      setBusy(false)
+      overviewRequestGate.finish(request)
+      if (mounted.current && currentScan.current === request) {
+        currentScan.current = undefined
+        setBusy(false)
+      }
     }
   }
 
@@ -380,17 +500,21 @@ export function UsagePage({
                   <div className="flex items-center gap-1.5 text-xs font-medium">
                     OpenAI 官方参考价格
                     <Badge variant="secondary">
-                      {officialCatalog
-                        ? officialCatalog.status === "waiting"
-                          ? "待同步"
-                          : `${officialCatalog.modelCount} 个模型`
-                        : "读取中"}
+                      {officialPricingError
+                        ? "同步失败"
+                        : officialCatalog
+                          ? officialCatalog.status === "waiting"
+                            ? "待同步"
+                            : `${officialCatalog.modelCount} 个模型`
+                          : "读取中"}
                     </Badge>
                   </div>
                   <div className="mt-0.5 truncate text-xs text-muted-foreground">
-                    {officialCatalog?.fetchedAtMs
-                      ? `上次同步 ${formatDate(officialCatalog.fetchedAtMs, true)}`
-                      : "进入用量页会自动同步，也可手动刷新。"}
+                    {officialPricingError
+                      ? `同步失败：${officialPricingError}`
+                      : officialCatalog?.fetchedAtMs
+                        ? `上次同步 ${formatDate(officialCatalog.fetchedAtMs, true)}`
+                        : "进入用量页会自动同步，也可手动刷新。"}
                   </div>
                 </div>
                 <Button
@@ -407,10 +531,14 @@ export function UsagePage({
                       data-icon="inline-start"
                     />
                   )}
-                  同步
+                  {officialPricingError ? "重试" : "同步"}
                 </Button>
               </div>
-              {rules?.length ? (
+              {!rules ? (
+                rulesError ? null : (
+                  <Skeleton className="h-24 rounded-xl" />
+                )
+              ) : rules.length ? (
                 <ItemGroup>
                   {rules.map((rule) => (
                     <Item
@@ -512,6 +640,7 @@ export function UsagePage({
         onOpenChange={(open) => !open && setSelected(undefined)}
       />
       <PricingEditor
+        key={ruleOpen ? "open" : "closed"}
         open={ruleOpen}
         onOpenChange={setRuleOpen}
         onSaved={() => {

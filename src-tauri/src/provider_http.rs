@@ -1,5 +1,37 @@
 use crate::models::{AppError, ProviderProfile};
 
+pub(crate) const MAX_UPSTREAM_BODY_BYTES: usize = 8 * 1024 * 1024;
+const MAX_FETCHED_MODELS: usize = 10_000;
+const MAX_MODEL_ID_BYTES: usize = 512;
+const MAX_MODEL_DESCRIPTION_BYTES: usize = 16 * 1024;
+
+pub(crate) async fn read_response_body_limited(
+    response: reqwest::Response,
+    limit: usize,
+) -> Result<bytes::Bytes, AppError> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > limit as u64)
+    {
+        return Err(AppError::InvalidConfig(format!(
+            "上游响应体超过允许的 {limit} 字节。"
+        )));
+    }
+    let mut stream = response.bytes_stream();
+    let mut body = Vec::new();
+    while let Some(chunk) = futures_util::StreamExt::next(&mut stream).await {
+        let chunk = chunk
+            .map_err(|error| AppError::InvalidConfig(format!("读取上游响应体失败：{error}")))?;
+        if body.len().saturating_add(chunk.len()) > limit {
+            return Err(AppError::InvalidConfig(format!(
+                "上游响应体超过允许的 {limit} 字节。"
+            )));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body.into())
+}
+
 /// 从服务 `/models` 接口解析出的单个模型及其可选信息。
 #[derive(Debug, Clone, PartialEq)]
 pub struct FetchedModelDetail {
@@ -58,21 +90,46 @@ pub async fn fetch_model_details(
             response.status().as_u16()
         )));
     }
-    let payload: serde_json::Value = response
-        .json()
+    let body = read_response_body_limited(response, MAX_UPSTREAM_BODY_BYTES)
         .await
+        .map_err(|_| AppError::InvalidConfig("模型列表响应过大或读取失败。".into()))?;
+    let payload: serde_json::Value = serde_json::from_slice(&body)
         .map_err(|_| AppError::InvalidConfig("模型列表响应不是有效 JSON。".into()))?;
-    let mut models = payload
+    parse_model_details_payload(&payload)
+}
+
+fn parse_model_details_payload(
+    payload: &serde_json::Value,
+) -> Result<Vec<FetchedModelDetail>, AppError> {
+    let items = payload
         .get("data")
         .and_then(serde_json::Value::as_array)
-        .into_iter()
-        .flatten()
+        .ok_or_else(|| AppError::InvalidConfig("模型列表响应缺少 data 数组。".into()))?;
+    if items.len() > MAX_FETCHED_MODELS {
+        return Err(AppError::InvalidConfig(format!(
+            "模型列表数量超过允许的 {MAX_FETCHED_MODELS} 个。"
+        )));
+    }
+    if items.iter().any(|item| {
+        item.get("id")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|id| id.trim().len() > MAX_MODEL_ID_BYTES)
+            || model_description_value(item)
+                .is_some_and(|description| description.trim().len() > MAX_MODEL_DESCRIPTION_BYTES)
+    }) {
+        return Err(AppError::InvalidConfig(
+            "模型 ID 或简介超过允许长度。".into(),
+        ));
+    }
+    let mut models = items
+        .iter()
         .filter_map(|item| {
             let id = item
                 .get("id")
                 .and_then(serde_json::Value::as_str)
                 .map(str::trim)
                 .filter(|id| !id.is_empty())
+                .filter(|id| id.len() <= MAX_MODEL_ID_BYTES)
                 .map(str::to_owned)?;
             Some(FetchedModelDetail {
                 id,
@@ -94,6 +151,13 @@ pub async fn fetch_model_details(
 /// 从 `/models` 单项里解析模型简介；优先 `description` 字段，
 /// 兼容少量嵌套位置；空白视为没有。
 fn parse_model_description(item: &serde_json::Value) -> Option<String> {
+    model_description_value(item).and_then(|text| {
+        let text = text.trim();
+        (!text.is_empty() && text.len() <= MAX_MODEL_DESCRIPTION_BYTES).then(|| text.to_owned())
+    })
+}
+
+fn model_description_value(item: &serde_json::Value) -> Option<&str> {
     const PATHS: &[&[&str]] = &[
         &["description"],
         &["meta", "description"],
@@ -104,12 +168,8 @@ fn parse_model_description(item: &serde_json::Value) -> Option<String> {
         let value = path.iter().fold(item, |current, key| {
             current.get(key).unwrap_or(&serde_json::Value::Null)
         });
-        let text = value
-            .as_str()
-            .map(str::trim)
-            .filter(|text| !text.is_empty());
-        if text.is_some() {
-            return text.map(str::to_owned);
+        if let Some(text) = value.as_str().filter(|text| !text.trim().is_empty()) {
+            return Some(text);
         }
     }
     None
@@ -404,5 +464,88 @@ mod tests {
         let error = fetch_model_details(&client, &provider).await.unwrap_err();
         assert!(error.to_string().contains("没有返回可用的模型列表"));
         server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn fetch_models_reads_chunked_response_without_content_length() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request);
+            let chunks = [r#"{"data":[{"id":"chunk"#, r#"ed-model"}]}"#];
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            for chunk in chunks {
+                write!(stream, "{:X}\r\n{}\r\n", chunk.len(), chunk).unwrap();
+            }
+            stream.write_all(b"0\r\n\r\n").unwrap();
+        });
+        let mut provider = provider("p");
+        provider.base_url = format!("http://{address}/v1");
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+
+        let models = fetch_model_details(&client, &provider).await.unwrap();
+        assert_eq!(models[0].id, "chunked-model");
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn fetch_models_rejects_chunked_body_over_limit() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            let chunk = vec![b'x'; MAX_UPSTREAM_BODY_BYTES + 1];
+            write!(stream, "{:X}\r\n", chunk.len()).unwrap();
+            stream.write_all(&chunk).unwrap();
+            stream.write_all(b"\r\n0\r\n\r\n").unwrap();
+        });
+        let mut provider = provider("p");
+        provider.base_url = format!("http://{address}/v1");
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+
+        let error = fetch_model_details(&client, &provider).await.unwrap_err();
+        assert!(error.to_string().contains("过大"));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn model_payload_rejects_excessive_count_and_field_lengths() {
+        let too_many = json!({
+            "data": (0..=MAX_FETCHED_MODELS)
+                .map(|index| json!({"id": format!("model-{index}")}))
+                .collect::<Vec<_>>()
+        });
+        assert!(
+            parse_model_details_payload(&too_many)
+                .unwrap_err()
+                .to_string()
+                .contains("数量")
+        );
+
+        for payload in [
+            json!({"data": [{"id": "x".repeat(MAX_MODEL_ID_BYTES + 1)}]}),
+            json!({"data": [{
+                "id": "model",
+                "description": "x".repeat(MAX_MODEL_DESCRIPTION_BYTES + 1)
+            }]}),
+        ] {
+            assert!(
+                parse_model_details_payload(&payload)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("超过允许长度")
+            );
+        }
     }
 }

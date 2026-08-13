@@ -14,7 +14,7 @@
 //! `response.output_item.added` / `response.output_text.delta` /
 //! `response.function_call_arguments.delta` / `response.completed` 事件还原。
 //!
-//! 健壮性：非流式请求按服务配置整体超时，流式请求只约束首字节到达时间；
+//! 健壮性：请求响应头及非流式响应体分别按服务配置整体超时；
 //! 上游流停滞过久转成明确的 response.failed 事件；上游忽略 stream=true
 //! 直接返回 JSON 时合成等价的 SSE 流；下游长时间无事件时发送心跳注释行保活。
 
@@ -49,9 +49,6 @@ pub(crate) const PROXY_PORT: u16 = 27777;
 /// 转换代理接受的请求体上限。Codex 会把完整会话历史（含 base64 图片）发给
 /// 代理，axum 默认只允许 2MB，必须放宽，否则长对话/带图请求会被 413 拒绝。
 const MAX_REQUEST_BODY_BYTES: usize = 64 * 1024 * 1024;
-/// 写入 Codex auth.json 的固定占位 Key。真实的服务商 Key 只保存在本应用，
-/// 由转换代理注入上游请求，Codex 侧始终使用这个固定 Key。
-pub(crate) const PROXY_FIXED_API_KEY: &str = "codex-tools";
 /// 写入 Codex 配置的本机代理地址路径。
 pub(crate) const PROXY_BASE_PATH: &str = "/v1";
 /// 下游（Codex 侧）SSE 心跳间隔：上游长时间不产生事件时发送注释行，
@@ -60,11 +57,8 @@ const DOWNSTREAM_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 /// 上游流式响应的停滞上限：超过该时长完全没有字节到达说明连接很可能
 /// 已死亡（半开的 TCP 连接无法被及时发现），转成明确的 response.failed 事件。
 const UPSTREAM_STALL_TIMEOUT: Duration = Duration::from_secs(300);
-
-/// 本机转换代理的完整根地址。
-pub(crate) fn proxy_base_url() -> String {
-    format!("http://{PROXY_HOST}:{PROXY_PORT}{PROXY_BASE_PATH}")
-}
+const MAX_SSE_LINE_BUFFER_BYTES: usize = 1024 * 1024;
+const MAX_SSE_EVENT_DATA_BYTES: usize = 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // 注册表：一个共享的本机转换代理
@@ -88,12 +82,18 @@ struct RunningProxy {
     shutdown: oneshot::Sender<()>,
     /// 共享的上游配置。
     config: Arc<ProxyConfigSlot>,
+    proxy_api_key: String,
+}
+
+pub(crate) struct ActivationTarget {
+    pub(crate) base_url: String,
+    pub(crate) proxy_api_key: Option<String>,
 }
 
 impl ChatProxyRegistry {
     /// 确保转换代理正在运行，并把上游配置切换到 `provider`。
     /// 监听地址固定为 `http://127.0.0.1:27777/v1`。
-    pub(crate) async fn ensure(&self, provider: &ProviderProfile) -> Result<u16, AppError> {
+    async fn ensure(&self, provider: &ProviderProfile) -> Result<(u16, String), AppError> {
         let fingerprint = proxy_fingerprint(provider);
         let config = ProxyConfig::from_provider(provider);
         let mut single = self.single.lock().await;
@@ -103,17 +103,18 @@ impl ChatProxyRegistry {
                 running.fingerprint = fingerprint;
                 running.owner = provider.id.clone();
             }
-            return Ok(running.port);
+            return Ok((running.port, running.proxy_api_key.clone()));
         }
-        let (port, shutdown, config_slot) = start_proxy(config).await?;
+        let (port, shutdown, config_slot, proxy_api_key) = start_proxy(config).await?;
         *single = Some(RunningProxy {
             port,
             fingerprint,
             owner: provider.id.clone(),
             shutdown,
             config: config_slot,
+            proxy_api_key: proxy_api_key.clone(),
         });
-        Ok(port)
+        Ok((port, proxy_api_key))
     }
 
     /// 服务被删除时调用：如果它正是当前代理配置的服务，清空上游配置，
@@ -158,8 +159,8 @@ struct ProxyConfig {
     /// 服务商自定义请求头：配置切换时一次性构建好，请求热路径只克隆引用，
     /// 不再逐请求重复校验与组装。
     headers: reqwest::header::HeaderMap,
-    /// 单次上游请求的超时（来自服务配置）：非流式请求覆盖连接与整个响应体，
-    /// 流式请求只约束首字节（响应头）到达时间。
+    /// 单次上游请求的超时（来自服务配置）：所有请求约束响应头到达时间，
+    /// 非流式响应体读取另行使用同一上限。
     timeout: Duration,
 }
 
@@ -223,6 +224,7 @@ impl ProxyConfigSlot {
 struct ProxyState {
     config: Arc<ProxyConfigSlot>,
     client: ProxyClient,
+    proxy_api_key: String,
     /// 上一轮响应产生的 `reasoning_content` 按输出条目 id 保存，
     /// 供下一轮请求回传（DeepSeek 等要求 thinking 模式的 reasoning_content 必须回传）。
     reasoning_store: Arc<std::sync::Mutex<ReasoningStore>>,
@@ -318,11 +320,19 @@ fn test_port() -> u16 {
 
 async fn start_proxy(
     config: ProxyConfig,
-) -> Result<(u16, oneshot::Sender<()>, Arc<ProxyConfigSlot>), AppError> {
+) -> Result<(u16, oneshot::Sender<()>, Arc<ProxyConfigSlot>, String), AppError> {
     let config_slot = ProxyConfigSlot::new(config);
+    // Each UUID v4 contributes 122 random bits after fixed version/variant bits.
+    let proxy_api_key = format!(
+        "{}{}{}",
+        uuid::Uuid::new_v4(),
+        uuid::Uuid::new_v4(),
+        uuid::Uuid::new_v4()
+    );
     let state = ProxyState {
         config: config_slot.clone(),
         client: ProxyClient::default(),
+        proxy_api_key: proxy_api_key.clone(),
         reasoning_store: Arc::new(std::sync::Mutex::new(ReasoningStore::default())),
     };
     let listener = tokio::net::TcpListener::bind((PROXY_HOST, bind_port()))
@@ -348,7 +358,7 @@ async fn start_proxy(
             })
             .await;
     });
-    Ok((address.port(), shutdown_tx, config_slot))
+    Ok((address.port(), shutdown_tx, config_slot, proxy_api_key))
 }
 
 /// 服务只提供 Chat Completions API 时，写入 Codex 的 base_url 是本机代理；
@@ -356,12 +366,18 @@ async fn start_proxy(
 pub(crate) async fn effective_base_url(
     provider: &ProviderProfile,
     registry: &ChatProxyRegistry,
-) -> Result<String, AppError> {
+) -> Result<ActivationTarget, AppError> {
     match provider.api_type {
-        ProviderApiType::Responses => Ok(provider.base_url.clone()),
+        ProviderApiType::Responses => Ok(ActivationTarget {
+            base_url: provider.base_url.clone(),
+            proxy_api_key: None,
+        }),
         ProviderApiType::Chat => {
-            registry.ensure(provider).await?;
-            Ok(proxy_base_url())
+            let (port, proxy_api_key) = registry.ensure(provider).await?;
+            Ok(ActivationTarget {
+                base_url: format!("http://{PROXY_HOST}:{port}{PROXY_BASE_PATH}"),
+                proxy_api_key: Some(proxy_api_key),
+            })
         }
     }
 }
@@ -381,32 +397,26 @@ fn apply_upstream_headers(
 
 /// 发送上游 Chat Completions 请求，并把连接/超时错误翻译成给 Codex 的错误响应。
 ///
-/// 转换代理的网络客户端为了长时间流式响应特意不设总超时，这里按请求类型补偿：
-/// - 非流式：设置整体超时（连接 + 读完响应体），上游挂起时不会无限等待；
-/// - 流式：只约束首字节（响应头）到达时间，响应出流后时长由内容决定，不再受限。
+/// 转换代理的网络客户端为了长时间流式响应特意不设总超时，这里约束响应头
+/// 到达时间；非流式响应体在调用方另行约束整体读取时间。
 async fn send_chat_request(
     client: &reqwest::Client,
     url: &str,
     config: &ProxyConfig,
     body: &Value,
-    stream: bool,
 ) -> Result<reqwest::Response, Response> {
     let request = apply_upstream_headers(client.post(url), config).json(body);
-    let result = if stream {
-        match tokio::time::timeout(config.timeout, request.send()).await {
-            Ok(result) => result,
-            Err(_) => {
-                return Err(error_response(
-                    StatusCode::GATEWAY_TIMEOUT,
-                    &format!(
-                        "等待上游服务返回响应超时（{} 秒）。",
-                        config.timeout.as_secs()
-                    ),
-                ));
-            }
+    let result = match tokio::time::timeout(config.timeout, request.send()).await {
+        Ok(result) => result,
+        Err(_) => {
+            return Err(error_response(
+                StatusCode::GATEWAY_TIMEOUT,
+                &format!(
+                    "等待上游服务返回响应超时（{} 秒）。",
+                    config.timeout.as_secs()
+                ),
+            ));
         }
-    } else {
-        request.timeout(config.timeout).send().await
     };
     result.map_err(|error| {
         if error.is_timeout() {
@@ -425,8 +435,16 @@ async fn send_chat_request(
 
 /// 读取上游错误响应的响应体；读取失败/超时时返回空串，由调用方兜底文案。
 async fn read_error_body(response: reqwest::Response, config: &ProxyConfig) -> String {
-    match tokio::time::timeout(config.timeout, response.text()).await {
-        Ok(Ok(text)) => text,
+    match tokio::time::timeout(
+        config.timeout,
+        crate::provider_http::read_response_body_limited(
+            response,
+            crate::provider_http::MAX_UPSTREAM_BODY_BYTES,
+        ),
+    )
+    .await
+    {
+        Ok(Ok(body)) => String::from_utf8_lossy(&body).into_owned(),
         _ => String::new(),
     }
 }
@@ -464,10 +482,10 @@ fn error_response(status: StatusCode, message: &str) -> Response {
     response
 }
 
-/// 校验调用方凭证：只有本应用写入 Codex 配置的固定 Key 可以访问转换代理，
+/// 校验调用方凭证：只有本应用为当前代理运行实例生成的 Key 可以访问，
 /// 防止本机其他进程或网页借用代理消耗用户的真实上游额度。
-fn is_authorized(headers: &HeaderMap) -> bool {
-    let expected = format!("Bearer {PROXY_FIXED_API_KEY}");
+fn is_authorized(headers: &HeaderMap, proxy_api_key: &str) -> bool {
+    let expected = format!("Bearer {proxy_api_key}");
     headers
         .get(reqwest::header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
@@ -482,7 +500,7 @@ fn unauthorized_response() -> Response {
 }
 
 async fn handle_models(State(state): State<Arc<ProxyState>>, headers: HeaderMap) -> Response {
-    if !is_authorized(&headers) {
+    if !is_authorized(&headers, &state.proxy_api_key) {
         return unauthorized_response();
     }
     let config = state.config.current.read().await.clone();
@@ -506,9 +524,13 @@ async fn handle_models(State(state): State<Arc<ProxyState>>, headers: HeaderMap)
             .await
             .map_err(|error| format!("无法连接上游服务获取模型列表：{error}"))?;
         let status = response.status();
-        let body = response
-            .json::<Value>()
-            .await
+        let bytes = crate::provider_http::read_response_body_limited(
+            response,
+            crate::provider_http::MAX_UPSTREAM_BODY_BYTES,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        let body = serde_json::from_slice::<Value>(&bytes)
             .map_err(|_| "上游服务返回的模型列表不是有效 JSON。".to_string())?;
         Ok::<_, String>((status, body))
     };
@@ -527,7 +549,7 @@ async fn handle_responses(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if !is_authorized(&headers) {
+    if !is_authorized(&headers, &state.proxy_api_key) {
         return unauthorized_response();
     }
     let body: Value = match serde_json::from_slice(&body) {
@@ -555,11 +577,10 @@ async fn handle_responses(
         Err(error) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
     };
     let url = crate::provider_http::endpoint_for(&config.upstream_base, "chat/completions");
-    let mut response =
-        match send_chat_request(&client, &url, &config, &chat_body, stream_requested).await {
-            Ok(response) => response,
-            Err(error_response) => return error_response,
-        };
+    let mut response = match send_chat_request(&client, &url, &config, &chat_body).await {
+        Ok(response) => response,
+        Err(error_response) => return error_response,
+    };
     if !response.status().is_success() {
         let status = response.status();
         let detail = read_error_body(response, &config).await;
@@ -569,7 +590,7 @@ async fn handle_responses(
         if chat_body.get("response_format").is_some() && looks_like_structured_output_error(&detail)
         {
             let degraded = degrade_structured_output(&chat_body);
-            match send_chat_request(&client, &url, &config, &degraded, stream_requested).await {
+            match send_chat_request(&client, &url, &config, &degraded).await {
                 Ok(retry) => {
                     if !retry.status().is_success() {
                         let status = retry.status();
@@ -609,14 +630,28 @@ async fn handle_responses(
         let stream = translate_stream(response, response_id, model, created_at, reasoning_store);
         sse_response(stream)
     } else {
-        let chat_response = match response.json::<Value>().await {
-            Ok(value) => value,
+        let chat_response = match tokio::time::timeout(
+            config.timeout,
+            crate::provider_http::read_response_body_limited(
+                response,
+                crate::provider_http::MAX_UPSTREAM_BODY_BYTES,
+            ),
+        )
+        .await
+        {
+            Ok(Ok(body)) => match serde_json::from_slice::<Value>(&body) {
+                Ok(value) => value,
+                Err(_) => {
+                    return error_response(
+                        StatusCode::BAD_GATEWAY,
+                        "上游服务返回的响应不是有效 JSON。",
+                    );
+                }
+            },
             Err(_) => {
-                return error_response(
-                    StatusCode::BAD_GATEWAY,
-                    "上游服务返回的响应不是有效 JSON。",
-                );
+                return error_response(StatusCode::GATEWAY_TIMEOUT, "读取上游服务响应超时。");
             }
+            Ok(Err(_)) => return error_response(StatusCode::BAD_GATEWAY, "读取上游服务响应失败。"),
         };
         Json(chat_to_responses_body(
             &chat_response,
@@ -641,9 +676,20 @@ async fn fallback_non_sse_stream(
     created_at: i64,
     store: Arc<std::sync::Mutex<ReasoningStore>>,
 ) -> Response {
-    let text = match tokio::time::timeout(config.timeout, response.text()).await {
-        Ok(Ok(text)) => text,
-        _ => {
+    let text = match tokio::time::timeout(
+        config.timeout,
+        crate::provider_http::read_response_body_limited(
+            response,
+            crate::provider_http::MAX_UPSTREAM_BODY_BYTES,
+        ),
+    )
+    .await
+    {
+        Ok(Ok(body)) => String::from_utf8_lossy(&body).into_owned(),
+        Err(_) => {
+            return error_response(StatusCode::GATEWAY_TIMEOUT, "读取上游服务响应超时。");
+        }
+        Ok(Err(_)) => {
             return error_response(StatusCode::BAD_GATEWAY, "读取上游服务响应失败。");
         }
     };
@@ -780,19 +826,23 @@ struct SseEventParser {
 
 impl SseEventParser {
     /// 喂入一行（不含换行符与行尾 `\r`）。返回累积的事件 data（空行触发分发时）。
-    fn push_line(&mut self, line: &str) -> Option<String> {
+    fn push_line(&mut self, line: &str) -> Result<Option<String>, ()> {
         let line = line.strip_suffix('\r').unwrap_or(line);
         if line.is_empty() {
-            return self.dispatch();
+            return Ok(self.dispatch());
         }
         if let Some(data) = line.strip_prefix("data:") {
             let data = data.strip_prefix(' ').unwrap_or(data);
+            let added = data.len() + usize::from(!self.data.is_empty());
+            if self.data.len().saturating_add(added) > MAX_SSE_EVENT_DATA_BYTES {
+                return Err(());
+            }
             if !self.data.is_empty() {
                 self.data.push('\n');
             }
             self.data.push_str(data);
         }
-        None
+        Ok(None)
     }
 
     /// 流结束（EOF）时处理残留数据。
@@ -830,11 +880,18 @@ fn dispatch_data(
         *done = true;
         return true;
     }
-    if let Ok(chunk) = serde_json::from_str::<Value>(data)
-        && translator.push_chunk(&chunk, pending).is_some()
-    {
-        *failed = true;
-        return true;
+    match serde_json::from_str::<Value>(data) {
+        Ok(chunk) => {
+            if translator.push_chunk(&chunk, pending).is_some() {
+                *failed = true;
+                return true;
+            }
+        }
+        Err(_) => {
+            translator.fail(pending, "上游流式响应包含无效 JSON。");
+            *failed = true;
+            return true;
+        }
     }
     false
 }
@@ -894,11 +951,29 @@ fn translate_stream(
                 let position = start + relative;
                 let line = utf8_lossy_slice(&buffer[start..position]);
                 start = position + 1;
-                if let Some(data) = parser.push_line(line.as_ref())
-                    && dispatch_data(&mut translator, &data, &mut pending, &mut failed, &mut done)
-                {
-                    break;
+                match parser.push_line(line.as_ref()) {
+                    Ok(Some(data))
+                        if dispatch_data(
+                            &mut translator,
+                            &data,
+                            &mut pending,
+                            &mut failed,
+                            &mut done,
+                        ) =>
+                    {
+                        break;
+                    }
+                    Err(()) => {
+                        failed = true;
+                        failure_message = "上游 SSE 事件数据超过允许大小。";
+                        break;
+                    }
+                    _ => {}
                 }
+            }
+            if !done && !failed && buffer.len().saturating_sub(start) > MAX_SSE_LINE_BUFFER_BYTES {
+                failed = true;
+                failure_message = "上游 SSE 未换行数据超过允许大小。";
             }
             if !done && !failed && start > 0 {
                 // 已消费的行一次性移除（每块只搬运一次剩余部分）；
@@ -913,12 +988,19 @@ fn translate_stream(
         if !done && !failed {
             // 上游没有发送 [DONE] 就断开：先把残留的未换行行喂给解析器，
             // 再分发解析器里累积的数据，保证最后一个事件不丢失。
-            if !buffer.is_empty()
-                && let Some(data) = parser.push_line(utf8_lossy_slice(&buffer).as_ref())
-            {
-                dispatch_data(&mut translator, &data, &mut pending, &mut failed, &mut done);
+            if !buffer.is_empty() {
+                match parser.push_line(utf8_lossy_slice(&buffer).as_ref()) {
+                    Ok(Some(data)) => {
+                        dispatch_data(&mut translator, &data, &mut pending, &mut failed, &mut done);
+                    }
+                    Err(()) => {
+                        failed = true;
+                        failure_message = "上游 SSE 事件数据超过允许大小。";
+                    }
+                    Ok(None) => {}
+                }
             }
-            if let Some(data) = parser.finish() {
+            if !failed && let Some(data) = parser.finish() {
                 dispatch_data(&mut translator, &data, &mut pending, &mut failed, &mut done);
             }
         }
@@ -2365,17 +2447,27 @@ mod tests {
     #[test]
     fn sse_parser_joins_multi_line_data_and_dispatches_on_blank_line() {
         let mut parser = SseEventParser::default();
-        assert!(parser.push_line("data: {\"id\": \"chatcmpl-1\",").is_none());
-        assert!(parser.push_line("data: \"choices\": []}").is_none());
-        let data = parser.push_line("").unwrap();
+        assert!(
+            parser
+                .push_line("data: {\"id\": \"chatcmpl-1\",")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            parser
+                .push_line("data: \"choices\": []}")
+                .unwrap()
+                .is_none()
+        );
+        let data = parser.push_line("").unwrap().unwrap();
         assert_eq!(data, "{\"id\": \"chatcmpl-1\",\n\"choices\": []}");
         // 注释与 event: 行被忽略。
-        assert!(parser.push_line(": keep-alive").is_none());
-        assert!(parser.push_line("event: message").is_none());
-        assert!(parser.push_line("data: [DONE]").is_none());
-        assert_eq!(parser.push_line("").unwrap(), "[DONE]");
+        assert!(parser.push_line(": keep-alive").unwrap().is_none());
+        assert!(parser.push_line("event: message").unwrap().is_none());
+        assert!(parser.push_line("data: [DONE]").unwrap().is_none());
+        assert_eq!(parser.push_line("").unwrap().unwrap(), "[DONE]");
         // EOF 时残留数据也会被分发。
-        assert!(parser.push_line("data: {\"a\":1}").is_none());
+        assert!(parser.push_line("data: {\"a\":1}").unwrap().is_none());
         assert_eq!(parser.finish().unwrap(), "{\"a\":1}");
         assert!(parser.finish().is_none());
     }
@@ -2604,28 +2696,56 @@ mod tests {
     #[test]
     fn sse_parser_accumulates_multiline_data_and_tolerates_cr() {
         let mut parser = SseEventParser::default();
-        assert_eq!(parser.push_line("data: {\"type\":\"a\""), None);
-        assert_eq!(parser.push_line("data: ,\"more\":1}"), None);
+        assert_eq!(parser.push_line("data: {\"type\":\"a\"").unwrap(), None);
+        assert_eq!(parser.push_line("data: ,\"more\":1}").unwrap(), None);
         // event:/注释行忽略。
-        assert_eq!(parser.push_line("event: x"), None);
-        assert_eq!(parser.push_line(": comment"), None);
+        assert_eq!(parser.push_line("event: x").unwrap(), None);
+        assert_eq!(parser.push_line(": comment").unwrap(), None);
         assert_eq!(
-            parser.push_line(""),
+            parser.push_line("").unwrap(),
             Some("{\"type\":\"a\"\n,\"more\":1}".into())
         );
         // 分发后缓冲区已取走，可复用。
         assert!(parser.data.is_empty());
         // 行尾 \r 容错。
-        assert_eq!(parser.push_line("data: done\r"), None);
-        assert_eq!(parser.push_line(""), Some("done".into()));
+        assert_eq!(parser.push_line("data: done\r").unwrap(), None);
+        assert_eq!(parser.push_line("").unwrap(), Some("done".into()));
     }
 
     #[test]
     fn sse_parser_finish_dispatchs_remaining_data() {
         let mut parser = SseEventParser::default();
-        assert_eq!(parser.push_line("data: tail"), None);
+        assert_eq!(parser.push_line("data: tail").unwrap(), None);
         assert_eq!(parser.finish(), Some("tail".into()));
         assert_eq!(parser.finish(), None);
+    }
+
+    #[test]
+    fn sse_parser_rejects_oversized_event_data() {
+        let mut parser = SseEventParser::default();
+        let line = format!("data: {}", "x".repeat(MAX_SSE_EVENT_DATA_BYTES + 1));
+        assert!(parser.push_line(&line).is_err());
+    }
+
+    #[test]
+    fn malformed_sse_json_emits_failed_not_completed() {
+        let mut translator = StreamTranslator::new("resp_bad", "model", 1);
+        let mut events = Vec::new();
+        let mut failed = false;
+        let mut done = false;
+        assert!(dispatch_data(
+            &mut translator,
+            "{not-json}",
+            &mut events,
+            &mut failed,
+            &mut done,
+        ));
+        let types = events
+            .iter()
+            .map(|event| event.event_type)
+            .collect::<Vec<_>>();
+        assert!(types.contains(&"response.failed"));
+        assert!(!types.contains(&"response.completed"));
     }
 
     #[test]
@@ -2669,13 +2789,14 @@ mod tests {
             .unwrap();
         });
         let provider = provider("p", &format!("http://{address}"));
-        let (port, _shutdown, _slot) = start_proxy(ProxyConfig::from_provider(&provider))
-            .await
-            .unwrap();
+        let (port, _shutdown, _slot, proxy_api_key) =
+            start_proxy(ProxyConfig::from_provider(&provider))
+                .await
+                .unwrap();
         let client = reqwest::Client::builder().no_proxy().build().unwrap();
         let response = client
             .post(format!("http://127.0.0.1:{port}/v1/responses"))
-            .bearer_auth(PROXY_FIXED_API_KEY)
+            .bearer_auth(&proxy_api_key)
             .json(&json!({"model": "deepseek-chat", "input": "你好", "stream": false}))
             .send()
             .await
@@ -2689,26 +2810,34 @@ mod tests {
 
         // 不同的服务复用同一个共享代理：监听端口固定，只切换上游配置。
         let registry = ChatProxyRegistry::default();
-        let port2 = registry.ensure(&provider).await.unwrap();
+        let (port2, _) = registry.ensure(&provider).await.unwrap();
         let mut other = provider.clone();
         other.id = "p2".into();
         other.base_url = "http://127.0.0.1:2/v1".into();
-        let port3 = registry.ensure(&other).await.unwrap();
+        let (port3, _) = registry.ensure(&other).await.unwrap();
         assert_eq!(port2, port3);
         registry.stop_all().await;
     }
 
     #[tokio::test]
     async fn proxy_rejects_requests_without_credentials() {
-        // 未携带本应用写入 Codex 的固定凭证时直接 401，不转发上游。
+        // 未携带本应用写入 Codex 的运行时凭证时直接 401，不转发上游。
         let provider = provider("p", "http://127.0.0.1:2/v1");
-        let (port, _shutdown, _slot) = start_proxy(ProxyConfig::from_provider(&provider))
-            .await
-            .unwrap();
+        let (port, _shutdown, _slot, proxy_api_key) =
+            start_proxy(ProxyConfig::from_provider(&provider))
+                .await
+                .unwrap();
         let client = reqwest::Client::builder().no_proxy().build().unwrap();
         let response = client
             .post(format!("http://127.0.0.1:{port}/v1/responses"))
             .json(&json!({"model": "deepseek-chat", "input": "hi"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status().as_u16(), 401);
+        let response = client
+            .get(format!("http://127.0.0.1:{port}/v1/models"))
+            .bearer_auth("codex-tools")
             .send()
             .await
             .unwrap();
@@ -2721,6 +2850,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status().as_u16(), 401);
+        let response = client
+            .get(format!("http://127.0.0.1:{port}/v1/models"))
+            .bearer_auth(&proxy_api_key)
+            .send()
+            .await
+            .unwrap();
+        assert_ne!(response.status().as_u16(), 401);
     }
 
     #[tokio::test]
@@ -2742,13 +2878,14 @@ mod tests {
             .unwrap();
         });
         let provider = provider("p", &format!("http://{address}"));
-        let (port, _shutdown, _slot) = start_proxy(ProxyConfig::from_provider(&provider))
-            .await
-            .unwrap();
+        let (port, _shutdown, _slot, proxy_api_key) =
+            start_proxy(ProxyConfig::from_provider(&provider))
+                .await
+                .unwrap();
         let client = reqwest::Client::builder().no_proxy().build().unwrap();
         let response = client
             .post(format!("http://127.0.0.1:{port}/v1/responses"))
-            .bearer_auth(PROXY_FIXED_API_KEY)
+            .bearer_auth(&proxy_api_key)
             .json(&json!({"model": "deepseek-chat", "input": "hi"}))
             .send()
             .await
@@ -2796,13 +2933,14 @@ mod tests {
             .unwrap();
         });
         let provider = provider("p", &format!("http://{address}"));
-        let (port, _shutdown, _slot) = start_proxy(ProxyConfig::from_provider(&provider))
-            .await
-            .unwrap();
+        let (port, _shutdown, _slot, proxy_api_key) =
+            start_proxy(ProxyConfig::from_provider(&provider))
+                .await
+                .unwrap();
         let client = reqwest::Client::builder().no_proxy().build().unwrap();
         let response = client
             .post(format!("http://127.0.0.1:{port}/v1/responses"))
-            .bearer_auth(PROXY_FIXED_API_KEY)
+            .bearer_auth(&proxy_api_key)
             .json(&json!({
                 "model": "deepseek-chat",
                 "input": "hi",
@@ -2849,13 +2987,14 @@ mod tests {
             .unwrap();
         });
         let provider = provider("p", &format!("http://{address}"));
-        let (port, _shutdown, _slot) = start_proxy(ProxyConfig::from_provider(&provider))
-            .await
-            .unwrap();
+        let (port, _shutdown, _slot, proxy_api_key) =
+            start_proxy(ProxyConfig::from_provider(&provider))
+                .await
+                .unwrap();
         let client = reqwest::Client::builder().no_proxy().build().unwrap();
         let response = client
             .post(format!("http://127.0.0.1:{port}/v1/responses"))
-            .bearer_auth(PROXY_FIXED_API_KEY)
+            .bearer_auth(&proxy_api_key)
             .json(&json!({"model": "deepseek-chat", "input": "你好", "stream": true}))
             .send()
             .await
@@ -2921,13 +3060,14 @@ mod tests {
             stream.flush().unwrap();
         });
         let provider = provider("p", &format!("http://{address}"));
-        let (port, _shutdown, _slot) = start_proxy(ProxyConfig::from_provider(&provider))
-            .await
-            .unwrap();
+        let (port, _shutdown, _slot, proxy_api_key) =
+            start_proxy(ProxyConfig::from_provider(&provider))
+                .await
+                .unwrap();
         let client = reqwest::Client::builder().no_proxy().build().unwrap();
         let response = client
             .post(format!("http://127.0.0.1:{port}/v1/responses"))
-            .bearer_auth(PROXY_FIXED_API_KEY)
+            .bearer_auth(&proxy_api_key)
             .json(&json!({"model": "deepseek-chat", "input": "hi", "stream": true}))
             .send()
             .await
@@ -3006,15 +3146,16 @@ mod tests {
             .unwrap();
         });
         let provider = provider("p", &format!("http://{address}"));
-        let (port, _shutdown, _slot) = start_proxy(ProxyConfig::from_provider(&provider))
-            .await
-            .unwrap();
+        let (port, _shutdown, _slot, proxy_api_key) =
+            start_proxy(ProxyConfig::from_provider(&provider))
+                .await
+                .unwrap();
         let client = reqwest::Client::builder().no_proxy().build().unwrap();
         let base = format!("http://127.0.0.1:{port}/v1/responses");
         // 第一轮：流式请求，拿到输出条目（含代理生成的 id）。
         let response = client
             .post(&base)
-            .bearer_auth(PROXY_FIXED_API_KEY)
+            .bearer_auth(&proxy_api_key)
             .json(&json!({"model": "deepseek-reasoner", "input": "运行命令", "stream": true}))
             .send()
             .await
@@ -3041,7 +3182,7 @@ mod tests {
         // 第二轮：带历史继续请求（id 与第一轮响应一致）。
         let response = client
             .post(&base)
-            .bearer_auth(PROXY_FIXED_API_KEY)
+            .bearer_auth(&proxy_api_key)
             .json(&json!({
                 "model": "deepseek-reasoner",
                 "input": [
@@ -3073,13 +3214,14 @@ mod tests {
             drop(stream);
         });
         let provider = provider("p", &format!("http://{address}"));
-        let (port, _shutdown, _slot) = start_proxy(ProxyConfig::from_provider(&provider))
-            .await
-            .unwrap();
+        let (port, _shutdown, _slot, proxy_api_key) =
+            start_proxy(ProxyConfig::from_provider(&provider))
+                .await
+                .unwrap();
         let client = reqwest::Client::builder().no_proxy().build().unwrap();
         let response = client
             .post(format!("http://127.0.0.1:{port}/v1/responses"))
-            .bearer_auth(PROXY_FIXED_API_KEY)
+            .bearer_auth(&proxy_api_key)
             .json(&json!({"model": "deepseek-chat", "input": "hi", "stream": true}))
             .send()
             .await
@@ -3102,6 +3244,116 @@ mod tests {
             .unwrap();
         let output = completed["response"]["output"].as_array().unwrap();
         assert_eq!(output[0]["content"][0]["text"], "你好世界");
+        upstream.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn proxy_fails_stream_with_oversized_unterminated_line() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let upstream = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            stream
+                .write_all(&vec![b'x'; MAX_SSE_LINE_BUFFER_BYTES + 1])
+                .unwrap();
+        });
+        let provider = provider("p", &format!("http://{address}"));
+        let (port, _shutdown, _slot, proxy_api_key) =
+            start_proxy(ProxyConfig::from_provider(&provider))
+                .await
+                .unwrap();
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let text = client
+            .post(format!("http://127.0.0.1:{port}/v1/responses"))
+            .bearer_auth(&proxy_api_key)
+            .json(&json!({"model": "m", "input": "hi", "stream": true}))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(text.contains("response.failed"));
+        assert!(!text.contains("response.completed"));
+        upstream.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn proxy_fails_when_eof_line_pushes_event_data_over_limit() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let upstream = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            write!(
+                stream,
+                "data: {}\ndata: tail",
+                "x".repeat(MAX_SSE_EVENT_DATA_BYTES - 4)
+            )
+            .unwrap();
+        });
+        let provider = provider("p", &format!("http://{address}"));
+        let (port, _shutdown, _slot, proxy_api_key) =
+            start_proxy(ProxyConfig::from_provider(&provider))
+                .await
+                .unwrap();
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let text = client
+            .post(format!("http://127.0.0.1:{port}/v1/responses"))
+            .bearer_auth(&proxy_api_key)
+            .json(&json!({"model": "m", "input": "hi", "stream": true}))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(text.contains("response.failed"));
+        assert!(!text.contains("response.completed"));
+        upstream.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn proxy_rejects_oversized_non_streaming_response() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let upstream = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request);
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                crate::provider_http::MAX_UPSTREAM_BODY_BYTES + 1
+            )
+            .unwrap();
+        });
+        let provider = provider("p", &format!("http://{address}"));
+        let (port, _shutdown, _slot, proxy_api_key) =
+            start_proxy(ProxyConfig::from_provider(&provider))
+                .await
+                .unwrap();
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let response = client
+            .post(format!("http://127.0.0.1:{port}/v1/responses"))
+            .bearer_auth(&proxy_api_key)
+            .json(&json!({"model": "m", "input": "hi", "stream": false}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
         upstream.join().unwrap();
     }
 
@@ -3137,7 +3389,7 @@ mod tests {
     async fn deleting_config_owner_disables_upstream_until_next_switch() {
         let registry = ChatProxyRegistry::default();
         let first = provider("p", "http://127.0.0.1:1/v1");
-        let port = registry.ensure(&first).await.unwrap();
+        let (port, token) = registry.ensure(&first).await.unwrap();
         // 删除当前配置所属的服务后，配置被清空但监听仍在（端口不变）。
         registry.stop("p").await;
         let slot = registry
@@ -3151,7 +3403,7 @@ mod tests {
         assert!(slot.current.read().await.clone().is_disabled());
         // 切换到其他服务后配置恢复。
         let other = provider("p2", "http://127.0.0.1:2/v1");
-        assert_eq!(registry.ensure(&other).await.unwrap(), port);
+        assert_eq!(registry.ensure(&other).await.unwrap(), (port, token));
         let slot = registry
             .single
             .lock()
@@ -3171,15 +3423,31 @@ mod tests {
     async fn effective_url_uses_proxy_for_chat_and_direct_for_responses() {
         let registry = ChatProxyRegistry::default();
         let chat = provider("chat", "https://api.deepseek.com/v1");
-        let url = effective_base_url(&chat, &registry).await.unwrap();
-        assert_eq!(url, format!("http://127.0.0.1:{PROXY_PORT}/v1"));
-        assert_eq!(url, proxy_base_url());
+        let target = effective_base_url(&chat, &registry).await.unwrap();
+        assert!(target.base_url.starts_with("http://127.0.0.1:"));
+        assert!(target.base_url.ends_with("/v1"));
+        assert!(target.proxy_api_key.is_some());
 
         let mut responses = chat.clone();
         responses.api_type = ProviderApiType::Responses;
-        let url = effective_base_url(&responses, &registry).await.unwrap();
-        assert_eq!(url, "https://api.deepseek.com/v1");
+        let target = effective_base_url(&responses, &registry).await.unwrap();
+        assert_eq!(target.base_url, "https://api.deepseek.com/v1");
+        assert!(target.proxy_api_key.is_none());
         registry.stop_all().await;
+    }
+
+    #[tokio::test]
+    async fn registries_generate_distinct_proxy_tokens() {
+        let provider = provider("p", "http://127.0.0.1:1/v1");
+        let first = ChatProxyRegistry::default();
+        let second = ChatProxyRegistry::default();
+        let (_, first_token) = first.ensure(&provider).await.unwrap();
+        let (_, second_token) = second.ensure(&provider).await.unwrap();
+
+        assert_ne!(first_token, second_token);
+        assert!(first_token.len() >= 108);
+        first.stop_all().await;
+        second.stop_all().await;
     }
 
     #[test]
@@ -3241,13 +3509,14 @@ mod tests {
             .unwrap();
         });
         let provider = provider("p", &format!("http://{address}"));
-        let (port, _shutdown, _slot) = start_proxy(ProxyConfig::from_provider(&provider))
-            .await
-            .unwrap();
+        let (port, _shutdown, _slot, proxy_api_key) =
+            start_proxy(ProxyConfig::from_provider(&provider))
+                .await
+                .unwrap();
         let client = reqwest::Client::builder().no_proxy().build().unwrap();
         let response = client
             .post(format!("http://127.0.0.1:{port}/v1/responses"))
-            .bearer_auth(PROXY_FIXED_API_KEY)
+            .bearer_auth(&proxy_api_key)
             .json(&json!({"model": "deepseek-chat", "input": "hi", "stream": true}))
             .send()
             .await
@@ -3304,13 +3573,14 @@ mod tests {
             .unwrap();
         });
         let provider = provider("p", &format!("http://{address}"));
-        let (port, _shutdown, _slot) = start_proxy(ProxyConfig::from_provider(&provider))
-            .await
-            .unwrap();
+        let (port, _shutdown, _slot, proxy_api_key) =
+            start_proxy(ProxyConfig::from_provider(&provider))
+                .await
+                .unwrap();
         let client = reqwest::Client::builder().no_proxy().build().unwrap();
         let response = client
             .post(format!("http://127.0.0.1:{port}/v1/responses"))
-            .bearer_auth(PROXY_FIXED_API_KEY)
+            .bearer_auth(&proxy_api_key)
             .json(&json!({"model": "bad", "input": "hi", "stream": true}))
             .send()
             .await
@@ -3337,13 +3607,14 @@ mod tests {
             });
             let mut provider = provider("p", &format!("http://{address}"));
             provider.timeout_secs = 1;
-            let (port, _shutdown, _slot) = start_proxy(ProxyConfig::from_provider(&provider))
-                .await
-                .unwrap();
+            let (port, _shutdown, _slot, proxy_api_key) =
+                start_proxy(ProxyConfig::from_provider(&provider))
+                    .await
+                    .unwrap();
             let client = reqwest::Client::builder().no_proxy().build().unwrap();
             let response = client
                 .post(format!("http://127.0.0.1:{port}/v1/responses"))
-                .bearer_auth(PROXY_FIXED_API_KEY)
+                .bearer_auth(&proxy_api_key)
                 .json(&json!({"model": "m", "input": "hi", "stream": stream}))
                 .send()
                 .await
@@ -3359,5 +3630,41 @@ mod tests {
             );
             upstream.join().unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn proxy_returns_gateway_timeout_when_non_streaming_body_stalls() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let upstream = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{")
+                .unwrap();
+            while stream
+                .read(&mut request)
+                .map(|read| read > 0)
+                .unwrap_or(false)
+            {}
+        });
+        let mut provider = provider("p", &format!("http://{address}"));
+        provider.timeout_secs = 1;
+        let (port, _shutdown, _slot, proxy_api_key) =
+            start_proxy(ProxyConfig::from_provider(&provider))
+                .await
+                .unwrap();
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let response = client
+            .post(format!("http://127.0.0.1:{port}/v1/responses"))
+            .bearer_auth(&proxy_api_key)
+            .json(&json!({"model": "m", "input": "hi", "stream": false}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        upstream.join().unwrap();
     }
 }
