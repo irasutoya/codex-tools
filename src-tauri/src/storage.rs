@@ -9,7 +9,7 @@ use std::{
 };
 
 const MAX_SAVED_PROVIDERS: usize = 500;
-const MAX_SAVED_OPENAI_ACCOUNTS: usize = 500;
+pub(crate) const MAX_SAVED_OPENAI_ACCOUNTS: usize = 500;
 const MAX_EMAIL_CHARS: usize = 320;
 #[cfg(test)]
 const MAX_APP_DATA_BYTES: u64 = 32 * 1024 * 1024;
@@ -578,60 +578,77 @@ impl Store {
         &self,
         account: &StoredOfficialAccount,
     ) -> Result<StoredOfficialAccount, AppError> {
-        let mut incoming = account.clone();
-        normalize_official_account(&mut incoming)?;
+        self.save_official_accounts(std::slice::from_ref(account))?
+            .into_iter()
+            .next()
+            .ok_or_else(|| AppError::Internal("OpenAI 账号保存结果为空。".into()))
+    }
+
+    pub fn save_official_accounts(
+        &self,
+        accounts: &[StoredOfficialAccount],
+    ) -> Result<Vec<StoredOfficialAccount>, AppError> {
+        let mut incoming_accounts = accounts.to_vec();
+        for account in &mut incoming_accounts {
+            normalize_official_account(account)?;
+        }
         let now = chrono::Utc::now().timestamp();
 
-        self.update(|state| {
-            if let Some(existing_index) = state
-                .official_accounts
-                .iter()
-                .position(|saved| saved.account_id == incoming.account_id)
-            {
-                let existing = &state.official_accounts[existing_index];
-                incoming.id = existing.id.clone();
-                incoming.created_at = existing.created_at;
-                // Remarks have a dedicated update path. Credential refreshes and
-                // repeated logins must never overwrite a concurrent user edit.
-                incoming.remark = existing.remark.clone();
-                // Credential refreshes and repeated device logins must not clear
-                // the last quota snapshot. Quota has its own dedicated update path.
-                incoming.quota = existing.quota.clone();
-                incoming.updated_at = now;
-                state.official_accounts[existing_index] = incoming.clone();
-                let mut kept_match = false;
-                state.official_accounts.retain(|saved| {
-                    if saved.account_id != incoming.account_id {
-                        true
-                    } else if kept_match {
-                        false
-                    } else {
-                        kept_match = true;
-                        true
-                    }
-                });
-                return Ok(incoming);
-            }
-
-            if incoming.id.trim().is_empty()
-                || state
+        self.update(move |state| {
+            let mut saved_accounts = Vec::with_capacity(incoming_accounts.len());
+            for mut incoming in incoming_accounts {
+                if let Some(existing_index) = state
                     .official_accounts
                     .iter()
-                    .any(|saved| saved.id == incoming.id)
-            {
-                incoming.id = uuid::Uuid::new_v4().to_string();
+                    .position(|saved| saved.account_id == incoming.account_id)
+                {
+                    let existing = &state.official_accounts[existing_index];
+                    incoming.id = existing.id.clone();
+                    incoming.created_at = existing.created_at;
+                    // Remarks have a dedicated update path. Credential refreshes and
+                    // repeated logins must never overwrite a concurrent user edit.
+                    incoming.remark = existing.remark.clone();
+                    // Credential refreshes and repeated device logins must not clear
+                    // the last quota snapshot. Quota has its own dedicated update path.
+                    incoming.quota = existing.quota.clone();
+                    incoming.updated_at = now;
+                    state.official_accounts[existing_index] = incoming.clone();
+                    let mut kept_match = false;
+                    state.official_accounts.retain(|saved| {
+                        if saved.account_id != incoming.account_id {
+                            true
+                        } else if kept_match {
+                            false
+                        } else {
+                            kept_match = true;
+                            true
+                        }
+                    });
+                    saved_accounts.push(incoming);
+                    continue;
+                }
+
+                if incoming.id.trim().is_empty()
+                    || state
+                        .official_accounts
+                        .iter()
+                        .any(|saved| saved.id == incoming.id)
+                {
+                    incoming.id = uuid::Uuid::new_v4().to_string();
+                }
+                if incoming.created_at == 0 {
+                    incoming.created_at = now;
+                }
+                if state.official_accounts.len() >= MAX_SAVED_OPENAI_ACCOUNTS {
+                    return Err(AppError::InvalidConfig(
+                        "最多可保存 500 个 OpenAI 账号，请先删除不再使用的账号。".into(),
+                    ));
+                }
+                incoming.updated_at = now;
+                state.official_accounts.push(incoming.clone());
+                saved_accounts.push(incoming);
             }
-            if incoming.created_at == 0 {
-                incoming.created_at = now;
-            }
-            if state.official_accounts.len() >= MAX_SAVED_OPENAI_ACCOUNTS {
-                return Err(AppError::InvalidConfig(
-                    "最多可保存 500 个 OpenAI 账号，请先删除不再使用的账号。".into(),
-                ));
-            }
-            incoming.updated_at = now;
-            state.official_accounts.push(incoming.clone());
-            Ok(incoming)
+            Ok(saved_accounts)
         })
     }
 
@@ -1243,6 +1260,36 @@ mod tests {
         assert_eq!(third.remark, "保留的备注");
         assert_eq!(third.quota.status, QuotaStatus::Success);
         assert_eq!(third.quota.fetched_at, Some(42));
+    }
+
+    #[test]
+    fn batch_official_account_save_is_atomic_at_capacity() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path().to_path_buf()).unwrap();
+        for index in 0..MAX_SAVED_OPENAI_ACCOUNTS {
+            store
+                .save_official_account(&official_account(
+                    &format!("workspace-{index}"),
+                    &format!("account-{index}"),
+                ))
+                .unwrap();
+        }
+
+        let result = store.save_official_accounts(&[
+            official_account("workspace-new-1", "new-1"),
+            official_account("workspace-new-2", "new-2"),
+        ]);
+
+        assert!(result.is_err());
+        assert_eq!(store.snapshot().unwrap().official_accounts.len(), 500);
+        assert!(
+            !store
+                .snapshot()
+                .unwrap()
+                .official_accounts
+                .iter()
+                .any(|account| account.account_id == "workspace-new-1")
+        );
     }
 
     #[test]

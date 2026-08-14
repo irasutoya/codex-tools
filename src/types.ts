@@ -300,6 +300,11 @@ export type OfficialAccountView = {
   updatedAt: number
 }
 
+export type ProxyImportResult = {
+  accounts: OfficialAccountView[]
+  detectedFormats: string[]
+}
+
 export type ProviderOverview = {
   providers: Provider[]
   officialAccounts: OfficialAccountView[]

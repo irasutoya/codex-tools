@@ -82,7 +82,7 @@ export function AccountLoginDialog({
         <DialogHeader>
           <DialogTitle>添加 OpenAI 账号</DialogTitle>
           <DialogDescription>
-            选择浏览器授权，或导入已有的 Cookie 登录凭据。
+            选择浏览器授权，或粘贴反代账号登录材料。
           </DialogDescription>
         </DialogHeader>
 
@@ -105,7 +105,7 @@ export function AccountLoginDialog({
               </TabsTrigger>
               <TabsTrigger value="cookie" disabled={busy}>
                 <HugeiconsIcon icon={Key01Icon} />
-                Cookie 登录
+                反代账号登录
               </TabsTrigger>
             </TabsList>
 
@@ -227,7 +227,7 @@ export function AccountLoginDialog({
                 </Field>
                 <Field data-disabled={busy}>
                   <FieldLabel htmlFor="cookie-account-content">
-                    Cookie Token / 单账号 JSON
+                    RT / Token / 反代账号 JSON
                   </FieldLabel>
                   <Textarea
                     ref={contentRef}
@@ -239,14 +239,14 @@ export function AccountLoginDialog({
                     wrap="soft"
                     maxLength={MAX_COOKIE_CREDENTIAL_LENGTH}
                     placeholder={
-                      '粘贴 at-…、accessToken，或包含 "access_token" / "refresh_token" 的单账号 JSON'
+                      "可粘贴纯 RT、at-…、JWT，或 CPA / Sub2API / Cockpit / 9router JSON"
                     }
                     onInput={(event) =>
                       setHasContent(/\S/.test(event.currentTarget.value))
                     }
                   />
                   <FieldDescription>
-                    原始内容不会保存；程序只提取登录字段并写入本机应用数据。
+                    程序会自动识别格式并拆分多账号；原始内容只提取登录字段写入本机应用数据。
                   </FieldDescription>
                 </Field>
               </FieldGroup>
@@ -282,7 +282,7 @@ export function AccountLoginDialog({
               ) : (
                 <HugeiconsIcon icon={Key01Icon} data-icon="inline-start" />
               )}
-              {importing ? "正在导入…" : "导入并登录"}
+              {importing ? "正在识别并登录…" : "识别并登录"}
             </Button>
           )}
         </DialogFooter>

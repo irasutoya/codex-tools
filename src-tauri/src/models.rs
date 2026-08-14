@@ -1243,8 +1243,10 @@ pub(crate) fn ensure_char_limit(
 }
 
 pub(crate) fn is_personal_access_token_credential(credential: &CodexAuthCredential) -> bool {
-    credential.tokens.id_token.trim().is_empty()
-        || credential.tokens.refresh_token.trim().is_empty()
+    credential.auth_mode == "personal_access_token"
+        || (credential.tokens.id_token.trim().is_empty()
+            && credential.tokens.refresh_token.trim().is_empty()
+            && credential.tokens.access_token.trim().starts_with("at-"))
 }
 
 pub(crate) fn validate_official_credential(
@@ -1252,13 +1254,12 @@ pub(crate) fn validate_official_credential(
 ) -> Result<(), AppError> {
     let tokens = &credential.tokens;
     let personal_access_token = is_personal_access_token_credential(credential);
-    if credential.auth_mode != "chatgpt"
-        || tokens.access_token.trim().is_empty()
+    if !matches!(
+        credential.auth_mode.as_str(),
+        "chatgpt" | "personal_access_token"
+    ) || tokens.access_token.trim().is_empty()
         || tokens.account_id.trim().is_empty()
-        || (!personal_access_token
-            && (tokens.id_token.trim().is_empty()
-                || tokens.refresh_token.trim().is_empty()
-                || credential.last_refresh.trim().is_empty()))
+        || (!personal_access_token && credential.last_refresh.trim().is_empty())
     {
         return Err(AppError::InvalidConfig(
             "OpenAI 登录信息不完整，请重新登录。".into(),
@@ -1572,7 +1573,7 @@ mod tests {
 
         let mut missing_refresh = credential();
         missing_refresh.tokens.refresh_token.clear();
-        assert!(is_personal_access_token_credential(&missing_refresh));
+        assert!(!is_personal_access_token_credential(&missing_refresh));
         assert!(validate_official_credential(&missing_refresh).is_ok());
 
         let mut missing_last_refresh = credential();
@@ -1590,7 +1591,7 @@ mod tests {
         let credential = CodexAuthCredential {
             tokens: CodexAuthTokens {
                 id_token: String::new(),
-                access_token: "pat-secret".into(),
+                access_token: "at-pat-secret".into(),
                 refresh_token: String::new(),
                 account_id: "workspace-account".into(),
             },
@@ -1598,6 +1599,31 @@ mod tests {
             ..credential()
         };
         assert!(is_personal_access_token_credential(&credential));
+        assert!(validate_official_credential(&credential).is_ok());
+    }
+
+    #[test]
+    fn access_token_only_oauth_is_not_treated_as_personal_access_token() {
+        let credential = CodexAuthCredential {
+            tokens: CodexAuthTokens {
+                id_token: String::new(),
+                access_token: "header.payload.signature".into(),
+                refresh_token: String::new(),
+                account_id: "workspace-account".into(),
+            },
+            ..credential()
+        };
+
+        assert!(!is_personal_access_token_credential(&credential));
+        assert!(validate_official_credential(&credential).is_ok());
+    }
+
+    #[test]
+    fn oauth_with_id_token_and_empty_refresh_is_not_personal_access_token() {
+        let mut credential = credential();
+        credential.tokens.refresh_token.clear();
+
+        assert!(!is_personal_access_token_credential(&credential));
         assert!(validate_official_credential(&credential).is_ok());
     }
 

@@ -308,7 +308,7 @@ impl AuthCenter {
             ensure_char_limit(
                 token,
                 MAX_CREDENTIAL_CHARS,
-                "Cookie 中的单项登录凭据过长，请导入有效的账号数据。",
+                "反代账号中的单项登录凭据过长，请导入有效的账号数据。",
             )?;
         }
         if imported.access_token.is_none() {
@@ -317,7 +317,7 @@ impl AuthCenter {
             // auth path can consume that token at the same time.
             let _guard = self.refresh_lock.lock().await;
             let refresh_token = imported.refresh_token.clone().ok_or_else(|| {
-                AppError::InvalidConfig("Cookie 凭据缺少 accessToken 或 refresh_token。".into())
+                AppError::InvalidConfig("反代账号凭据缺少 accessToken 或 refresh_token。".into())
             })?;
             let http = self.client()?;
             let response = http
@@ -330,8 +330,8 @@ impl AuthCenter {
                 .send()
                 .await
                 .map_err(safe_network_error)?;
-            let response = require_success(response, "无法使用 Cookie 中的 refresh_token 登录")?;
-            let refreshed: TokenResponse = read_json_bounded(response, "Cookie 登录结果").await?;
+            let response = require_success(response, "无法使用反代账号的 refresh_token 登录")?;
+            let refreshed: TokenResponse = read_json_bounded(response, "反代账号登录结果").await?;
             let refreshed_import = ImportedProxyCredential {
                 access_token: Some(required_token(refreshed.access_token, "access_token")?),
                 id_token: non_empty(refreshed.id_token),
@@ -340,6 +340,9 @@ impl AuthCenter {
                 account_id: imported.account_id,
                 email: imported.email,
                 suggested_name: imported.suggested_name,
+                expires_at: imported.expires_at,
+                source_format: imported.source_format,
+                is_personal_access_token: imported.is_personal_access_token,
             };
             return account_from_imported_tokens(refreshed_import, requested_name);
         }
@@ -480,9 +483,7 @@ fn refresh_decision(
             .is_some_and(|expires_at| expires_at <= now)
         {
             let message = match account.source {
-                OfficialAccountSource::ProxyImport => {
-                    "Cookie 账号的 accessToken 已过期，请重新导入。"
-                }
+                OfficialAccountSource::ProxyImport => "反代账号的 accessToken 已过期，请重新导入。",
                 OfficialAccountSource::OpenAiOauth => {
                     "OpenAI 登录已过期且缺少 refresh token，请重新登录。"
                 }
@@ -578,7 +579,7 @@ fn account_from_imported_tokens(
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| AppError::InvalidConfig("Cookie 凭据缺少 accessToken。".into()))?
+        .ok_or_else(|| AppError::InvalidConfig("反代账号凭据缺少 accessToken。".into()))?
         .to_owned();
     let id_token = imported.id_token.clone().unwrap_or_default();
     let id_claims = token_identity(&id_token).unwrap_or_default();
@@ -597,7 +598,10 @@ fn account_from_imported_tokens(
         .unwrap_or_default();
     let now = chrono::Utc::now();
     let now_timestamp = now.timestamp();
-    let expires_at = access_claims.expires_at.or(id_claims.expires_at);
+    let expires_at = access_claims
+        .expires_at
+        .or(id_claims.expires_at)
+        .or(imported.expires_at);
     let mut account = StoredOfficialAccount {
         id: String::new(),
         name: String::new(),
@@ -605,7 +609,11 @@ fn account_from_imported_tokens(
         account_id: account_id.clone(),
         email,
         credential: CodexAuthCredential {
-            auth_mode: "chatgpt".into(),
+            auth_mode: if imported.is_personal_access_token {
+                "personal_access_token".into()
+            } else {
+                "chatgpt".into()
+            },
             openai_api_key: None,
             tokens: CodexAuthTokens {
                 id_token,
@@ -640,7 +648,7 @@ fn apply_imported_profile(
         .map(str::to_owned)
         .or_else(|| imported.suggested_name.clone())
         .or_else(|| (!account.email.is_empty()).then(|| account.email.clone()))
-        .unwrap_or_else(|| "Cookie 账号".into());
+        .unwrap_or_else(|| "反代账号".into());
 }
 
 fn parse_interval(value: Option<&Value>) -> u64 {
@@ -1027,6 +1035,9 @@ mod tests {
                 account_id: None,
                 email: Some("proxy@example.test".into()),
                 suggested_name: Some("日常 Cookie 账号".into()),
+                expires_at: None,
+                source_format: crate::proxy_import::ProxyCredentialFormat::RawAccessToken,
+                is_personal_access_token: true,
             },
             None,
         )
