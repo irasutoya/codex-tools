@@ -9,8 +9,6 @@ const readJson = (path) => JSON.parse(read(path))
 const semverPattern =
   /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-((?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*))*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/
 
-const escapeRegExp = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
-
 export const isValidSemver = (version) => semverPattern.test(version)
 
 export function readCargoPackageVersion(toml) {
@@ -33,29 +31,7 @@ export function readCargoLockPackageVersion(lockfile, packageName) {
   return matchingPackages[0].match(/^version\s*=\s*"([^"]+)"\s*$/m)?.[1]
 }
 
-export function findVersionHeading(lines, version) {
-  const heading = new RegExp(
-    `^## \\[${escapeRegExp(version)}\\] - \\d{4}-\\d{2}-\\d{2}$`
-  )
-  return lines.find((line) => heading.test(line))
-}
-
-export function hasUnreleasedContent(changelog) {
-  const lines = changelog.split(/\r?\n/)
-  const start = lines.indexOf("## [Unreleased]")
-  if (start === -1) throw new Error("CHANGELOG.md 缺少 Unreleased 部分")
-
-  const end = lines.findIndex(
-    (line, index) =>
-      index > start &&
-      (/^## \[[^\]]+\](?:\s|$)/.test(line) || /^\[[^\]]+\]:\s/.test(line))
-  )
-  return lines
-    .slice(start + 1, end === -1 ? lines.length : end)
-    .some((line) => line.trim() !== "")
-}
-
-export function checkVersions({ versions, expected, tag, changelog }) {
+export function checkVersions({ versions, expected, tag }) {
   if (!isValidSemver(expected)) {
     throw new Error(`package.json 中的版本不是有效的 SemVer：${expected}`)
   }
@@ -72,20 +48,6 @@ export function checkVersions({ versions, expected, tag, changelog }) {
 
   if (tag && tag !== `v${expected}`) {
     throw new Error(`发布标签 ${tag} 与项目版本 v${expected} 不一致`)
-  }
-
-  if (tag) {
-    const changelogLines = changelog.split(/\r?\n/)
-    if (!findVersionHeading(changelogLines, expected)) {
-      throw new Error(
-        `CHANGELOG.md 缺少“## [${expected}] - YYYY-MM-DD”版本标题`
-      )
-    }
-    if (hasUnreleasedContent(changelog)) {
-      throw new Error(
-        "CHANGELOG.md 的 Unreleased 仍有内容，请先移动到当前发布版本"
-      )
-    }
   }
 }
 
@@ -127,7 +89,6 @@ function main() {
     versions,
     expected,
     tag,
-    changelog: tag ? read("CHANGELOG.md") : "",
   })
   console.log(
     tag

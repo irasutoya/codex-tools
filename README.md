@@ -90,7 +90,7 @@ X-Custom-Header = "<可选请求头>"
 | Windows | 安装目录或可执行文件同级的 `data/app.json`                               |
 | macOS   | `~/Library/Application Support/io.github.irasutoya.codex-tools/app.json` |
 
-激活第三方账号后，API Key 还会写入 Codex 的 `auth.json`。可用 `CODEX_TOOLS_DATA_DIR` 覆盖数据目录。完整边界见 [安全策略](SECURITY.md)。
+激活第三方账号后，API Key 还会写入 Codex 的 `auth.json`。可用 `CODEX_TOOLS_DATA_DIR` 覆盖数据目录。
 
 ## 本地开发
 
@@ -119,11 +119,9 @@ npm run dist:win
 npm run dist:mac:arm64
 ```
 
-发布流程见 [发布指南](docs/RELEASING.md)，参与开发请阅读 [贡献指南](CONTRIBUTING.md)。
-
 ## 项目状态
 
-项目仍处于早期预览阶段。升级前请阅读 [更新日志](CHANGELOG.md)，在 [Issues](https://github.com/irasutoya/codex-tools/issues) 中报告问题；请移除 API Key、OAuth token、`auth.json`、`credentials.json` 与会话正文。
+项目仍处于早期预览阶段。请在 [Issues](https://github.com/irasutoya/codex-tools/issues) 中报告问题；提交前请移除 API Key、OAuth token、`auth.json`、`credentials.json` 与会话正文。
 
 ## 许可证
 

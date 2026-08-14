@@ -104,11 +104,9 @@ jobs:
       - name: Generate checksums
         working-directory: release-artifacts
         run: sha256sum * > SHA256SUMS.txt
-      - name: Extract release notes
-        run: npm run release:notes -- --version "${GITHUB_REF_NAME#v}"
       - uses: softprops/action-gh-release@v2
         with:
           draft: true
           prerelease: true
           files: release-artifacts/*
-          body_path: release-notes.md
+          generate_release_notes: true

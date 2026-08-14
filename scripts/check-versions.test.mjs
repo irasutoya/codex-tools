@@ -2,8 +2,6 @@ import { describe, expect, it } from "vitest"
 
 import {
   checkVersions,
-  findVersionHeading,
-  hasUnreleasedContent,
   isValidSemver,
   readCargoLockPackageVersion,
   readCargoPackageVersion,
@@ -60,41 +58,7 @@ source = "registry+https://example.com"
   })
 })
 
-describe("CHANGELOG validation", () => {
-  it("matches an exact version heading instead of a version prefix", () => {
-    expect(
-      findVersionHeading(["## [1.2.30] - 2026-01-01"], "1.2.3")
-    ).toBeUndefined()
-    expect(
-      findVersionHeading(["## [1.2.3] - 2026-01-01"], "1.2.3")
-    ).toBeDefined()
-  })
-
-  it.each(["### Added", "release prose", "<!-- pending -->", "- release item"])(
-    "detects non-empty Unreleased content: %s",
-    (content) => {
-      expect(
-        hasUnreleasedContent(
-          `## [Unreleased]\n\n${content}\n\n## [1.2.3] - 2026-01-01\n`
-        )
-      ).toBe(true)
-    }
-  )
-
-  it("accepts an empty Unreleased section", () => {
-    expect(
-      hasUnreleasedContent("## [Unreleased]\n\n## [1.2.3] - 2026-01-01\n")
-    ).toBe(false)
-  })
-
-  it("does not treat link references as Unreleased content", () => {
-    expect(
-      hasUnreleasedContent(
-        "## [Unreleased]\n\n[Unreleased]: https://example.com/compare\n"
-      )
-    ).toBe(false)
-  })
-
+describe("version validation", () => {
   it("reports a missing Cargo.lock root version as a mismatch", () => {
     expect(() =>
       checkVersions({
