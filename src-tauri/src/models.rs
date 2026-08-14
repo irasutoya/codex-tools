@@ -1262,7 +1262,7 @@ pub(crate) fn validate_official_credential(
         || (!personal_access_token && credential.last_refresh.trim().is_empty())
     {
         return Err(AppError::InvalidConfig(
-            "OpenAI 登录信息不完整，请重新登录。".into(),
+            "保存的 OpenAI 登录凭据不完整，请重新进行官方授权或导入 Cookie 数据。".into(),
         ));
     }
     for token in [
@@ -1273,7 +1273,7 @@ pub(crate) fn validate_official_credential(
         ensure_char_limit(
             token,
             MAX_CREDENTIAL_CHARS,
-            "OpenAI 登录凭据过长，请重新登录或导入有效的 Cookie。",
+            "OpenAI 登录凭据过长，请重新进行官方授权或检查 Cookie 数据。",
         )?;
     }
     ensure_char_limit(

@@ -104,7 +104,7 @@ export function ProvidersPage({
     } catch (reason) {
       setLoginError(errorMessage(reason))
       toast.add({
-        title: "无法开始登录",
+        title: "无法获取 OpenAI 授权码",
         description: errorMessage(reason),
         type: "error",
       })
@@ -116,7 +116,7 @@ export function ProvidersPage({
   const finishLoginPoll = useCallback(
     (result: Awaited<ReturnType<typeof call<"connections_login_poll">>>) => {
       if (result.status === "complete") {
-        toast.add({ title: "OpenAI 登录成功", type: "success" })
+        toast.add({ title: "OpenAI 账号已登录", type: "success" })
         setAuthorization(undefined)
         setLoginOpen(false)
         onSelectedIdChange(result.account.id)
@@ -125,7 +125,7 @@ export function ProvidersPage({
       }
       if (result.status === "expired") {
         setAuthorization(undefined)
-        setLoginError("登录码已过期，请重新生成后继续。")
+        setLoginError("授权码已过期，请重新获取授权码。")
         return true
       }
       return false
@@ -142,12 +142,12 @@ export function ProvidersPage({
       })
       if (!finishLoginPoll(result)) {
         toast.add({
-          title: "仍在等待授权",
+          title: "OpenAI 尚未确认授权",
         })
       }
     } catch (reason) {
       toast.add({
-        title: "登录状态检查失败",
+        title: "无法检查授权结果",
         description: errorMessage(reason),
         type: "error",
       })
@@ -178,7 +178,7 @@ export function ProvidersPage({
             .catch((reason) => {
               if (cancelled) return
               setLoginError(
-                `暂时无法确认登录结果，程序会自动重试：${errorMessage(reason)}`
+                `暂时无法连接 OpenAI，本应用将自动重试：${errorMessage(reason)}`
               )
               schedule()
             })
@@ -215,12 +215,13 @@ export function ProvidersPage({
         content,
       })
       const firstAccount = imported.accounts[0]
-      const formatLabel = imported.detectedFormats.join("、") || "反代账号"
+      const formatLabel =
+        imported.detectedFormats.join("、") || "Cookie 登录数据"
       toast.add({
         title:
           imported.accounts.length > 1
-            ? `已导入 ${imported.accounts.length} 个反代账号`
-            : "反代账号已导入",
+            ? `已导入 ${imported.accounts.length} 个 Cookie 账号`
+            : "Cookie 登录数据已导入",
         description: `${formatLabel}${firstAccount ? ` · ${firstAccount.name}` : ""}`,
         type: "success",
       })
@@ -231,7 +232,7 @@ export function ProvidersPage({
     } catch (reason) {
       setLoginError(errorMessage(reason))
       toast.add({
-        title: "反代账号登录失败",
+        title: "Cookie 登录数据导入失败",
         description: errorMessage(reason),
         type: "error",
       })
@@ -300,7 +301,7 @@ export function ProvidersPage({
               </EmptyMedia>
               <EmptyTitle>还没有连接</EmptyTitle>
               <EmptyDescription>
-                添加 OpenAI 账号或自定义 API 服务。
+                登录 OpenAI 账号，或连接兼容 Responses API 的服务。
               </EmptyDescription>
             </EmptyHeader>
             <div className="flex gap-2">
@@ -310,7 +311,7 @@ export function ProvidersPage({
                 onClick={() => openAccountLogin("browser")}
               >
                 <HugeiconsIcon icon={Login03Icon} data-icon="inline-start" />
-                添加账号
+                OpenAI 授权
               </Button>
               <Button
                 type="button"
@@ -319,7 +320,7 @@ export function ProvidersPage({
                 onClick={() => openAccountLogin("cookie")}
               >
                 <HugeiconsIcon icon={Key01Icon} data-icon="inline-start" />
-                反代账号登录
+                导入 Cookie
               </Button>
               <Button
                 type="button"
@@ -331,7 +332,7 @@ export function ProvidersPage({
                 }}
               >
                 <HugeiconsIcon icon={Add01Icon} data-icon="inline-start" />
-                添加 API
+                添加 API 服务
               </Button>
             </div>
           </Empty>
@@ -356,7 +357,7 @@ export function ProvidersPage({
           <div className="mr-auto flex min-w-40 flex-col gap-0.5">
             <div className="text-sm font-medium">添加连接</div>
             <div className="text-xs text-muted-foreground">
-              登录 OpenAI 账号，或添加兼容 API 服务。
+              使用官方授权或 Cookie 登录 OpenAI，也可以连接兼容 API 服务。
             </div>
           </div>
           <Button
@@ -366,7 +367,7 @@ export function ProvidersPage({
             onClick={() => openAccountLogin("browser")}
           >
             <HugeiconsIcon icon={Login03Icon} data-icon="inline-start" />
-            添加账号
+            OpenAI 授权
           </Button>
           <Button
             type="button"
@@ -388,7 +389,7 @@ export function ProvidersPage({
             disabled={actionBusy}
             onClick={() => openAccountLogin("cookie")}
           >
-            反代账号登录
+            导入 Cookie
           </Button>
         </CardContent>
       </Card>
@@ -416,7 +417,9 @@ export function ProvidersPage({
             label="接入方式"
             value={
               isAccount
-                ? "OpenAI OAuth"
+                ? account?.source === "proxy_import"
+                  ? "Cookie 登录数据"
+                  : "OpenAI 官方授权"
                 : provider?.apiType === "chat"
                   ? "Chat Completions"
                   : "Responses API"
@@ -480,7 +483,7 @@ export function ProvidersPage({
                   void run(
                     "login-refresh",
                     () => call("connections_refresh_login", { id: item.id }),
-                    { success: "登录状态已刷新", onSuccess: onRefresh }
+                    { success: "登录凭据已更新", onSuccess: onRefresh }
                   )
                 }
               >
@@ -489,7 +492,7 @@ export function ProvidersPage({
                 ) : (
                   <HugeiconsIcon icon={Login03Icon} data-icon="inline-start" />
                 )}
-                刷新登录
+                更新登录凭据
               </Button>
             </>
           ) : (
@@ -598,8 +601,8 @@ function credentialLabel(account: OfficialAccountView | undefined) {
   if (account.quota.status === "unauthorized") return "登录已失效"
   if (accountIsExpired(account)) return "登录已过期"
   return account.source === "proxy_import"
-    ? "反代账号登录有效"
-    : "OAuth 登录有效"
+    ? "Cookie 登录数据有效"
+    : "官方授权有效"
 }
 
 function Detail({ label, value }: { label: string; value: string }) {

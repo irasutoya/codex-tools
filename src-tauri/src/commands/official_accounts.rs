@@ -41,7 +41,8 @@ pub(crate) async fn connections_import_cookie(
     {
         if imported.len() != 1 {
             return Err(AppError::InvalidConfig(
-                "批量反代账号不能同时指定一个 Account ID。".into(),
+                "导入内容包含多个账号时，请不要填写统一的 Account ID；每个账号应在 JSON 中提供自己的标识。"
+                    .into(),
             ));
         }
         imported[0].account_id = Some(account_id.to_owned());
@@ -90,7 +91,7 @@ pub(crate) async fn connections_import_cookie(
         .len();
     if existing_account_ids.len() + new_account_count > crate::storage::MAX_SAVED_OPENAI_ACCOUNTS {
         return Err(AppError::InvalidConfig(
-            "本次导入会超过 500 个 OpenAI 账号上限，请先删除不再使用的账号。".into(),
+            "导入后将超过 500 个 OpenAI 账号的保存上限，请先删除不再使用的账号。".into(),
         ));
     }
     let saved_accounts = store.save_official_accounts(&resolved_accounts)?;
@@ -454,7 +455,7 @@ pub(crate) fn connections_open_login_page() -> Result<(), AppError> {
 fn platform_open() -> Result<(), AppError> {
     crate::platform::open_url("https://auth.openai.com/codex/device").map_err(|error| {
         AppError::Internal(format!(
-            "无法打开 OpenAI 登录页面，请手动前往 https://auth.openai.com/codex/device：{error}"
+            "无法自动打开 OpenAI 授权页面。请在浏览器中访问 https://auth.openai.com/codex/device：{error}"
         ))
     })
 }

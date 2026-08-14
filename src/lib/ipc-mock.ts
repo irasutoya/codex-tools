@@ -657,7 +657,7 @@ export async function mockCall(
       const id = `account-cookie-${Date.now()}`
       const account: OfficialAccountView = {
         id,
-        name: input.name?.trim() || "反代账号",
+        name: input.name?.trim() || "Cookie 账号",
         remark: "",
         accountId: input.accountId?.trim() || id,
         email: "",
@@ -669,7 +669,7 @@ export async function mockCall(
         updatedAt: Date.now(),
       }
       mockAccounts.push(account)
-      return { accounts: [account], detectedFormats: ["反代账号"] }
+      return { accounts: [account], detectedFormats: ["Cookie 登录数据"] }
     }
     case "connections_login_start":
       return {

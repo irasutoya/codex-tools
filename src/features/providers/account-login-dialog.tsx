@@ -80,16 +80,16 @@ export function AccountLoginDialog({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent showCloseButton={!busy} aria-busy={busy}>
         <DialogHeader>
-          <DialogTitle>添加 OpenAI 账号</DialogTitle>
+          <DialogTitle>登录 OpenAI 账号</DialogTitle>
           <DialogDescription>
-            选择浏览器授权，或粘贴反代账号登录材料。
+            通过 OpenAI 官方授权登录，或导入已有的 Cookie 登录数据。
           </DialogDescription>
         </DialogHeader>
 
         <DialogBody>
           {error && (
             <Alert variant="destructive">
-              <AlertTitle>登录暂时无法继续</AlertTitle>
+              <AlertTitle>无法完成登录</AlertTitle>
               <AlertDescription>{error}</AlertDescription>
             </Alert>
           )}
@@ -101,11 +101,11 @@ export function AccountLoginDialog({
             <TabsList className="grid w-full grid-cols-2">
               <TabsTrigger value="browser" disabled={busy}>
                 <HugeiconsIcon icon={Login03Icon} />
-                浏览器登录
+                官方授权
               </TabsTrigger>
               <TabsTrigger value="cookie" disabled={busy}>
                 <HugeiconsIcon icon={Key01Icon} />
-                反代账号登录
+                Cookie 导入
               </TabsTrigger>
             </TabsList>
 
@@ -114,18 +114,18 @@ export function AccountLoginDialog({
                 <Alert>
                   <HugeiconsIcon icon={Login03Icon} />
                   <AlertTitle className="flex flex-wrap items-center gap-2">
-                    登录码：
+                    授权码：
                     <code className="font-mono font-semibold">
                       {authorization.userCode}
                     </code>
                     <Badge variant="outline">
                       <Spinner data-icon="inline-start" />
-                      等待登录
+                      等待授权
                     </Badge>
                   </AlertTitle>
                   <AlertDescription>
-                    在 OpenAI
-                    登录页面输入此代码；完成后程序会自动确认并刷新账号。
+                    请在 OpenAI
+                    授权页面输入此代码。授权完成后，本应用会自动保存账号并更新登录状态。
                   </AlertDescription>
                 </Alert>
               ) : (
@@ -133,22 +133,23 @@ export function AccountLoginDialog({
                   {starting ? (
                     <>
                       <Spinner />
-                      <div className="text-sm font-medium">正在生成登录码…</div>
+                      <div className="text-sm font-medium">正在获取授权码…</div>
                     </>
                   ) : (
                     <>
                       <div className="text-sm font-medium">
-                        使用 OpenAI 设备授权登录
+                        使用 OpenAI 官方设备授权
                       </div>
                       <div className="text-xs text-muted-foreground">
-                        点击后会生成一次性登录码，不会读取浏览器 Cookie。
+                        获取一次性授权码后，在 OpenAI
+                        页面确认登录；本应用不会读取浏览器 Cookie。
                       </div>
                       <Button type="button" disabled={busy} onClick={onStart}>
                         <HugeiconsIcon
                           icon={Login03Icon}
                           data-icon="inline-start"
                         />
-                        生成登录码
+                        获取授权码
                       </Button>
                     </>
                   )}
@@ -166,7 +167,7 @@ export function AccountLoginDialog({
                     }
                   >
                     <HugeiconsIcon icon={Copy01Icon} data-icon="inline-start" />
-                    复制登录码
+                    复制授权码
                   </Button>
                   <Button
                     type="button"
@@ -178,7 +179,7 @@ export function AccountLoginDialog({
                       icon={ExternalLinkIcon}
                       data-icon="inline-start"
                     />
-                    打开登录页面
+                    打开授权页面
                   </Button>
                   <Button
                     type="button"
@@ -187,7 +188,7 @@ export function AccountLoginDialog({
                     onClick={onCheck}
                   >
                     {polling && <Spinner data-icon="inline-start" />}
-                    立即检查
+                    检查授权结果
                   </Button>
                 </div>
               )}
@@ -197,37 +198,38 @@ export function AccountLoginDialog({
               <FieldGroup>
                 <Field data-disabled={busy}>
                   <FieldLabel htmlFor="cookie-account-name">
-                    账号名称
+                    显示名称（可选）
                   </FieldLabel>
                   <Input
                     id="cookie-account-name"
                     disabled={busy}
                     maxLength={MAX_DISPLAY_NAME_LENGTH}
-                    placeholder="可选，例如：工作 Cookie 账号"
+                    placeholder="例如：工作账号"
                     value={name}
                     onChange={(event) => setName(event.target.value)}
                   />
                 </Field>
                 <Field data-disabled={busy}>
                   <FieldLabel htmlFor="cookie-account-id">
-                    ChatGPT Account ID
+                    ChatGPT Account ID（可选）
                   </FieldLabel>
                   <Input
                     id="cookie-account-id"
                     autoComplete="off"
                     disabled={busy}
                     maxLength={MAX_ACCOUNT_ID_LENGTH}
-                    placeholder="可选；团队账号查询额度时可能需要"
+                    placeholder="团队账号可填写；个人账号通常留空"
                     value={accountId}
                     onChange={(event) => setAccountId(event.target.value)}
                   />
                   <FieldDescription>
-                    个人账号通常留空；JSON 已包含 accountId 时也可留空。
+                    用于识别团队空间和查询额度。导入内容已包含 Account ID
+                    时无需重复填写。
                   </FieldDescription>
                 </Field>
                 <Field data-disabled={busy}>
                   <FieldLabel htmlFor="cookie-account-content">
-                    RT / Token / 反代账号 JSON
+                    Cookie 登录数据
                   </FieldLabel>
                   <Textarea
                     ref={contentRef}
@@ -239,14 +241,16 @@ export function AccountLoginDialog({
                     wrap="soft"
                     maxLength={MAX_COOKIE_CREDENTIAL_LENGTH}
                     placeholder={
-                      "可粘贴纯 RT、at-…、JWT，或 CPA / Sub2API / Cockpit / 9router JSON"
+                      "粘贴 Refresh Token、Access Token，或账号工具导出的 JSON"
                     }
                     onInput={(event) =>
                       setHasContent(/\S/.test(event.currentTarget.value))
                     }
                   />
                   <FieldDescription>
-                    程序会自动识别格式并拆分多账号；原始内容只提取登录字段写入本机应用数据。
+                    支持单个 Token、单账号 JSON 和账号数组，并可识别
+                    CPA、Sub2API、Cockpit、9router
+                    的导出格式。只会提取登录所需字段，原始内容不会保存。
                   </FieldDescription>
                 </Field>
               </FieldGroup>
@@ -282,7 +286,7 @@ export function AccountLoginDialog({
               ) : (
                 <HugeiconsIcon icon={Key01Icon} data-icon="inline-start" />
               )}
-              {importing ? "正在识别并登录…" : "识别并登录"}
+              {importing ? "正在验证并导入…" : "导入 Cookie 数据"}
             </Button>
           )}
         </DialogFooter>

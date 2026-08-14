@@ -21,8 +21,8 @@ impl ProxyCredentialFormat {
             Self::Cockpit => "Cockpit",
             Self::NineRouter => "9router",
             Self::RawAccessToken => "Access Token",
-            Self::RawRefreshToken => "纯 RT",
-            Self::GenericJson => "通用 Token JSON",
+            Self::RawRefreshToken => "Refresh Token",
+            Self::GenericJson => "通用登录凭据 JSON",
         }
     }
 }
@@ -44,7 +44,7 @@ pub struct ImportedProxyCredential {
 fn parse_proxy_credential(input: &str) -> Result<ImportedProxyCredential, String> {
     let mut credentials = parse_proxy_credentials(input)?;
     if credentials.len() != 1 {
-        return Err("检测到多个反代账号，请使用批量导入入口。".into());
+        return Err("导入内容包含多个账号，请使用支持账号数组的导入入口。".into());
     }
     Ok(credentials.remove(0))
 }
@@ -52,19 +52,22 @@ fn parse_proxy_credential(input: &str) -> Result<ImportedProxyCredential, String
 pub fn parse_proxy_credentials(input: &str) -> Result<Vec<ImportedProxyCredential>, String> {
     let input = input.trim();
     if input.is_empty() {
-        return Err("请粘贴 RT、Access Token 或反代账号 JSON。".into());
+        return Err(
+            "Cookie 登录数据不能为空。请粘贴 Refresh Token、Access Token 或导出的账号 JSON。"
+                .into(),
+        );
     }
 
     if input.chars().count() > MAX_COOKIE_CREDENTIAL_LENGTH {
-        return Err("反代账号内容不能超过 262,144 个字符。".into());
+        return Err("Cookie 登录数据不能超过 262,144 个字符，请减少账号数量后重试。".into());
     }
 
     if input.starts_with('{') || input.starts_with('[') {
-        let value: Value =
-            serde_json::from_str(input).map_err(|_| "反代账号 JSON 格式不正确。".to_string())?;
+        let value: Value = serde_json::from_str(input)
+            .map_err(|_| "无法解析 Cookie 登录数据：JSON 格式不正确。".to_string())?;
         let credentials = parse_json_credentials(&value)?;
         if credentials.is_empty() {
-            return Err("反代账号 JSON 中没有找到可导入的账号。".into());
+            return Err("JSON 中没有找到 Access Token 或 Refresh Token。".into());
         }
         return Ok(credentials);
     }
@@ -110,7 +113,7 @@ fn parse_json_credentials(value: &Value) -> Result<Vec<ImportedProxyCredential>,
             let mut credentials = Vec::new();
             for (index, item) in items.iter().enumerate() {
                 let mut parsed = parse_json_credentials(item)
-                    .map_err(|error| format!("第 {} 条反代账号：{error}", index + 1))?;
+                    .map_err(|error| format!("账号数组第 {} 项无法导入：{error}", index + 1))?;
                 credentials.append(&mut parsed);
             }
             Ok(credentials)
@@ -120,8 +123,9 @@ fn parse_json_credentials(value: &Value) -> Result<Vec<ImportedProxyCredential>,
                 let mut credentials = Vec::with_capacity(accounts.len());
                 for (index, account) in accounts.iter().enumerate() {
                     credentials.push(
-                        extract_json_credential(account, ProxyCredentialFormat::Sub2api)
-                            .map_err(|error| format!("Sub2API 第 {} 个账号：{error}", index + 1))?,
+                        extract_json_credential(account, ProxyCredentialFormat::Sub2api).map_err(
+                            |error| format!("Sub2API 账号列表第 {} 项无法导入：{error}", index + 1),
+                        )?,
                     );
                 }
                 return Ok(credentials);
@@ -130,7 +134,7 @@ fn parse_json_credentials(value: &Value) -> Result<Vec<ImportedProxyCredential>,
             let format = detect_json_format(value);
             extract_json_credential(value, format).map(|credential| vec![credential])
         }
-        _ => Err("账号记录必须是 JSON 对象。".into()),
+        _ => Err("账号数组中的每一项都必须是 JSON 对象。".into()),
     }
 }
 
@@ -210,7 +214,10 @@ fn extract_json_credential(
         ],
     );
     if access_token.is_none() && refresh_token.is_none() {
-        return Err("没有找到 accessToken/access_token 或 refreshToken/refresh_token。".into());
+        return Err(
+            "未找到登录 Token。请确认数据中包含 access_token、accessToken、refresh_token 或 refreshToken 字段。"
+                .into(),
+        );
     }
 
     let mut account_id = first_string(
@@ -552,6 +559,9 @@ mod tests {
         let input = "x".repeat(MAX_COOKIE_CREDENTIAL_LENGTH + 1);
         let error = parse_proxy_credential(&input).err().unwrap();
 
-        assert_eq!(error, "反代账号内容不能超过 262,144 个字符。");
+        assert_eq!(
+            error,
+            "Cookie 登录数据不能超过 262,144 个字符，请减少账号数量后重试。"
+        );
     }
 }

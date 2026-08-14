@@ -57,7 +57,7 @@ async fn fetch_quota_from(
     if access_token.is_empty() {
         return Err(QuotaFetchError::new(
             QuotaStatus::Unauthorized,
-            "账号缺少 accessToken，请重新登录或导入",
+            "账号缺少 Access Token，请重新进行官方授权或导入 Cookie 数据",
         ));
     }
 
@@ -65,7 +65,7 @@ async fn fetch_quota_from(
     headers.insert(
         AUTHORIZATION,
         HeaderValue::from_str(&format!("Bearer {access_token}"))
-            .map_err(|_| QuotaFetchError::new(QuotaStatus::Error, "accessToken 包含无效字符"))?,
+            .map_err(|_| QuotaFetchError::new(QuotaStatus::Error, "Access Token 包含无效字符"))?,
     );
     headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
@@ -88,7 +88,7 @@ async fn fetch_quota_from(
         client.get(endpoint).headers(headers).send(),
     )
     .await
-    .map_err(|_| QuotaFetchError::retryable("OpenAI 额度查询超时"))?
+    .map_err(|_| QuotaFetchError::retryable("OpenAI 额度查询超时，请稍后重试"))?
     .map_err(|error| {
         if error.is_connect() || error.is_timeout() {
             QuotaFetchError::retryable("无法连接 OpenAI 额度服务，请检查网络或系统代理")
@@ -101,7 +101,7 @@ async fn fetch_quota_from(
         let (quota_status, message) = match status {
             reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN => (
                 QuotaStatus::Unauthorized,
-                "OpenAI 登录已失效或无额度查询权限".to_string(),
+                "OpenAI 拒绝了额度查询请求，登录凭据可能已失效或当前账号没有查询权限".to_string(),
             ),
             reqwest::StatusCode::TOO_MANY_REQUESTS => (
                 QuotaStatus::RateLimited,
@@ -167,7 +167,7 @@ fn parse_quota_payload(payload: &Value, now: i64) -> Result<QuotaData, QuotaPars
         .or_else(|| payload.get("data").and_then(|data| data.get("rate_limit")));
     let Some(rate_limit) = rate_limit.filter(|value| !value.is_null()) else {
         return Err(QuotaParseError::Unsupported(
-            "OpenAI 额度响应中没有 5H/7D 窗口，该账号暂不支持额度查询。".into(),
+            "OpenAI 返回的数据中没有 5 小时或 7 天用量窗口，该账号暂不支持额度查询。".into(),
         ));
     };
     let primary = rate_limit
@@ -182,7 +182,7 @@ fn parse_quota_payload(payload: &Value, now: i64) -> Result<QuotaData, QuotaPars
         .transpose()?;
     if primary.is_none() && secondary.is_none() {
         return Err(QuotaParseError::Unsupported(
-            "OpenAI 额度响应中没有可用的 5H/7D 窗口，该账号暂不支持额度查询。".into(),
+            "OpenAI 返回的 5 小时和 7 天用量窗口均不可用，该账号暂不支持额度查询。".into(),
         ));
     }
     Ok(QuotaData::Windowed { primary, secondary })
@@ -213,11 +213,12 @@ fn parse_window(value: &Value, now: i64) -> Result<QuotaWindow, QuotaParseError>
 fn parse_percent(value: Option<&Value>) -> Result<f64, QuotaParseError> {
     let Some(value) = value else {
         return Err(QuotaParseError::Invalid(
-            "OpenAI 额度窗口缺少 used_percent".into(),
+            "OpenAI 返回的额度窗口缺少 used_percent 字段".into(),
         ));
     };
-    parse_non_negative_f64(value)
-        .ok_or_else(|| QuotaParseError::Invalid("OpenAI 额度窗口 used_percent 无效".into()))
+    parse_non_negative_f64(value).ok_or_else(|| {
+        QuotaParseError::Invalid("OpenAI 返回的额度窗口包含无效的 used_percent".into())
+    })
 }
 
 fn parse_number(value: &Value) -> Option<i64> {

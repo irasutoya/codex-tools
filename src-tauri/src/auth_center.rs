@@ -130,12 +130,12 @@ impl AuthCenter {
             .send()
             .await
             .map_err(safe_network_error)?;
-        let response = require_success(response, "无法开始 OpenAI 登录")?;
-        let payload: DeviceStartResponse = read_json_bounded(response, "登录码").await?;
+        let response = require_success(response, "无法向 OpenAI 申请授权码")?;
+        let payload: DeviceStartResponse = read_json_bounded(response, "授权码").await?;
 
         if payload.device_auth_id.trim().is_empty() || payload.user_code.trim().is_empty() {
             return Err(AppError::InvalidConfig(
-                "OpenAI 没有返回有效的登录码，请重新开始登录。".into(),
+                "OpenAI 未返回有效的授权码，请重新获取。".into(),
             ));
         }
 
@@ -199,14 +199,14 @@ impl AuthCenter {
                 Ok(DevicePollResult::Expired)
             }
             PollStatus::Failed(status) => Err(AppError::InvalidConfig(format!(
-                "无法确认 OpenAI 登录结果（HTTP {status}），请稍后重试。"
+                "无法查询 OpenAI 授权状态（HTTP {status}），请稍后重试。"
             ))),
             PollStatus::Complete => {
-                let code: DevicePollResponse = read_json_bounded(response, "登录结果").await?;
+                let code: DevicePollResponse = read_json_bounded(response, "授权结果").await?;
                 if code.authorization_code.trim().is_empty() || code.code_verifier.trim().is_empty()
                 {
                     return Err(AppError::InvalidConfig(
-                        "OpenAI 返回的登录结果不完整，请重新登录。".into(),
+                        "OpenAI 返回的授权结果不完整，请重新获取授权码。".into(),
                     ));
                 }
                 let tokens = self.exchange_code(&code).await?;
@@ -268,11 +268,11 @@ impl AuthCenter {
 
         if response.status() == StatusCode::UNAUTHORIZED {
             return Err(AppError::InvalidConfig(
-                "OpenAI 登录已过期，请重新登录。".into(),
+                "OpenAI 授权已过期，请重新登录。".into(),
             ));
         }
-        let response = require_success(response, "无法续期 OpenAI 登录")?;
-        let refreshed: TokenResponse = read_json_bounded(response, "登录续期结果").await?;
+        let response = require_success(response, "无法更新 OpenAI 登录凭据")?;
+        let refreshed: TokenResponse = read_json_bounded(response, "登录凭据更新结果").await?;
         let tokens = merge_refreshed_tokens(refreshed, &account)?;
         let refreshed = account_from_tokens(tokens, Some(&account))?;
         store.save_official_account(&refreshed)
@@ -308,7 +308,7 @@ impl AuthCenter {
             ensure_char_limit(
                 token,
                 MAX_CREDENTIAL_CHARS,
-                "反代账号中的单项登录凭据过长，请导入有效的账号数据。",
+                "Cookie 登录数据中的单个 Token 过长，请检查导入内容。",
             )?;
         }
         if imported.access_token.is_none() {
@@ -317,7 +317,9 @@ impl AuthCenter {
             // auth path can consume that token at the same time.
             let _guard = self.refresh_lock.lock().await;
             let refresh_token = imported.refresh_token.clone().ok_or_else(|| {
-                AppError::InvalidConfig("反代账号凭据缺少 accessToken 或 refresh_token。".into())
+                AppError::InvalidConfig(
+                    "Cookie 登录数据缺少 Access Token 或 Refresh Token。".into(),
+                )
             })?;
             let http = self.client()?;
             let response = http
@@ -330,8 +332,10 @@ impl AuthCenter {
                 .send()
                 .await
                 .map_err(safe_network_error)?;
-            let response = require_success(response, "无法使用反代账号的 refresh_token 登录")?;
-            let refreshed: TokenResponse = read_json_bounded(response, "反代账号登录结果").await?;
+            let response =
+                require_success(response, "无法使用 Cookie 中的 Refresh Token 获取登录凭据")?;
+            let refreshed: TokenResponse =
+                read_json_bounded(response, "Cookie 登录数据交换结果").await?;
             let refreshed_import = ImportedProxyCredential {
                 access_token: Some(required_token(refreshed.access_token, "access_token")?),
                 id_token: non_empty(refreshed.id_token),
@@ -397,8 +401,8 @@ impl AuthCenter {
             .send()
             .await
             .map_err(safe_network_error)?;
-        let response = require_success(response, "无法完成 OpenAI 登录")?;
-        let response: TokenResponse = read_json_bounded(response, "登录结果").await?;
+        let response = require_success(response, "OpenAI 未能完成授权")?;
+        let response: TokenResponse = read_json_bounded(response, "授权登录结果").await?;
         complete_login_tokens(response)
     }
 }
@@ -451,7 +455,7 @@ fn merge_refreshed_tokens(
         .unwrap_or_else(|| previous.credential.tokens.refresh_token.clone());
     if id_token.is_empty() || access_token.is_empty() || refresh_token.is_empty() {
         return Err(AppError::InvalidConfig(
-            "OpenAI 返回的登录续期信息不完整，请重新登录。".into(),
+            "OpenAI 返回的登录凭据不完整，请重新进行官方授权。".into(),
         ));
     }
     Ok(CompleteTokens {
@@ -464,7 +468,9 @@ fn merge_refreshed_tokens(
 
 fn required_token(value: Option<String>, name: &str) -> Result<String, AppError> {
     non_empty(value).ok_or_else(|| {
-        AppError::InvalidConfig(format!("OpenAI 返回的登录信息缺少 {name}，请重新登录。"))
+        AppError::InvalidConfig(format!(
+            "OpenAI 返回的登录凭据缺少 {name}，请重新进行官方授权。"
+        ))
     })
 }
 
@@ -483,9 +489,11 @@ fn refresh_decision(
             .is_some_and(|expires_at| expires_at <= now)
         {
             let message = match account.source {
-                OfficialAccountSource::ProxyImport => "反代账号的 accessToken 已过期，请重新导入。",
+                OfficialAccountSource::ProxyImport => {
+                    "Cookie 登录的 Access Token 已过期，请重新导入 Cookie 数据。"
+                }
                 OfficialAccountSource::OpenAiOauth => {
-                    "OpenAI 登录已过期且缺少 refresh token，请重新登录。"
+                    "OpenAI 登录凭据已过期且无法自动更新，请重新进行官方授权。"
                 }
             };
             return Err(AppError::InvalidConfig(message.into()));
@@ -514,12 +522,14 @@ fn account_from_tokens(
         .or(access_claims.account_id)
         .or_else(|| previous.map(|account| account.account_id.clone()))
         .ok_or_else(|| {
-            AppError::InvalidConfig("OpenAI 返回的登录信息缺少账号标识，请重新登录。".into())
+            AppError::InvalidConfig(
+                "OpenAI 返回的登录凭据缺少账号标识，请重新进行官方授权。".into(),
+            )
         })?;
 
     if previous.is_some_and(|account| account.account_id != account_id) {
         return Err(AppError::InvalidConfig(
-            "OpenAI 返回了其他账号的登录信息，请重新登录。".into(),
+            "OpenAI 返回的凭据属于其他账号，请重新进行官方授权。".into(),
         ));
     }
 
@@ -579,7 +589,7 @@ fn account_from_imported_tokens(
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| AppError::InvalidConfig("反代账号凭据缺少 accessToken。".into()))?
+        .ok_or_else(|| AppError::InvalidConfig("Cookie 登录数据缺少 Access Token。".into()))?
         .to_owned();
     let id_token = imported.id_token.clone().unwrap_or_default();
     let id_claims = token_identity(&id_token).unwrap_or_default();
@@ -648,7 +658,7 @@ fn apply_imported_profile(
         .map(str::to_owned)
         .or_else(|| imported.suggested_name.clone())
         .or_else(|| (!account.email.is_empty()).then(|| account.email.clone()))
-        .unwrap_or_else(|| "反代账号".into());
+        .unwrap_or_else(|| "Cookie 账号".into());
 }
 
 fn parse_interval(value: Option<&Value>) -> u64 {
@@ -722,13 +732,13 @@ async fn read_json_bounded<T: DeserializeOwned>(
 
 fn safe_network_error(error: reqwest::Error) -> AppError {
     let kind = if error.is_timeout() {
-        "登录请求超时，请检查网络后重试。"
+        "OpenAI 授权请求超时，请检查网络连接后重试。"
     } else if error.is_connect() {
-        "无法连接 OpenAI 登录服务，请检查网络。"
+        "无法连接 OpenAI 授权服务，请检查网络或系统代理。"
     } else if error.is_body() || error.is_decode() {
-        "无法读取 OpenAI 的登录结果，请重试。"
+        "无法读取 OpenAI 返回的授权结果，请重试。"
     } else {
-        "OpenAI 登录请求未完成，请检查网络后重试。"
+        "OpenAI 授权请求未完成，请检查网络连接后重试。"
     };
     AppError::Internal(kind.into())
 }
@@ -965,7 +975,7 @@ mod tests {
         );
 
         let error = refresh_decision(&account, true, now).unwrap_err();
-        assert!(error.to_string().contains("accessToken 已过期"));
+        assert!(error.to_string().contains("Access Token 已过期"));
     }
 
     #[test]

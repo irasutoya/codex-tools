@@ -111,7 +111,7 @@ fn activation_for_official(
         model_provider: Some("openai".into()),
         display_name_snapshot: match account.source {
             OfficialAccountSource::OpenAiOauth => display_name.to_owned(),
-            OfficialAccountSource::ProxyImport => format!("{display_name} · Cookie / 反代"),
+            OfficialAccountSource::ProxyImport => format!("{display_name} · Cookie 登录"),
         },
         auth_source: Some(
             match account.source {
