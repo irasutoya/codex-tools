@@ -214,19 +214,24 @@ export function ProvidersPage({
         accountId,
         content,
       })
+      const firstAccount = imported.accounts[0]
+      const formatLabel = imported.detectedFormats.join("、") || "反代账号"
       toast.add({
-        title: "Cookie 账号已导入",
-        description: imported.name,
+        title:
+          imported.accounts.length > 1
+            ? `已导入 ${imported.accounts.length} 个反代账号`
+            : "反代账号已导入",
+        description: `${formatLabel}${firstAccount ? ` · ${firstAccount.name}` : ""}`,
         type: "success",
       })
       setAuthorization(undefined)
       setLoginOpen(false)
-      onSelectedIdChange(imported.id)
+      if (firstAccount) onSelectedIdChange(firstAccount.id)
       onRefresh()
     } catch (reason) {
       setLoginError(errorMessage(reason))
       toast.add({
-        title: "Cookie 登录失败",
+        title: "反代账号登录失败",
         description: errorMessage(reason),
         type: "error",
       })
@@ -314,7 +319,7 @@ export function ProvidersPage({
                 onClick={() => openAccountLogin("cookie")}
               >
                 <HugeiconsIcon icon={Key01Icon} data-icon="inline-start" />
-                Cookie 登录
+                反代账号登录
               </Button>
               <Button
                 type="button"
@@ -383,7 +388,7 @@ export function ProvidersPage({
             disabled={actionBusy}
             onClick={() => openAccountLogin("cookie")}
           >
-            Cookie 登录
+            反代账号登录
           </Button>
         </CardContent>
       </Card>
@@ -593,7 +598,7 @@ function credentialLabel(account: OfficialAccountView | undefined) {
   if (account.quota.status === "unauthorized") return "登录已失效"
   if (accountIsExpired(account)) return "登录已过期"
   return account.source === "proxy_import"
-    ? "Cookie 登录有效"
+    ? "反代账号登录有效"
     : "OAuth 登录有效"
 }
 

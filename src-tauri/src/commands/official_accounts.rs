@@ -10,9 +10,18 @@ use crate::{
     storage::Store,
 };
 use futures_util::{StreamExt, TryStreamExt, stream};
+use serde::Serialize;
+use std::collections::HashSet;
 use tauri::State;
 
 const QUOTA_REFRESH_CONCURRENCY: usize = 4;
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ProxyImportResult {
+    pub accounts: Vec<OfficialAccountView>,
+    pub detected_formats: Vec<String>,
+}
 
 #[tauri::command]
 pub(crate) async fn connections_import_cookie(
@@ -22,21 +31,90 @@ pub(crate) async fn connections_import_cookie(
     name: Option<String>,
     account_id: Option<String>,
     content: String,
-) -> Result<OfficialAccountView, AppError> {
+) -> Result<ProxyImportResult, AppError> {
     let mut imported =
-        proxy_import::parse_proxy_credential(&content).map_err(AppError::InvalidConfig)?;
+        proxy_import::parse_proxy_credentials(&content).map_err(AppError::InvalidConfig)?;
     if let Some(account_id) = account_id
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
     {
-        imported.account_id = Some(account_id.to_owned());
+        if imported.len() != 1 {
+            return Err(AppError::InvalidConfig(
+                "批量反代账号不能同时指定一个 Account ID。".into(),
+            ));
+        }
+        imported[0].account_id = Some(account_id.to_owned());
     }
     let _guard = activation.0.lock().await;
     let home = codex::home(&store.codex_home_setting()?);
     sync_active_openai_credential(&store, &home)?;
-    let account = center.connections_import_cookie(imported, name).await?;
-    save_imported_account_and_sync_active_locked(&store, &home, &account)
+    let total = imported.len();
+    let detected_formats = imported
+        .iter()
+        .map(|item| item.source_format.label().to_string())
+        .fold(Vec::<String>::new(), |mut formats, format| {
+            if !formats.contains(&format) {
+                formats.push(format);
+            }
+            formats
+        });
+    let mut accounts = Vec::with_capacity(total);
+    let mut resolved_accounts = Vec::with_capacity(total);
+    for (index, credential) in imported.into_iter().enumerate() {
+        let requested_name = name.as_deref().map(|value| {
+            if total <= 1 {
+                value.to_owned()
+            } else {
+                format!("{} #{}", value, index + 1)
+            }
+        });
+        resolved_accounts.push(
+            center
+                .connections_import_cookie(credential, requested_name)
+                .await?,
+        );
+    }
+    let existing_account_ids = store.read(|state| {
+        state
+            .official_accounts
+            .iter()
+            .map(|account| account.account_id.clone())
+            .collect::<HashSet<_>>()
+    })?;
+    let new_account_count = resolved_accounts
+        .iter()
+        .map(|account| account.account_id.clone())
+        .filter(|account_id| !existing_account_ids.contains(account_id))
+        .collect::<HashSet<_>>()
+        .len();
+    if existing_account_ids.len() + new_account_count > crate::storage::MAX_SAVED_OPENAI_ACCOUNTS {
+        return Err(AppError::InvalidConfig(
+            "本次导入会超过 500 个 OpenAI 账号上限，请先删除不再使用的账号。".into(),
+        ));
+    }
+    let saved_accounts = store.save_official_accounts(&resolved_accounts)?;
+    let active_credential = store.read(|state| {
+        if !matches!(state.active.kind, ActiveKind::Official) {
+            return None;
+        }
+        let active_id = state.active.account_id.as_deref()?;
+        state
+            .official_accounts
+            .iter()
+            .find(|account| account.id == active_id)
+            .map(|account| account.credential.clone())
+    })?;
+    if let Some(credential) = active_credential {
+        codex::connections_activate_official_account(&home, &credential, None)?;
+    }
+    for account in saved_accounts {
+        accounts.push(store.official_account_view(&account.id)?);
+    }
+    Ok(ProxyImportResult {
+        accounts,
+        detected_formats,
+    })
 }
 
 #[cfg(test)]
@@ -51,6 +129,7 @@ async fn save_imported_account_and_sync_active(
     save_imported_account_and_sync_active_locked(store, &home, account)
 }
 
+#[cfg(test)]
 fn save_imported_account_and_sync_active_locked(
     store: &Store,
     home: &std::path::Path,

@@ -10,6 +10,7 @@ import type {
   ModelUnlockResult,
   ModelUnlockStatus,
   OfficialAccountView,
+  ProxyImportResult,
   OfficialPricingCatalog,
   PageResult,
   PricingRule,
@@ -47,7 +48,7 @@ type CommandMap = {
   connections_delete_provider: CommandSpec<{ id: string }, void>
   connections_import_cookie: CommandSpec<
     { name?: string; accountId?: string; content: string },
-    OfficialAccountView
+    ProxyImportResult
   >
   connections_login_start: CommandSpec<undefined, DeviceAuthorization>
   connections_login_poll: CommandSpec<

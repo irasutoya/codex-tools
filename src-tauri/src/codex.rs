@@ -407,7 +407,7 @@ pub fn read_official_account(codex_home: &Path) -> Result<Option<CodexAuthCreden
                 .and_then(|identity| identity.account_id.clone())
                 .unwrap_or_else(|| token_local_identity(personal_access_token));
             CodexAuthCredential {
-                auth_mode: "chatgpt".into(),
+                auth_mode: "personal_access_token".into(),
                 openai_api_key: None,
                 tokens: crate::models::CodexAuthTokens {
                     id_token: String::new(),
@@ -1566,6 +1566,56 @@ base_url = "https://custom.example.test/v1"
                 .access_token,
             "at-proxy-secret"
         );
+    }
+
+    #[test]
+    fn access_token_only_oauth_account_keeps_tokens_auth_shape() {
+        let temp = tempfile::tempdir().unwrap();
+        prepare_home(temp.path());
+        let credential = CodexAuthCredential {
+            auth_mode: "chatgpt".into(),
+            openai_api_key: None,
+            tokens: crate::models::CodexAuthTokens {
+                id_token: String::new(),
+                access_token: "header.payload.signature".into(),
+                refresh_token: String::new(),
+                account_id: "proxy-local-id".into(),
+            },
+            last_refresh: "2026-07-31T00:00:00Z".into(),
+        };
+
+        connections_activate_official_account(temp.path(), &credential, None).unwrap();
+
+        let auth: serde_json::Value =
+            serde_json::from_slice(&fs::read(temp.path().join("auth.json")).unwrap()).unwrap();
+        assert_eq!(auth["OPENAI_API_KEY"], serde_json::Value::Null);
+        assert_eq!(auth["tokens"]["access_token"], "header.payload.signature");
+        assert_eq!(auth["tokens"]["refresh_token"], "");
+        assert_eq!(auth["tokens"]["account_id"], "proxy-local-id");
+        assert!(auth.get("personal_access_token").is_none());
+    }
+
+    #[test]
+    fn explicit_personal_access_token_round_trips_without_prefix() {
+        let temp = tempfile::tempdir().unwrap();
+        prepare_home(temp.path());
+        let credential = CodexAuthCredential {
+            auth_mode: "personal_access_token".into(),
+            openai_api_key: None,
+            tokens: crate::models::CodexAuthTokens {
+                id_token: String::new(),
+                access_token: "pat-secret".into(),
+                refresh_token: String::new(),
+                account_id: "proxy-local-id".into(),
+            },
+            last_refresh: "2026-07-31T00:00:00Z".into(),
+        };
+
+        connections_activate_official_account(temp.path(), &credential, None).unwrap();
+        let restored = read_official_account(temp.path()).unwrap().unwrap();
+
+        assert_eq!(restored.auth_mode, "personal_access_token");
+        assert_eq!(restored.tokens.access_token, "pat-secret");
     }
 
     #[test]

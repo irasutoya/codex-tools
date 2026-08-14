@@ -4,6 +4,14 @@
 
 ## [Unreleased]
 
+### Added
+
+- 反代账号登录支持自动识别 CPA、Sub2API、Cockpit、9router、纯 RT 和 Token JSON，并支持批量导入。
+
+### Fixed
+
+- 修复 access-token-only 的 OAuth/CPA 账号被误写成 `personal_access_token` 的问题，并保留空的 `refresh_token` 字段。
+
 ## [0.6.6] - 2026-08-14
 
 ### Changed
