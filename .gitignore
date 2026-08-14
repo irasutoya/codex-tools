@@ -5,7 +5,6 @@ logs
 node_modules/
 .vite/
 dist/
-release-notes.md
 data
 src-tauri/target
 *.local
