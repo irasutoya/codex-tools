@@ -157,7 +157,7 @@ export function ProvidersPage({
   }
 
   useEffect(() => {
-    if (!authorization || !loginOpen) return
+    if (!authorization || !loginOpen || loginMode !== "browser") return
     let cancelled = false
     let timer: number | undefined
 
@@ -193,10 +193,11 @@ export function ProvidersPage({
       cancelled = true
       if (timer !== undefined) window.clearTimeout(timer)
     }
-  }, [authorization, begin, end, finishLoginPoll, loginOpen])
+  }, [authorization, begin, end, finishLoginPoll, loginMode, loginOpen])
 
   const openAccountLogin = (mode: AccountLoginMode) => {
     if (busy) return
+    if (mode !== "browser") setAuthorization(undefined)
     setLoginMode(mode)
     setLoginError(undefined)
     setLoginOpen(true)
@@ -257,7 +258,10 @@ export function ProvidersPage({
         key={loginOpen ? "login-open" : "login-closed"}
         open={loginOpen}
         mode={loginMode}
-        onModeChange={setLoginMode}
+        onModeChange={(mode) => {
+          if (mode !== "browser") setAuthorization(undefined)
+          setLoginMode(mode)
+        }}
         onOpenChange={(open) => {
           if (!open && busy) return
           setLoginOpen(open)

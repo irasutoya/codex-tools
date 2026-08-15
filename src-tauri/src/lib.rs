@@ -177,7 +177,6 @@ pub fn run() {
     let store = Store::new().expect("无法初始化应用数据");
     let usage_ledger = UsageLedger::open(store.root()).expect("无法初始化本机用量数据库");
     let app = tauri::Builder::default()
-        .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_single_instance::init(|app, _, _| {
             show_main_window(app)

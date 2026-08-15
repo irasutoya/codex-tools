@@ -10,7 +10,6 @@ use std::time::Duration;
 
 const OPENAI_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 const MAX_QUOTA_RESPONSE_BYTES: usize = 256 * 1024;
-const CHATGPT_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36";
 
 #[derive(Debug)]
 pub struct QuotaFetchError {
@@ -70,7 +69,11 @@ async fn fetch_quota_from(
     headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
     headers.insert(REFERER, HeaderValue::from_static("https://chatgpt.com/"));
-    headers.insert(USER_AGENT, HeaderValue::from_static(CHATGPT_USER_AGENT));
+    headers.insert(
+        USER_AGENT,
+        HeaderValue::from_str(crate::network::codex_user_agent())
+            .expect("Codex CLI User-Agent 应始终是有效请求头"),
+    );
     headers.insert("OpenAI-Beta", HeaderValue::from_static("codex-1"));
     headers.insert("oai-language", HeaderValue::from_static("zh-CN"));
     headers.insert("originator", HeaderValue::from_static("Codex Desktop"));
@@ -314,6 +317,7 @@ mod tests {
             assert!(request.contains("chatgpt-account-id: workspace-1"));
             assert!(request.contains("openai-beta: codex-1"));
             assert!(request.contains("originator: codex desktop"));
+            assert!(request.contains("user-agent: codex_cli_rs/"));
         });
         let client = reqwest::Client::builder().no_proxy().build().unwrap();
 

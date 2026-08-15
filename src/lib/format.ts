@@ -56,9 +56,8 @@ export function formatUsd(microusd = 0) {
 export function formatDate(value?: number, includeTime = false) {
   if (!value) return "—"
   const formatter = includeTime ? dateTimeFormatter : dateFormatter
-  return formatter.format(
-    new Date(value > 10_000_000_000 ? value : value * 1000)
-  )
+  const date = new Date(value > 10_000_000_000 ? value : value * 1000)
+  return Number.isFinite(date.getTime()) ? formatter.format(date) : "—"
 }
 
 export function formatRange(range: UsageRange) {
@@ -89,6 +88,7 @@ export function formatPercent(value?: number) {
 }
 
 export function quotaWindow(quota?: AccountQuota) {
+  if (quota?.status !== "success") return undefined
   return quota?.data?.primary ?? quota?.data?.secondary
 }
 

@@ -672,7 +672,13 @@ fn update_profile_model_provider(profile: &mut Item, provider: Option<&str>) {
 }
 
 fn merged_headers(provider: &ProviderProfile) -> BTreeMap<String, String> {
-    provider.headers.clone()
+    let mut headers = provider.headers.clone();
+    headers.retain(|name, _| !name.eq_ignore_ascii_case("user-agent"));
+    headers.insert(
+        "User-Agent".into(),
+        crate::network::codex_user_agent().into(),
+    );
+    headers
 }
 
 fn parse_config_document(text: &str) -> Result<DocumentMut, AppError> {

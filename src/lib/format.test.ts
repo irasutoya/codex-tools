@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest"
 
 import {
   cacheHitRate,
+  formatDate,
   formatPercent,
   formatTokens,
   quotaWindow,
@@ -51,5 +52,22 @@ describe("format helpers", () => {
         },
       })?.usedPercent
     ).toBe(25)
+  })
+
+  it("does not expose stale quota data after a failed refresh", () => {
+    expect(
+      quotaWindow({
+        status: "unauthorized",
+        data: {
+          kind: "windowed",
+          primary: { usedPercent: 25, remainingPercent: 75 },
+        },
+      })
+    ).toBeUndefined()
+  })
+
+  it("formats invalid timestamps as unavailable", () => {
+    expect(formatDate(Number.POSITIVE_INFINITY)).toBe("—")
+    expect(formatDate(Number.MAX_VALUE)).toBe("—")
   })
 })

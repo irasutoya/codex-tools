@@ -1,7 +1,7 @@
 use crate::{
     codex,
     models::{AppError, PageResult, RepairResult, RepairScan, SessionSummary},
-    provider_sync,
+    platform, provider_sync,
     session_index::{self, SessionIndex},
     storage::Store,
 };
@@ -36,6 +36,12 @@ pub(crate) async fn sessions_repair(
     index: State<'_, SessionIndex>,
     target_provider: String,
 ) -> Result<RepairResult, AppError> {
+    let configured = store.codex_app_setting()?;
+    if platform::codex_app_running(configured.as_deref()) {
+        return Err(AppError::InvalidConfig(
+            "请先退出 Codex，再修复会话归属，以免覆盖正在写入的会话内容。".into(),
+        ));
+    }
     let home = codex::home(&store.codex_home_setting()?);
     let index = index.inner().clone();
     let result = repair_home(home, target_provider).await;

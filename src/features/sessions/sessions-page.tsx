@@ -117,10 +117,12 @@ export function SessionsPage({
       const response = await call("sessions_repair", {
         targetProvider: scan.currentProvider,
       })
+      const partial = response.filesFailed > 0 || response.warnings.length > 0
       toast.add({
-        title: "会话归属已修复",
-        description: `已更新 ${response.rowsUpdated} 条记录。`,
-        type: "success",
+        title: partial ? "会话修复已完成，但有部分警告" : "会话归属已修复",
+        description:
+          response.warnings[0] ?? `已更新 ${response.rowsUpdated} 条记录。`,
+        type: partial ? "warning" : "success",
       })
       setRepairTarget(undefined)
       onRefresh()
@@ -164,6 +166,19 @@ export function SessionsPage({
     )
   const pageCount = Math.max(1, Math.ceil(result.total / pageSize))
   const currentPage = result.page
+  const repairTargets = scan.targets.filter(
+    (target) => !target.current && target.count > 0
+  )
+  const repairCount = repairTargets.reduce(
+    (total, target) => total + target.count,
+    0
+  )
+  const combinedRepairTarget: RepairTarget = {
+    id: "all",
+    current: false,
+    count: repairCount,
+    sources: [...new Set(repairTargets.flatMap((target) => target.sources))],
+  }
 
   return (
     <div className="flex min-h-full flex-col gap-3 px-3 pt-1 pb-3">
@@ -181,6 +196,18 @@ export function SessionsPage({
           <AlertDescription>{scanError}</AlertDescription>
         </Alert>
       )}
+      {scan.warnings.length > 0 && (
+        <Alert>
+          <HugeiconsIcon icon={InformationCircleIcon} />
+          <AlertTitle>部分会话数据未能完整扫描</AlertTitle>
+          <AlertDescription>
+            {scan.warnings[0] ?? "扫描返回了未分类警告。"}
+            {scan.warnings.length > 1
+              ? `（另有 ${scan.warnings.length - 1} 条警告）`
+              : ""}
+          </AlertDescription>
+        </Alert>
+      )}
       <Card size="sm" className="shrink-0">
         <CardContent className="grid grid-cols-[1fr_1fr_auto] items-center gap-4">
           <Summary
@@ -194,20 +221,16 @@ export function SessionsPage({
             value={formatInteger(scan.rolloutFiles)}
           />
           <div className="flex gap-2">
-            {scan.targets
-              .filter((target) => !target.current && target.count > 0)
-              .slice(0, 1)
-              .map((target) => (
-                <Button
-                  key={target.id}
-                  size="sm"
-                  variant="outline"
-                  onClick={() => setRepairTarget(target)}
-                >
-                  <HugeiconsIcon icon={Wrench01Icon} data-icon="inline-start" />
-                  修复 {target.count} 条
-                </Button>
-              ))}
+            {repairCount > 0 && (
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() => setRepairTarget(combinedRepairTarget)}
+              >
+                <HugeiconsIcon icon={Wrench01Icon} data-icon="inline-start" />
+                修复 {repairCount} 条
+              </Button>
+            )}
           </div>
         </CardContent>
       </Card>

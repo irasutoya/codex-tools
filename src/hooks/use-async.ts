@@ -68,5 +68,10 @@ export function useAsync<T>(
     setError(undefined)
   }, [])
 
-  return { data, error, mutate }
+  const clear = useCallback(() => {
+    setData(undefined)
+    setError(undefined)
+  }, [])
+
+  return { data, error, mutate, clear }
 }

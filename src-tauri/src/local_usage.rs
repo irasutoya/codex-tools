@@ -2564,7 +2564,9 @@ fn accumulate_day_point(
     estimated_cost_microusd: Option<u64>,
     source_kind: UsageSourceKind,
 ) {
-    let day_start = local_day_start_ms(occurred_at_ms);
+    let Some(day_start) = local_day_start_ms(occurred_at_ms) else {
+        return;
+    };
     let point = match points.entry(day_start) {
         Entry::Occupied(entry) => entry.into_mut(),
         Entry::Vacant(entry) => entry.insert(UsageTrendPoint {
@@ -2599,24 +2601,23 @@ fn accumulate_day_point(
     }
 }
 
-fn local_day_start_ms(occurred_at_ms: i64) -> i64 {
-    let local = Local
-        .timestamp_millis_opt(occurred_at_ms)
-        .single()
-        .expect("本地时间戳转换应有效");
+fn local_day_start_ms(occurred_at_ms: i64) -> Option<i64> {
+    let local = Local.timestamp_millis_opt(occurred_at_ms).single()?;
     let midnight = local
         .date_naive()
         .and_hms_opt(0, 0, 0)
         .expect("本机日期的午夜时刻应有效");
-    Local
-        .from_local_datetime(&midnight)
-        .single()
-        .or_else(|| Local.from_local_datetime(&midnight).earliest())
-        .map(|value| value.timestamp_millis())
-        .unwrap_or_else(|| {
-            // 极少数时区在午夜发生 DST 跳变时兜底：直接按当地日期构造。
-            midnight.and_utc().timestamp_millis()
-        })
+    Some(
+        Local
+            .from_local_datetime(&midnight)
+            .single()
+            .or_else(|| Local.from_local_datetime(&midnight).earliest())
+            .map(|value| value.timestamp_millis())
+            .unwrap_or_else(|| {
+                // 极少数时区在午夜发生 DST 跳变时兜底：直接按当地日期构造。
+                midnight.and_utc().timestamp_millis()
+            }),
+    )
 }
 
 fn aggregate_cost_status(aggregate: &UsageAggregate) -> CostStatus {
@@ -4026,7 +4027,7 @@ mod tests {
         for point in &result.points {
             assert_eq!(
                 super::local_day_start_ms(point.day_start_ms),
-                point.day_start_ms
+                Some(point.day_start_ms)
             );
         }
         // 跨日总和与全部事件一致。
@@ -4039,8 +4040,8 @@ mod tests {
         assert_eq!(total_tokens, 108 + 15);
         assert_eq!(total_requests, 2);
         // 每个事件归属到正确的一天（两个事件相隔超过 2 天，任何时区都落在不同本地日）。
-        let day1 = super::local_day_start_ms(1_785_544_200_000);
-        let day2 = super::local_day_start_ms(1_785_758_400_000);
+        let day1 = super::local_day_start_ms(1_785_544_200_000).unwrap();
+        let day2 = super::local_day_start_ms(1_785_758_400_000).unwrap();
         assert_ne!(day1, day2);
         let first = result
             .points
@@ -4055,6 +4056,11 @@ mod tests {
             .find(|point| point.day_start_ms == day2)
             .expect("应找到第二天的点");
         assert_eq!(second.tokens.total_tokens, 15);
+    }
+
+    #[test]
+    fn out_of_range_timestamp_does_not_create_a_trend_point() {
+        assert_eq!(super::local_day_start_ms(i64::MAX), None);
     }
 
     #[test]

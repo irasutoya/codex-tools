@@ -134,11 +134,16 @@ export function UsagePage({
     data: overview,
     error: overviewError,
     mutate: setOverview,
+    clear: clearOverview,
   } = useAsync(
     fetchOverview,
     { requestGate: overviewRequestGate },
     refreshRevision
   )
+
+  useEffect(() => {
+    clearOverview()
+  }, [clearOverview, query])
 
   const fetchRules = useCallback(() => call("usage_list_pricing_rules", {}), [])
   const {
@@ -255,7 +260,11 @@ export function UsagePage({
       )
         return
       setOverview(next)
-      toast.add({ title: "用量已刷新", type: "success" })
+      toast.add({
+        title: next.warnings.length ? "用量已刷新，但有部分警告" : "用量已刷新",
+        description: next.warnings[0]?.message,
+        type: next.warnings.length ? "warning" : "success",
+      })
     } catch (reason) {
       if (!mounted.current || !overviewRequestGate.isCurrent(request)) return
       toast.add({
@@ -276,7 +285,17 @@ export function UsagePage({
     try {
       await call("usage_delete_pricing_rule", { id })
       setRules((current) => (current ?? []).filter((rule) => rule.id !== id))
-      toast.add({ title: "价格规则已删除", type: "success" })
+      try {
+        await call("usage_reprice", { range: query.range })
+        await reloadOverview(query)
+        toast.add({ title: "价格规则已删除", type: "success" })
+      } catch (reason) {
+        toast.add({
+          title: "价格规则已删除，但重新计价失败",
+          description: errorMessage(reason),
+          type: "warning",
+        })
+      }
     } catch (reason) {
       toast.add({
         title: "删除失败",
@@ -326,6 +345,18 @@ export function UsagePage({
           <HugeiconsIcon icon={InformationCircleIcon} />
           <AlertTitle>用量刷新失败</AlertTitle>
           <AlertDescription>{overviewError}</AlertDescription>
+        </Alert>
+      )}
+      {overview.warnings.length > 0 && (
+        <Alert>
+          <HugeiconsIcon icon={InformationCircleIcon} />
+          <AlertTitle>部分用量日志未能完整读取</AlertTitle>
+          <AlertDescription>
+            {overview.warnings[0]?.message}
+            {overview.warnings.length > 1
+              ? `（另有 ${overview.warnings.length - 1} 条警告）`
+              : ""}
+          </AlertDescription>
         </Alert>
       )}
       {rulesError && (
@@ -642,6 +673,7 @@ export function UsagePage({
       <PricingEditor
         key={ruleOpen ? "open" : "closed"}
         open={ruleOpen}
+        range={query.range}
         onOpenChange={setRuleOpen}
         onSaved={() => {
           setRuleOpen(false)

@@ -15,6 +15,70 @@ const PROXY_ENV_NAMES: [&str; 8] = [
     "NO_PROXY",
     "no_proxy",
 ];
+const CODEX_ORIGINATOR: &str = "codex_cli_rs";
+const CODEX_LOGIN_SUFFIX: &str = "codex_login";
+const FALLBACK_CODEX_VERSION: &str = "0.144.1";
+
+pub(crate) fn codex_user_agent() -> &'static str {
+    static USER_AGENT: OnceLock<String> = OnceLock::new();
+    USER_AGENT
+        .get_or_init(|| {
+            build_codex_user_agent(
+                detected_codex_version(),
+                crate::platform::os_name(),
+                &crate::platform::os_version(),
+                std::env::consts::ARCH,
+            )
+        })
+        .as_str()
+}
+
+fn build_codex_user_agent(version: &str, os_name: &str, os_version: &str, arch: &str) -> String {
+    format!(
+        "{CODEX_ORIGINATOR}/{version} ({os_name} {os_version}; {arch}) unknown ({CODEX_LOGIN_SUFFIX}; {version})"
+    )
+}
+
+fn detected_codex_version() -> &'static str {
+    static VERSION: OnceLock<String> = OnceLock::new();
+    VERSION
+        .get_or_init(|| detect_codex_version().unwrap_or_else(|| FALLBACK_CODEX_VERSION.into()))
+        .as_str()
+}
+
+fn detect_codex_version() -> Option<String> {
+    let mut command = crate::platform::codex_cli_command();
+    command.arg("--version");
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    let output = command.output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_codex_version(&String::from_utf8_lossy(&output.stdout))
+}
+
+fn parse_codex_version(output: &str) -> Option<String> {
+    let mut fields = output.split_whitespace();
+    let product = fields.next()?;
+    if !matches!(product, "codex-cli" | "codex") {
+        return None;
+    }
+    let version = fields.next()?.trim_start_matches('v');
+    if version.is_empty()
+        || version.len() > 32
+        || !version
+            .bytes()
+            .all(|value| value.is_ascii_alphanumeric() || matches!(value, b'.' | b'-' | b'+'))
+    {
+        return None;
+    }
+    Some(version.to_owned())
+}
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct SystemProxy {
@@ -140,7 +204,7 @@ fn proxy_snapshot() -> ProxySnapshot {
 }
 
 fn client_builder_for(snapshot: &ProxySnapshot) -> Result<ClientBuilder, reqwest::Error> {
-    let builder = Client::builder();
+    let builder = Client::builder().user_agent(codex_user_agent());
     if environment_proxy_configured(snapshot) {
         return Ok(builder);
     }
@@ -372,6 +436,23 @@ fn parse_scutil_proxy(text: &str) -> Option<SystemProxy> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn user_agent_matches_codex_cli_shape() {
+        assert_eq!(
+            build_codex_user_agent("0.144.1", "Windows", "10.0.26100", "x86_64"),
+            "codex_cli_rs/0.144.1 (Windows 10.0.26100; x86_64) unknown (codex_login; 0.144.1)"
+        );
+        assert_eq!(
+            build_codex_user_agent("0.144.1", "Mac OS", "15.5", "aarch64"),
+            "codex_cli_rs/0.144.1 (Mac OS 15.5; aarch64) unknown (codex_login; 0.144.1)"
+        );
+        assert_eq!(
+            parse_codex_version("codex-cli 0.144.1\r\n"),
+            Some("0.144.1".into())
+        );
+        assert_eq!(parse_codex_version("malicious token value"), None);
+    }
 
     #[test]
     fn parses_windows_shared_and_protocol_proxy_values() {

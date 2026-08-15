@@ -237,6 +237,9 @@ pub fn headers_from_pairs(
     for (name, value) in pairs {
         let name = reqwest::header::HeaderName::from_bytes(name.as_bytes())
             .map_err(|_| AppError::InvalidConfig(format!("请求头名称无效：{name}")))?;
+        if name == reqwest::header::USER_AGENT {
+            continue;
+        }
         let value = reqwest::header::HeaderValue::from_str(&value)
             .map_err(|_| AppError::InvalidConfig("请求头内容包含无效字符。".into()))?;
         headers.insert(name, value);

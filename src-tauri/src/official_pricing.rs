@@ -169,7 +169,8 @@ pub(crate) fn resolve_model<'a>(
         catalog
             .models
             .iter()
-            .find(|(candidate, _)| normalized.starts_with(&format!("{candidate}-")))
+            .filter(|(candidate, _)| normalized.starts_with(&format!("{candidate}-")))
+            .max_by_key(|(candidate, _)| candidate.len())
             .map(|(_, rate)| rate)
     })
 }
@@ -332,6 +333,22 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cost, 4_226_954);
+        assert_eq!(
+            resolve_model(&catalog, "gpt-live-test-2030-2026-01-01")
+                .unwrap()
+                .model,
+            "gpt-live-test-2030"
+        );
+    }
+
+    #[test]
+    fn model_resolution_prefers_the_longest_matching_family() {
+        let fixture = FIXTURE.replace(
+            "| gpt-no-write |",
+            "| gpt-live | $1.00 | $0.10 | - | $2.00 | - | - | - | - |\n| gpt-no-write |",
+        );
+        let catalog = build_catalog(&fixture, 123, None, None).unwrap();
+
         assert_eq!(
             resolve_model(&catalog, "gpt-live-test-2030-2026-01-01")
                 .unwrap()

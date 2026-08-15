@@ -242,6 +242,7 @@ async fn refresh_official_quota(
     activation: &ActivationLock,
     account_id: &str,
 ) -> Result<ProviderAccountQuota, AppError> {
+    let _quota_guard = client.1.lock().await;
     let stored = store.official_account(account_id)?;
     let now = chrono::Utc::now().timestamp();
     let mut snapshot = stored.quota.clone();

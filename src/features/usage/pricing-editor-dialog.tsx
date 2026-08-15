@@ -24,14 +24,16 @@ import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group"
 import { toast } from "@/components/ui/toast"
 import { errorMessage } from "@/lib/format"
 import { call } from "@/lib/ipc"
-import type { BillingMode, PricingRule } from "@/types"
+import type { BillingMode, PricingRule, UsageRange } from "@/types"
 
 export function PricingEditor({
   open,
+  range,
   onOpenChange,
   onSaved,
 }: {
   open: boolean
+  range: UsageRange
   onOpenChange: (open: boolean) => void
   onSaved: () => void
 }) {
@@ -61,13 +63,22 @@ export function PricingEditor({
       cacheWriteUsdPerMillion: billingMode === "token" ? cacheWrite : undefined,
       outputUsdPerMillion: billingMode === "token" ? output : undefined,
       cacheWriteIncludedInInput: cacheWriteIncluded,
-      effectiveFromMs: now,
+      effectiveFromMs: range.startAtMs,
       createdAtMs: now,
       updatedAtMs: now,
     }
     try {
       await call("usage_save_pricing_rule", { input: rule })
-      toast.add({ title: "价格规则已保存", type: "success" })
+      try {
+        await call("usage_reprice", { range })
+        toast.add({ title: "价格规则已保存", type: "success" })
+      } catch (reason) {
+        toast.add({
+          title: "价格规则已保存，但重新计价失败",
+          description: errorMessage(reason),
+          type: "warning",
+        })
+      }
       onSaved()
     } catch (reason) {
       toast.add({

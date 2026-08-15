@@ -63,6 +63,7 @@ const DOWNSTREAM_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 const UPSTREAM_STALL_TIMEOUT: Duration = Duration::from_secs(300);
 const MAX_SSE_LINE_BUFFER_BYTES: usize = 1024 * 1024;
 const MAX_SSE_EVENT_DATA_BYTES: usize = 1024 * 1024;
+const MAX_STREAM_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // 注册表：一个共享的本机转换代理
@@ -213,6 +214,9 @@ fn build_upstream_headers(
         let Ok(name) = reqwest::header::HeaderName::from_bytes(name.as_bytes()) else {
             continue;
         };
+        if name == reqwest::header::USER_AGENT {
+            continue;
+        }
         let Ok(value) = reqwest::header::HeaderValue::from_str(&value) else {
             continue;
         };
@@ -1031,6 +1035,7 @@ fn translate_stream(
         let mut stream = response.bytes_stream();
         let mut failed = false;
         let mut done = false;
+        let mut received_bytes = 0usize;
         let mut failure_message = "读取上游流式响应失败，连接可能已中断。";
         loop {
             // 停滞检测：上游长时间没有任何字节到达，视为连接已死亡，
@@ -1045,7 +1050,15 @@ fn translate_stream(
                 }
             };
             match chunk {
-                Ok(bytes) => buffer.extend_from_slice(&bytes),
+                Ok(bytes) => {
+                    received_bytes = received_bytes.saturating_add(bytes.len());
+                    if received_bytes > MAX_STREAM_RESPONSE_BYTES {
+                        failed = true;
+                        failure_message = "上游流式响应超过允许大小。";
+                        break;
+                    }
+                    buffer.extend_from_slice(&bytes);
+                }
                 Err(_) => {
                     failed = true;
                     break;
@@ -4348,6 +4361,7 @@ mod tests {
         // 异常请求头只跳过错误项，不影响其余有效头（保存时已校验，这里是兜底）。
         let headers = build_upstream_headers(vec![
             ("X-Custom".into(), "ok".into()),
+            ("User-Agent".into(), "custom-agent".into()),
             ("invalid header".into(), "x".into()),
             ("X-Other".into(), "bad\nvalue".into()),
         ]);

@@ -25,7 +25,10 @@ impl ActivationLock {
 }
 
 #[derive(Default)]
-pub(crate) struct ApiClient(pub(crate) crate::network::ClientCache);
+pub(crate) struct ApiClient(
+    pub(crate) crate::network::ClientCache,
+    pub(crate) tokio::sync::Mutex<()>,
+);
 
 impl ApiClient {
     pub(crate) fn current(&self) -> Result<reqwest::Client, crate::AppError> {

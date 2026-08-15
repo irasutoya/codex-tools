@@ -7,12 +7,11 @@ use crate::proxy_import::ImportedProxyCredential;
 use crate::storage::Store;
 use futures_util::StreamExt;
 use reqwest::StatusCode;
-use reqwest::header::{HeaderMap, HeaderValue, USER_AGENT};
+use reqwest::header::{HeaderMap, HeaderValue};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use std::collections::HashMap;
-use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
@@ -23,8 +22,6 @@ const TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 const VERIFICATION_URL: &str = "https://auth.openai.com/codex/device";
 const DEVICE_REDIRECT_URI: &str = "https://auth.openai.com/deviceauth/callback";
 const CODEX_ORIGINATOR: &str = "codex_cli_rs";
-const CODEX_LOGIN_SUFFIX: &str = "codex_login";
-const FALLBACK_CODEX_VERSION: &str = "0.144.1";
 const DEFAULT_DEVICE_LIFETIME_SECS: u64 = 15 * 60;
 const MAX_DEVICE_LIFETIME_SECS: u64 = 60 * 60;
 const MAX_OAUTH_RESPONSE_BYTES: usize = 64 * 1024;
@@ -62,7 +59,6 @@ pub(crate) enum DevicePollResult {
 
 pub struct AuthCenter {
     client: crate::network::ClientCache,
-    user_agent: String,
     pending: Mutex<HashMap<String, PendingDeviceAuth>>,
     refresh_lock: Mutex<()>,
 }
@@ -111,10 +107,8 @@ enum AccountRefreshDecision {
 
 impl Default for AuthCenter {
     fn default() -> Self {
-        let user_agent = codex_user_agent();
         Self {
             client: crate::network::ClientCache::default(),
-            user_agent,
             pending: Mutex::new(HashMap::new()),
             refresh_lock: Mutex::new(()),
         }
@@ -336,6 +330,11 @@ impl AuthCenter {
                 require_success(response, "无法使用 Cookie 中的 Refresh Token 获取登录凭据")?;
             let refreshed: TokenResponse =
                 read_json_bounded(response, "Cookie 登录数据交换结果").await?;
+            let expires_at = refreshed
+                .expires_in
+                .filter(|seconds| *seconds > 0)
+                .map(|seconds| chrono::Utc::now().timestamp().saturating_add(seconds))
+                .or(imported.expires_at);
             let refreshed_import = ImportedProxyCredential {
                 access_token: Some(required_token(refreshed.access_token, "access_token")?),
                 id_token: non_empty(refreshed.id_token),
@@ -344,7 +343,7 @@ impl AuthCenter {
                 account_id: imported.account_id,
                 email: imported.email,
                 suggested_name: imported.suggested_name,
-                expires_at: imported.expires_at,
+                expires_at,
                 source_format: imported.source_format,
                 is_personal_access_token: imported.is_personal_access_token,
             };
@@ -355,15 +354,12 @@ impl AuthCenter {
     }
 
     fn client(&self) -> Result<reqwest::Client, AppError> {
-        let user_agent = self.user_agent.clone();
-        self.client
-            .current(|builder| build_oauth_client(builder, &user_agent))
-            .map_err(|error| {
-                AppError::Internal(format!(
-                    "无法初始化 OpenAI 网络客户端：{}",
-                    error.without_url()
-                ))
-            })
+        self.client.current(build_oauth_client).map_err(|error| {
+            AppError::Internal(format!(
+                "无法初始化 OpenAI 网络客户端：{}",
+                error.without_url()
+            ))
+        })
     }
 
     async fn poll_snapshot(&self, operation_id: &str) -> Result<LocalPollState, AppError> {
@@ -413,15 +409,9 @@ impl PendingDeviceAuth {
     }
 }
 
-fn build_oauth_client(
-    builder: reqwest::ClientBuilder,
-    user_agent: &str,
-) -> Result<reqwest::Client, reqwest::Error> {
+fn build_oauth_client(builder: reqwest::ClientBuilder) -> Result<reqwest::Client, reqwest::Error> {
     let mut headers = HeaderMap::new();
     headers.insert("originator", HeaderValue::from_static(CODEX_ORIGINATOR));
-    if let Ok(value) = HeaderValue::from_str(user_agent) {
-        headers.insert(USER_AGENT, value);
-    }
     builder
         .default_headers(headers)
         .redirect(reqwest::redirect::Policy::none())
@@ -743,67 +733,6 @@ fn safe_network_error(error: reqwest::Error) -> AppError {
     AppError::Internal(kind.into())
 }
 
-fn codex_user_agent() -> String {
-    static USER_AGENT: OnceLock<String> = OnceLock::new();
-    USER_AGENT
-        .get_or_init(|| {
-            build_codex_user_agent(
-                detected_codex_version(),
-                crate::platform::os_name(),
-                &crate::platform::os_version(),
-                std::env::consts::ARCH,
-            )
-        })
-        .clone()
-}
-
-fn build_codex_user_agent(version: &str, os_name: &str, os_version: &str, arch: &str) -> String {
-    format!(
-        "{CODEX_ORIGINATOR}/{version} ({os_name} {os_version}; {arch}) unknown ({CODEX_LOGIN_SUFFIX}; {version})"
-    )
-}
-
-fn detected_codex_version() -> &'static str {
-    static VERSION: OnceLock<String> = OnceLock::new();
-    VERSION
-        .get_or_init(|| detect_codex_version().unwrap_or_else(|| FALLBACK_CODEX_VERSION.into()))
-        .as_str()
-}
-
-fn detect_codex_version() -> Option<String> {
-    let mut command = crate::platform::codex_cli_command();
-    command.arg("--version");
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        command.creation_flags(CREATE_NO_WINDOW);
-    }
-    let output = command.output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    parse_codex_version(&String::from_utf8_lossy(&output.stdout))
-}
-
-fn parse_codex_version(output: &str) -> Option<String> {
-    let mut fields = output.split_whitespace();
-    let product = fields.next()?;
-    if !matches!(product, "codex-cli" | "codex") {
-        return None;
-    }
-    let version = fields.next()?.trim_start_matches('v');
-    if version.is_empty()
-        || version.len() > 32
-        || !version
-            .bytes()
-            .all(|value| value.is_ascii_alphanumeric() || matches!(value, b'.' | b'-' | b'+'))
-    {
-        return None;
-    }
-    Some(version.to_owned())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -902,23 +831,6 @@ mod tests {
         assert_eq!(parse_interval(Some(&json!(0))), 1);
         assert_eq!(parse_interval(Some(&json!(600))), 60);
         assert_eq!(parse_interval(None), 5);
-    }
-
-    #[test]
-    fn user_agent_matches_codex_cli_shape() {
-        assert_eq!(
-            build_codex_user_agent("0.144.1", "Windows", "10.0.26100", "x86_64"),
-            "codex_cli_rs/0.144.1 (Windows 10.0.26100; x86_64) unknown (codex_login; 0.144.1)"
-        );
-        assert_eq!(
-            build_codex_user_agent("0.144.1", "Mac OS", "15.5", "aarch64"),
-            "codex_cli_rs/0.144.1 (Mac OS 15.5; aarch64) unknown (codex_login; 0.144.1)"
-        );
-        assert_eq!(
-            parse_codex_version("codex-cli 0.144.1\r\n"),
-            Some("0.144.1".into())
-        );
-        assert_eq!(parse_codex_version("malicious token value"), None);
     }
 
     #[test]
