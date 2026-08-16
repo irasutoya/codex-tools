@@ -41,6 +41,53 @@ const COLLECTION_MODE: &str = "after_update";
 const COLLECTION_VERSION: &str = env!("CARGO_PKG_VERSION");
 const PARSER_VERSION: &str = "5";
 
+struct BoundedLine {
+    bytes: Vec<u8>,
+    bytes_read: usize,
+    complete: bool,
+    truncated: bool,
+}
+
+fn read_bounded_line<R: BufRead>(
+    reader: &mut R,
+    max_content_bytes: usize,
+    mut consume: impl FnMut(&[u8]),
+) -> std::io::Result<BoundedLine> {
+    // Keep enough room for a valid maximum-length line plus CRLF.
+    let capacity = max_content_bytes.saturating_add(2);
+    let mut bytes = Vec::new();
+    let mut bytes_read = 0usize;
+    let mut complete = false;
+
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            break;
+        }
+        let consumed = available
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(available.len(), |position| position + 1);
+        let chunk = &available[..consumed];
+        consume(chunk);
+        bytes_read = bytes_read.saturating_add(consumed);
+        let retained = capacity.saturating_sub(bytes.len()).min(consumed);
+        bytes.extend_from_slice(&chunk[..retained]);
+        complete = chunk.ends_with(b"\n");
+        reader.consume(consumed);
+        if complete {
+            break;
+        }
+    }
+
+    Ok(BoundedLine {
+        bytes,
+        bytes_read,
+        complete,
+        truncated: bytes_read > capacity,
+    })
+}
+
 #[derive(Clone)]
 pub(crate) struct UsageLedger {
     database_path: Arc<PathBuf>,
@@ -1576,26 +1623,26 @@ fn refresh_file(
     let mut inherited_events_skipped = 0;
 
     loop {
-        let mut line = Vec::new();
-        let bytes_read = reader
-            .read_until(b'\n', &mut line)
-            .map_err(|error| format!("读取会话文件失败：{error}"))?;
-        if bytes_read == 0 {
+        let mut line_hasher = prefix_hasher.clone();
+        let line = read_bounded_line(&mut reader, MAX_RECORD_LINE_BYTES, |chunk| {
+            line_hasher.update(chunk);
+        })
+        .map_err(|error| format!("读取会话文件失败：{error}"))?;
+        if line.bytes_read == 0 {
             break;
         }
-        let complete_line = line.ends_with(b"\n");
-        if !complete_line {
+        if !line.complete {
             partial_lines += 1;
             break;
         }
-        prefix_hasher.update(&line);
-        current_offset = current_offset.saturating_add(bytes_read as u64);
-        let trimmed = line.strip_suffix(b"\n").unwrap_or(&line);
+        prefix_hasher = line_hasher;
+        current_offset = current_offset.saturating_add(line.bytes_read as u64);
+        let trimmed = line.bytes.strip_suffix(b"\n").unwrap_or(&line.bytes);
         let trimmed = trimmed.strip_suffix(b"\r").unwrap_or(trimmed);
         if trimmed.is_empty() {
             continue;
         }
-        if trimmed.len() > MAX_RECORD_LINE_BYTES {
+        if line.truncated || trimmed.len() > MAX_RECORD_LINE_BYTES {
             events_skipped += 1;
             warnings.push(UsageWarning {
                 path: Some(path.display().to_string()),
@@ -1782,20 +1829,18 @@ fn committed_prefix_matches(
     let mut expected_events = Vec::new();
 
     while offset < cursor.byte_offset {
-        let mut line = Vec::new();
-        let bytes_read = reader
-            .read_until(b'\n', &mut line)
+        let line = read_bounded_line(&mut reader, MAX_RECORD_LINE_BYTES, |_| {})
             .map_err(|error| format!("验证会话文件前缀失败：{error}"))?;
-        if bytes_read == 0
-            || !line.ends_with(b"\n")
-            || offset.saturating_add(bytes_read as u64) > cursor.byte_offset
+        if line.bytes_read == 0
+            || !line.complete
+            || offset.saturating_add(line.bytes_read as u64) > cursor.byte_offset
         {
             return Ok(false);
         }
-        offset = offset.saturating_add(bytes_read as u64);
-        let trimmed = line.strip_suffix(b"\n").unwrap_or(&line);
+        offset = offset.saturating_add(line.bytes_read as u64);
+        let trimmed = line.bytes.strip_suffix(b"\n").unwrap_or(&line.bytes);
         let trimmed = trimmed.strip_suffix(b"\r").unwrap_or(trimmed);
-        if trimmed.is_empty() || trimmed.len() > MAX_RECORD_LINE_BYTES {
+        if trimmed.is_empty() || line.truncated || trimmed.len() > MAX_RECORD_LINE_BYTES {
             continue;
         }
         if let Ok(LineResult::Event(event)) = parse_line(trimmed, &mut state)
@@ -1844,18 +1889,19 @@ fn rollout_state(path: &Path, boundary_marker_required: bool) -> Result<ParserSt
         ..ParserState::default()
     };
     loop {
-        let mut line = Vec::new();
-        let bytes_read = reader
-            .read_until(b'\n', &mut line)
+        let line = read_bounded_line(&mut reader, MAX_RECORD_LINE_BYTES, |_| {})
             .map_err(|error| format!("读取子任务边界失败：{error}"))?;
-        if bytes_read == 0 {
+        if line.bytes_read == 0 {
             return Ok(state);
         }
+        if line.truncated {
+            continue;
+        }
+        let line = line.bytes.strip_suffix(b"\n").unwrap_or(&line.bytes);
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
         if line.len() > MAX_RECORD_LINE_BYTES {
             continue;
         }
-        let line = line.strip_suffix(b"\n").unwrap_or(&line);
-        let line = line.strip_suffix(b"\r").unwrap_or(line);
         let _ = parse_line(line, &mut state);
     }
 }
@@ -1905,18 +1951,18 @@ fn discover_rollout(path: &Path) -> Result<Option<DiscoveredRollout>, String> {
         if scanned >= MAX_METADATA_SCAN_BYTES {
             break;
         }
-        let mut line = Vec::new();
-        let bytes_read = reader
-            .read_until(b'\n', &mut line)
+        let line = read_bounded_line(&mut reader, MAX_METADATA_SCAN_BYTES, |_| {})
             .map_err(|error| format!("读取会话元数据失败：{error}"))?;
-        if bytes_read == 0 {
+        if line.bytes_read == 0 {
             break;
         }
-        scanned = scanned.saturating_add(bytes_read);
-        if !line.ends_with(b"\n") {
+        scanned = scanned.saturating_add(line.bytes_read);
+        if !line.complete {
             break;
         }
-        lines.push(line);
+        if !line.truncated {
+            lines.push(line.bytes);
+        }
     }
     let boundary_marker_required = lines.iter().any(|line| is_inter_agent_trigger_line(line));
     let mut state = ParserState {
@@ -2681,7 +2727,7 @@ fn u64_db(value: u64) -> Result<i64, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ActivationSnapshot, UsageLedger, file_modified_at_ms};
+    use super::{ActivationSnapshot, UsageLedger, file_modified_at_ms, read_bounded_line};
     use crate::models::{
         ActivationRecord, AppError, BillingMode, CostStatus, PricingMatchKind, PricingScopeKind,
         SavePricingRule, UsageGroupBy, UsageQuery, UsageRange, UsageSourceKind,
@@ -2689,7 +2735,25 @@ mod tests {
     use crate::official_pricing::build_catalog;
     use crate::usage_log::{ParsedUsageEvent, TokenUsage, UsageQuality};
     use chrono::DateTime;
-    use std::{fs, path::Path};
+    use std::{fs, io::Cursor, path::Path};
+
+    #[test]
+    fn bounded_line_drains_oversized_records_without_retaining_them() {
+        let mut reader = Cursor::new(b"abcdef\nnext\n");
+        let mut consumed = Vec::new();
+        let oversized =
+            read_bounded_line(&mut reader, 4, |chunk| consumed.extend_from_slice(chunk)).unwrap();
+
+        assert_eq!(oversized.bytes_read, 7);
+        assert!(oversized.complete);
+        assert!(oversized.truncated);
+        assert_eq!(oversized.bytes.len(), 6);
+        assert_eq!(consumed, b"abcdef\n");
+
+        let next = read_bounded_line(&mut reader, 4, |_| {}).unwrap();
+        assert_eq!(next.bytes, b"next\n");
+        assert!(!next.truncated);
+    }
 
     fn rollout_prefix() -> &'static str {
         concat!(

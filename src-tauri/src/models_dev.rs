@@ -307,15 +307,17 @@ async fn fetch_document_uncached(client: &reqwest::Client) -> Result<String, App
     {
         return Err(AppError::Internal("models.dev 数据超过 4MB 限制。".into()));
     }
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|error| AppError::Internal(format!("读取 models.dev 数据失败：{error}")))?;
-    if bytes.len() > MAX_DOCUMENT_BYTES {
-        return Err(AppError::Internal("models.dev 数据超过 4MB 限制。".into()));
+    let mut stream = response.bytes_stream();
+    let mut bytes = Vec::new();
+    while let Some(chunk) = futures_util::StreamExt::next(&mut stream).await {
+        let chunk = chunk
+            .map_err(|error| AppError::Internal(format!("读取 models.dev 数据失败：{error}")))?;
+        if bytes.len().saturating_add(chunk.len()) > MAX_DOCUMENT_BYTES {
+            return Err(AppError::Internal("models.dev 数据超过 4MB 限制。".into()));
+        }
+        bytes.extend_from_slice(&chunk);
     }
-    String::from_utf8(bytes.to_vec())
-        .map_err(|_| AppError::Internal("models.dev 数据不是 UTF-8。".into()))
+    String::from_utf8(bytes).map_err(|_| AppError::Internal("models.dev 数据不是 UTF-8。".into()))
 }
 
 #[derive(Deserialize)]

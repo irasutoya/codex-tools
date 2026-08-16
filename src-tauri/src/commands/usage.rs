@@ -123,16 +123,19 @@ pub(crate) async fn usage_refresh_official_pricing(
         .get(reqwest::header::LAST_MODIFIED)
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|error| AppError::Internal(format!("读取官方价格失败：{error}")))?;
-    if bytes.len() > official_pricing::MAX_DOCUMENT_BYTES {
-        return Err(AppError::Internal(
-            "官方价格文档超过 512KB 限制，已保留上次缓存。".into(),
-        ));
+    let mut stream = response.bytes_stream();
+    let mut bytes = Vec::new();
+    while let Some(chunk) = futures_util::StreamExt::next(&mut stream).await {
+        let chunk =
+            chunk.map_err(|error| AppError::Internal(format!("读取官方价格失败：{error}")))?;
+        if bytes.len().saturating_add(chunk.len()) > official_pricing::MAX_DOCUMENT_BYTES {
+            return Err(AppError::Internal(
+                "官方价格文档超过 512KB 限制，已保留上次缓存。".into(),
+            ));
+        }
+        bytes.extend_from_slice(&chunk);
     }
-    let document = String::from_utf8(bytes.to_vec())
+    let document = String::from_utf8(bytes)
         .map_err(|_| AppError::Internal("官方价格文档不是 UTF-8。".into()))?;
     let now = chrono::Utc::now().timestamp_millis();
     let catalog = official_pricing::build_catalog(&document, now, etag, last_modified)
