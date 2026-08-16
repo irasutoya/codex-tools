@@ -26,6 +26,7 @@ import {
   EmptyTitle,
 } from "@/components/ui/empty"
 import { Spinner } from "@/components/ui/spinner"
+import { Switch } from "@/components/ui/switch"
 import { Skeleton } from "@/components/ui/skeleton"
 import { toast } from "@/components/ui/toast"
 import { errorMessage, formatDate, quotaWindow } from "@/lib/format"
@@ -431,6 +432,45 @@ export function ProvidersPage({
           />
           {isAccount && (
             <Detail label="账号备注" value={account?.remark || "未设置"} />
+          )}
+          {isAccount && account?.deviceSessionConvergenceAvailable && (
+            <div className="col-span-2 rounded-lg border p-3">
+              <div className="flex items-center justify-between gap-4">
+                <div>
+                  <div className="text-sm font-medium">设备＋会话收敛</div>
+                  <p className="mt-1 text-xs text-muted-foreground">
+                    官方 OAuth 或已验证 RT
+                    导入账号默认启用：统一此账号跨设备的设备与会话标识，同时保留不同真实会话的独立线程；不会隐藏
+                    IP、改变登录记录或保证避免封禁。
+                  </p>
+                </div>
+                <Switch
+                  aria-label="设备＋会话收敛"
+                  checked={account.deviceSessionConvergenceEnabled}
+                  disabled={actionBusy}
+                  onCheckedChange={(enabled) =>
+                    void run(
+                      "installation-id",
+                      () =>
+                        call("connections_set_device_session_convergence", {
+                          id: account.id,
+                          enabled,
+                        }),
+                      {
+                        success: enabled
+                          ? "设备＋会话收敛已启用"
+                          : "设备＋会话收敛已关闭",
+                        onSuccess: onRefresh,
+                      }
+                    )
+                  }
+                />
+              </div>
+              <p className="mt-2 text-xs text-muted-foreground">
+                默认启用。启用后需保持 Codex Tools
+                运行，本机中继才可用；关闭后恢复官方直连。
+              </p>
+            </div>
           )}
           <Detail
             label="凭据状态"

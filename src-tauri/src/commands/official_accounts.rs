@@ -1,8 +1,12 @@
 use crate::{
-    activation::{activate_openai_record, sync_active_openai_credential},
+    activation::{
+        activate_openai_record, sync_active_codex_configuration_with_installation_proxy,
+        sync_active_openai_credential,
+    },
     auth_center::{AuthCenter, DevicePollResult},
     chat_proxy::ChatProxyRegistry,
     codex::{self, ConfigManager},
+    installation_id_proxy::InstallationIdProxyRegistry,
     local_usage::UsageLedger,
     models::*,
     official_quota, proxy_import,
@@ -24,10 +28,14 @@ pub(crate) struct ProxyImportResult {
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)] // Tauri injects each managed state separately.
 pub(crate) async fn connections_import_cookie(
     store: State<'_, Store>,
     center: State<'_, AuthCenter>,
+    manager: State<'_, ConfigManager>,
     activation: State<'_, ActivationLock>,
+    proxy: State<'_, ChatProxyRegistry>,
+    installation_proxy: State<'_, InstallationIdProxyRegistry>,
     name: Option<String>,
     account_id: Option<String>,
     content: String,
@@ -95,20 +103,7 @@ pub(crate) async fn connections_import_cookie(
         ));
     }
     let saved_accounts = store.save_official_accounts(&resolved_accounts)?;
-    let active_credential = store.read(|state| {
-        if !matches!(state.active.kind, ActiveKind::Official) {
-            return None;
-        }
-        let active_id = state.active.account_id.as_deref()?;
-        state
-            .official_accounts
-            .iter()
-            .find(|account| account.id == active_id)
-            .map(|account| account.credential.clone())
-    })?;
-    if let Some(credential) = active_credential {
-        codex::connections_activate_official_account(&home, &credential, None)?;
-    }
+    sync_active_imported_account(&store, &manager, &proxy, &installation_proxy).await?;
     for account in saved_accounts {
         accounts.push(store.official_account_view(&account.id)?);
     }
@@ -118,36 +113,28 @@ pub(crate) async fn connections_import_cookie(
     })
 }
 
-#[cfg(test)]
-async fn save_imported_account_and_sync_active(
+async fn sync_active_imported_account(
     store: &Store,
-    activation: &ActivationLock,
-    account: &StoredOfficialAccount,
-) -> Result<OfficialAccountView, AppError> {
-    let _guard = activation.0.lock().await;
-    let home = codex::home(&store.codex_home_setting()?);
-    sync_active_openai_credential(store, &home)?;
-    save_imported_account_and_sync_active_locked(store, &home, account)
-}
-
-#[cfg(test)]
-fn save_imported_account_and_sync_active_locked(
-    store: &Store,
-    home: &std::path::Path,
-    account: &StoredOfficialAccount,
-) -> Result<OfficialAccountView, AppError> {
-    let saved = store.save_official_account(account)?;
+    manager: &ConfigManager,
+    proxy: &ChatProxyRegistry,
+    installation_proxy: &InstallationIdProxyRegistry,
+) -> Result<(), AppError> {
     let is_active = store.read(|state| {
-        matches!(state.active.kind, ActiveKind::Official)
-            && state.active.account_id.as_deref() == Some(saved.id.as_str())
+        matches!(state.active.kind, ActiveKind::Official) && state.active.account_id.is_some()
     })?;
     if is_active {
-        // A repeated Cookie import can replace the active single-use refresh
-        // token. Update Codex immediately so a later sync cannot re-import the
-        // superseded credential from auth.json.
-        codex::connections_activate_official_account(home, &saved.credential, None)?;
+        // Reimports can replace an active refresh token. Use the same managed
+        // sync path as normal activation so an eligible RT account keeps its
+        // live relay instead of falling back to a direct Codex configuration.
+        sync_active_codex_configuration_with_installation_proxy(
+            store,
+            manager,
+            proxy,
+            installation_proxy,
+        )
+        .await?;
     }
-    store.official_account_view(&saved.id)
+    Ok(())
 }
 
 #[tauri::command]
@@ -157,6 +144,48 @@ pub(crate) fn connections_update_account_remark(
     remark: String,
 ) -> Result<OfficialAccountView, AppError> {
     let saved = store.update_official_account_remark(&id, remark)?;
+    store.official_account_view(&saved.id)
+}
+
+#[tauri::command]
+pub(crate) async fn connections_set_device_session_convergence(
+    store: State<'_, Store>,
+    manager: State<'_, ConfigManager>,
+    activation: State<'_, ActivationLock>,
+    proxy: State<'_, ChatProxyRegistry>,
+    installation_proxy: State<'_, InstallationIdProxyRegistry>,
+    id: String,
+    enabled: bool,
+) -> Result<OfficialAccountView, AppError> {
+    let _guard = activation.0.lock().await;
+    let previous = store.official_installation_id_setting(&id)?;
+    let saved = store.set_official_installation_id_unification(&id, enabled)?;
+    let active = store.read(|state| {
+        matches!(state.active.kind, ActiveKind::Official)
+            && state.active.account_id.as_deref() == Some(id.as_str())
+    })?;
+    if active
+        && let Err(error) = sync_active_codex_configuration_with_installation_proxy(
+            &store,
+            &manager,
+            &proxy,
+            &installation_proxy,
+        )
+        .await
+    {
+        // Persisted state and the live Codex config move together. If the
+        // reconfiguration fails, restore the prior setting and best-effort
+        // restore its prior direct/relay route before reporting the error.
+        let _ = store.set_official_installation_id_unification(&id, previous.enabled);
+        let _ = sync_active_codex_configuration_with_installation_proxy(
+            &store,
+            &manager,
+            &proxy,
+            &installation_proxy,
+        )
+        .await;
+        return Err(error);
+    }
     store.official_account_view(&saved.id)
 }
 
@@ -178,13 +207,16 @@ fn connections_update_account_remarks_in_store(
             .then(|| state.active.account_id.clone())
             .flatten()
     })?;
-    Ok(saved
+    saved
         .into_iter()
         .map(|account| {
             let active = active_account_id.as_deref() == Some(account.id.as_str());
-            account.view(active)
+            Ok(account.view(
+                active,
+                store.official_installation_id_setting(&account.id)?.enabled,
+            ))
         })
-        .collect())
+        .collect()
 }
 
 #[tauri::command]
@@ -335,6 +367,7 @@ pub(crate) async fn connections_login_start(
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)] // Tauri injects each managed state separately.
 pub(crate) async fn connections_login_poll(
     store: State<'_, Store>,
     center: State<'_, AuthCenter>,
@@ -342,6 +375,7 @@ pub(crate) async fn connections_login_poll(
     ledger: State<'_, UsageLedger>,
     activation: State<'_, ActivationLock>,
     proxy: State<'_, ChatProxyRegistry>,
+    installation_proxy: State<'_, InstallationIdProxyRegistry>,
     operation_id: String,
 ) -> Result<OpenAiDevicePoll, AppError> {
     match center.poll_openai(&operation_id).await? {
@@ -355,7 +389,15 @@ pub(crate) async fn connections_login_poll(
             }
             sync_active_openai_credential(&store, &codex::home(&store.codex_home_setting()?))?;
             let saved = store.save_official_account(&account)?;
-            let repair = activate_openai_record(&store, &manager, &ledger, &proxy, &saved).await?;
+            let repair = activate_openai_record(
+                &store,
+                &manager,
+                &ledger,
+                &proxy,
+                &installation_proxy,
+                &saved,
+            )
+            .await?;
             Ok(OpenAiDevicePoll::Complete {
                 account: Box::new(store.official_account_view(&saved.id)?),
                 repair,
@@ -365,6 +407,7 @@ pub(crate) async fn connections_login_poll(
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)] // Tauri injects each managed state separately.
 pub(crate) async fn connections_activate_account(
     store: State<'_, Store>,
     center: State<'_, AuthCenter>,
@@ -372,6 +415,7 @@ pub(crate) async fn connections_activate_account(
     ledger: State<'_, UsageLedger>,
     activation: State<'_, ActivationLock>,
     proxy: State<'_, ChatProxyRegistry>,
+    installation_proxy: State<'_, InstallationIdProxyRegistry>,
     id: String,
 ) -> Result<RepairResult, AppError> {
     let activation_operation = activation.begin_operation();
@@ -381,7 +425,15 @@ pub(crate) async fn connections_activate_account(
     }
     sync_active_openai_credential(&store, &codex::home(&store.codex_home_setting()?))?;
     let saved = center.refresh_account(&store, &id).await?;
-    activate_openai_record(&store, &manager, &ledger, &proxy, &saved).await
+    activate_openai_record(
+        &store,
+        &manager,
+        &ledger,
+        &proxy,
+        &installation_proxy,
+        &saved,
+    )
+    .await
 }
 
 #[tauri::command]
@@ -392,6 +444,7 @@ pub(crate) async fn connections_activate_official(
     ledger: State<'_, UsageLedger>,
     activation: State<'_, ActivationLock>,
     proxy: State<'_, ChatProxyRegistry>,
+    installation_proxy: State<'_, InstallationIdProxyRegistry>,
 ) -> Result<RepairResult, AppError> {
     let activation_operation = activation.begin_operation();
     let _guard = activation.0.lock().await;
@@ -417,7 +470,15 @@ pub(crate) async fn connections_activate_official(
     let id =
         id.ok_or_else(|| AppError::InvalidConfig("请先在“账号与服务”中登录 OpenAI。".into()))?;
     let saved = center.refresh_account(&store, &id).await?;
-    activate_openai_record(&store, &manager, &ledger, &proxy, &saved).await
+    activate_openai_record(
+        &store,
+        &manager,
+        &ledger,
+        &proxy,
+        &installation_proxy,
+        &saved,
+    )
+    .await
 }
 
 #[tauri::command]
@@ -464,7 +525,17 @@ fn platform_open() -> Result<(), AppError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
     use std::fs;
+
+    fn claimed_token(account_id: &str) -> String {
+        let payload = URL_SAFE_NO_PAD.encode(
+            serde_json::json!({ "chatgpt_account_id": account_id })
+                .to_string()
+                .as_bytes(),
+        );
+        format!("header.{payload}.signature")
+    }
 
     fn account(account_id: &str, remark: &str) -> StoredOfficialAccount {
         StoredOfficialAccount {
@@ -682,15 +753,76 @@ mod tests {
         reimported.remark.clear();
         reimported.credential.tokens.access_token = "at-cookie-reimported".into();
         reimported.credential.last_refresh = "2026-08-01T00:00:00Z".into();
-        let imported_view =
-            save_imported_account_and_sync_active(&store, &ActivationLock::default(), &reimported)
-                .await
-                .unwrap();
+        let saved_reimport = store.save_official_account(&reimported).unwrap();
+        let manager = ConfigManager::default();
+        let proxy = ChatProxyRegistry::default();
+        let installation_proxy = InstallationIdProxyRegistry::default();
+        sync_active_imported_account(&store, &manager, &proxy, &installation_proxy)
+            .await
+            .unwrap();
+        let imported_view = store.official_account_view(&saved_reimport.id).unwrap();
 
         assert!(imported_view.active);
         assert_eq!(imported_view.remark, "备用账号");
         let auth: serde_json::Value =
             serde_json::from_slice(&fs::read(home.join("auth.json")).unwrap()).unwrap();
         assert_eq!(auth["personal_access_token"], "at-cookie-reimported");
+    }
+
+    #[tokio::test]
+    async fn active_oauth_to_eligible_rt_reimport_keeps_the_managed_relay() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex-home");
+        fs::create_dir_all(&home).unwrap();
+        let store = Store::open(temp.path().join("data")).unwrap();
+        store
+            .update(|state| {
+                state.codex.home = home.display().to_string();
+                Ok(())
+            })
+            .unwrap();
+        let mut oauth = account("shared-account", "");
+        oauth.source = OfficialAccountSource::OpenAiOauth;
+        oauth.credential.tokens.refresh_token = "oauth-refresh".into();
+        let oauth = store.save_official_account(&oauth).unwrap();
+        store
+            .connections_activate_official_account(&oauth.id)
+            .unwrap();
+
+        let mut rt = oauth.clone();
+        rt.id.clear();
+        rt.source = OfficialAccountSource::ProxyImport;
+        rt.credential.tokens.access_token = "rt-access".into();
+        rt.credential.tokens.refresh_token = "rt-refresh".into();
+        rt.credential.tokens.id_token = claimed_token("shared-account");
+        rt.credential.last_refresh = "2026-08-01T00:00:00Z".into();
+        let rt = store.save_official_account(&rt).unwrap();
+        assert_eq!(rt.id, oauth.id);
+        assert!(
+            store
+                .official_installation_id_setting(&rt.id)
+                .unwrap()
+                .enabled
+        );
+
+        let manager = ConfigManager::default();
+        let proxy = ChatProxyRegistry::default();
+        let installation_proxy = InstallationIdProxyRegistry::default();
+        // `connections_import_cookie` invokes this same helper while holding
+        // its activation lock, which guards against a direct-config bypass.
+        sync_active_imported_account(&store, &manager, &proxy, &installation_proxy)
+            .await
+            .unwrap();
+
+        let config = fs::read_to_string(home.join("config.toml")).unwrap();
+        let document = config.parse::<toml_edit::DocumentMut>().unwrap();
+        assert_eq!(
+            document["model_provider"].as_str(),
+            Some(crate::codex::INSTALLATION_ID_RELAY_PROVIDER_ID)
+        );
+        assert!(document["model_providers"][crate::codex::INSTALLATION_ID_RELAY_PROVIDER_ID]
+            ["base_url"]
+            .as_str()
+            .is_some_and(|url| url.starts_with("http://127.0.0.1:")));
     }
 }

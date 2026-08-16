@@ -39,8 +39,9 @@ thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util"] }
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect"] }
 toml_edit = "0.22"
-uuid = { version = "1", features = ["v4", "serde"] }
+uuid = { version = "1", features = ["v4", "v7", "serde"] }
 walkdir = "2"
+zstd = "0.13"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
