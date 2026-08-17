@@ -56,6 +56,10 @@ type CommandMap = {
     DeviceAuthPollResult
   >
   connections_activate_account: CommandSpec<{ id: string }, RepairResult>
+  connections_set_device_session_convergence: CommandSpec<
+    { id: string; enabled: boolean },
+    OfficialAccountView
+  >
   connections_refresh_login: CommandSpec<{ id: string }, OfficialAccountView>
   connections_update_account_remark: CommandSpec<
     { id: string; remark: string },

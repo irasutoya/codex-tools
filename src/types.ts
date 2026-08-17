@@ -295,6 +295,8 @@ export type OfficialAccountView = {
   source: "open_ai_oauth" | "proxy_import"
   expiresAt: number | null
   quota: AccountQuota
+  deviceSessionConvergenceAvailable: boolean
+  deviceSessionConvergenceEnabled: boolean
   active: boolean
   createdAt: number
   updatedAt: number
