@@ -83,6 +83,14 @@ type DeleteTarget = {
 
 const EMPTY_ACCOUNTS: OfficialAccountView[] = []
 const EMPTY_PROVIDERS: Provider[] = []
+const DELETE_NAME_MAX_LENGTH = 16
+
+function truncateDeleteName(name: string) {
+  const characters = Array.from(name)
+  return characters.length > DELETE_NAME_MAX_LENGTH
+    ? `${characters.slice(0, DELETE_NAME_MAX_LENGTH).join("")}…`
+    : name
+}
 
 export function ConnectionManagerSheet({
   open,
@@ -309,6 +317,8 @@ export function ConnectionManagerSheet({
       })),
     [accounts]
   )
+  const deleteTargetName = deleteTarget?.name ?? "这个连接"
+  const deleteTargetLabel = truncateDeleteName(deleteTargetName)
 
   return (
     <>
@@ -593,8 +603,11 @@ export function ConnectionManagerSheet({
       >
         <AlertDialogContent aria-busy={pending?.action === "delete"}>
           <AlertDialogHeader>
-            <AlertDialogTitle>
-              删除“{deleteTarget?.name ?? "这个连接"}”？
+            <AlertDialogTitle
+              className="max-w-full min-w-0 truncate"
+              title={`删除“${deleteTargetName}”？`}
+            >
+              删除“{deleteTargetLabel}”？
             </AlertDialogTitle>
             <AlertDialogDescription>
               {deleteTarget?.active
@@ -608,13 +621,17 @@ export function ConnectionManagerSheet({
             </AlertDialogCancel>
             <AlertDialogAction
               variant="destructive"
+              className="max-w-[min(16rem,100%)] min-w-0"
               disabled={pending?.action === "delete"}
               onClick={() => void deleteConnection()}
+              title={`删除“${deleteTargetName}”`}
             >
               {pending?.action === "delete" && (
                 <Spinner data-icon="inline-start" />
               )}
-              删除“{deleteTarget?.name ?? "连接"}”
+              <span className="min-w-0 truncate">
+                删除“{deleteTargetLabel}”
+              </span>
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>

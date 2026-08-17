@@ -13,8 +13,22 @@ import {
 import { HugeiconsIcon } from "@hugeicons/react"
 import { Cancel01Icon } from "@hugeicons/core-free-icons"
 
-function Sheet({ ...props }: SheetPrimitive.Root.Props) {
-  return <SheetPrimitive.Root data-slot="sheet" {...props} />
+function Sheet({ open, ...props }: SheetPrimitive.Root.Props) {
+  const [initialOpenReady, setInitialOpenReady] = React.useState(open !== true)
+
+  React.useEffect(() => {
+    if (initialOpenReady) return
+    const frame = requestAnimationFrame(() => setInitialOpenReady(true))
+    return () => cancelAnimationFrame(frame)
+  }, [initialOpenReady])
+
+  return (
+    <SheetPrimitive.Root
+      data-slot="sheet"
+      open={open === undefined ? undefined : open && initialOpenReady}
+      {...props}
+    />
+  )
 }
 
 function SheetTrigger({ ...props }: SheetPrimitive.Trigger.Props) {
