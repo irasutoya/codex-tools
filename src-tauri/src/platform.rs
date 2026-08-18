@@ -195,7 +195,7 @@ pub fn codex_app_found(configured: Option<&str>) -> bool {
     codex_app_path(configured).is_some()
 }
 
-/// Codex 桌面应用当前是否在运行（仅用于提示用户手动退出后再启动）。
+/// Codex 桌面应用当前是否在运行，用于阻止认证、配置和会话文件并发改写。
 pub fn codex_app_running(configured: Option<&str>) -> bool {
     #[cfg(target_os = "macos")]
     {

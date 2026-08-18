@@ -1,15 +1,17 @@
 use crate::{
     activation::{
-        compensate_activation_failure_with_installation_proxy, record_written_model,
-        sync_active_codex_configuration_with_installation_proxy, sync_active_openai_credential,
+        compensate_activation_failure_with_installation_proxy, ensure_codex_stopped,
+        record_written_model, sync_active_codex_configuration_with_installation_proxy,
+        sync_active_openai_credential,
     },
     chat_proxy::ChatProxyRegistry,
     codex::{self, AppliedConfigPatch, ConfigManager},
-    commands::sessions::repair_home,
+    commands::sessions::repair_home_after_activation,
     installation_id_proxy::InstallationIdProxyRegistry,
     local_usage::UsageLedger,
     models::*,
     models_dev, provider_http, provider_sync,
+    session_index::SessionIndex,
     state::{ActivationLock, ApiClient},
     storage::{ProviderSnapshotRevision, ProviderSourceFingerprint, Store},
 };
@@ -33,6 +35,9 @@ pub(crate) async fn connections_save_provider(
 ) -> Result<ProviderProfile, AppError> {
     let _model_transaction = activation.2.lock().await;
     let provider = ProviderProfile::from(provider);
+    if store.is_active_provider(&provider.id)? {
+        ensure_codex_stopped(&store)?;
+    }
     let (previous, saved_source, saved_revision, needs_model_refresh, was_active, saved) = {
         let _guard = activation.0.lock().await;
         let (previous, saved) = store.connections_save_provider_with_previous(provider)?;
@@ -376,6 +381,9 @@ pub(crate) async fn connections_list_models(
     let _model_transaction = activation.2.lock().await;
     let (mut provider, starting_revision, was_active) =
         store.provider_model_refresh_snapshot(&id)?;
+    if was_active {
+        ensure_codex_stopped(&store)?;
+    }
     provider.normalize_and_validate()?;
     if provider
         .api_key
@@ -428,6 +436,7 @@ pub(crate) async fn connections_refresh_models(
         })?;
     let (provider, starting_revision, was_active) =
         store.provider_model_refresh_snapshot(&provider_id)?;
+    ensure_codex_stopped(&store)?;
     let synced = sync_provider_models(
         &client.current()?,
         &store,
@@ -520,6 +529,26 @@ async fn sync_active_provider_configuration(
 struct SyncedProviderModels {
     models: Vec<String>,
     revision: ProviderSnapshotRevision,
+}
+
+fn validate_fresh_activation_models(
+    refresh_error: Option<AppError>,
+    available_models: &[String],
+) -> Result<(), AppError> {
+    if let Some(error) = refresh_error {
+        if matches!(error, AppError::StaleOperation) {
+            return Err(error);
+        }
+        return Err(AppError::InvalidConfig(format!(
+            "无法获取此服务的最新模型，连接未切换；已保留原有模型缓存：{error}"
+        )));
+    }
+    if available_models.iter().all(|model| model.trim().is_empty()) {
+        return Err(AppError::InvalidConfig(
+            "此服务没有可用模型，无法激活。请检查 /models 接口后重试".into(),
+        ));
+    }
+    Ok(())
 }
 
 async fn sync_provider_models(
@@ -644,6 +673,7 @@ pub(crate) async fn settings_apply_activation(
     if !activation.is_current(activation_operation) {
         return Err(AppError::StaleOperation);
     }
+    ensure_codex_stopped(&store)?;
     let previous_managed_model = store.last_managed_model()?;
     let applied = manager.apply(&operation_id)?;
     // 写入成功后记录 config.toml 当前的服务模型，供切换到 OpenAI 时精确清除。
@@ -676,6 +706,7 @@ pub(crate) async fn connections_activate(
     proxy: State<'_, ChatProxyRegistry>,
     installation_proxy: State<'_, InstallationIdProxyRegistry>,
     client: State<'_, ApiClient>,
+    index: State<'_, SessionIndex>,
     id: String,
 ) -> Result<RepairResult, AppError> {
     let activation_operation = activation.begin_operation();
@@ -683,8 +714,10 @@ pub(crate) async fn connections_activate(
     if !activation.is_current(activation_operation) {
         return Err(AppError::StaleOperation);
     }
-    // 先在激活锁之外刷新模型，避免网络请求阻塞其他切换。短暂网络故障时可
-    // 继续使用之前由 `/models` 成功保存的缓存；从未获取过模型则拒绝激活。
+    ensure_codex_stopped(&store)?;
+    // 先在激活锁之外刷新模型，避免网络请求阻塞其他切换。激活属于高影响
+    // 操作，必须以本次 `/models` 实时验证为准，不能用旧缓存掩盖失效的 Key
+    // 或不可达的服务。
     let mut candidate = store.provider(&id)?;
     candidate.normalize_and_validate()?;
     if !candidate.enabled {
@@ -705,23 +738,13 @@ pub(crate) async fn connections_activate(
         .await
         .err();
     let refreshed = store.provider(&id)?;
-    if refreshed
-        .available_models
-        .iter()
-        .all(|model| model.trim().is_empty())
-    {
-        let detail = refresh_error
-            .map(|error| format!("：{error}"))
-            .unwrap_or_default();
-        return Err(AppError::InvalidConfig(format!(
-            "此服务没有可用模型，无法激活。请检查 /models 接口后重试{detail}"
-        )));
-    }
+    validate_fresh_activation_models(refresh_error, &refreshed.available_models)?;
     let repair = {
         let _guard = activation.0.lock().await;
         if !activation.is_current(activation_operation) {
             return Err(AppError::StaleOperation);
         }
+        ensure_codex_stopped(&store)?;
         let mut provider = store.provider(&id)?;
         provider.normalize_and_validate()?;
         if !provider.enabled {
@@ -776,7 +799,7 @@ pub(crate) async fn connections_activate(
             // 转换代理保持运行：Codex 会缓存配置里的地址，端口必须在本机会话内
             // 保持稳定，切回其他服务再切回来时才能继续使用同一端口。
             let repair = if repair_sessions {
-                repair_home(home, codex::MANAGED_PROVIDER_ID.into()).await?
+                repair_home_after_activation(&store, home, codex::MANAGED_PROVIDER_ID.into()).await
             } else {
                 RepairResult {
                     target_provider: codex::MANAGED_PROVIDER_ID.into(),
@@ -797,6 +820,7 @@ pub(crate) async fn connections_activate(
             }
         }
     }?;
+    index.invalidate();
     Ok(repair)
 }
 
@@ -831,6 +855,25 @@ mod tests {
             base_url: base_url.into(),
             proxy_api_key: None,
         }
+    }
+
+    #[test]
+    fn activation_never_falls_back_to_cached_models_after_refresh_failure() {
+        let error = validate_fresh_activation_models(
+            Some(AppError::Internal("network down".into())),
+            &["cached-model".into()],
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("连接未切换"));
+        assert!(error.to_string().contains("network down"));
+    }
+
+    #[test]
+    fn activation_requires_a_non_empty_fresh_model_list() {
+        let error = validate_fresh_activation_models(None, &["  ".into()]).unwrap_err();
+        assert!(error.to_string().contains("没有可用模型"));
+        validate_fresh_activation_models(None, &["fresh-model".into()]).unwrap();
     }
 
     #[tokio::test]

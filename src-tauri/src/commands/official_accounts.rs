@@ -1,7 +1,7 @@
 use crate::{
     activation::{
-        activate_openai_record, sync_active_codex_configuration_with_installation_proxy,
-        sync_active_openai_credential,
+        activate_openai_record, ensure_codex_stopped,
+        sync_active_codex_configuration_with_installation_proxy, sync_active_openai_credential,
     },
     auth_center::{AuthCenter, DevicePollResult},
     chat_proxy::ChatProxyRegistry,
@@ -10,6 +10,7 @@ use crate::{
     local_usage::UsageLedger,
     models::*,
     official_quota, proxy_import,
+    session_index::SessionIndex,
     state::{ActivationLock, ApiClient},
     storage::Store,
 };
@@ -102,8 +103,29 @@ pub(crate) async fn connections_import_cookie(
             "导入后将超过 500 个 OpenAI 账号的保存上限，请先删除不再使用的账号。".into(),
         ));
     }
+    let active_account = store.read(|state| {
+        if !matches!(state.active.kind, ActiveKind::Official) {
+            return None;
+        }
+        let active_id = state.active.account_id.as_deref()?;
+        state
+            .official_accounts
+            .iter()
+            .find(|account| account.id == active_id)
+            .map(|account| (account.id.clone(), account.account_id.clone()))
+    })?;
+    let replaces_active = active_account.as_ref().is_some_and(|(id, account_id)| {
+        resolved_accounts
+            .iter()
+            .any(|account| account.id == *id || account.account_id == *account_id)
+    });
+    if replaces_active {
+        ensure_codex_stopped(&store)?;
+    }
     let saved_accounts = store.save_official_accounts(&resolved_accounts)?;
-    sync_active_imported_account(&store, &manager, &proxy, &installation_proxy).await?;
+    if replaces_active {
+        sync_active_imported_account(&store, &manager, &proxy, &installation_proxy).await?;
+    }
     for account in saved_accounts {
         accounts.push(store.official_account_view(&account.id)?);
     }
@@ -247,6 +269,13 @@ async fn refresh_account_and_sync_active(
     force: bool,
 ) -> Result<StoredOfficialAccount, AppError> {
     let _guard = activation.0.lock().await;
+    let is_active = store.read(|state| {
+        matches!(state.active.kind, ActiveKind::Official)
+            && state.active.account_id.as_deref() == Some(id)
+    })?;
+    if is_active {
+        ensure_codex_stopped(store)?;
+    }
     let home = codex::home(&store.codex_home_setting()?);
     // Codex may have rotated the active credential independently. Import that
     // copy before exchanging its refresh token, then write the newly refreshed
@@ -257,10 +286,6 @@ async fn refresh_account_and_sync_active(
     } else {
         center.refresh_account(store, id).await?
     };
-    let is_active = store.read(|state| {
-        matches!(state.active.kind, ActiveKind::Official)
-            && state.active.account_id.as_deref() == Some(id)
-    })?;
     if is_active {
         codex::connections_activate_official_account(&home, &saved.credential, None)?;
     }
@@ -279,18 +304,17 @@ async fn refresh_official_quota(
     let now = chrono::Utc::now().timestamp();
     let mut snapshot = stored.quota.clone();
     snapshot.last_attempt_at = Some(now);
-    let account =
-        match refresh_account_and_sync_active(store, center, activation, account_id, false).await {
-            Ok(account) => account,
-            Err(error) => {
-                snapshot.status = match error {
-                    AppError::InvalidConfig(_) => QuotaStatus::Unauthorized,
-                    AppError::StaleOperation | AppError::Internal(_) => QuotaStatus::Error,
-                };
-                snapshot.error = Some(error.to_string());
-                return store.save_official_account_quota(account_id, snapshot);
-            }
-        };
+    let account = match account_for_quota(store, center, activation, account_id).await {
+        Ok(account) => account,
+        Err(error) => {
+            snapshot.status = match error {
+                AppError::InvalidConfig(_) => QuotaStatus::Unauthorized,
+                AppError::StaleOperation | AppError::Internal(_) => QuotaStatus::Error,
+            };
+            snapshot.error = Some(error.to_string());
+            return store.save_official_account_quota(account_id, snapshot);
+        }
+    };
     let http = client.current()?;
     let mut quota_result = official_quota::fetch_quota(&http, &account).await;
     if matches!(&quota_result, Err(error) if error.is_retryable()) {
@@ -311,6 +335,26 @@ async fn refresh_official_quota(
         }
     }
     store.save_official_account_quota(account_id, snapshot)
+}
+
+async fn account_for_quota(
+    store: &Store,
+    center: &AuthCenter,
+    activation: &ActivationLock,
+    account_id: &str,
+) -> Result<StoredOfficialAccount, AppError> {
+    let _guard = activation.0.lock().await;
+    let stored = store.official_account(account_id)?;
+    let is_active = store.read(|state| {
+        matches!(state.active.kind, ActiveKind::Official)
+            && state.active.account_id.as_deref() == Some(account_id)
+    })?;
+    // “刷新额度”对当前账号保持只读：不得轮换正在被 Codex 使用的凭据。
+    if is_active {
+        Ok(stored)
+    } else {
+        center.refresh_account(store, account_id).await
+    }
 }
 
 #[tauri::command]
@@ -371,39 +415,29 @@ pub(crate) async fn connections_login_start(
 pub(crate) async fn connections_login_poll(
     store: State<'_, Store>,
     center: State<'_, AuthCenter>,
-    manager: State<'_, ConfigManager>,
-    ledger: State<'_, UsageLedger>,
     activation: State<'_, ActivationLock>,
-    proxy: State<'_, ChatProxyRegistry>,
-    installation_proxy: State<'_, InstallationIdProxyRegistry>,
     operation_id: String,
 ) -> Result<OpenAiDevicePoll, AppError> {
     match center.poll_openai(&operation_id).await? {
         DevicePollResult::Pending => Ok(OpenAiDevicePoll::Pending),
         DevicePollResult::Expired => Ok(OpenAiDevicePoll::Expired),
         DevicePollResult::Complete(account) => {
-            let activation_operation = activation.begin_operation();
             let _guard = activation.0.lock().await;
-            if !activation.is_current(activation_operation) {
-                return Err(AppError::StaleOperation);
-            }
-            sync_active_openai_credential(&store, &codex::home(&store.codex_home_setting()?))?;
-            let saved = store.save_official_account(&account)?;
-            let repair = activate_openai_record(
-                &store,
-                &manager,
-                &ledger,
-                &proxy,
-                &installation_proxy,
-                &saved,
-            )
-            .await?;
+            let saved = save_completed_login(&store, &account)?;
             Ok(OpenAiDevicePoll::Complete {
-                account: Box::new(store.official_account_view(&saved.id)?),
-                repair,
+                account: Box::new(saved),
             })
         }
     }
+}
+
+fn save_completed_login(
+    store: &Store,
+    account: &StoredOfficialAccount,
+) -> Result<OfficialAccountView, AppError> {
+    sync_active_openai_credential(store, &codex::home(&store.codex_home_setting()?))?;
+    let saved = store.save_official_account(account)?;
+    store.official_account_view(&saved.id)
 }
 
 #[tauri::command]
@@ -416,6 +450,7 @@ pub(crate) async fn connections_activate_account(
     activation: State<'_, ActivationLock>,
     proxy: State<'_, ChatProxyRegistry>,
     installation_proxy: State<'_, InstallationIdProxyRegistry>,
+    index: State<'_, SessionIndex>,
     id: String,
 ) -> Result<RepairResult, AppError> {
     let activation_operation = activation.begin_operation();
@@ -423,9 +458,10 @@ pub(crate) async fn connections_activate_account(
     if !activation.is_current(activation_operation) {
         return Err(AppError::StaleOperation);
     }
+    ensure_codex_stopped(&store)?;
     sync_active_openai_credential(&store, &codex::home(&store.codex_home_setting()?))?;
     let saved = center.refresh_account(&store, &id).await?;
-    activate_openai_record(
+    let repair = activate_openai_record(
         &store,
         &manager,
         &ledger,
@@ -433,10 +469,13 @@ pub(crate) async fn connections_activate_account(
         &installation_proxy,
         &saved,
     )
-    .await
+    .await?;
+    index.invalidate();
+    Ok(repair)
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)] // Tauri injects each managed state separately.
 pub(crate) async fn connections_activate_official(
     store: State<'_, Store>,
     center: State<'_, AuthCenter>,
@@ -445,12 +484,14 @@ pub(crate) async fn connections_activate_official(
     activation: State<'_, ActivationLock>,
     proxy: State<'_, ChatProxyRegistry>,
     installation_proxy: State<'_, InstallationIdProxyRegistry>,
+    index: State<'_, SessionIndex>,
 ) -> Result<RepairResult, AppError> {
     let activation_operation = activation.begin_operation();
     let _guard = activation.0.lock().await;
     if !activation.is_current(activation_operation) {
         return Err(AppError::StaleOperation);
     }
+    ensure_codex_stopped(&store)?;
     let (home_setting, id) = store.read(|state| {
         let id = state
             .active
@@ -470,7 +511,7 @@ pub(crate) async fn connections_activate_official(
     let id =
         id.ok_or_else(|| AppError::InvalidConfig("请先在“账号与服务”中登录 OpenAI。".into()))?;
     let saved = center.refresh_account(&store, &id).await?;
-    activate_openai_record(
+    let repair = activate_openai_record(
         &store,
         &manager,
         &ledger,
@@ -478,7 +519,9 @@ pub(crate) async fn connections_activate_official(
         &installation_proxy,
         &saved,
     )
-    .await
+    .await?;
+    index.invalidate();
+    Ok(repair)
 }
 
 #[tauri::command]
@@ -561,6 +604,56 @@ mod tests {
             created_at: 0,
             updated_at: 0,
         }
+    }
+
+    #[test]
+    fn completed_login_saves_the_account_without_switching_connections() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path().join("data")).unwrap();
+
+        let view = save_completed_login(&store, &account("new-account", "")).unwrap();
+
+        assert!(!view.active);
+        assert!(matches!(
+            store.snapshot().unwrap().active.kind,
+            ActiveKind::None
+        ));
+    }
+
+    #[tokio::test]
+    async fn active_account_quota_refresh_does_not_rotate_or_write_credentials() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex-home");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(home.join("auth.json"), b"external-codex-auth").unwrap();
+        let store = Store::open(temp.path().join("data")).unwrap();
+        store
+            .update(|state| {
+                state.codex.home = home.display().to_string();
+                Ok(())
+            })
+            .unwrap();
+        let mut expired = account("active-account", "");
+        expired.expires_at = Some(1);
+        let saved = store.save_official_account(&expired).unwrap();
+        store
+            .connections_activate_official_account(&saved.id)
+            .unwrap();
+
+        let quota_account = account_for_quota(
+            &store,
+            &AuthCenter::default(),
+            &ActivationLock::default(),
+            &saved.id,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(quota_account.credential, saved.credential);
+        assert_eq!(
+            fs::read(home.join("auth.json")).unwrap(),
+            b"external-codex-auth"
+        );
     }
 
     #[test]

@@ -50,7 +50,12 @@ import { toast } from "@/components/ui/toast"
 import { errorMessage } from "@/lib/format"
 import { useAsyncAction } from "@/hooks/use-async-action"
 import { call } from "@/lib/ipc"
-import type { OfficialAccountView, Provider, ProviderOverview } from "@/types"
+import type {
+  OfficialAccountView,
+  Provider,
+  ProviderOverview,
+  RepairResult,
+} from "@/types"
 
 import { AccountManagerDialog } from "./account-manager-dialog"
 import {
@@ -58,6 +63,7 @@ import {
   accountIsExpired,
   buildFallbackCandidates,
   emptyProvider,
+  repairWarning,
   switchActiveConnection,
   type ConnectionKind,
 } from "./connection-utils"
@@ -124,18 +130,23 @@ export function ConnectionManagerSheet({
     remarkAccount || providerEditorOpen || deleteTarget || accountManagerOpen
   )
 
-  const runAction = async (
+  const runAction = async <T,>(
     action: PendingAction["action"],
     id: string,
-    task: () => Promise<unknown>,
-    success: string
+    task: () => Promise<T>,
+    success: string,
+    successDescription?: (result: T) => string | undefined
   ) => {
     const key: PendingAction = { action, id }
     if (!begin(key)) return false
     try {
-      await task()
+      const result = await task()
       onChanged()
-      toast.add({ title: success, type: "success" })
+      toast.add({
+        title: success,
+        description: successDescription?.(result),
+        type: "success",
+      })
       return true
     } catch (reason) {
       toast.add({
@@ -162,7 +173,8 @@ export function ConnectionManagerSheet({
         kind === "account"
           ? call("connections_activate_account", { id })
           : call("connections_activate", { id }),
-      "连接已切换"
+      "连接已切换",
+      repairWarning
     )
     if (activated) onSelectedIdChange(id)
   }
@@ -229,6 +241,7 @@ export function ConnectionManagerSheet({
     if (!begin(key)) return
 
     let switchedId: string | undefined
+    let switchRepair: RepairResult | undefined
     let lastSwitchError: unknown
     try {
       if (target.active) {
@@ -243,6 +256,7 @@ export function ConnectionManagerSheet({
           )
         )
         switchedId = switchResult.switchedId
+        switchRepair = switchResult.repair
         lastSwitchError = switchResult.error
 
         if (!switchedId) {
@@ -283,7 +297,11 @@ export function ConnectionManagerSheet({
       }
 
       onChanged()
-      toast.add({ title: `已删除“${target.name}”`, type: "success" })
+      toast.add({
+        title: `已删除“${target.name}”`,
+        description: switchRepair ? repairWarning(switchRepair) : undefined,
+        type: "success",
+      })
       setDeleteTarget(undefined)
     } catch (reason) {
       onChanged()

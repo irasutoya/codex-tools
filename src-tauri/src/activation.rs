@@ -1,13 +1,41 @@
 use crate::{
     chat_proxy::ChatProxyRegistry,
     codex::{self, ConfigManager},
-    commands::sessions::repair_home,
+    commands::sessions::repair_home_after_activation,
     installation_id_proxy::InstallationIdProxyRegistry,
     models::{ActiveKind, AppError, RepairResult, StoredOfficialAccount},
     provider_sync,
     storage::Store,
 };
 use std::fs;
+
+const CODEX_RUNNING_WARNING: &str =
+    "请先退出 Codex，再更改账号、连接或会话归属，以免当前会话丢失或认证状态被覆盖。";
+
+pub(crate) fn ensure_codex_stopped(store: &Store) -> Result<(), AppError> {
+    let configured = store.codex_app_setting()?;
+    ensure_codex_stopped_with(configured.as_deref(), |configured| {
+        #[cfg(test)]
+        {
+            let _ = configured;
+            false
+        }
+        #[cfg(not(test))]
+        {
+            crate::platform::codex_app_running(configured)
+        }
+    })
+}
+
+fn ensure_codex_stopped_with(
+    configured: Option<&str>,
+    running: impl FnOnce(Option<&str>) -> bool,
+) -> Result<(), AppError> {
+    if running(configured) {
+        return Err(AppError::InvalidConfig(CODEX_RUNNING_WARNING.into()));
+    }
+    Ok(())
+}
 
 pub(crate) fn sync_active_openai_credential(
     store: &Store,
@@ -119,6 +147,7 @@ pub(crate) async fn sync_active_codex_configuration_with_installation_proxy(
     proxy: &ChatProxyRegistry,
     installation_proxy: &InstallationIdProxyRegistry,
 ) -> Result<(), AppError> {
+    ensure_codex_stopped(store)?;
     let (home_setting, active) =
         store.read(|state| (state.codex.home.clone(), state.active.clone()))?;
     let home = codex::home(&home_setting);
@@ -193,6 +222,7 @@ pub(crate) async fn activate_openai_record(
     installation_proxy: &InstallationIdProxyRegistry,
     account: &StoredOfficialAccount,
 ) -> Result<RepairResult, AppError> {
+    ensure_codex_stopped(store)?;
     let home = codex::home(&store.codex_home_setting()?);
     let repair_sessions = provider_sync::configured_provider(&home) == codex::MANAGED_PROVIDER_ID;
     // 切换前计算本应用写入的服务模型，切回 OpenAI 时把它一并清除，
@@ -233,7 +263,7 @@ pub(crate) async fn activate_openai_record(
             .await);
         }
         let repair = if repair_sessions {
-            repair_home(home, "openai".into()).await?
+            repair_home_after_activation(store, home, "openai".into()).await
         } else {
             RepairResult {
                 target_provider: "openai".into(),
@@ -313,6 +343,17 @@ mod tests {
         ProviderApiType, ProviderProfile, token_local_identity,
     };
     use std::fs;
+
+    #[test]
+    fn codex_mutation_gate_rejects_a_running_app() {
+        let error = ensure_codex_stopped_with(Some("Codex.exe"), |_| true).unwrap_err();
+        assert!(error.to_string().contains("请先退出 Codex"));
+    }
+
+    #[test]
+    fn codex_mutation_gate_allows_a_stopped_app() {
+        ensure_codex_stopped_with(None, |_| false).unwrap();
+    }
 
     #[tokio::test]
     async fn active_custom_configuration_syncs_codex_credentials_and_provider() {

@@ -40,10 +40,11 @@ import { toast } from "@/components/ui/toast"
 import { useAsyncAction } from "@/hooks/use-async-action"
 import { errorMessage } from "@/lib/format"
 import { call } from "@/lib/ipc"
-import type { OfficialAccountView, Provider } from "@/types"
+import type { OfficialAccountView, Provider, RepairResult } from "@/types"
 
 import {
   buildFallbackCandidates,
+  repairWarning,
   switchActiveConnection,
 } from "./connection-utils"
 
@@ -206,12 +207,14 @@ export function AccountManagerDialog({
     const ids = selectedAccounts.map((account) => account.id)
     const deletingIds = new Set(ids)
     let switchedId: string | undefined
+    let switchRepair: RepairResult | undefined
     let lastSwitchError: unknown
 
     try {
       if (activeSelected) {
         const switchResult = await switchActiveConnection(fallbackCandidates())
         switchedId = switchResult.switchedId
+        switchRepair = switchResult.repair
         lastSwitchError = switchResult.error
 
         if (!switchedId) {
@@ -245,6 +248,7 @@ export function AccountManagerDialog({
 
       toast.add({
         title: `已删除 ${ids.length} 个账号`,
+        description: switchRepair ? repairWarning(switchRepair) : undefined,
         type: "success",
       })
       onRefresh()

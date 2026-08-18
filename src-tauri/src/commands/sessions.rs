@@ -1,7 +1,8 @@
 use crate::{
+    activation::ensure_codex_stopped,
     codex,
     models::{AppError, PageResult, RepairResult, RepairScan, SessionSummary},
-    platform, provider_sync,
+    provider_sync,
     session_index::{self, SessionIndex},
     storage::Store,
 };
@@ -17,12 +18,29 @@ pub(crate) async fn scan_home(home: PathBuf) -> Result<RepairScan, AppError> {
 }
 
 pub(crate) async fn repair_home(
+    store: &Store,
     home: PathBuf,
     target_provider: String,
 ) -> Result<RepairResult, AppError> {
+    ensure_codex_stopped(store)?;
     tokio::task::spawn_blocking(move || provider_sync::repair(&home, &target_provider))
         .await
         .map_err(|error| AppError::Internal(error.to_string()))?
+}
+
+pub(crate) async fn repair_home_after_activation(
+    store: &Store,
+    home: PathBuf,
+    target_provider: String,
+) -> RepairResult {
+    match repair_home(store, home, target_provider.clone()).await {
+        Ok(result) => result,
+        Err(error) => RepairResult {
+            target_provider,
+            warnings: vec![format!("会话归属未自动修复：{error}")],
+            ..RepairResult::default()
+        },
+    }
 }
 
 #[tauri::command]
@@ -36,15 +54,9 @@ pub(crate) async fn sessions_repair(
     index: State<'_, SessionIndex>,
     target_provider: String,
 ) -> Result<RepairResult, AppError> {
-    let configured = store.codex_app_setting()?;
-    if platform::codex_app_running(configured.as_deref()) {
-        return Err(AppError::InvalidConfig(
-            "请先退出 Codex，再修复会话归属，以免覆盖正在写入的会话内容。".into(),
-        ));
-    }
     let home = codex::home(&store.codex_home_setting()?);
     let index = index.inner().clone();
-    let result = repair_home(home, target_provider).await;
+    let result = repair_home(&store, home, target_provider).await;
     index.invalidate();
     result
 }
@@ -76,4 +88,26 @@ pub(crate) async fn sessions_list(
     })
     .await
     .map_err(|error| AppError::Internal(error.to_string()))?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn post_activation_repair_failure_is_returned_as_a_warning() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path().join("data")).unwrap();
+
+        let result = repair_home_after_activation(
+            &store,
+            temp.path().join("codex-home"),
+            "unsupported".into(),
+        )
+        .await;
+
+        assert_eq!(result.target_provider, "unsupported");
+        assert_eq!(result.warnings.len(), 1);
+        assert!(result.warnings[0].contains("未自动修复"));
+    }
 }
