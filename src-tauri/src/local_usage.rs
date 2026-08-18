@@ -188,12 +188,12 @@ impl UsageLedger {
         secure_directory(app_data_root)?;
         let database_path = app_data_root.join("usage.sqlite3");
         let ledger = Self {
-            database_path: Arc::new(database_path.clone()),
+            database_path: Arc::new(database_path),
             refresh_lock: Arc::new(Mutex::new(())),
         };
         let connection = ledger.open_connection()?;
         initialize_schema(&connection)?;
-        secure_file(&database_path)?;
+        secure_file(&ledger.database_path)?;
         Ok(ledger)
     }
 

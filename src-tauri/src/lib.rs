@@ -3,6 +3,7 @@ mod auth_center;
 mod chat_proxy;
 mod codex;
 mod commands;
+mod installation_id_proxy;
 mod json_store;
 mod local_usage;
 mod model_unlock;
@@ -21,10 +22,11 @@ mod state;
 mod storage;
 mod usage_log;
 
-use activation::sync_active_codex_configuration_inner;
+use activation::sync_active_codex_configuration_with_installation_proxy;
 use auth_center::AuthCenter;
 use chat_proxy::ChatProxyRegistry;
 use codex::ConfigManager;
+use installation_id_proxy::InstallationIdProxyRegistry;
 use local_usage::UsageLedger;
 use models::*;
 use session_index::SessionIndex;
@@ -47,10 +49,16 @@ async fn sync_configured_provider(app: tauri::AppHandle) {
     let ledger = app.state::<UsageLedger>();
     let activation = app.state::<ActivationLock>();
     let proxy = app.state::<ChatProxyRegistry>();
+    let installation_proxy = app.state::<InstallationIdProxyRegistry>();
     let _guard = activation.0.lock().await;
-    if sync_active_codex_configuration_inner(&store, &manager, &proxy)
-        .await
-        .is_ok()
+    if sync_active_codex_configuration_with_installation_proxy(
+        &store,
+        &manager,
+        &proxy,
+        &installation_proxy,
+    )
+    .await
+    .is_ok()
     {
         let _ = reconcile_current_activation(&store, &ledger);
     } else {
@@ -188,6 +196,7 @@ pub fn run() {
         .manage(ActivationLock::default())
         .manage(ApiClient::default())
         .manage(ChatProxyRegistry::default())
+        .manage(InstallationIdProxyRegistry::default())
         .manage(SessionIndex::default())
         .setup(|app| {
             let show =
@@ -243,6 +252,7 @@ pub fn run() {
             commands::official_accounts::connections_delete_account,
             commands::official_accounts::connections_delete_accounts,
             commands::official_accounts::connections_update_account_remark,
+            commands::official_accounts::connections_set_device_session_convergence,
             commands::official_accounts::connections_update_account_remarks,
             commands::official_accounts::connections_refresh_login,
             commands::official_accounts::connections_open_login_page,
@@ -284,7 +294,9 @@ pub fn run() {
         } => show_main_window(app),
         tauri::RunEvent::Exit => {
             let proxy = app.state::<ChatProxyRegistry>();
+            let installation_proxy = app.state::<InstallationIdProxyRegistry>();
             tauri::async_runtime::block_on(proxy.stop_all());
+            tauri::async_runtime::block_on(installation_proxy.stop_all());
         }
         _ => {
             let _ = app;

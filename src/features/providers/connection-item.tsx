@@ -1,3 +1,4 @@
+import { memo } from "react"
 import {
   ApiIcon,
   Delete02Icon,
@@ -36,7 +37,13 @@ import { type ConnectionKind } from "./connection-utils"
 
 export type PendingAction = {
   action:
-    "activate" | "delete" | "quota" | "login" | "test" | "models" | "remark"
+    | "activate"
+    | "delete"
+    | "quota"
+    | "login"
+    | "test"
+    | "models"
+    | "remark"
   id: string
 }
 
@@ -46,7 +53,7 @@ export type MoreAction = {
   onSelect: () => void
 }
 
-export function ConnectionItem({
+export const ConnectionItem = memo(function ConnectionItem({
   kind,
   id,
   name,
@@ -199,9 +206,13 @@ export function ConnectionItem({
       </ItemFooter>
     </Item>
   )
-}
+})
 
-export function EmptyConnectionItem({ label }: { label: string }) {
+export const EmptyConnectionItem = memo(function EmptyConnectionItem({
+  label,
+}: {
+  label: string
+}) {
   return (
     <Item size="xs" variant="outline">
       <ItemContent>
@@ -209,4 +220,4 @@ export function EmptyConnectionItem({ label }: { label: string }) {
       </ItemContent>
     </Item>
   )
-}
+})

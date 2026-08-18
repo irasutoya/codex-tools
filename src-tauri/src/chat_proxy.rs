@@ -319,8 +319,9 @@ impl ReasoningStore {
                 self.entries.remove(&oldest);
             }
         }
-        self.entries.insert(id.to_owned(), content);
-        self.order.push_back(id.to_owned());
+        let owned_id = id.to_owned();
+        self.entries.insert(owned_id.clone(), content);
+        self.order.push_back(owned_id);
     }
 
     fn insert_call_alias(&mut self, call_id: &str, content: Arc<str>) {
@@ -1015,7 +1016,6 @@ fn translate_buffered_sse(text: &str, context: ResponseTranslationContext) -> Ve
             Ok(Some(data)) => {
                 let stop =
                     dispatch_data(&mut translator, &data, &mut pending, &mut failed, &mut done);
-                parser.recycle(data);
                 if stop {
                     break;
                 }
@@ -1256,7 +1256,6 @@ fn translate_stream(
                             &mut failed,
                             &mut done,
                         );
-                        parser.recycle(data);
                         if stop {
                             break;
                         }

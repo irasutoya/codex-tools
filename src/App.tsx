@@ -199,7 +199,7 @@ export default function App() {
     setRefreshRevision((value) => value + 1)
   }, [])
 
-  const launch = async () => {
+  const launch = useCallback(async () => {
     setLaunching(true)
     try {
       const result = await call("dashboard_launch")
@@ -218,7 +218,7 @@ export default function App() {
     } finally {
       setLaunching(false)
     }
-  }
+  }, [refresh])
 
   const contextLabel = useMemo(() => {
     if (page === "usage")

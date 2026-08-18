@@ -118,6 +118,9 @@ fn cached_proxy_snapshot() -> ProxySnapshot {
     snapshot
 }
 
+/// 缓存快照的引用版本：调用方在 TTL 内可以避免克隆整个快照。
+/// 返回的 guard 持有 Mutex 锁，调用方应尽快使用后释放。
+
 #[derive(Default)]
 pub(crate) struct ClientCache {
     cached: Mutex<Option<CachedClient>>,
@@ -209,7 +212,7 @@ fn client_builder_for(snapshot: &ProxySnapshot) -> Result<ClientBuilder, reqwest
         return Ok(builder);
     }
 
-    apply_system_proxy(builder, snapshot.platform.clone())
+    apply_system_proxy(builder, snapshot.platform.as_ref())
 }
 
 fn environment_proxy_configured(snapshot: &ProxySnapshot) -> bool {
@@ -239,7 +242,7 @@ pub(crate) fn support_diagnostics() -> SupportNetworkDiagnostics {
 
 fn apply_system_proxy(
     mut builder: ClientBuilder,
-    settings: Option<SystemProxy>,
+    settings: Option<&SystemProxy>,
 ) -> Result<ClientBuilder, reqwest::Error> {
     let Some(settings) = settings else {
         return Ok(builder);
@@ -263,7 +266,7 @@ fn apply_system_proxy(
             builder = builder.proxy(Proxy::https(https)?.no_proxy(no_proxy.clone()));
         }
         (None, None) => {
-            if let Some(socks) = settings.socks {
+            if let Some(socks) = &settings.socks {
                 builder = builder.proxy(Proxy::all(socks)?.no_proxy(no_proxy));
             }
         }
@@ -513,7 +516,7 @@ mod tests {
             bypass: vec!["<local>;*.example.com".into()],
         };
         assert!(
-            apply_system_proxy(Client::builder(), Some(settings))
+            apply_system_proxy(Client::builder(), Some(&settings))
                 .and_then(ClientBuilder::build)
                 .is_ok()
         );
@@ -525,7 +528,7 @@ mod tests {
             bypass: Vec::new(),
         };
         assert!(
-            apply_system_proxy(Client::builder(), Some(socks))
+            apply_system_proxy(Client::builder(), Some(&socks))
                 .and_then(ClientBuilder::build)
                 .is_ok()
         );
@@ -537,7 +540,7 @@ mod tests {
             bypass: Vec::new(),
         };
         assert!(
-            apply_system_proxy(Client::builder(), Some(http_only))
+            apply_system_proxy(Client::builder(), Some(&http_only))
                 .and_then(ClientBuilder::build)
                 .is_ok()
         );
