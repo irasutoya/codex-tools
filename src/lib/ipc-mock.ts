@@ -137,8 +137,6 @@ const mockAccounts: OfficialAccountView[] = [
     source: "open_ai_oauth",
     expiresAt: null,
     quota: mockQuota,
-    deviceSessionConvergenceAvailable: true,
-    deviceSessionConvergenceEnabled: true,
     active: true,
     createdAt: now - 60 * day,
     updatedAt: now,
@@ -152,8 +150,6 @@ const mockAccounts: OfficialAccountView[] = [
     source: "open_ai_oauth",
     expiresAt: null,
     quota: { status: "never" },
-    deviceSessionConvergenceAvailable: true,
-    deviceSessionConvergenceEnabled: true,
     active: false,
     createdAt: now - 50 * day,
     updatedAt: now - 4 * day,
@@ -400,13 +396,6 @@ export async function mockCall(
         provider.active = false
       })
       return mockRepair
-    }
-    case "connections_set_device_session_convergence": {
-      const { id, enabled } = args as { id: string; enabled: boolean }
-      const account = mockAccounts.find((candidate) => candidate.id === id)
-      if (!account) throw new Error("OpenAI 账号不存在")
-      account.deviceSessionConvergenceEnabled = enabled
-      return account
     }
     case "settings_get_overview": {
       const provider = activeMockProvider()
@@ -670,7 +659,6 @@ export async function mockCall(
         content?: string
       }
       const id = `account-cookie-${Date.now()}`
-      const verifiedRt = /^\s*rt-/i.test(input.content ?? "")
       const account: OfficialAccountView = {
         id,
         name: input.name?.trim() || "Cookie 账号",
@@ -680,8 +668,6 @@ export async function mockCall(
         source: "proxy_import",
         expiresAt: null,
         quota: { status: "never" },
-        deviceSessionConvergenceAvailable: verifiedRt,
-        deviceSessionConvergenceEnabled: verifiedRt,
         active: false,
         createdAt: Date.now(),
         updatedAt: Date.now(),

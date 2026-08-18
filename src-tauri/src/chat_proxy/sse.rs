@@ -7,6 +7,7 @@ use super::MAX_SSE_EVENT_DATA_BYTES;
 #[derive(Default)]
 pub(super) struct SseEventParser {
     pub(super) data: String,
+    spare: String,
 }
 
 impl SseEventParser {
@@ -38,7 +39,15 @@ impl SseEventParser {
         if self.data.is_empty() {
             return None;
         }
-        Some(std::mem::take(&mut self.data))
+        std::mem::swap(&mut self.data, &mut self.spare);
+        Some(std::mem::take(&mut self.spare))
+    }
+
+    pub(super) fn recycle(&mut self, mut data: String) {
+        data.clear();
+        if data.capacity() > self.data.capacity() {
+            self.data = data;
+        }
     }
 }
 

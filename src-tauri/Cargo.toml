@@ -26,6 +26,7 @@ bytes = "1"
 chrono = { version = "0.4", features = ["serde"] }
 dirs = "6"
 futures-util = "0.3"
+jsonschema = { version = "0.30", default-features = false }
 pulldown-cmark = { version = "0.13", default-features = false }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "socks", "stream"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
@@ -41,7 +42,6 @@ tokio-tungstenite = { version = "0.24", default-features = false, features = ["c
 toml_edit = "0.22"
 uuid = { version = "1", features = ["v4", "v7", "serde"] }
 walkdir = "2"
-zstd = "0.13"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.61", features = ["Win32_Storage_FileSystem"] }

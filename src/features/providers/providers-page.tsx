@@ -25,14 +25,7 @@ import {
   EmptyMedia,
   EmptyTitle,
 } from "@/components/ui/empty"
-import {
-  Field,
-  FieldContent,
-  FieldDescription,
-  FieldLabel,
-} from "@/components/ui/field"
 import { Spinner } from "@/components/ui/spinner"
-import { Switch } from "@/components/ui/switch"
 import { Skeleton } from "@/components/ui/skeleton"
 import { toast } from "@/components/ui/toast"
 import { errorMessage, formatDate, quotaWindow } from "@/lib/format"
@@ -438,61 +431,6 @@ export function ProvidersPage({
           />
           {isAccount && (
             <Detail label="账号备注" value={account?.remark || "未设置"} />
-          )}
-          {isAccount && account?.deviceSessionConvergenceAvailable && (
-            <Field
-              orientation="horizontal"
-              className="col-span-2 rounded-xl bg-muted/40 p-4 ring-1 ring-foreground/10"
-            >
-              <FieldContent>
-                <div className="flex flex-wrap items-center gap-2">
-                  <FieldLabel htmlFor="device-session-convergence">
-                    设备与会话收敛
-                  </FieldLabel>
-                  <Badge
-                    variant={
-                      account.deviceSessionConvergenceEnabled
-                        ? "secondary"
-                        : "outline"
-                    }
-                  >
-                    {account.deviceSessionConvergenceEnabled
-                      ? "已启用"
-                      : "已关闭"}
-                  </Badge>
-                </div>
-                <FieldDescription>
-                  跨设备统一此账号的 Codex
-                  设备与会话标识，并保持各会话线程独立。
-                </FieldDescription>
-                <FieldDescription className="mt-1 border-t pt-2">
-                  启用时需保持 Codex Tools 运行；此功能不会隐藏 IP
-                  或改变登录记录。
-                </FieldDescription>
-              </FieldContent>
-              <Switch
-                id="device-session-convergence"
-                aria-label="设备与会话收敛"
-                checked={account.deviceSessionConvergenceEnabled}
-                disabled={actionBusy}
-                onCheckedChange={(enabled) =>
-                  void run(
-                    "installation-id",
-                    () =>
-                      call("connections_set_device_session_convergence", {
-                        id: account.id,
-                        enabled,
-                      }),
-                    {
-                      success: enabled
-                        ? "设备与会话收敛已启用"
-                        : "设备与会话收敛已关闭",
-                      onSuccess: onRefresh,
-                    }
-                  )
-                }
-              />
-            </Field>
           )}
           <Detail
             label="凭据状态"

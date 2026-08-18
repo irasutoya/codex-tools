@@ -9,7 +9,7 @@
 //! 转换规则参考了社区成熟的实现（codex_deepseek_proxy、api2codex、
 //! openai-responses-to-chat 等）：`input`/`instructions` → `messages`，
 //! `function_call`/`function_call_output` → `tool_calls`/`tool` 消息，
-//! `tools` 扁平结构 → Chat 嵌套结构，`max_output_tokens` → `max_tokens`，
+//! `tools` 扁平结构 → Chat 嵌套结构，`max_output_tokens` → `max_completion_tokens`，
 //! `reasoning.effort` → `reasoning_effort`；流式输出按
 //! `response.output_item.added` / `response.output_text.delta` /
 //! `response.function_call_arguments.delta` / `response.completed` 事件还原。
@@ -35,10 +35,12 @@ use axum::{
     },
     routing::{get, post},
 };
+use bytes::{Buf, BytesMut};
 use futures_util::StreamExt;
 use serde_json::{Map, Value, json};
 use std::{
-    collections::{BTreeMap, HashMap, VecDeque},
+    borrow::Cow,
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     sync::Arc,
     time::Duration,
 };
@@ -109,6 +111,8 @@ impl ChatProxyRegistry {
                 let mut snapshot = running.config.current.write().await;
                 if config_changed {
                     snapshot.config = Arc::new(config);
+                    snapshot.prompt_structured_output_models =
+                        Arc::new(std::sync::Mutex::new(HashSet::new()));
                     running.fingerprint = fingerprint;
                 }
                 snapshot.reasoning_store =
@@ -139,6 +143,7 @@ impl ChatProxyRegistry {
             *running.config.current.write().await = ProxyRuntimeSnapshot {
                 config: Arc::new(ProxyConfig::disabled()),
                 reasoning_store: Arc::new(std::sync::Mutex::new(ReasoningStore::default())),
+                prompt_structured_output_models: Arc::new(std::sync::Mutex::new(HashSet::new())),
             };
             running.fingerprint.clear();
             running.owner.clear();
@@ -235,6 +240,7 @@ struct ProxyConfigSlot {
 struct ProxyRuntimeSnapshot {
     config: Arc<ProxyConfig>,
     reasoning_store: Arc<std::sync::Mutex<ReasoningStore>>,
+    prompt_structured_output_models: Arc<std::sync::Mutex<HashSet<String>>>,
 }
 
 impl ProxyConfigSlot {
@@ -243,39 +249,69 @@ impl ProxyConfigSlot {
             current: tokio::sync::RwLock::new(ProxyRuntimeSnapshot {
                 config: Arc::new(config),
                 reasoning_store: Arc::new(std::sync::Mutex::new(ReasoningStore::default())),
+                prompt_structured_output_models: Arc::new(std::sync::Mutex::new(HashSet::new())),
             }),
         })
     }
 
-    async fn snapshot(&self) -> (Arc<ProxyConfig>, Arc<std::sync::Mutex<ReasoningStore>>) {
+    async fn snapshot(
+        &self,
+    ) -> (
+        Arc<ProxyConfig>,
+        Arc<std::sync::Mutex<ReasoningStore>>,
+        Arc<std::sync::Mutex<HashSet<String>>>,
+    ) {
         let snapshot = self.current.read().await.clone();
-        (snapshot.config, snapshot.reasoning_store)
+        (
+            snapshot.config,
+            snapshot.reasoning_store,
+            snapshot.prompt_structured_output_models,
+        )
     }
 }
 
 struct ProxyState {
     config: Arc<ProxyConfigSlot>,
     client: ProxyClient,
-    proxy_api_key: String,
+    proxy_authorization: HeaderValue,
 }
 
 /// 有界的 reasoning_content 存储：条目 id → 思考内容。
 /// 只保留最近若干轮，超限时淘汰最早的条目。
 #[derive(Default)]
 struct ReasoningStore {
-    entries: HashMap<String, String>,
+    entries: HashMap<String, Arc<str>>,
     order: VecDeque<String>,
+    ambiguous_call_ids: HashSet<String>,
 }
 
 impl ReasoningStore {
     const MAX_ENTRIES: usize = 2000;
+    const MAX_CONTENT_BYTES: usize = 1024 * 1024;
 
+    #[cfg(test)]
     fn insert(&mut self, id: &str, content: &str) {
         if content.trim().is_empty() {
             return;
         }
+        self.insert_shared(id, Self::bounded_content(content));
+    }
+
+    fn bounded_content(content: &str) -> Arc<str> {
+        if content.len() <= Self::MAX_CONTENT_BYTES {
+            Arc::<str>::from(content)
+        } else {
+            let mut end = Self::MAX_CONTENT_BYTES;
+            while !content.is_char_boundary(end) {
+                end -= 1;
+            }
+            Arc::<str>::from(&content[..end])
+        }
+    }
+
+    fn insert_shared(&mut self, id: &str, content: Arc<str>) {
         if self.entries.contains_key(id) {
-            self.entries.insert(id.to_owned(), content.to_owned());
+            self.entries.insert(id.to_owned(), content);
             return;
         }
         if self.entries.len() >= Self::MAX_ENTRIES {
@@ -283,48 +319,66 @@ impl ReasoningStore {
                 self.entries.remove(&oldest);
             }
         }
-        self.entries.insert(id.to_owned(), content.to_owned());
+        self.entries.insert(id.to_owned(), content);
         self.order.push_back(id.to_owned());
     }
 
+    fn insert_call_alias(&mut self, call_id: &str, content: Arc<str>) {
+        if self.ambiguous_call_ids.contains(call_id) {
+            return;
+        }
+        if let Some(existing) = self.entries.get(call_id)
+            && existing.as_ref() != content.as_ref()
+        {
+            self.entries.remove(call_id);
+            self.ambiguous_call_ids.insert(call_id.to_owned());
+            return;
+        }
+        self.insert_shared(call_id, content);
+    }
+
     fn get(&self, id: &str) -> Option<&str> {
-        self.entries.get(id).map(String::as_str)
+        self.entries.get(id).map(AsRef::as_ref)
     }
 }
 
 /// 跟随系统代理变化的独立网络客户端（不设置整体超时，允许长时间流式响应）。
 struct ProxyClient {
-    cached: std::sync::Mutex<Option<(crate::network::ProxySnapshot, reqwest::Client)>>,
+    cached: Arc<std::sync::Mutex<Option<(crate::network::ProxySnapshot, reqwest::Client)>>>,
 }
 
 impl Default for ProxyClient {
     fn default() -> Self {
         Self {
-            cached: std::sync::Mutex::new(None),
+            cached: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 }
 
 impl ProxyClient {
-    fn current(&self) -> Result<reqwest::Client, AppError> {
-        let snapshot = ClientCache::cached_snapshot();
-        let mut cached = self
-            .cached
-            .lock()
-            .map_err(|_| AppError::Internal("本机转换代理的网络客户端锁已损坏。".into()))?;
-        if let Some((cached_snapshot, client)) = cached.as_ref()
-            && cached_snapshot == &snapshot
-        {
-            return Ok(client.clone());
-        }
-        let client = ClientCache::build_standalone(None).map_err(|error| {
-            AppError::Internal(format!(
-                "无法初始化本机转换代理的网络客户端：{}",
-                error.without_url()
-            ))
-        })?;
-        *cached = Some((snapshot, client.clone()));
-        Ok(client)
+    async fn current(&self) -> Result<reqwest::Client, AppError> {
+        let cached = self.cached.clone();
+        tokio::task::spawn_blocking(move || {
+            let snapshot = ClientCache::cached_snapshot();
+            let mut cached = cached.lock().map_err(|_| {
+                AppError::Internal("本机转换代理的网络客户端锁已损坏。".into())
+            })?;
+            if let Some((cached_snapshot, client)) = cached.as_ref()
+                && cached_snapshot == &snapshot
+            {
+                return Ok(client.clone());
+            }
+            let client = ClientCache::build_standalone(None).map_err(|error| {
+                AppError::Internal(format!(
+                    "无法初始化本机转换代理的网络客户端：{}",
+                    error.without_url()
+                ))
+            })?;
+            *cached = Some((snapshot, client.clone()));
+            Ok(client)
+        })
+        .await
+        .map_err(|error| AppError::Internal(format!("网络客户端初始化任务失败：{error}")))?
     }
 }
 
@@ -361,7 +415,8 @@ async fn start_proxy(
     let state = ProxyState {
         config: config_slot.clone(),
         client: ProxyClient::default(),
-        proxy_api_key: proxy_api_key.clone(),
+        proxy_authorization: HeaderValue::from_str(&format!("Bearer {proxy_api_key}"))
+            .expect("generated proxy key is a valid authorization header"),
     };
     let listener = tokio::net::TcpListener::bind((PROXY_HOST, bind_port()))
         .await
@@ -484,7 +539,11 @@ fn is_event_stream(response: &reqwest::Response) -> bool {
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.to_ascii_lowercase().contains("text/event-stream"))
+        .is_some_and(|value| {
+            value.split(';').next().is_some_and(|media_type| {
+                media_type.trim().eq_ignore_ascii_case("text/event-stream")
+            })
+        })
 }
 
 /// 给 Codex 的 SSE 响应统一入口：禁用一切缓冲，保证事件逐条实时到达。
@@ -510,14 +569,19 @@ fn error_response(status: StatusCode, message: &str) -> Response {
     response
 }
 
+fn invalid_request_response(message: &str) -> Response {
+    let mut response = Json(json!({
+        "error": {"message": message, "type": "invalid_request_error", "param": null, "code": "invalid_request"}
+    }))
+    .into_response();
+    *response.status_mut() = StatusCode::BAD_REQUEST;
+    response
+}
+
 /// 校验调用方凭证：只有本应用为当前代理运行实例生成的 Key 可以访问，
 /// 防止本机其他进程或网页借用代理消耗用户的真实上游额度。
-fn is_authorized(headers: &HeaderMap, proxy_api_key: &str) -> bool {
-    let expected = format!("Bearer {proxy_api_key}");
-    headers
-        .get(reqwest::header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        == Some(expected.as_str())
+fn is_authorized(headers: &HeaderMap, expected: &HeaderValue) -> bool {
+    headers.get(reqwest::header::AUTHORIZATION) == Some(expected)
 }
 
 fn unauthorized_response() -> Response {
@@ -528,17 +592,17 @@ fn unauthorized_response() -> Response {
 }
 
 async fn handle_models(State(state): State<Arc<ProxyState>>, headers: HeaderMap) -> Response {
-    if !is_authorized(&headers, &state.proxy_api_key) {
+    if !is_authorized(&headers, &state.proxy_authorization) {
         return unauthorized_response();
     }
-    let (config, _) = state.config.snapshot().await;
+    let (config, _, _) = state.config.snapshot().await;
     if config.is_disabled() {
         return error_response(
             StatusCode::SERVICE_UNAVAILABLE,
             "本机转换代理尚未配置上游服务，请先在应用中切换一个 Chat Completions 服务。",
         );
     }
-    let client = match state.client.current() {
+    let client = match state.client.current().await {
         Ok(client) => client,
         Err(error) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
     };
@@ -575,12 +639,12 @@ async fn handle_models(State(state): State<Arc<ProxyState>>, headers: HeaderMap)
 async fn handle_responses(
     State(state): State<Arc<ProxyState>>,
     headers: HeaderMap,
-    body: Bytes,
+    body_bytes: Bytes,
 ) -> Response {
-    if !is_authorized(&headers, &state.proxy_api_key) {
+    if !is_authorized(&headers, &state.proxy_authorization) {
         return unauthorized_response();
     }
-    let body: Value = match serde_json::from_slice(&body) {
+    let body: Value = match serde_json::from_slice(&body_bytes) {
         Ok(body @ Value::Object(_)) => body,
         Err(_) => {
             return error_response(
@@ -595,8 +659,12 @@ async fn handle_responses(
             );
         }
     };
+    drop(body_bytes);
+    if let Err(message) = validate_supported_responses_request(&body) {
+        return invalid_request_response(&message);
+    }
     // 先校验代理配置，避免在未配置上游时做无用的请求翻译。
-    let (config, reasoning_store) = state.config.snapshot().await;
+    let (config, reasoning_store, structured_output_capabilities) = state.config.snapshot().await;
     if config.is_disabled() {
         return error_response(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -604,26 +672,54 @@ async fn handle_responses(
         );
     }
     let stream_requested = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
-    let chat_body = responses_to_chat_body(&body, &reasoning_store);
-    let structured_output = chat_body.get("response_format").is_some();
-    let client = match state.client.current() {
+    let response_metadata = ResponseMetadata::from_request(&body);
+    let model = body
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let native_chat_body = responses_to_chat_body(&body, &reasoning_store);
+    let structured_output = native_chat_body.get("response_format").is_some();
+    let structured_schema = native_chat_body
+        .pointer("/response_format/json_schema/schema")
+        .cloned();
+    let format_kind = native_chat_body
+        .pointer("/response_format/type")
+        .and_then(Value::as_str)
+        .unwrap_or("none");
+    let capability_key = format!("{model}\n{format_kind}");
+    let use_prompt_structured_output = structured_output
+        && structured_output_capabilities
+            .lock()
+            .is_ok_and(|models| models.contains(&capability_key));
+    let degraded_body = if use_prompt_structured_output {
+        Some(degrade_structured_output(&native_chat_body))
+    } else {
+        None
+    };
+    let chat_body = degraded_body.as_ref().unwrap_or(&native_chat_body);
+    let client = match state.client.current().await {
         Ok(client) => client,
         Err(error) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
     };
     let url = crate::provider_http::endpoint_for(&config.upstream_base, "chat/completions");
-    let mut response = match send_chat_request(&client, &url, &config, &chat_body).await {
+    let mut response = match send_chat_request(&client, &url, &config, chat_body).await {
         Ok(response) => response,
         Err(error_response) => return error_response,
     };
+    let mut learn_prompt_capability = false;
     if !response.status().is_success() {
         let status = response.status();
         let detail = read_error_body(response, &config).await;
-        // 部分第三方 API 不支持 response_format（json_schema）结构化输出，
-        // 此时降级为“把 JSON Schema 写进系统提示词”的方式重试一次，
-        // 让自动审查等依赖结构化输出的功能在第三方模型上也能工作。
-        if chat_body.get("response_format").is_some() && looks_like_structured_output_error(&detail)
+        // Unknown OpenAI-compatible Chat endpoints are capability-probed with
+        // the standard response_format request. A validation rejection before
+        // any output permits one prompt-based retry; a successful retry learns
+        // that capability for this exact upstream/model pair.
+        if structured_output
+            && !use_prompt_structured_output
+            && matches!(status.as_u16(), 400 | 422)
         {
-            let degraded = degrade_structured_output(&chat_body);
+            let degraded = degrade_structured_output(&native_chat_body);
             match send_chat_request(&client, &url, &config, &degraded).await {
                 Ok(retry) => {
                     if !retry.status().is_success() {
@@ -631,6 +727,7 @@ async fn handle_responses(
                         let retry_detail = read_error_body(retry, &config).await;
                         return upstream_error_response(status, &retry_detail);
                     }
+                    learn_prompt_capability = true;
                     response = retry;
                 }
                 Err(error_response) => return error_response,
@@ -639,11 +736,6 @@ async fn handle_responses(
             return upstream_error_response(status, &detail);
         }
     }
-    let model = body
-        .get("model")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_owned();
     let response_id = format!("resp_{}", uuid::Uuid::new_v4().simple());
     let created_at = chrono::Utc::now().timestamp();
     if stream_requested {
@@ -654,21 +746,37 @@ async fn handle_responses(
             return fallback_non_sse_stream(
                 response,
                 &config,
-                response_id,
-                model,
-                created_at,
-                reasoning_store,
-                structured_output,
+                ResponseTranslationContext {
+                    response_id,
+                    model,
+                    created_at,
+                    store: reasoning_store,
+                    structured_output,
+                    structured_schema,
+                    metadata: response_metadata.clone(),
+                    capability_learning: learn_prompt_capability.then(|| CapabilityLearning {
+                        cache: structured_output_capabilities.clone(),
+                        key: capability_key.clone(),
+                    }),
+                },
             )
             .await;
         }
         let stream = translate_stream(
             response,
-            response_id,
-            model,
-            created_at,
-            reasoning_store,
-            structured_output,
+            ResponseTranslationContext {
+                response_id,
+                model,
+                created_at,
+                store: reasoning_store,
+                structured_output,
+                structured_schema,
+                metadata: response_metadata.clone(),
+                capability_learning: learn_prompt_capability.then(|| CapabilityLearning {
+                    cache: structured_output_capabilities.clone(),
+                    key: capability_key.clone(),
+                }),
+            },
         );
         sse_response(stream)
     } else {
@@ -695,18 +803,97 @@ async fn handle_responses(
             }
             Ok(Err(_)) => return error_response(StatusCode::BAD_GATEWAY, "读取上游服务响应失败。"),
         };
-        let translated = match chat_to_responses_body(
+        let translated = match chat_to_responses_body_with_schema(
             &chat_response,
             &response_id,
             &model,
             created_at,
             &reasoning_store,
             structured_output,
+            structured_schema.as_ref(),
         ) {
             Ok(translated) => translated,
             Err(message) => return error_response(StatusCode::BAD_GATEWAY, &message),
         };
+        let mut translated = translated;
+        response_metadata.apply(&mut translated);
+        if learn_prompt_capability {
+            record_prompt_structured_output_capability(
+                &structured_output_capabilities,
+                capability_key,
+            );
+        }
         Json(translated).into_response()
+    }
+}
+
+struct ResponseTranslationContext {
+    response_id: String,
+    model: String,
+    created_at: i64,
+    store: Arc<std::sync::Mutex<ReasoningStore>>,
+    structured_output: bool,
+    structured_schema: Option<Value>,
+    metadata: ResponseMetadata,
+    capability_learning: Option<CapabilityLearning>,
+}
+
+#[derive(Clone)]
+struct ResponseMetadata {
+    values: Map<String, Value>,
+}
+
+impl ResponseMetadata {
+    fn from_request(body: &Value) -> Self {
+        let mut values = Map::new();
+        for (key, default) in [
+            ("instructions", Value::Null),
+            ("metadata", json!({})),
+            ("parallel_tool_calls", Value::Bool(true)),
+            ("tool_choice", Value::String("auto".into())),
+            ("tools", json!([])),
+            ("temperature", Value::Null),
+            ("top_p", Value::Null),
+            ("max_output_tokens", Value::Null),
+            ("reasoning", json!({"effort": null, "summary": null})),
+            ("text", json!({"format": {"type": "text"}})),
+            ("store", Value::Bool(false)),
+            ("truncation", Value::String("disabled".into())),
+            ("user", Value::Null),
+        ] {
+            values.insert(key.into(), body.get(key).cloned().unwrap_or(default));
+        }
+        Self { values }
+    }
+
+    fn apply(&self, response: &mut Value) {
+        if let Some(response) = response.as_object_mut() {
+            response.extend(self.values.clone());
+        }
+    }
+}
+
+impl Default for ResponseMetadata {
+    fn default() -> Self {
+        Self::from_request(&Value::Null)
+    }
+}
+
+struct CapabilityLearning {
+    cache: Arc<std::sync::Mutex<HashSet<String>>>,
+    key: String,
+}
+
+fn record_prompt_structured_output_capability(
+    cache: &std::sync::Mutex<HashSet<String>>,
+    key: String,
+) {
+    const MAX_CAPABILITIES: usize = 2048;
+    if let Ok(mut capabilities) = cache.lock() {
+        if capabilities.len() >= MAX_CAPABILITIES {
+            capabilities.clear();
+        }
+        capabilities.insert(key);
     }
 }
 
@@ -717,11 +904,7 @@ async fn handle_responses(
 async fn fallback_non_sse_stream(
     response: reqwest::Response,
     config: &ProxyConfig,
-    response_id: String,
-    model: String,
-    created_at: i64,
-    store: Arc<std::sync::Mutex<ReasoningStore>>,
-    structured_output: bool,
+    context: ResponseTranslationContext,
 ) -> Response {
     let text = match tokio::time::timeout(
         config.timeout,
@@ -743,14 +926,7 @@ async fn fallback_non_sse_stream(
     let value: Value = match serde_json::from_str(&text) {
         Ok(value) => value,
         Err(_) if text.lines().any(|line| line.starts_with("data:")) => {
-            let pending = translate_buffered_sse(
-                &text,
-                &response_id,
-                &model,
-                created_at,
-                &store,
-                structured_output,
-            );
+            let pending = translate_buffered_sse(&text, context);
             let stream = futures_util::stream::iter(
                 pending
                     .into_iter()
@@ -774,11 +950,13 @@ async fn fallback_non_sse_stream(
             "上游服务返回的响应既不是 SSE 流也不是补全结果。",
         );
     }
-    let mut translator = StreamTranslator::new_with_structured_output(
-        &response_id,
-        &model,
-        created_at,
-        structured_output,
+    let mut translator = StreamTranslator::new_with_metadata(
+        &context.response_id,
+        &context.model,
+        context.created_at,
+        context.structured_output,
+        context.structured_schema,
+        context.metadata,
     );
     let created = translator.stub("response.created", "in_progress");
     let in_progress = translator.stub("response.in_progress", "in_progress");
@@ -793,13 +971,11 @@ async fn fallback_non_sse_stream(
     // 把一次性补全结果包装成单个分片，复用同一套翻译逻辑生成完整事件序列。
     let chunk = completion_to_chunk(&value);
     let failed = translator.push_chunk(&chunk, &mut pending).is_some();
-    let completed = !failed && translator.finish(&mut pending, &store);
-    if completed {
-        pending.push(PendingEvent {
-            event_type: "done",
-            data: "[DONE]".into(),
-        });
-    } else if !translator.has_failed_event {
+    let completed = !failed && translator.finish(&mut pending, &context.store);
+    if completed && let Some(learning) = context.capability_learning {
+        record_prompt_structured_output_capability(&learning.cache, learning.key);
+    }
+    if !completed && !translator.has_failed_event {
         translator.fail(&mut pending, "无法转换上游 Chat Completions 响应。");
     }
     let stream = futures_util::stream::iter(
@@ -812,19 +988,14 @@ async fn fallback_non_sse_stream(
 
 /// 部分兼容服务会返回合法 SSE 正文却遗漏 Content-Type。此路径先有界读取完整
 /// 响应，再复用同一个解析器和状态机，牺牲实时性但不牺牲协议正确性。
-fn translate_buffered_sse(
-    text: &str,
-    response_id: &str,
-    model: &str,
-    created_at: i64,
-    store: &std::sync::Mutex<ReasoningStore>,
-    structured_output: bool,
-) -> Vec<PendingEvent> {
-    let mut translator = StreamTranslator::new_with_structured_output(
-        response_id,
-        model,
-        created_at,
-        structured_output,
+fn translate_buffered_sse(text: &str, context: ResponseTranslationContext) -> Vec<PendingEvent> {
+    let mut translator = StreamTranslator::new_with_metadata(
+        &context.response_id,
+        &context.model,
+        context.created_at,
+        context.structured_output,
+        context.structured_schema,
+        context.metadata,
     );
     let created = translator.stub("response.created", "in_progress");
     let in_progress = translator.stub("response.in_progress", "in_progress");
@@ -842,7 +1013,10 @@ fn translate_buffered_sse(
     for line in text.split('\n') {
         match parser.push_line(line) {
             Ok(Some(data)) => {
-                if dispatch_data(&mut translator, &data, &mut pending, &mut failed, &mut done) {
+                let stop =
+                    dispatch_data(&mut translator, &data, &mut pending, &mut failed, &mut done);
+                parser.recycle(data);
+                if stop {
                     break;
                 }
             }
@@ -864,11 +1038,11 @@ fn translate_buffered_sse(
         if !translator.has_failed_event {
             translator.fail(&mut pending, "无法解析上游 SSE 响应。");
         }
-    } else if translator.finish(&mut pending, store) {
-        pending.push(PendingEvent {
-            event_type: "done",
-            data: "[DONE]".into(),
-        });
+    } else {
+        let completed = translator.finish(&mut pending, &context.store);
+        if completed && let Some(learning) = context.capability_learning {
+            record_prompt_structured_output_capability(&learning.cache, learning.key);
+        }
     }
     pending
 }
@@ -919,7 +1093,13 @@ fn completion_to_chunk(completion: &Value) -> Value {
             .collect::<Vec<_>>();
         delta.insert("tool_calls".into(), Value::Array(indexed));
     }
+    if let Some(function_call) = message.get("function_call") {
+        delta.insert("function_call".into(), function_call.clone());
+    }
     let mut chunk = json!({"choices": [{"index": 0, "delta": Value::Object(delta)}]});
+    if let Some(model) = completion.get("model") {
+        chunk["model"] = model.clone();
+    }
     if let Some(usage) = completion.get("usage") {
         chunk["usage"] = usage.clone();
     }
@@ -999,19 +1179,17 @@ fn dispatch_data(
 
 fn translate_stream(
     response: reqwest::Response,
-    response_id: String,
-    model: String,
-    created_at: i64,
-    store: Arc<std::sync::Mutex<ReasoningStore>>,
-    structured_output: bool,
+    context: ResponseTranslationContext,
 ) -> impl futures_util::Stream<Item = Result<Event, std::convert::Infallible>> {
     let (tx, rx) = tokio::sync::mpsc::channel::<PendingEvent>(64);
     tokio::spawn(async move {
-        let mut translator = StreamTranslator::new_with_structured_output(
-            &response_id,
-            &model,
-            created_at,
-            structured_output,
+        let mut translator = StreamTranslator::new_with_metadata(
+            &context.response_id,
+            &context.model,
+            context.created_at,
+            context.structured_output,
+            context.structured_schema,
+            context.metadata,
         );
         let created = translator.stub("response.created", "in_progress");
         let in_progress = translator.stub("response.in_progress", "in_progress");
@@ -1031,7 +1209,7 @@ fn translate_stream(
 
         let mut parser = SseEventParser::default();
         // 预分配接收缓冲，避免逐块扩容；行提取用游标定位，避免每行整体搬运剩余缓冲。
-        let mut buffer: Vec<u8> = Vec::with_capacity(8 * 1024);
+        let mut buffer = BytesMut::with_capacity(8 * 1024);
         let mut stream = response.bytes_stream();
         let mut failed = false;
         let mut done = false;
@@ -1070,16 +1248,18 @@ fn translate_stream(
                 let line = utf8_lossy_slice(&buffer[start..position]);
                 start = position + 1;
                 match parser.push_line(line.as_ref()) {
-                    Ok(Some(data))
-                        if dispatch_data(
+                    Ok(Some(data)) => {
+                        let stop = dispatch_data(
                             &mut translator,
                             &data,
                             &mut pending,
                             &mut failed,
                             &mut done,
-                        ) =>
-                    {
-                        break;
+                        );
+                        parser.recycle(data);
+                        if stop {
+                            break;
+                        }
                     }
                     Err(()) => {
                         failed = true;
@@ -1087,6 +1267,9 @@ fn translate_stream(
                         break;
                     }
                     _ => {}
+                }
+                if pending.len() >= 32 && !flush_events(&tx, &mut pending).await {
+                    return;
                 }
             }
             if !done && !failed && buffer.len().saturating_sub(start) > MAX_SSE_LINE_BUFFER_BYTES {
@@ -1096,7 +1279,7 @@ fn translate_stream(
             if !done && !failed && start > 0 {
                 // 已消费的行一次性移除（每块只搬运一次剩余部分）；
                 // 结束时不搬，直接丢弃。
-                buffer.drain(..start);
+                buffer.advance(start);
             }
             if !flush_events(&tx, &mut pending).await {
                 return;
@@ -1124,26 +1307,18 @@ fn translate_stream(
                 dispatch_data(&mut translator, &data, &mut pending, &mut failed, &mut done);
             }
         }
-        let completed = if failed {
+        if failed {
             // 上游已在流中报告错误（fail 事件已发出）或连接中断。
             if !translator.has_failed_event {
                 translator.fail(&mut pending, failure_message);
             }
-            false
         } else {
-            translator.finish(&mut pending, &store)
-        };
-        if !flush_events(&tx, &mut pending).await {
-            return;
+            let completed = translator.finish(&mut pending, &context.store);
+            if completed && let Some(learning) = context.capability_learning {
+                record_prompt_structured_output_capability(&learning.cache, learning.key);
+            }
         }
-        if completed {
-            let _ = tx
-                .send(PendingEvent {
-                    event_type: "done",
-                    data: "[DONE]".into(),
-                })
-                .await;
-        }
+        flush_events(&tx, &mut pending).await;
         // 发送端随任务结束被丢弃，接收端流随之结束。
     });
     let keepalive = tokio::time::interval_at(
@@ -1228,7 +1403,7 @@ fn text_delta_event(
     PendingEvent {
         event_type,
         data: format!(
-            "{{\"type\":\"{event_type}\",\"item_id\":\"{item_id}\",\"output_index\":{output_index},\"content_index\":{content_index},\"sequence_number\":{sequence},\"delta\":{delta}}}"
+            "{{\"type\":\"{event_type}\",\"item_id\":\"{item_id}\",\"output_index\":{output_index},\"content_index\":{content_index},\"sequence_number\":{sequence},\"delta\":{delta},\"logprobs\":[]}}"
         ),
     }
 }
@@ -1258,14 +1433,177 @@ fn into_axum_event(pending: PendingEvent) -> Event {
 // 请求转换：Responses API → Chat Completions
 // ---------------------------------------------------------------------------
 
+fn validate_supported_responses_request(body: &Value) -> Result<(), String> {
+    if body
+        .get("model")
+        .and_then(Value::as_str)
+        .is_none_or(|model| model.trim().is_empty() || model.len() > 512)
+    {
+        return Err("Responses 请求缺少有效的 model。".into());
+    }
+    if body.get("stream").is_some_and(|value| !value.is_boolean()) {
+        return Err("Responses stream 必须是布尔值。".into());
+    }
+    if body
+        .get("previous_response_id")
+        .is_some_and(|value| !value.is_null())
+        || body
+            .get("conversation")
+            .is_some_and(|value| !value.is_null())
+        || body.get("background").and_then(Value::as_bool) == Some(true)
+    {
+        return Err("Chat Completions 转换不支持服务端会话状态，请发送完整 input 历史。".into());
+    }
+    if let Some(format) = body.get("text").and_then(|text| text.get("format")) {
+        match format.get("type").and_then(Value::as_str) {
+            None | Some("text" | "json_object") => {}
+            Some("json_schema") => {
+                let schema = format
+                    .get("schema")
+                    .ok_or_else(|| "Responses text.format.json_schema 缺少 schema。".to_string())?;
+                if !jsonschema::meta::is_valid(schema) {
+                    return Err("Responses text.format 包含无效的 JSON Schema。".into());
+                }
+                if schema.get("type").and_then(Value::as_str) != Some("object") {
+                    return Err("Responses 结构化输出仅支持 object 根 Schema。".into());
+                }
+            }
+            Some(format_type) => {
+                return Err(format!(
+                    "Chat Completions 转换不支持 text.format 类型：{format_type}。"
+                ));
+            }
+        }
+    }
+    if let Some(tools) = body.get("tools").and_then(Value::as_array) {
+        for tool in tools
+            .iter()
+            .filter(|tool| tool.get("type").and_then(Value::as_str) == Some("function"))
+        {
+            if tool
+                .get("name")
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+            {
+                return Err("Responses function 工具缺少 name。".into());
+            }
+            if let Some(parameters) = tool.get("parameters")
+                && !jsonschema::meta::is_valid(parameters)
+            {
+                return Err("Responses function 工具包含无效的 parameters Schema。".into());
+            }
+        }
+    }
+    if let Some(choice) = body.get("tool_choice") {
+        let function_names = body
+            .get("tools")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|tool| tool.get("type").and_then(Value::as_str) == Some("function"))
+            .filter_map(|tool| tool.get("name").and_then(Value::as_str))
+            .collect::<HashSet<_>>();
+        let supported = match choice {
+            Value::String(value) => matches!(value.as_str(), "auto" | "none" | "required"),
+            Value::Object(map) => {
+                map.get("type").and_then(Value::as_str) == Some("function")
+                    && map
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .is_some_and(|name| !name.is_empty())
+            }
+            _ => false,
+        };
+        if !supported {
+            return Err("Chat Completions 转换不支持此 tool_choice。".into());
+        }
+        if choice.as_str() == Some("required") && function_names.is_empty() {
+            return Err("tool_choice=required，但没有可转换的 function 工具。".into());
+        }
+        if let Some(name) = choice.get("name").and_then(Value::as_str)
+            && !function_names.contains(name)
+        {
+            return Err("tool_choice 指定的 function 未出现在工具列表中。".into());
+        }
+    }
+    if body
+        .get("input")
+        .is_some_and(|input| !input.is_string() && !input.is_array())
+    {
+        return Err("Responses input 必须是字符串或条目数组。".into());
+    }
+    if let Some(items) = body.get("input").and_then(Value::as_array) {
+        for item in items {
+            let Some(map) = item.as_object() else {
+                if item.is_string() {
+                    continue;
+                }
+                return Err("Responses input 包含不支持的条目。".into());
+            };
+            match map.get("type").and_then(Value::as_str).unwrap_or("message") {
+                "message" | "" => {
+                    if map.get("role").and_then(Value::as_str).is_none_or(|role| {
+                        !matches!(role, "system" | "developer" | "user" | "assistant")
+                    }) {
+                        return Err("Responses message 包含不支持的 role。".into());
+                    }
+                    if !map.get("content").is_some_and(|content| {
+                        content.is_string() || content.is_array() || content.is_null()
+                    }) {
+                        return Err("Responses message 缺少有效的 content。".into());
+                    }
+                }
+                // Reasoning items carry no Chat-visible content. Provider
+                // reasoning needed for continuation is restored from the
+                // bounded item/call-id store instead of exposing private text.
+                "reasoning" => {}
+                "function_call" => {
+                    if map
+                        .get("call_id")
+                        .or_else(|| map.get("id"))
+                        .and_then(Value::as_str)
+                        .is_none_or(str::is_empty)
+                        || map
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .is_none_or(str::is_empty)
+                        || !map.get("arguments").is_some_and(Value::is_string)
+                    {
+                        return Err(
+                            "Responses function_call 缺少有效的 call_id、name 或 arguments。"
+                                .into(),
+                        );
+                    }
+                }
+                "function_call_output" => {
+                    if map
+                        .get("call_id")
+                        .and_then(Value::as_str)
+                        .is_none_or(str::is_empty)
+                    {
+                        return Err("Responses function_call_output 缺少 call_id。".into());
+                    }
+                    if !map.contains_key("output") {
+                        return Err("Responses function_call_output 缺少 output。".into());
+                    }
+                }
+                item_type => {
+                    return Err(format!(
+                        "Chat Completions 转换不支持 Responses input 类型：{item_type}。"
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn responses_to_chat_body(body: &Value, store: &std::sync::Mutex<ReasoningStore>) -> Value {
     let mut chat = Map::new();
     if let Some(model) = body.get("model").cloned() {
         chat.insert("model".into(), model);
     }
-    let store = store
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let store = reasoning_lookup_for_body(body, store);
     chat.insert(
         "messages".into(),
         Value::Array(input_to_messages(body, &store)),
@@ -1281,13 +1619,14 @@ fn responses_to_chat_body(body: &Value, store: &std::sync::Mutex<ReasoningStore>
         .and_then(Value::as_array)
         .map(|tools| convert_tools(tools))
         .unwrap_or_default();
-    if !tools.is_empty() {
+    let has_tools = !tools.is_empty();
+    if has_tools {
         chat.insert("tools".into(), Value::Array(tools));
         if let Some(parallel) = body.get("parallel_tool_calls").cloned() {
             chat.insert("parallel_tool_calls".into(), parallel);
         }
     }
-    if let Some(tool_choice) = body.get("tool_choice") {
+    if has_tools && let Some(tool_choice) = body.get("tool_choice") {
         let converted = convert_tool_choice(tool_choice);
         // 默认的 auto 不需要显式发送，部分平台对不认识的参数会直接报错。
         if converted != Value::String("auto".into()) {
@@ -1295,7 +1634,7 @@ fn responses_to_chat_body(body: &Value, store: &std::sync::Mutex<ReasoningStore>
         }
     }
     if let Some(max_output_tokens) = body.get("max_output_tokens") {
-        chat.insert("max_tokens".into(), max_output_tokens.clone());
+        chat.insert("max_completion_tokens".into(), max_output_tokens.clone());
     }
     for key in ["temperature", "top_p", "store", "metadata", "user"] {
         if let Some(value) = body.get(key).filter(|value| !value.is_null()) {
@@ -1333,19 +1672,36 @@ fn responses_to_chat_body(body: &Value, store: &std::sync::Mutex<ReasoningStore>
     Value::Object(chat)
 }
 
-/// 判断上游错误是否与结构化输出（response_format / json_schema）相关，
-/// 用于决定是否需要降级重试。
-fn looks_like_structured_output_error(detail: &str) -> bool {
-    let lower = detail.to_ascii_lowercase();
-    [
-        "response_format",
-        "json_schema",
-        "structured output",
-        "structured_output",
-        "structured outputs",
-    ]
-    .iter()
-    .any(|keyword| lower.contains(keyword))
+fn reasoning_lookup_for_body(
+    body: &Value,
+    store: &std::sync::Mutex<ReasoningStore>,
+) -> ReasoningStore {
+    let mut ids = HashSet::new();
+    if let Some(items) = body.get("input").and_then(Value::as_array) {
+        for item in items.iter().filter_map(Value::as_object) {
+            for key in ["id", "call_id"] {
+                if let Some(id) = item.get(key).and_then(Value::as_str) {
+                    ids.insert(id);
+                }
+            }
+        }
+    }
+    let store = store
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let entries = ids
+        .into_iter()
+        .filter_map(|id| {
+            store
+                .entries
+                .get(id)
+                .map(|content| (id.to_owned(), content.clone()))
+        })
+        .collect();
+    ReasoningStore {
+        entries,
+        ..ReasoningStore::default()
+    }
 }
 
 /// 把 Chat 请求里的 `response_format`（json_schema）降级为系统提示词指令，
@@ -1539,7 +1895,35 @@ fn input_to_messages(body: &Value, store: &ReasoningStore) -> Vec<Value> {
         }
         _ => {}
     }
-    messages
+    normalize_system_messages(messages)
+}
+
+/// Chat templates commonly accept exactly one system message and require it at
+/// index zero. Responses input can contain developer messages later in the
+/// history, so merge every system-level instruction before forwarding.
+fn normalize_system_messages(messages: Vec<Value>) -> Vec<Value> {
+    let mut system_content = String::new();
+    let mut regular = Vec::with_capacity(messages.len());
+    let mut had_system = false;
+    for message in messages {
+        if message.get("role").and_then(Value::as_str) == Some("system") {
+            had_system = true;
+            if let Some(content) = message.get("content").and_then(chat_content_to_text)
+                && !content.trim().is_empty()
+            {
+                if !system_content.is_empty() {
+                    system_content.push_str("\n\n");
+                }
+                system_content.push_str(&content);
+            }
+        } else {
+            regular.push(message);
+        }
+    }
+    if had_system {
+        regular.insert(0, json!({ "role": "system", "content": system_content }));
+    }
+    regular
 }
 
 fn flush_tool_calls(
@@ -1726,6 +2110,13 @@ fn chat_content_to_text(value: &Value) -> Option<String> {
     }
 }
 
+fn chat_content_to_text_cow(value: &Value) -> Option<Cow<'_, str>> {
+    match value {
+        Value::String(text) => Some(Cow::Borrowed(text)),
+        _ => chat_content_to_text(value).map(Cow::Owned),
+    }
+}
+
 fn message_reasoning_text(message: &Value) -> Option<String> {
     [
         "reasoning_content",
@@ -1738,30 +2129,29 @@ fn message_reasoning_text(message: &Value) -> Option<String> {
     .filter(|text| !text.trim().is_empty())
 }
 
-fn json_object_from_text(text: &str) -> Option<String> {
-    let parse_object = |candidate: &str| {
-        serde_json::from_str::<Value>(candidate)
-            .ok()
-            .filter(Value::is_object)
-            .and_then(|value| serde_json::to_string(&value).ok())
-    };
-    parse_object(text).or_else(|| {
-        let start = text.find('{')?;
-        let end = text.rfind('}')?;
-        (start < end)
-            .then(|| &text[start..=end])
-            .and_then(parse_object)
-    })
-}
-
-fn strict_json_object(text: &str) -> Option<String> {
-    serde_json::from_str::<Value>(text)
-        .ok()
-        .filter(Value::is_object)
-        .and_then(|value| serde_json::to_string(&value).ok())
+fn validate_structured_output(text: &str, schema: Option<&Value>) -> Option<String> {
+    let value = serde_json::from_str::<Value>(text).ok()?;
+    if !value.is_object() {
+        return None;
+    }
+    if schema.is_some_and(|schema| !jsonschema::is_valid(schema, &value)) {
+        return None;
+    }
+    serde_json::to_string(&value).ok()
 }
 
 fn message_output_text(message: &Value, structured_output: bool) -> String {
+    if structured_output {
+        return ["content", "parsed"]
+            .into_iter()
+            .filter_map(|key| message.get(key))
+            .find_map(|value| match value {
+                Value::Object(_) => serde_json::to_string(value).ok(),
+                _ => chat_content_to_text(value),
+            })
+            .filter(|text| !text.trim().is_empty())
+            .unwrap_or_default();
+    }
     let content = message
         .get("content")
         .and_then(chat_content_to_text)
@@ -1772,20 +2162,14 @@ fn message_output_text(message: &Value, structured_output: bool) -> String {
                 .and_then(chat_content_to_text)
                 .filter(|text| !text.trim().is_empty())
         });
-    content.unwrap_or_else(|| {
-        if structured_output {
-            return message_reasoning_text(message)
-                .and_then(|text| json_object_from_text(&text))
-                .unwrap_or_default();
-        }
-        String::new()
-    })
+    content.unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
 // 非流式响应转换：Chat Completions → Responses API
 // ---------------------------------------------------------------------------
 
+#[cfg(test)]
 fn chat_to_responses_body(
     chat: &Value,
     response_id: &str,
@@ -1793,6 +2177,26 @@ fn chat_to_responses_body(
     created_at: i64,
     store: &std::sync::Mutex<ReasoningStore>,
     structured_output: bool,
+) -> Result<Value, String> {
+    chat_to_responses_body_with_schema(
+        chat,
+        response_id,
+        model,
+        created_at,
+        store,
+        structured_output,
+        None,
+    )
+}
+
+fn chat_to_responses_body_with_schema(
+    chat: &Value,
+    response_id: &str,
+    model: &str,
+    created_at: i64,
+    store: &std::sync::Mutex<ReasoningStore>,
+    structured_output: bool,
+    structured_schema: Option<&Value>,
 ) -> Result<Value, String> {
     if let Some(error) = chat.get("error") {
         let message = error
@@ -1810,6 +2214,11 @@ fn chat_to_responses_body(
         .get("message")
         .filter(|value| value.is_object())
         .ok_or_else(|| "上游 Chat Completions 响应缺少有效 assistant message。".to_string())?;
+    let response_model = chat
+        .get("model")
+        .and_then(Value::as_str)
+        .filter(|model| !model.is_empty())
+        .unwrap_or(model);
     let mut content_text = message_output_text(message, structured_output);
     let refusal = message
         .get("refusal")
@@ -1819,8 +2228,11 @@ fn chat_to_responses_body(
         .get("tool_calls")
         .and_then(Value::as_array)
         .is_some_and(|calls| !calls.is_empty());
+    if message.get("function_call").is_some() {
+        return Err("上游返回了旧版 function_call；转换代理要求标准 tool_calls 格式。".into());
+    }
     if structured_output && refusal.is_none() {
-        content_text = match strict_json_object(&content_text) {
+        content_text = match validate_structured_output(&content_text, structured_schema) {
             Some(content) => content,
             None if has_tool_calls => String::new(),
             None => return Err("上游模型未返回有效的结构化 JSON 对象。".into()),
@@ -1833,7 +2245,8 @@ fn chat_to_responses_body(
         .cloned()
         .unwrap_or_default();
     let (status, incomplete_reason) = match choice.get("finish_reason").and_then(Value::as_str) {
-        None | Some("stop" | "tool_calls" | "function_call") => ("completed", None),
+        Some("stop" | "tool_calls" | "function_call") => ("completed", None),
+        None => return Err("上游 Chat Completions 响应缺少 finish_reason。".into()),
         Some("length") => ("incomplete", Some("max_output_tokens")),
         Some("content_filter") => ("incomplete", Some("content_filter")),
         Some(reason) => return Err(format!("上游返回了无法识别的 finish_reason：{reason}")),
@@ -1847,12 +2260,13 @@ fn chat_to_responses_body(
     // 按输出条目 id 与工具 call_id 双重索引，id 被重写时仍能匹配。
     if let Some(reasoning) = message_reasoning_text(message) {
         if let Ok(mut store) = store.lock() {
-            store.insert(&format!("msg_{suffix}"), &reasoning);
+            let reasoning = ReasoningStore::bounded_content(&reasoning);
+            store.insert_shared(&format!("msg_{suffix}"), reasoning.clone());
             for (index, tool_call) in tool_calls.iter().enumerate() {
                 let fc_id = format!("fc_{suffix}_{index}");
-                store.insert(&fc_id, &reasoning);
+                store.insert_shared(&fc_id, reasoning.clone());
                 if let Some(call_id) = tool_call.get("id").and_then(Value::as_str) {
-                    store.insert(call_id, &reasoning);
+                    store.insert_call_alias(call_id, reasoning.clone());
                 }
             }
         }
@@ -1914,11 +2328,12 @@ fn chat_to_responses_body(
         let total_tokens = usage
             .get("total_tokens")
             .and_then(Value::as_u64)
-            .unwrap_or(input_tokens + output_tokens);
+            .unwrap_or_else(|| input_tokens.saturating_add(output_tokens));
         json!({
             "input_tokens": input_tokens,
             "input_tokens_details": {
-                "cached_tokens": usage.pointer("/prompt_tokens_details/cached_tokens").and_then(Value::as_u64).unwrap_or(0)
+                "cached_tokens": usage.pointer("/prompt_tokens_details/cached_tokens").and_then(Value::as_u64).unwrap_or(0),
+                "cache_write_tokens": usage.pointer("/prompt_tokens_details/cache_write_tokens").and_then(Value::as_u64).unwrap_or(0)
             },
             "output_tokens": output_tokens,
             "output_tokens_details": {
@@ -1932,7 +2347,7 @@ fn chat_to_responses_body(
         "object": "response",
         "created_at": created_at,
         "status": status,
-        "model": model,
+        "model": response_model,
         "output": output,
         "error": null,
         "incomplete_details": incomplete_reason.map(|reason| json!({"reason": reason})),
@@ -1974,13 +2389,17 @@ struct StreamTranslator {
     /// 结束后按输出条目 id 存入 store 供下一轮回传。
     reasoning_content: String,
     structured_output: bool,
+    structured_schema: Option<Value>,
+    metadata: ResponseMetadata,
     tool_calls: BTreeMap<usize, ToolCallAcc>,
     next_output_index: usize,
     input_tokens: u64,
     output_tokens: u64,
     cached_tokens: u64,
+    cache_write_tokens: u64,
     reasoning_tokens: u64,
     total_tokens: Option<u64>,
+    saw_usage: bool,
     finish_reason: Option<String>,
     saw_valid_choice: bool,
     sequence: u32,
@@ -2003,11 +2422,41 @@ impl StreamTranslator {
         Self::new_with_structured_output(response_id, model, created_at, false)
     }
 
+    #[cfg(test)]
     fn new_with_structured_output(
         response_id: &str,
         model: &str,
         created_at: i64,
         structured_output: bool,
+    ) -> Self {
+        Self::new_with_structured_schema(response_id, model, created_at, structured_output, None)
+    }
+
+    #[cfg(test)]
+    fn new_with_structured_schema(
+        response_id: &str,
+        model: &str,
+        created_at: i64,
+        structured_output: bool,
+        structured_schema: Option<Value>,
+    ) -> Self {
+        Self::new_with_metadata(
+            response_id,
+            model,
+            created_at,
+            structured_output,
+            structured_schema,
+            ResponseMetadata::default(),
+        )
+    }
+
+    fn new_with_metadata(
+        response_id: &str,
+        model: &str,
+        created_at: i64,
+        structured_output: bool,
+        structured_schema: Option<Value>,
+        metadata: ResponseMetadata,
     ) -> Self {
         Self {
             response_id: response_id.to_owned(),
@@ -2024,13 +2473,17 @@ impl StreamTranslator {
             refusal_content_index: None,
             reasoning_content: String::new(),
             structured_output,
+            structured_schema,
+            metadata,
             tool_calls: BTreeMap::new(),
             next_output_index: 0,
             input_tokens: 0,
             output_tokens: 0,
             cached_tokens: 0,
+            cache_write_tokens: 0,
             reasoning_tokens: 0,
             total_tokens: None,
+            saw_usage: false,
             finish_reason: None,
             saw_valid_choice: false,
             sequence: 0,
@@ -2039,7 +2492,7 @@ impl StreamTranslator {
     }
 
     fn stub(&self, event_type: &str, status: &str) -> Value {
-        json!({
+        let mut event = json!({
             "type": event_type,
             "response": {
                 "id": self.response_id,
@@ -2049,8 +2502,16 @@ impl StreamTranslator {
                 "model": self.model,
                 "output": [],
                 "usage": null,
+                "error": null,
+                "incomplete_details": null,
+                "instructions": null,
+                "parallel_tool_calls": true,
+                "tool_choice": "auto",
+                "tools": [],
             }
-        })
+        });
+        self.metadata.apply(&mut event["response"]);
+        event
     }
 
     /// 处理一个上游流式分片。返回 `Some(错误信息)` 表示上游在流中报告了错误，
@@ -2064,7 +2525,19 @@ impl StreamTranslator {
             self.fail(out, message);
             return Some(message.to_owned());
         }
+        if let Some(model) = chunk
+            .get("model")
+            .and_then(Value::as_str)
+            .filter(|model| !model.is_empty())
+            .filter(|model| *model != self.model)
+        {
+            self.model.clear();
+            self.model.push_str(model);
+        }
         if let Some(usage) = chunk.get("usage") {
+            self.saw_usage = ["prompt_tokens", "completion_tokens", "total_tokens"]
+                .into_iter()
+                .any(|key| usage.get(key).and_then(Value::as_u64).is_some());
             self.input_tokens = usage
                 .get("prompt_tokens")
                 .and_then(Value::as_u64)
@@ -2077,6 +2550,10 @@ impl StreamTranslator {
                 .pointer("/prompt_tokens_details/cached_tokens")
                 .and_then(Value::as_u64)
                 .unwrap_or(self.cached_tokens);
+            self.cache_write_tokens = usage
+                .pointer("/prompt_tokens_details/cache_write_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(self.cache_write_tokens);
             self.reasoning_tokens = usage
                 .pointer("/completion_tokens_details/reasoning_tokens")
                 .and_then(Value::as_u64)
@@ -2114,8 +2591,8 @@ impl StreamTranslator {
         }
         if let Some(text) = delta
             .get("content")
-            .and_then(chat_content_to_text)
-            .or_else(|| delta.get("parsed").and_then(chat_content_to_text))
+            .and_then(chat_content_to_text_cow)
+            .or_else(|| delta.get("parsed").and_then(chat_content_to_text_cow))
             .filter(|text| !text.is_empty())
         {
             self.full_text.push_str(&text);
@@ -2136,7 +2613,7 @@ impl StreamTranslator {
         }
         if let Some(refusal) = delta
             .get("refusal")
-            .and_then(chat_content_to_text)
+            .and_then(chat_content_to_text_cow)
             .filter(|text| !text.is_empty())
         {
             self.start_refusal(out);
@@ -2154,6 +2631,11 @@ impl StreamTranslator {
                 }),
             ));
         }
+        if delta.get("function_call").is_some() {
+            let message = "上游返回了旧版 function_call；转换代理要求标准 tool_calls 格式。";
+            self.fail(out, message);
+            return Some(message.into());
+        }
         if let Some(tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
             for (position, tool_call) in tool_calls.iter().enumerate() {
                 let index = tool_call
@@ -2162,6 +2644,27 @@ impl StreamTranslator {
                     .map(|index| index as usize)
                     .unwrap_or(position);
                 let function = tool_call.get("function").unwrap_or(&Value::Null);
+                let incoming_id = tool_call.get("id").and_then(Value::as_str);
+                let incoming_name = function.get("name").and_then(Value::as_str);
+                if let Some(existing) = self.tool_calls.get(&index)
+                    && (incoming_id.is_some_and(|id| !existing.id.is_empty() && existing.id != id)
+                        || incoming_name
+                            .is_some_and(|name| !existing.name.is_empty() && existing.name != name))
+                {
+                    let message = format!("上游工具调用索引 {index} 的 id 或函数名发生冲突。");
+                    self.fail(out, &message);
+                    return Some(message);
+                }
+                let arguments_delta = match function.get("arguments") {
+                    None | Some(Value::Null) => "",
+                    Some(Value::String(arguments)) => arguments.as_str(),
+                    Some(_) => {
+                        let message =
+                            format!("上游工具调用索引 {index} 的 function.arguments 不是字符串。");
+                        self.fail(out, &message);
+                        return Some(message);
+                    }
+                };
                 let acc = self.tool_calls.entry(index).or_insert_with(|| ToolCallAcc {
                     id: String::new(),
                     name: String::new(),
@@ -2171,18 +2674,13 @@ impl StreamTranslator {
                     started: false,
                     emitted_arguments_len: 0,
                 });
-                if let Some(id) = tool_call.get("id").and_then(Value::as_str) {
+                if let Some(id) = incoming_id {
                     acc.id = id.to_owned();
                 }
-                if let Some(name) = function.get("name").and_then(Value::as_str) {
+                if let Some(name) = incoming_name {
                     acc.name = name.to_owned();
                 }
-                let arguments_delta = match function.get("arguments") {
-                    None | Some(Value::Null) => String::new(),
-                    Some(Value::String(arguments)) => arguments.clone(),
-                    Some(arguments) => serde_json::to_string(arguments).unwrap_or_default(),
-                };
-                acc.arguments.push_str(&arguments_delta);
+                acc.arguments.push_str(arguments_delta);
                 // Chat 服务经常把 id/name 拆到不同分片。只有身份完整后才开启 item，
                 // 避免 added 事件永久携带空函数名或空 call_id。
                 if !acc.started && !acc.id.is_empty() && !acc.name.is_empty() {
@@ -2307,7 +2805,7 @@ impl StreamTranslator {
         }
         self.has_failed_event = true;
         let mut response = self.stub("response.failed", "failed");
-        response["response"]["error"] = json!({"message": message, "type": "upstream_error"});
+        response["response"]["error"] = json!({"code": "server_error", "message": message});
         response["response"]["incomplete_details"] = Value::Null;
         out.push(sequenced_sse_event(
             &mut self.sequence,
@@ -2326,7 +2824,11 @@ impl StreamTranslator {
             return false;
         }
         let incomplete_reason = match self.finish_reason.as_deref() {
-            None | Some("stop" | "tool_calls" | "function_call") => None,
+            Some("stop" | "tool_calls" | "function_call") => None,
+            None => {
+                self.fail(out, "上游 Chat Completions 流未提供终止 finish_reason。");
+                return false;
+            }
             Some("length") => Some("max_output_tokens"),
             Some("content_filter") => Some("content_filter"),
             Some(reason) => {
@@ -2353,20 +2855,19 @@ impl StreamTranslator {
         if !self.reasoning_content.trim().is_empty()
             && let Ok(mut store) = store.lock()
         {
-            store.insert(&self.msg_item_id, &self.reasoning_content);
+            let reasoning = ReasoningStore::bounded_content(&self.reasoning_content);
+            store.insert_shared(&self.msg_item_id, reasoning.clone());
             for acc in self.tool_calls.values() {
-                store.insert(&acc.item_id, &self.reasoning_content);
+                store.insert_shared(&acc.item_id, reasoning.clone());
                 if !acc.id.is_empty() {
-                    store.insert(&acc.id, &self.reasoning_content);
+                    store.insert_call_alias(&acc.id, reasoning.clone());
                 }
             }
         }
         if self.structured_output && !self.text_started && !self.refusal_started {
             let has_text = !self.full_text.trim().is_empty();
             let text = if has_text {
-                strict_json_object(&self.full_text)
-            } else if self.tool_calls.is_empty() {
-                json_object_from_text(&self.reasoning_content)
+                validate_structured_output(&self.full_text, self.structured_schema.as_ref())
             } else {
                 None
             };
@@ -2413,7 +2914,7 @@ impl StreamTranslator {
                         "output_index": output_index,
                         "content_index": content_index,
                         "text": self.full_text,
-                        "annotations": [],
+                        "logprobs": [],
                     }),
                 ));
                 out.push(sequenced_sse_event(
@@ -2495,6 +2996,7 @@ impl StreamTranslator {
                         "item_id": acc.item_id,
                         "output_index": output_index,
                         "arguments": acc.arguments,
+                        "name": acc.name,
                     }),
                 ));
             }
@@ -2529,6 +3031,18 @@ impl StreamTranslator {
         } else {
             "response.completed"
         };
+        let usage = self.saw_usage.then(|| {
+            json!({
+            "input_tokens": self.input_tokens,
+            "input_tokens_details": {
+                "cached_tokens": self.cached_tokens,
+                "cache_write_tokens": self.cache_write_tokens
+            },
+                "output_tokens": self.output_tokens,
+                "output_tokens_details": {"reasoning_tokens": self.reasoning_tokens},
+            "total_tokens": self.total_tokens.unwrap_or(self.input_tokens.saturating_add(self.output_tokens)),
+            })
+        });
         let mut response = json!({
             "type": event_type,
             "response": {
@@ -2538,16 +3052,15 @@ impl StreamTranslator {
                 "status": status,
                 "model": self.model,
                 "output": output,
-                "usage": {
-                    "input_tokens": self.input_tokens,
-                    "input_tokens_details": {"cached_tokens": self.cached_tokens},
-                    "output_tokens": self.output_tokens,
-                    "output_tokens_details": {"reasoning_tokens": self.reasoning_tokens},
-                    "total_tokens": self.total_tokens.unwrap_or(self.input_tokens + self.output_tokens),
-                },
+                "usage": usage,
+                "parallel_tool_calls": true,
+                "tool_choice": "auto",
+                "tools": [],
+                "instructions": null,
             }
         });
         response["response"]["error"] = Value::Null;
+        self.metadata.apply(&mut response["response"]);
         response["response"]["incomplete_details"] = incomplete_reason
             .map(|reason| json!({"reason": reason}))
             .unwrap_or(Value::Null);
@@ -2639,6 +3152,42 @@ mod tests {
         assert_eq!(messages[1]["content"], "你好");
         assert_eq!(chat["model"], "deepseek-chat");
         assert_eq!(chat["stream"], true);
+    }
+
+    #[test]
+    fn developer_messages_are_merged_into_the_leading_system_message() {
+        let chat = responses_to_chat_body(
+            &json!({
+                "model": "strict-template-model",
+                "instructions": "Base instructions",
+                "input": [
+                    {"type": "message", "role": "user", "content": "first"},
+                    {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "Late developer instruction"}]},
+                    {"type": "message", "role": "assistant", "content": "reply"},
+                    {"type": "message", "role": "system", "content": "Additional system instruction"},
+                    {"type": "message", "role": "user", "content": "second"}
+                ]
+            }),
+            &empty_reasoning_store(),
+        );
+
+        let messages = chat["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[0]["role"], "system");
+        assert_eq!(
+            messages[0]["content"],
+            "Base instructions\n\nLate developer instruction\n\nAdditional system instruction"
+        );
+        assert_eq!(messages[1]["role"], "user");
+        assert_eq!(messages[2]["role"], "assistant");
+        assert_eq!(messages[3]["role"], "user");
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| message["role"] == "system")
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -2797,24 +3346,6 @@ mod tests {
     }
 
     #[test]
-    fn structured_output_error_detection_ignores_case_and_variants() {
-        assert!(looks_like_structured_output_error(
-            "This response_format type is unavailable now"
-        ));
-        assert!(looks_like_structured_output_error(
-            "invalid parameter: response_format"
-        ));
-        assert!(looks_like_structured_output_error(
-            "JSON_Schema is not supported"
-        ));
-        assert!(looks_like_structured_output_error(
-            "structured output not enabled"
-        ));
-        assert!(!looks_like_structured_output_error("invalid api key"));
-        assert!(!looks_like_structured_output_error("rate limit exceeded"));
-    }
-
-    #[test]
     fn tools_and_tool_choice_are_converted() {
         let chat = responses_to_chat_body(
             &json!({
@@ -2841,9 +3372,62 @@ mod tests {
         assert_eq!(tools[0]["function"]["strict"], true);
         assert_eq!(chat["tool_choice"]["type"], "function");
         assert_eq!(chat["tool_choice"]["function"]["name"], "f");
-        assert_eq!(chat["max_tokens"], 128);
+        assert_eq!(chat["max_completion_tokens"], 128);
         assert_eq!(chat["reasoning_effort"], "low");
         assert_eq!(chat["temperature"], 0.3);
+    }
+
+    #[test]
+    fn optional_builtin_tools_are_filtered_while_functions_are_preserved() {
+        let request = json!({
+            "model": "chat-model",
+            "input": "hi",
+            "tool_choice": "auto",
+            "tools": [
+                {"type": "web_search_preview"},
+                {"type": "function", "name": "read_file", "parameters": {"type": "object"}}
+            ]
+        });
+        assert!(validate_supported_responses_request(&request).is_ok());
+
+        let chat = responses_to_chat_body(&request, &empty_reasoning_store());
+        let tools = chat["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["function"]["name"], "read_file");
+
+        assert!(
+            validate_supported_responses_request(&json!({
+                "input": "hi",
+                "tool_choice": "required",
+                "tools": [{"type": "web_search_preview"}]
+            }))
+            .is_err()
+        );
+        assert!(
+            validate_supported_responses_request(&json!({
+                "input": "hi",
+                "tool_choice": {"type": "web_search_preview"},
+                "tools": [{"type": "web_search_preview"}]
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn unsupported_state_and_input_items_are_rejected_instead_of_dropped() {
+        assert!(
+            validate_supported_responses_request(&json!({
+                "input": [{"type": "file_search_call", "id": "search_1"}]
+            }))
+            .is_err()
+        );
+        assert!(
+            validate_supported_responses_request(&json!({
+                "input": "hi",
+                "text": {"format": {"type": "json_schema", "schema": {"type": "invalid"}}}
+            }))
+            .is_err()
+        );
     }
 
     #[test]
@@ -3003,7 +3587,8 @@ mod tests {
                         "role": "assistant",
                         "content": null,
                         "parsed": {"outcome": "allow"}
-                    }
+                    },
+                    "finish_reason": "stop"
                 }]
             }),
             "resp_guardian",
@@ -3017,6 +3602,29 @@ mod tests {
         assert_eq!(
             translated["output"][0]["content"][0]["text"],
             r#"{"outcome":"allow"}"#
+        );
+
+        let with_text_property = chat_to_responses_body(
+            &json!({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": null,
+                        "parsed": {"text": "keep", "ok": true}
+                    },
+                    "finish_reason": "stop"
+                }]
+            }),
+            "resp_text_property",
+            "model",
+            1,
+            &empty_reasoning_store(),
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            with_text_property["output"][0]["content"][0]["text"],
+            r#"{"ok":true,"text":"keep"}"#
         );
     }
 
@@ -3051,6 +3659,34 @@ mod tests {
         assert!(!values.iter().any(|event| {
             event["type"] == "response.output_text.delta" || event["type"] == "response.completed"
         }));
+    }
+
+    #[test]
+    fn structured_output_is_validated_against_the_requested_schema() {
+        let completion = json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "{\"ok\":\"yes\"}"},
+                "finish_reason": "stop"
+            }]
+        });
+        let schema = json!({
+            "type": "object",
+            "properties": {"ok": {"type": "boolean"}},
+            "required": ["ok"],
+            "additionalProperties": false
+        });
+
+        let result = chat_to_responses_body_with_schema(
+            &completion,
+            "resp_schema",
+            "model",
+            1,
+            &empty_reasoning_store(),
+            true,
+            Some(&schema),
+        );
+
+        assert!(result.is_err());
     }
 
     #[test]
@@ -3092,7 +3728,7 @@ mod tests {
     }
 
     #[test]
-    fn structured_stream_recovers_json_from_reasoning_when_content_is_empty() {
+    fn structured_stream_never_exposes_reasoning_as_output() {
         let mut translator = StreamTranslator::new_with_structured_output(
             "resp_guardian",
             "third-party-model",
@@ -3101,23 +3737,18 @@ mod tests {
         );
         let mut events = Vec::new();
         translator.push_chunk(
-            &json!({"choices": [{"delta": {"reasoning_content": "Decision:\n```json\n{\"outcome\":\"allow\"}\n```"}}]}),
+            &json!({"choices": [{"delta": {"reasoning_content": "Decision:\n```json\n{\"outcome\":\"allow\"}\n```"}, "finish_reason": "stop"}]}),
             &mut events,
         );
-        translator.finish(&mut events, &empty_reasoning_store());
+        assert!(!translator.finish(&mut events, &empty_reasoning_store()));
 
         let values = events_to_json(events);
-        let completed = values
-            .iter()
-            .find(|value| value["type"] == "response.completed")
-            .unwrap();
-        assert_eq!(
-            completed["response"]["output"][0]["content"][0]["text"],
-            r#"{"outcome":"allow"}"#
+        assert_eq!(values.last().unwrap()["type"], "response.failed");
+        assert!(
+            !values
+                .iter()
+                .any(|value| value["type"] == "response.output_text.delta")
         );
-        assert!(values.iter().any(|value| {
-            value["type"] == "response.output_item.done" && value["item"]["type"] == "message"
-        }));
     }
 
     #[test]
@@ -3126,6 +3757,10 @@ mod tests {
         let mut events = Vec::new();
         translator.push_chunk(
             &json!({"choices": [{"delta": {"reasoning_content": "{\"private\":true}"}}]}),
+            &mut events,
+        );
+        translator.push_chunk(
+            &json!({"choices": [{"delta": {}, "finish_reason": "stop"}]}),
             &mut events,
         );
         translator.finish(&mut events, &empty_reasoning_store());
@@ -3256,14 +3891,52 @@ mod tests {
     }
 
     #[test]
-    fn buffered_sse_without_content_type_uses_the_normal_state_machine() {
-        let events = translate_buffered_sse(
-            "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
-            "resp_buffered",
+    fn conflicting_or_legacy_tool_calls_fail_instead_of_completing_empty() {
+        let mut translator = StreamTranslator::new("resp_conflict", "model", 1);
+        let mut events = Vec::new();
+        translator.push_chunk(
+            &json!({"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "call_a", "function": {"name": "f", "arguments": ""}}]}}]}),
+            &mut events,
+        );
+        let error = translator.push_chunk(
+            &json!({"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "call_b", "function": {"name": "f", "arguments": "{}"}}]}}]}),
+            &mut events,
+        );
+        assert!(error.is_some());
+        assert!(events_to_json(events)
+            .iter()
+            .any(|event| event["type"] == "response.failed"));
+
+        let legacy = chat_to_responses_body(
+            &json!({
+                "choices": [{
+                    "message": {"role": "assistant", "content": null, "function_call": {"name": "f", "arguments": "{}"}},
+                    "finish_reason": "function_call"
+                }]
+            }),
+            "resp_legacy",
             "model",
             1,
             &empty_reasoning_store(),
             false,
+        );
+        assert!(legacy.is_err());
+    }
+
+    #[test]
+    fn buffered_sse_without_content_type_uses_the_normal_state_machine() {
+        let events = translate_buffered_sse(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+            ResponseTranslationContext {
+                response_id: "resp_buffered".into(),
+                model: "model".into(),
+                created_at: 1,
+                store: Arc::new(empty_reasoning_store()),
+                structured_output: false,
+                structured_schema: None,
+                metadata: ResponseMetadata::default(),
+                capability_learning: None,
+            },
         );
         let values = events_to_json(
             events
@@ -3276,6 +3949,34 @@ mod tests {
             values.last().unwrap()["response"]["output"][0]["content"][0]["text"],
             "ok"
         );
+    }
+
+    #[test]
+    fn buffered_sse_validates_schema_before_learning_prompt_capability() {
+        let cache = Arc::new(std::sync::Mutex::new(HashSet::new()));
+        let events = translate_buffered_sse(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"{\\\"ok\\\":\\\"wrong\\\"}\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+            ResponseTranslationContext {
+                response_id: "resp_buffered_schema".into(),
+                model: "model".into(),
+                created_at: 1,
+                store: Arc::new(empty_reasoning_store()),
+                structured_output: true,
+                structured_schema: Some(json!({
+                    "type": "object",
+                    "properties": {"ok": {"type": "boolean"}},
+                    "required": ["ok"]
+                })),
+                metadata: ResponseMetadata::default(),
+                capability_learning: Some(CapabilityLearning {
+                    cache: cache.clone(),
+                    key: "model\njson_schema".into(),
+                }),
+            },
+        );
+        let values = events_to_json(events);
+        assert_eq!(values.last().unwrap()["type"], "response.failed");
+        assert!(cache.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -3334,6 +4035,37 @@ mod tests {
             values[0]["response"]["error"]["message"],
             "model overloaded"
         );
+        assert_eq!(values[0]["response"]["error"]["code"], "server_error");
+        assert!(values[0]["response"]["error"].get("type").is_none());
+        for field in ["parallel_tool_calls", "tool_choice", "tools"] {
+            assert!(values[0]["response"].get(field).is_some());
+        }
+    }
+
+    #[test]
+    fn streaming_usage_includes_all_required_details() {
+        let mut translator = StreamTranslator::new("resp_usage", "model", 1);
+        let mut events = Vec::new();
+        translator.push_chunk(
+            &json!({
+                "choices": [{"delta": {}, "finish_reason": "stop"}],
+                "usage": {
+                    "prompt_tokens": 10,
+                    "completion_tokens": 5,
+                    "total_tokens": 15,
+                    "prompt_tokens_details": {"cached_tokens": 3, "cache_write_tokens": 2},
+                    "completion_tokens_details": {"reasoning_tokens": 1}
+                }
+            }),
+            &mut events,
+        );
+        assert!(translator.finish(&mut events, &empty_reasoning_store()));
+
+        let values = events_to_json(events);
+        let usage = &values.last().unwrap()["response"]["usage"];
+        assert_eq!(usage["input_tokens_details"]["cached_tokens"], 3);
+        assert_eq!(usage["input_tokens_details"]["cache_write_tokens"], 2);
+        assert_eq!(usage["output_tokens_details"]["reasoning_tokens"], 1);
     }
 
     #[test]
@@ -3351,6 +4083,10 @@ mod tests {
         );
         translator.push_chunk(
             &json!({"choices": [{"delta": {"content": "答案是 42"}}]}),
+            &mut events,
+        );
+        translator.push_chunk(
+            &json!({"choices": [{"delta": {}, "finish_reason": "stop"}]}),
             &mut events,
         );
         translator.finish(&mut events, &store);
@@ -3441,6 +4177,10 @@ mod tests {
             &json!({"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "call_1", "function": {"name": "f", "arguments": "{}"}}]}}]}),
             &mut events,
         );
+        translator.push_chunk(
+            &json!({"choices": [{"delta": {}, "finish_reason": "tool_calls"}]}),
+            &mut events,
+        );
         translator.finish(&mut events, &store);
 
         let guard = store.lock().unwrap();
@@ -3517,6 +4257,15 @@ mod tests {
     }
 
     #[test]
+    fn ambiguous_call_ids_never_leak_reasoning_between_conversations() {
+        let mut store = ReasoningStore::default();
+        store.insert_call_alias("call_1", Arc::from("conversation A"));
+        store.insert_call_alias("call_1", Arc::from("conversation B"));
+
+        assert_eq!(store.get("call_1"), None);
+    }
+
+    #[test]
     fn non_streaming_response_persists_reasoning_content() {
         let store = empty_reasoning_store();
         let chat_response = json!({
@@ -3526,7 +4275,8 @@ mod tests {
                     "content": "结果",
                     "reasoning_content": "思考过程",
                     "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "f", "arguments": "{}"}}]
-                }
+                },
+                "finish_reason": "tool_calls"
             }]
         });
         let body = chat_to_responses_body(
@@ -3607,6 +4357,10 @@ mod tests {
         let mut events = Vec::new();
         translator.push_chunk(
             &json!({"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "call_1", "function": {"name": "f", "arguments": "{}"}}]}}]}),
+            &mut events,
+        );
+        translator.push_chunk(
+            &json!({"choices": [{"delta": {}, "finish_reason": "tool_calls"}]}),
             &mut events,
         );
         translator.finish(&mut events, &empty_reasoning_store());
@@ -3750,7 +4504,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn proxy_degrades_structured_output_when_upstream_rejects_response_format() {
+    async fn proxy_learns_prompt_structured_output_after_validation_rejection() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let upstream = std::thread::spawn(move || {
@@ -3761,7 +4515,7 @@ mod tests {
             let _ = stream.read(&mut buf);
             let request = String::from_utf8_lossy(&buf);
             assert!(request.contains("response_format"));
-            let error_body = r#"{"error":{"message":"This response_format type is unavailable now","type":"invalid_request_error"}}"#;
+            let error_body = r#"{"error":{"code":400,"message":"invalid request","type":"invalid_request_error"}}"#;
             write!(
                 stream,
                 "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -3777,6 +4531,20 @@ mod tests {
             assert!(request.contains("JSON Schema"));
             assert!(!request.contains("top-level fields: ok"));
             let body = r#"{"id":"chatcmpl-2","object":"chat.completion","created":1700000000,"model":"deepseek-chat","choices":[{"index":0,"message":{"role":"assistant","content":"{\"ok\": true}"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+            // The learned capability applies to later requests for the same
+            // upstream/model, so they skip the known-invalid native attempt.
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = stream.read(&mut buf);
+            let request = String::from_utf8_lossy(&buf);
+            assert!(!request.contains("response_format"));
+            assert!(request.contains("JSON Schema"));
             write!(
                 stream,
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -3811,6 +4579,24 @@ mod tests {
         assert!(response.status().is_success());
         let body: Value = response.json().await.unwrap();
         assert_eq!(body["output"][0]["content"][0]["text"], "{\"ok\":true}");
+        let response = client
+            .post(format!("http://127.0.0.1:{port}/v1/responses"))
+            .bearer_auth(&proxy_api_key)
+            .json(&json!({
+                "model": "deepseek-chat",
+                "input": "hi again",
+                "text": {
+                    "format": {
+                        "type": "json_schema",
+                        "name": "review",
+                        "schema": {"type": "object", "properties": {"ok": {"type": "boolean"}}}
+                    }
+                }
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
         upstream.join().unwrap();
     }
 
@@ -3882,7 +4668,7 @@ mod tests {
                 "response.completed",
             ]
         );
-        assert!(text.contains("data: [DONE]"));
+        assert!(!text.contains("data: [DONE]"));
         upstream.join().unwrap();
     }
 
@@ -3962,6 +4748,7 @@ mod tests {
                 r#"data: {"id":"c","choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"第一步思考"}}]}"#,
                 r#"data: {"id":"c","choices":[{"index":0,"delta":{"content":"好的"}}]}"#,
                 r#"data: {"id":"c","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"run_shell","arguments":"{\"cmd\":\"ls\"}"}}]}}]}"#,
+                r#"data: {"id":"c","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
                 r#"data: {"id":"c","usage":{"prompt_tokens":3,"completion_tokens":5,"total_tokens":8}}"#,
                 "data: [DONE]",
             ]
@@ -4053,8 +4840,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn proxy_completes_when_upstream_closes_without_done() {
-        // 模拟“不发送 [DONE] 就断开、最后一行没有换行”的激进上游。
+    async fn proxy_fails_when_upstream_closes_without_a_terminal_choice() {
+        // Transport EOF without a terminal finish_reason is a truncated model response.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let upstream = std::thread::spawn(move || {
@@ -4089,14 +4876,8 @@ mod tests {
             .iter()
             .map(|value| value["type"].as_str().unwrap_or("").to_owned())
             .collect::<Vec<_>>();
-        // 没有 [DONE] 也要以 response.completed 正常收尾。
-        assert!(types.contains(&"response.completed".to_owned()));
-        let completed = values
-            .iter()
-            .find(|value| value["type"] == "response.completed")
-            .unwrap();
-        let output = completed["response"]["output"].as_array().unwrap();
-        assert_eq!(output[0]["content"][0]["text"], "你好世界");
+        assert!(types.contains(&"response.failed".to_owned()));
+        assert!(!types.contains(&"response.completed".to_owned()));
         upstream.join().unwrap();
     }
 
@@ -4456,7 +5237,7 @@ mod tests {
         assert_eq!(call["arguments"], "{\"a\":1}");
         assert_eq!(completed["response"]["usage"]["input_tokens"], 4);
         assert_eq!(completed["response"]["usage"]["output_tokens"], 6);
-        assert!(text.contains("data: [DONE]"));
+        assert!(!text.contains("data: [DONE]"));
         upstream.join().unwrap();
     }
 
