@@ -3,8 +3,9 @@ import { useCallback, useRef, useState } from "react"
 import { errorMessage } from "@/lib/format"
 import { toast } from "@/components/ui/toast"
 
-type RunOptions = {
+type RunOptions<T> = {
   success?: string
+  successDescription?: (result: T) => string | undefined
   onSuccess?: () => void
 }
 
@@ -26,16 +27,20 @@ export function useAsyncAction<TKey = string>() {
   }, [])
 
   const run = useCallback(
-    async (
+    async <T>(
       key: TKey,
-      action: () => Promise<unknown>,
-      options?: RunOptions
+      action: () => Promise<T>,
+      options?: RunOptions<T>
     ): Promise<boolean> => {
       if (!begin(key)) return false
       try {
-        await action()
+        const result = await action()
         if (options?.success) {
-          toast.add({ title: options.success, type: "success" })
+          toast.add({
+            title: options.success,
+            description: options.successDescription?.(result),
+            type: "success",
+          })
         }
         options?.onSuccess?.()
         return true

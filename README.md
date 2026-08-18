@@ -60,7 +60,7 @@ xattr -dr com.apple.quarantine "/Applications/Codex Tools.app"
 3. 测试连接、同步模型并选择当前使用的账号或服务。
 4. 从概览点击“启动 Codex”；需要第三方模型目录时可在设置页使用模型解锁。
 
-切换前建议退出正在运行的 Codex 实例，并避免用其他工具同时编辑 `config.toml` 或 `auth.json`。
+切换账号、服务或修复会话归属前，应用会要求先退出正在运行的 Codex 实例。也请避免用其他工具同时编辑 `config.toml` 或 `auth.json`；检测到外部修改时，本次切换会停止并要求重试。
 
 ## 配置行为
 

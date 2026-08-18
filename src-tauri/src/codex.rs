@@ -18,7 +18,10 @@ use std::{
 use toml_edit::{DocumentMut, Item, Table, Value, value};
 
 pub const MANAGED_PROVIDER_ID: &str = "custom";
-const REMOVED_OPENAI_RELAY_PROVIDER_ID: &str = "codex_tools_openai_relay";
+/// Dedicated OAuth-backed provider used only while installation-id relay is
+/// enabled. It keeps OpenAI's provider name/auth semantics but disables
+/// WebSockets, which the HTTP relay intentionally does not terminate.
+pub const INSTALLATION_ID_RELAY_PROVIDER_ID: &str = "codex_tools_openai_relay";
 const MAX_CODEX_CONFIG_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_CODEX_AUTH_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_MODEL_CATALOG_BYTES: u64 = 16 * 1024 * 1024;
@@ -64,6 +67,12 @@ struct CodexFilesSnapshot {
 /// 状态也提交成功后才应丢弃；不序列化、不暴露文件内容到 WebView。
 pub(crate) struct AppliedConfigPatch {
     original: CodexFilesSnapshot,
+}
+
+struct OfficialAccountPatch {
+    original: CodexFilesSnapshot,
+    config_rendered: Vec<u8>,
+    auth_rendered: Vec<u8>,
 }
 
 struct PatchDraft<'a> {
@@ -351,12 +360,64 @@ pub fn connections_activate_official_account(
     credential: &CodexAuthCredential,
     managed_model: Option<&str>,
 ) -> Result<(), AppError> {
+    connections_activate_official_account_with_relay(codex_home, credential, managed_model, None)
+}
+
+/// Activates direct OpenAI by default, or a dedicated OAuth-backed Responses
+/// provider while the installation-id relay is enabled. The dedicated provider
+/// is named `OpenAI` and has WebSockets disabled so no request is routed to an
+/// unsupported transport.
+pub fn connections_activate_official_account_with_relay(
+    codex_home: &Path,
+    credential: &CodexAuthCredential,
+    managed_model: Option<&str>,
+    relay_base_url: Option<&str>,
+) -> Result<(), AppError> {
+    let patch =
+        prepare_official_account_patch(codex_home, credential, managed_model, relay_base_url)?;
+    apply_official_account_patch(patch)
+}
+
+fn prepare_official_account_patch(
+    codex_home: &Path,
+    credential: &CodexAuthCredential,
+    managed_model: Option<&str>,
+    relay_base_url: Option<&str>,
+) -> Result<OfficialAccountPatch, AppError> {
     validate_official_credential(credential)?;
     fs::create_dir_all(codex_home)?;
     let config_path = codex_home.join("config.toml");
-    let mut document = parse_config_document(&read_optional(&config_path)?)?;
+    let original = CodexFilesSnapshot {
+        config: OptionalFileSnapshot::capture(
+            config_path.clone(),
+            MAX_CODEX_CONFIG_BYTES,
+            "Codex 配置文件超过 2 MB，程序已停止读取以避免占用过多内存。",
+        )?,
+        auth: OptionalFileSnapshot::capture(
+            config_path.with_file_name("auth.json"),
+            MAX_CODEX_AUTH_BYTES,
+            "Codex 登录文件超过 4 MB，程序已停止读取以避免占用过多内存。",
+        )?,
+        catalog: OptionalFileSnapshot::capture(
+            codex_home.join(MODEL_CATALOG_DIR).join(MODEL_CATALOG_FILE),
+            MAX_MODEL_CATALOG_BYTES,
+            "Codex 模型目录超过 16 MB，程序已停止读取以避免占用过多内存。",
+        )?,
+    };
+    let mut document = parse_config_document(&original.config.text()?)?;
     clear_custom_provider_fields(&mut document, managed_model)?;
-    remove_retired_openai_relay(&mut document);
+    // `clear_custom_provider_fields` deliberately supports legacy inline
+    // provider tables. The relay adds/removes one named table, so normalize
+    // only after that cleanup has preserved all unrelated entries.
+    normalize_inline_model_providers(&mut document);
+    match relay_base_url {
+        Some(base_url) => {
+            configure_installation_id_relay_provider(&mut document, base_url)?;
+        }
+        None => {
+            remove_installation_id_relay_provider(&mut document)?;
+        }
+    }
 
     let mut auth_rendered = if is_personal_access_token_credential(credential) {
         serde_json::to_vec_pretty(&serde_json::json!({
@@ -369,23 +430,96 @@ pub fn connections_activate_official_account(
     .map_err(|error| AppError::Internal(error.to_string()))?;
     auth_rendered.push(b'\n');
 
-    commit_codex_files(
-        &config_path,
-        document.to_string().as_bytes(),
-        &auth_rendered,
-        |path, bytes| atomic_write(path, bytes).map_err(AppError::from),
-    )
+    Ok(OfficialAccountPatch {
+        original,
+        config_rendered: document.to_string().into_bytes(),
+        auth_rendered,
+    })
 }
 
-fn remove_retired_openai_relay(document: &mut DocumentMut) {
-    normalize_inline_model_providers(document);
+fn apply_official_account_patch(patch: OfficialAccountPatch) -> Result<(), AppError> {
+    let current = CodexFilesSnapshot {
+        config: OptionalFileSnapshot::capture(
+            patch.original.config.path.clone(),
+            MAX_CODEX_CONFIG_BYTES,
+            "Codex 配置文件超过 2 MB，程序已停止读取以避免占用过多内存。",
+        )?,
+        auth: OptionalFileSnapshot::capture(
+            patch.original.auth.path.clone(),
+            MAX_CODEX_AUTH_BYTES,
+            "Codex 登录文件超过 4 MB，程序已停止读取以避免占用过多内存。",
+        )?,
+        catalog: OptionalFileSnapshot::capture(
+            patch.original.catalog.path.clone(),
+            MAX_MODEL_CATALOG_BYTES,
+            "Codex 模型目录超过 16 MB，程序已停止读取以避免占用过多内存。",
+        )?,
+    };
+    if current.config.contents != patch.original.config.contents
+        || current.auth.contents != patch.original.auth.contents
+        || current.catalog.contents != patch.original.catalog.contents
+    {
+        return Err(AppError::StaleOperation);
+    }
+
+    let result = commit_codex_files(
+        &patch.original.config.path,
+        &patch.config_rendered,
+        &patch.auth_rendered,
+        |path, bytes| atomic_write(path, bytes).map_err(AppError::from),
+    );
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) => match restore_codex_files(&patch.original) {
+            Ok(()) => Err(error),
+            Err(rollback) => Err(AppError::Internal(format!(
+                "{error}；Codex 原配置回滚失败，请手动检查配置文件：{rollback}"
+            ))),
+        },
+    }
+}
+
+fn configure_installation_id_relay_provider(
+    document: &mut DocumentMut,
+    base_url: &str,
+) -> Result<(), AppError> {
     let root = document.as_table_mut();
-    if root.get("model_provider").and_then(Item::as_str) == Some(REMOVED_OPENAI_RELAY_PROVIDER_ID) {
+    let providers = root
+        .entry("model_providers")
+        .or_insert(Item::Table(Table::new()))
+        .as_table_mut()
+        .ok_or_else(|| {
+            AppError::InvalidConfig(
+                "Codex 配置中的 model_providers 格式不正确，需要手动修复后再试。".into(),
+            )
+        })?;
+    let mut relay = Table::new();
+    relay["name"] = value("OpenAI");
+    relay["wire_api"] = value("responses");
+    relay["requires_openai_auth"] = value(true);
+    relay["supports_websockets"] = value(false);
+    relay["supports_standalone_web_search"] = value(true);
+    relay["base_url"] = value(base_url.trim().trim_end_matches('/'));
+    providers.insert(INSTALLATION_ID_RELAY_PROVIDER_ID, Item::Table(relay));
+    root["model_provider"] = value(INSTALLATION_ID_RELAY_PROVIDER_ID);
+    Ok(())
+}
+
+fn remove_installation_id_relay_provider(document: &mut DocumentMut) -> Result<(), AppError> {
+    let root = document.as_table_mut();
+    if root.get("model_provider").and_then(Item::as_str) == Some(INSTALLATION_ID_RELAY_PROVIDER_ID)
+    {
         root.remove("model_provider");
     }
-    if let Some(providers) = root.get_mut("model_providers").and_then(Item::as_table_mut) {
-        providers.remove(REMOVED_OPENAI_RELAY_PROVIDER_ID);
+    if let Some(providers) = root.get_mut("model_providers") {
+        let providers = providers.as_table_mut().ok_or_else(|| {
+            AppError::InvalidConfig(
+                "Codex 配置中的 model_providers 格式不正确，需要手动修复后再试。".into(),
+            )
+        })?;
+        providers.remove(INSTALLATION_ID_RELAY_PROVIDER_ID);
     }
+    Ok(())
 }
 
 pub fn read_official_account(codex_home: &Path) -> Result<Option<CodexAuthCredential>, AppError> {
@@ -1509,6 +1643,34 @@ base_url = "https://custom.example.test/v1"
     }
 
     #[test]
+    fn official_activation_rejects_files_changed_after_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+        prepare_home(temp.path());
+        let credential = CodexAuthCredential {
+            auth_mode: "chatgpt".into(),
+            openai_api_key: None,
+            tokens: crate::models::CodexAuthTokens {
+                id_token: "id-token".into(),
+                access_token: "access-token".into(),
+                refresh_token: "refresh-token".into(),
+                account_id: "account-id".into(),
+            },
+            last_refresh: "2026-08-18T00:00:00Z".into(),
+        };
+        let patch = prepare_official_account_patch(temp.path(), &credential, None, None).unwrap();
+        let external = "model = \"external-change\"\n";
+        fs::write(temp.path().join("config.toml"), external).unwrap();
+
+        let error = apply_official_account_patch(patch).unwrap_err();
+
+        assert!(matches!(error, AppError::StaleOperation));
+        assert_eq!(
+            fs::read_to_string(temp.path().join("config.toml")).unwrap(),
+            external
+        );
+    }
+
+    #[test]
     fn credential_commit_neutralizes_auth_before_config_and_final_auth() {
         let config_path = PathBuf::from("/codex/config.toml");
         let mut writes = vec![];
@@ -1638,6 +1800,57 @@ base_url = "https://custom.example.test/v1"
     }
 
     #[test]
+    fn official_relay_override_is_opt_in_and_cleanup_restores_direct_configuration() {
+        let temp = tempfile::tempdir().unwrap();
+        prepare_home(temp.path());
+        let credential = CodexAuthCredential {
+            auth_mode: "chatgpt".into(),
+            openai_api_key: None,
+            tokens: crate::models::CodexAuthTokens {
+                id_token: "id".into(),
+                access_token: "access".into(),
+                refresh_token: "refresh".into(),
+                account_id: "account".into(),
+            },
+            last_refresh: "2026-07-31T00:00:00Z".into(),
+        };
+        let relay_url = format!(
+            "http://127.0.0.1:43123/{}/{}",
+            crate::installation_id_proxy::RELAY_PATH_PREFIX,
+            "a".repeat(96)
+        );
+        connections_activate_official_account_with_relay(
+            temp.path(),
+            &credential,
+            None,
+            Some(&relay_url),
+        )
+        .unwrap();
+        let configured = fs::read_to_string(temp.path().join("config.toml")).unwrap();
+        let configured = configured.parse::<DocumentMut>().unwrap();
+        assert_eq!(
+            configured["model_provider"].as_str(),
+            Some(INSTALLATION_ID_RELAY_PROVIDER_ID)
+        );
+        let relay = configured["model_providers"][INSTALLATION_ID_RELAY_PROVIDER_ID]
+            .as_table()
+            .unwrap();
+        assert_eq!(relay["name"].as_str(), Some("OpenAI"));
+        assert_eq!(relay["base_url"].as_str(), Some(relay_url.as_str()));
+        assert_eq!(relay["wire_api"].as_str(), Some("responses"));
+        assert_eq!(relay["requires_openai_auth"].as_bool(), Some(true));
+        assert_eq!(relay["supports_websockets"].as_bool(), Some(false));
+        assert_eq!(
+            relay["supports_standalone_web_search"].as_bool(),
+            Some(true)
+        );
+
+        connections_activate_official_account(temp.path(), &credential, None).unwrap();
+        let direct = fs::read_to_string(temp.path().join("config.toml")).unwrap();
+        assert!(!direct.contains(INSTALLATION_ID_RELAY_PROVIDER_ID));
+    }
+
+    #[test]
     fn official_activation_preserves_a_user_authored_openai_base_url() {
         let temp = tempfile::tempdir().unwrap();
         prepare_home(temp.path());
@@ -1666,12 +1879,12 @@ base_url = "https://custom.example.test/v1"
     }
 
     #[test]
-    fn official_activation_removes_retired_openai_relay_configuration() {
+    fn relay_enable_preserves_a_user_authored_openai_base_url() {
         let temp = tempfile::tempdir().unwrap();
         prepare_home(temp.path());
         fs::write(
             temp.path().join("config.toml"),
-            "model_provider = \"codex_tools_openai_relay\"\n[model_providers.codex_tools_openai_relay]\nbase_url = \"http://127.0.0.1:43123/retired\"\n[model_providers.other]\nbase_url = \"https://other.example.test/v1\"\n",
+            "openai_base_url = \"https://user.example.test/v1\"\n",
         )
         .unwrap();
         let credential = CodexAuthCredential {
@@ -1685,12 +1898,103 @@ base_url = "https://custom.example.test/v1"
             },
             last_refresh: "2026-07-31T00:00:00Z".into(),
         };
+        let relay_url = format!(
+            "http://127.0.0.1:43123/{}/{}",
+            crate::installation_id_proxy::RELAY_PATH_PREFIX,
+            "b".repeat(96)
+        );
+        connections_activate_official_account_with_relay(
+            temp.path(),
+            &credential,
+            None,
+            Some(&relay_url),
+        )
+        .unwrap();
+        assert!(
+            fs::read_to_string(temp.path().join("config.toml"))
+                .unwrap()
+                .contains("https://user.example.test/v1")
+        );
+    }
 
+    #[test]
+    fn relay_cleanup_preserves_unrelated_provider_tables() {
+        let temp = tempfile::tempdir().unwrap();
+        prepare_home(temp.path());
+        fs::write(
+            temp.path().join("config.toml"),
+            "[model_providers.other]\nname = \"Other\"\nbase_url = \"https://other.example.test/v1\"\n",
+        )
+        .unwrap();
+        let credential = CodexAuthCredential {
+            auth_mode: "chatgpt".into(),
+            openai_api_key: None,
+            tokens: crate::models::CodexAuthTokens {
+                id_token: "id".into(),
+                access_token: "access".into(),
+                refresh_token: "refresh".into(),
+                account_id: "account".into(),
+            },
+            last_refresh: "2026-07-31T00:00:00Z".into(),
+        };
+        let relay_url = format!(
+            "http://127.0.0.1:43123/{}/{}",
+            crate::installation_id_proxy::RELAY_PATH_PREFIX,
+            "c".repeat(96)
+        );
+        connections_activate_official_account_with_relay(
+            temp.path(),
+            &credential,
+            None,
+            Some(&relay_url),
+        )
+        .unwrap();
         connections_activate_official_account(temp.path(), &credential, None).unwrap();
-
         let config = fs::read_to_string(temp.path().join("config.toml")).unwrap();
-        assert!(!config.contains("codex_tools_openai_relay"));
         assert!(config.contains("[model_providers.other]"));
+        assert!(!config.contains(INSTALLATION_ID_RELAY_PROVIDER_ID));
+    }
+
+    #[test]
+    fn relay_enable_and_direct_disable_accept_unrelated_inline_provider_tables() {
+        let temp = tempfile::tempdir().unwrap();
+        prepare_home(temp.path());
+        fs::write(
+            temp.path().join("config.toml"),
+            "model_providers = { other = { name = \"Other\", base_url = \"https://other.example.test/v1\" } }\n",
+        )
+        .unwrap();
+        let credential = CodexAuthCredential {
+            auth_mode: "chatgpt".into(),
+            openai_api_key: None,
+            tokens: crate::models::CodexAuthTokens {
+                id_token: "id".into(),
+                access_token: "access".into(),
+                refresh_token: "refresh".into(),
+                account_id: "account".into(),
+            },
+            last_refresh: "2026-07-31T00:00:00Z".into(),
+        };
+        let relay_url = format!(
+            "http://127.0.0.1:43123/{}/{}",
+            crate::installation_id_proxy::RELAY_PATH_PREFIX,
+            "d".repeat(96)
+        );
+        connections_activate_official_account_with_relay(
+            temp.path(),
+            &credential,
+            None,
+            Some(&relay_url),
+        )
+        .unwrap();
+        connections_activate_official_account(temp.path(), &credential, None).unwrap();
+        let config = fs::read_to_string(temp.path().join("config.toml"))
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+        let providers = config["model_providers"].as_table().unwrap();
+        assert!(providers.get("other").is_some());
+        assert!(providers.get(INSTALLATION_ID_RELAY_PROVIDER_ID).is_none());
     }
 
     #[test]

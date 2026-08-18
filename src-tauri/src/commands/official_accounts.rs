@@ -1,14 +1,16 @@
 use crate::{
     activation::{
-        activate_openai_record, sync_active_codex_configuration_inner,
-        sync_active_openai_credential,
+        activate_openai_record, ensure_codex_stopped,
+        sync_active_codex_configuration_with_installation_proxy, sync_active_openai_credential,
     },
     auth_center::{AuthCenter, DevicePollResult},
     chat_proxy::ChatProxyRegistry,
     codex::{self, ConfigManager},
+    installation_id_proxy::InstallationIdProxyRegistry,
     local_usage::UsageLedger,
     models::*,
     official_quota, proxy_import,
+    session_index::SessionIndex,
     state::{ActivationLock, ApiClient},
     storage::Store,
 };
@@ -34,6 +36,7 @@ pub(crate) async fn connections_import_cookie(
     manager: State<'_, ConfigManager>,
     activation: State<'_, ActivationLock>,
     proxy: State<'_, ChatProxyRegistry>,
+    installation_proxy: State<'_, InstallationIdProxyRegistry>,
     name: Option<String>,
     account_id: Option<String>,
     content: String,
@@ -100,8 +103,29 @@ pub(crate) async fn connections_import_cookie(
             "导入后将超过 500 个 OpenAI 账号的保存上限，请先删除不再使用的账号。".into(),
         ));
     }
+    let active_account = store.read(|state| {
+        if !matches!(state.active.kind, ActiveKind::Official) {
+            return None;
+        }
+        let active_id = state.active.account_id.as_deref()?;
+        state
+            .official_accounts
+            .iter()
+            .find(|account| account.id == active_id)
+            .map(|account| (account.id.clone(), account.account_id.clone()))
+    })?;
+    let replaces_active = active_account.as_ref().is_some_and(|(id, account_id)| {
+        resolved_accounts
+            .iter()
+            .any(|account| account.id == *id || account.account_id == *account_id)
+    });
+    if replaces_active {
+        ensure_codex_stopped(&store)?;
+    }
     let saved_accounts = store.save_official_accounts(&resolved_accounts)?;
-    sync_active_imported_account(&store, &manager, &proxy).await?;
+    if replaces_active {
+        sync_active_imported_account(&store, &manager, &proxy, &installation_proxy).await?;
+    }
     for account in saved_accounts {
         accounts.push(store.official_account_view(&account.id)?);
     }
@@ -115,12 +139,22 @@ async fn sync_active_imported_account(
     store: &Store,
     manager: &ConfigManager,
     proxy: &ChatProxyRegistry,
+    installation_proxy: &InstallationIdProxyRegistry,
 ) -> Result<(), AppError> {
     let is_active = store.read(|state| {
         matches!(state.active.kind, ActiveKind::Official) && state.active.account_id.is_some()
     })?;
     if is_active {
-        sync_active_codex_configuration_inner(store, manager, proxy).await?;
+        // Reimports can replace an active refresh token. Use the same managed
+        // sync path as normal activation so an eligible RT account keeps its
+        // live relay instead of falling back to a direct Codex configuration.
+        sync_active_codex_configuration_with_installation_proxy(
+            store,
+            manager,
+            proxy,
+            installation_proxy,
+        )
+        .await?;
     }
     Ok(())
 }
@@ -132,6 +166,48 @@ pub(crate) fn connections_update_account_remark(
     remark: String,
 ) -> Result<OfficialAccountView, AppError> {
     let saved = store.update_official_account_remark(&id, remark)?;
+    store.official_account_view(&saved.id)
+}
+
+#[tauri::command]
+pub(crate) async fn connections_set_device_session_convergence(
+    store: State<'_, Store>,
+    manager: State<'_, ConfigManager>,
+    activation: State<'_, ActivationLock>,
+    proxy: State<'_, ChatProxyRegistry>,
+    installation_proxy: State<'_, InstallationIdProxyRegistry>,
+    id: String,
+    enabled: bool,
+) -> Result<OfficialAccountView, AppError> {
+    let _guard = activation.0.lock().await;
+    let previous = store.official_installation_id_setting(&id)?;
+    let saved = store.set_official_installation_id_unification(&id, enabled)?;
+    let active = store.read(|state| {
+        matches!(state.active.kind, ActiveKind::Official)
+            && state.active.account_id.as_deref() == Some(id.as_str())
+    })?;
+    if active
+        && let Err(error) = sync_active_codex_configuration_with_installation_proxy(
+            &store,
+            &manager,
+            &proxy,
+            &installation_proxy,
+        )
+        .await
+    {
+        // Persisted state and the live Codex config move together. If the
+        // reconfiguration fails, restore the prior setting and best-effort
+        // restore its prior direct/relay route before reporting the error.
+        let _ = store.set_official_installation_id_unification(&id, previous.enabled);
+        let _ = sync_active_codex_configuration_with_installation_proxy(
+            &store,
+            &manager,
+            &proxy,
+            &installation_proxy,
+        )
+        .await;
+        return Err(error);
+    }
     store.official_account_view(&saved.id)
 }
 
@@ -157,7 +233,10 @@ fn connections_update_account_remarks_in_store(
         .into_iter()
         .map(|account| {
             let active = active_account_id.as_deref() == Some(account.id.as_str());
-            Ok(account.view(active))
+            Ok(account.view(
+                active,
+                store.official_installation_id_setting(&account.id)?.enabled,
+            ))
         })
         .collect()
 }
@@ -190,6 +269,13 @@ async fn refresh_account_and_sync_active(
     force: bool,
 ) -> Result<StoredOfficialAccount, AppError> {
     let _guard = activation.0.lock().await;
+    let is_active = store.read(|state| {
+        matches!(state.active.kind, ActiveKind::Official)
+            && state.active.account_id.as_deref() == Some(id)
+    })?;
+    if is_active {
+        ensure_codex_stopped(store)?;
+    }
     let home = codex::home(&store.codex_home_setting()?);
     // Codex may have rotated the active credential independently. Import that
     // copy before exchanging its refresh token, then write the newly refreshed
@@ -200,10 +286,6 @@ async fn refresh_account_and_sync_active(
     } else {
         center.refresh_account(store, id).await?
     };
-    let is_active = store.read(|state| {
-        matches!(state.active.kind, ActiveKind::Official)
-            && state.active.account_id.as_deref() == Some(id)
-    })?;
     if is_active {
         codex::connections_activate_official_account(&home, &saved.credential, None)?;
     }
@@ -222,18 +304,17 @@ async fn refresh_official_quota(
     let now = chrono::Utc::now().timestamp();
     let mut snapshot = stored.quota.clone();
     snapshot.last_attempt_at = Some(now);
-    let account =
-        match refresh_account_and_sync_active(store, center, activation, account_id, false).await {
-            Ok(account) => account,
-            Err(error) => {
-                snapshot.status = match error {
-                    AppError::InvalidConfig(_) => QuotaStatus::Unauthorized,
-                    AppError::StaleOperation | AppError::Internal(_) => QuotaStatus::Error,
-                };
-                snapshot.error = Some(error.to_string());
-                return store.save_official_account_quota(account_id, snapshot);
-            }
-        };
+    let account = match account_for_quota(store, center, activation, account_id).await {
+        Ok(account) => account,
+        Err(error) => {
+            snapshot.status = match error {
+                AppError::InvalidConfig(_) => QuotaStatus::Unauthorized,
+                AppError::StaleOperation | AppError::Internal(_) => QuotaStatus::Error,
+            };
+            snapshot.error = Some(error.to_string());
+            return store.save_official_account_quota(account_id, snapshot);
+        }
+    };
     let http = client.current()?;
     let mut quota_result = official_quota::fetch_quota(&http, &account).await;
     if matches!(&quota_result, Err(error) if error.is_retryable()) {
@@ -254,6 +335,26 @@ async fn refresh_official_quota(
         }
     }
     store.save_official_account_quota(account_id, snapshot)
+}
+
+async fn account_for_quota(
+    store: &Store,
+    center: &AuthCenter,
+    activation: &ActivationLock,
+    account_id: &str,
+) -> Result<StoredOfficialAccount, AppError> {
+    let _guard = activation.0.lock().await;
+    let stored = store.official_account(account_id)?;
+    let is_active = store.read(|state| {
+        matches!(state.active.kind, ActiveKind::Official)
+            && state.active.account_id.as_deref() == Some(account_id)
+    })?;
+    // “刷新额度”对当前账号保持只读：不得轮换正在被 Codex 使用的凭据。
+    if is_active {
+        Ok(stored)
+    } else {
+        center.refresh_account(store, account_id).await
+    }
 }
 
 #[tauri::command]
@@ -314,30 +415,29 @@ pub(crate) async fn connections_login_start(
 pub(crate) async fn connections_login_poll(
     store: State<'_, Store>,
     center: State<'_, AuthCenter>,
-    manager: State<'_, ConfigManager>,
-    ledger: State<'_, UsageLedger>,
     activation: State<'_, ActivationLock>,
-    proxy: State<'_, ChatProxyRegistry>,
     operation_id: String,
 ) -> Result<OpenAiDevicePoll, AppError> {
     match center.poll_openai(&operation_id).await? {
         DevicePollResult::Pending => Ok(OpenAiDevicePoll::Pending),
         DevicePollResult::Expired => Ok(OpenAiDevicePoll::Expired),
         DevicePollResult::Complete(account) => {
-            let activation_operation = activation.begin_operation();
             let _guard = activation.0.lock().await;
-            if !activation.is_current(activation_operation) {
-                return Err(AppError::StaleOperation);
-            }
-            sync_active_openai_credential(&store, &codex::home(&store.codex_home_setting()?))?;
-            let saved = store.save_official_account(&account)?;
-            let repair = activate_openai_record(&store, &manager, &ledger, &proxy, &saved).await?;
+            let saved = save_completed_login(&store, &account)?;
             Ok(OpenAiDevicePoll::Complete {
-                account: Box::new(store.official_account_view(&saved.id)?),
-                repair,
+                account: Box::new(saved),
             })
         }
     }
+}
+
+fn save_completed_login(
+    store: &Store,
+    account: &StoredOfficialAccount,
+) -> Result<OfficialAccountView, AppError> {
+    sync_active_openai_credential(store, &codex::home(&store.codex_home_setting()?))?;
+    let saved = store.save_official_account(account)?;
+    store.official_account_view(&saved.id)
 }
 
 #[tauri::command]
@@ -349,6 +449,8 @@ pub(crate) async fn connections_activate_account(
     ledger: State<'_, UsageLedger>,
     activation: State<'_, ActivationLock>,
     proxy: State<'_, ChatProxyRegistry>,
+    installation_proxy: State<'_, InstallationIdProxyRegistry>,
+    index: State<'_, SessionIndex>,
     id: String,
 ) -> Result<RepairResult, AppError> {
     let activation_operation = activation.begin_operation();
@@ -356,12 +458,24 @@ pub(crate) async fn connections_activate_account(
     if !activation.is_current(activation_operation) {
         return Err(AppError::StaleOperation);
     }
+    ensure_codex_stopped(&store)?;
     sync_active_openai_credential(&store, &codex::home(&store.codex_home_setting()?))?;
     let saved = center.refresh_account(&store, &id).await?;
-    activate_openai_record(&store, &manager, &ledger, &proxy, &saved).await
+    let repair = activate_openai_record(
+        &store,
+        &manager,
+        &ledger,
+        &proxy,
+        &installation_proxy,
+        &saved,
+    )
+    .await?;
+    index.invalidate();
+    Ok(repair)
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)] // Tauri injects each managed state separately.
 pub(crate) async fn connections_activate_official(
     store: State<'_, Store>,
     center: State<'_, AuthCenter>,
@@ -369,12 +483,15 @@ pub(crate) async fn connections_activate_official(
     ledger: State<'_, UsageLedger>,
     activation: State<'_, ActivationLock>,
     proxy: State<'_, ChatProxyRegistry>,
+    installation_proxy: State<'_, InstallationIdProxyRegistry>,
+    index: State<'_, SessionIndex>,
 ) -> Result<RepairResult, AppError> {
     let activation_operation = activation.begin_operation();
     let _guard = activation.0.lock().await;
     if !activation.is_current(activation_operation) {
         return Err(AppError::StaleOperation);
     }
+    ensure_codex_stopped(&store)?;
     let (home_setting, id) = store.read(|state| {
         let id = state
             .active
@@ -394,7 +511,17 @@ pub(crate) async fn connections_activate_official(
     let id =
         id.ok_or_else(|| AppError::InvalidConfig("请先在“账号与服务”中登录 OpenAI。".into()))?;
     let saved = center.refresh_account(&store, &id).await?;
-    activate_openai_record(&store, &manager, &ledger, &proxy, &saved).await
+    let repair = activate_openai_record(
+        &store,
+        &manager,
+        &ledger,
+        &proxy,
+        &installation_proxy,
+        &saved,
+    )
+    .await?;
+    index.invalidate();
+    Ok(repair)
 }
 
 #[tauri::command]
@@ -441,7 +568,17 @@ fn platform_open() -> Result<(), AppError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
     use std::fs;
+
+    fn claimed_token(account_id: &str) -> String {
+        let payload = URL_SAFE_NO_PAD.encode(
+            serde_json::json!({ "chatgpt_account_id": account_id })
+                .to_string()
+                .as_bytes(),
+        );
+        format!("header.{payload}.signature")
+    }
 
     fn account(account_id: &str, remark: &str) -> StoredOfficialAccount {
         StoredOfficialAccount {
@@ -467,6 +604,56 @@ mod tests {
             created_at: 0,
             updated_at: 0,
         }
+    }
+
+    #[test]
+    fn completed_login_saves_the_account_without_switching_connections() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path().join("data")).unwrap();
+
+        let view = save_completed_login(&store, &account("new-account", "")).unwrap();
+
+        assert!(!view.active);
+        assert!(matches!(
+            store.snapshot().unwrap().active.kind,
+            ActiveKind::None
+        ));
+    }
+
+    #[tokio::test]
+    async fn active_account_quota_refresh_does_not_rotate_or_write_credentials() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex-home");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(home.join("auth.json"), b"external-codex-auth").unwrap();
+        let store = Store::open(temp.path().join("data")).unwrap();
+        store
+            .update(|state| {
+                state.codex.home = home.display().to_string();
+                Ok(())
+            })
+            .unwrap();
+        let mut expired = account("active-account", "");
+        expired.expires_at = Some(1);
+        let saved = store.save_official_account(&expired).unwrap();
+        store
+            .connections_activate_official_account(&saved.id)
+            .unwrap();
+
+        let quota_account = account_for_quota(
+            &store,
+            &AuthCenter::default(),
+            &ActivationLock::default(),
+            &saved.id,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(quota_account.credential, saved.credential);
+        assert_eq!(
+            fs::read(home.join("auth.json")).unwrap(),
+            b"external-codex-auth"
+        );
     }
 
     #[test]
@@ -662,7 +849,8 @@ mod tests {
         let saved_reimport = store.save_official_account(&reimported).unwrap();
         let manager = ConfigManager::default();
         let proxy = ChatProxyRegistry::default();
-        sync_active_imported_account(&store, &manager, &proxy)
+        let installation_proxy = InstallationIdProxyRegistry::default();
+        sync_active_imported_account(&store, &manager, &proxy, &installation_proxy)
             .await
             .unwrap();
         let imported_view = store.official_account_view(&saved_reimport.id).unwrap();
@@ -672,5 +860,62 @@ mod tests {
         let auth: serde_json::Value =
             serde_json::from_slice(&fs::read(home.join("auth.json")).unwrap()).unwrap();
         assert_eq!(auth["personal_access_token"], "at-cookie-reimported");
+    }
+
+    #[tokio::test]
+    async fn active_oauth_to_eligible_rt_reimport_keeps_the_managed_relay() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex-home");
+        fs::create_dir_all(&home).unwrap();
+        let store = Store::open(temp.path().join("data")).unwrap();
+        store
+            .update(|state| {
+                state.codex.home = home.display().to_string();
+                Ok(())
+            })
+            .unwrap();
+        let mut oauth = account("shared-account", "");
+        oauth.source = OfficialAccountSource::OpenAiOauth;
+        oauth.credential.tokens.refresh_token = "oauth-refresh".into();
+        let oauth = store.save_official_account(&oauth).unwrap();
+        store
+            .connections_activate_official_account(&oauth.id)
+            .unwrap();
+
+        let mut rt = oauth.clone();
+        rt.id.clear();
+        rt.source = OfficialAccountSource::ProxyImport;
+        rt.credential.tokens.access_token = "rt-access".into();
+        rt.credential.tokens.refresh_token = "rt-refresh".into();
+        rt.credential.tokens.id_token = claimed_token("shared-account");
+        rt.credential.last_refresh = "2026-08-01T00:00:00Z".into();
+        let rt = store.save_official_account(&rt).unwrap();
+        assert_eq!(rt.id, oauth.id);
+        assert!(
+            store
+                .official_installation_id_setting(&rt.id)
+                .unwrap()
+                .enabled
+        );
+
+        let manager = ConfigManager::default();
+        let proxy = ChatProxyRegistry::default();
+        let installation_proxy = InstallationIdProxyRegistry::default();
+        // `connections_import_cookie` invokes this same helper while holding
+        // its activation lock, which guards against a direct-config bypass.
+        sync_active_imported_account(&store, &manager, &proxy, &installation_proxy)
+            .await
+            .unwrap();
+
+        let config = fs::read_to_string(home.join("config.toml")).unwrap();
+        let document = config.parse::<toml_edit::DocumentMut>().unwrap();
+        assert_eq!(
+            document["model_provider"].as_str(),
+            Some(crate::codex::INSTALLATION_ID_RELAY_PROVIDER_ID)
+        );
+        assert!(document["model_providers"][crate::codex::INSTALLATION_ID_RELAY_PROVIDER_ID]
+            ["base_url"]
+            .as_str()
+            .is_some_and(|url| url.starts_with("http://127.0.0.1:")));
     }
 }

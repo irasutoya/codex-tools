@@ -48,6 +48,7 @@ import {
 import { Skeleton } from "@/components/ui/skeleton"
 import { Spinner } from "@/components/ui/spinner"
 import { toast } from "@/components/ui/toast"
+import { repairWarning } from "@/features/providers/connection-utils"
 import { errorMessage } from "@/lib/format"
 import { useAsyncAction } from "@/hooks/use-async-action"
 import { call } from "@/lib/ipc"
@@ -183,6 +184,7 @@ export function SettingsPage({
           onOfficial={() =>
             void run("official", () => call("connections_activate_official"), {
               success: "已切换为 OpenAI 官方配置",
+              successDescription: repairWarning,
               onSuccess: onRefresh,
             })
           }

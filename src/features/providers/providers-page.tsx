@@ -116,7 +116,11 @@ export function ProvidersPage({
   const finishLoginPoll = useCallback(
     (result: Awaited<ReturnType<typeof call<"connections_login_poll">>>) => {
       if (result.status === "complete") {
-        toast.add({ title: "OpenAI 账号已登录", type: "success" })
+        toast.add({
+          title: "OpenAI 账号已保存",
+          description: "当前连接未切换；需要使用时请在账号列表中手动切换。",
+          type: "success",
+        })
         setAuthorization(undefined)
         setLoginOpen(false)
         onSelectedIdChange(result.account.id)
