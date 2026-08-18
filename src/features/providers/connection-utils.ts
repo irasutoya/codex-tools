@@ -1,6 +1,6 @@
 import { formatDate, quotaWindow } from "@/lib/format"
 import { call } from "@/lib/ipc"
-import type { OfficialAccountView, Provider } from "@/types"
+import type { OfficialAccountView, Provider, RepairResult } from "@/types"
 
 export type ConnectionKind = "account" | "provider"
 
@@ -63,6 +63,17 @@ export type FallbackCandidate = {
   kind: ConnectionKind
 }
 
+export function repairWarning(result: RepairResult) {
+  const details: string[] = []
+  if (result.filesFailed > 0) {
+    details.push(`${result.filesFailed} 个会话文件修复失败`)
+  }
+  if (result.warnings.length > 0) {
+    details.push(result.warnings.slice(0, 2).join("；"))
+  }
+  return details.length > 0 ? `连接已切换，但${details.join("；")}` : undefined
+}
+
 export function buildFallbackCandidates(
   accounts: OfficialAccountView[],
   providers: Provider[],
@@ -105,14 +116,14 @@ export function buildFallbackCandidates(
 
 export async function switchActiveConnection(
   candidates: FallbackCandidate[]
-): Promise<{ switchedId?: string; error?: unknown }> {
+): Promise<{ switchedId?: string; repair?: RepairResult; error?: unknown }> {
   let lastError: unknown
   for (const candidate of candidates) {
     try {
-      await (candidate.kind === "account"
+      const repair = await (candidate.kind === "account"
         ? call("connections_activate_account", { id: candidate.id })
         : call("connections_activate", { id: candidate.id }))
-      return { switchedId: candidate.id }
+      return { switchedId: candidate.id, repair }
     } catch (reason) {
       lastError = reason
     }

@@ -19,7 +19,7 @@ const MAX_HEADER_VALUE_CHARS: usize = 8_192;
 pub enum AppError {
     #[error("{0}")]
     InvalidConfig(String),
-    #[error("Codex 配置在预览后发生了变化，请重新打开预览再试。")]
+    #[error("Codex 配置在本次操作期间发生了变化，请重新检查后再试。")]
     StaleOperation,
     #[error("{0}")]
     Internal(String),
@@ -535,10 +535,7 @@ pub struct OpenAiDeviceAuthorization {
 pub enum OpenAiDevicePoll {
     Pending,
     Expired,
-    Complete {
-        account: Box<OfficialAccountView>,
-        repair: RepairResult,
-    },
+    Complete { account: Box<OfficialAccountView> },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1515,7 +1512,6 @@ mod tests {
     fn official_view_and_device_dtos_never_serialize_credentials() {
         let view = official_account().view(true, false);
         assert_eq!(serde_json::to_value(&view).unwrap()["remark"], "日常开发");
-        let repair = RepairResult::default();
         let values = [
             serde_json::to_value(&view).unwrap(),
             serde_json::to_value(OpenAiDeviceAuthorization {
@@ -1528,7 +1524,6 @@ mod tests {
             .unwrap(),
             serde_json::to_value(OpenAiDevicePoll::Complete {
                 account: Box::new(view),
-                repair,
             })
             .unwrap(),
         ];

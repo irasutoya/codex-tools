@@ -69,6 +69,12 @@ pub(crate) struct AppliedConfigPatch {
     original: CodexFilesSnapshot,
 }
 
+struct OfficialAccountPatch {
+    original: CodexFilesSnapshot,
+    config_rendered: Vec<u8>,
+    auth_rendered: Vec<u8>,
+}
+
 struct PatchDraft<'a> {
     target: PathBuf,
     original: &'a str,
@@ -367,10 +373,38 @@ pub fn connections_activate_official_account_with_relay(
     managed_model: Option<&str>,
     relay_base_url: Option<&str>,
 ) -> Result<(), AppError> {
+    let patch =
+        prepare_official_account_patch(codex_home, credential, managed_model, relay_base_url)?;
+    apply_official_account_patch(patch)
+}
+
+fn prepare_official_account_patch(
+    codex_home: &Path,
+    credential: &CodexAuthCredential,
+    managed_model: Option<&str>,
+    relay_base_url: Option<&str>,
+) -> Result<OfficialAccountPatch, AppError> {
     validate_official_credential(credential)?;
     fs::create_dir_all(codex_home)?;
     let config_path = codex_home.join("config.toml");
-    let mut document = parse_config_document(&read_optional(&config_path)?)?;
+    let original = CodexFilesSnapshot {
+        config: OptionalFileSnapshot::capture(
+            config_path.clone(),
+            MAX_CODEX_CONFIG_BYTES,
+            "Codex 配置文件超过 2 MB，程序已停止读取以避免占用过多内存。",
+        )?,
+        auth: OptionalFileSnapshot::capture(
+            config_path.with_file_name("auth.json"),
+            MAX_CODEX_AUTH_BYTES,
+            "Codex 登录文件超过 4 MB，程序已停止读取以避免占用过多内存。",
+        )?,
+        catalog: OptionalFileSnapshot::capture(
+            codex_home.join(MODEL_CATALOG_DIR).join(MODEL_CATALOG_FILE),
+            MAX_MODEL_CATALOG_BYTES,
+            "Codex 模型目录超过 16 MB，程序已停止读取以避免占用过多内存。",
+        )?,
+    };
+    let mut document = parse_config_document(&original.config.text()?)?;
     clear_custom_provider_fields(&mut document, managed_model)?;
     // `clear_custom_provider_fields` deliberately supports legacy inline
     // provider tables. The relay adds/removes one named table, so normalize
@@ -396,12 +430,53 @@ pub fn connections_activate_official_account_with_relay(
     .map_err(|error| AppError::Internal(error.to_string()))?;
     auth_rendered.push(b'\n');
 
-    commit_codex_files(
-        &config_path,
-        document.to_string().as_bytes(),
-        &auth_rendered,
+    Ok(OfficialAccountPatch {
+        original,
+        config_rendered: document.to_string().into_bytes(),
+        auth_rendered,
+    })
+}
+
+fn apply_official_account_patch(patch: OfficialAccountPatch) -> Result<(), AppError> {
+    let current = CodexFilesSnapshot {
+        config: OptionalFileSnapshot::capture(
+            patch.original.config.path.clone(),
+            MAX_CODEX_CONFIG_BYTES,
+            "Codex 配置文件超过 2 MB，程序已停止读取以避免占用过多内存。",
+        )?,
+        auth: OptionalFileSnapshot::capture(
+            patch.original.auth.path.clone(),
+            MAX_CODEX_AUTH_BYTES,
+            "Codex 登录文件超过 4 MB，程序已停止读取以避免占用过多内存。",
+        )?,
+        catalog: OptionalFileSnapshot::capture(
+            patch.original.catalog.path.clone(),
+            MAX_MODEL_CATALOG_BYTES,
+            "Codex 模型目录超过 16 MB，程序已停止读取以避免占用过多内存。",
+        )?,
+    };
+    if current.config.contents != patch.original.config.contents
+        || current.auth.contents != patch.original.auth.contents
+        || current.catalog.contents != patch.original.catalog.contents
+    {
+        return Err(AppError::StaleOperation);
+    }
+
+    let result = commit_codex_files(
+        &patch.original.config.path,
+        &patch.config_rendered,
+        &patch.auth_rendered,
         |path, bytes| atomic_write(path, bytes).map_err(AppError::from),
-    )
+    );
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) => match restore_codex_files(&patch.original) {
+            Ok(()) => Err(error),
+            Err(rollback) => Err(AppError::Internal(format!(
+                "{error}；Codex 原配置回滚失败，请手动检查配置文件：{rollback}"
+            ))),
+        },
+    }
 }
 
 fn configure_installation_id_relay_provider(
@@ -1565,6 +1640,34 @@ base_url = "https://custom.example.test/v1"
             .unwrap();
         assert!(parsed.get("model").is_none());
         assert!(parsed.get("model_provider").is_none());
+    }
+
+    #[test]
+    fn official_activation_rejects_files_changed_after_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+        prepare_home(temp.path());
+        let credential = CodexAuthCredential {
+            auth_mode: "chatgpt".into(),
+            openai_api_key: None,
+            tokens: crate::models::CodexAuthTokens {
+                id_token: "id-token".into(),
+                access_token: "access-token".into(),
+                refresh_token: "refresh-token".into(),
+                account_id: "account-id".into(),
+            },
+            last_refresh: "2026-08-18T00:00:00Z".into(),
+        };
+        let patch = prepare_official_account_patch(temp.path(), &credential, None, None).unwrap();
+        let external = "model = \"external-change\"\n";
+        fs::write(temp.path().join("config.toml"), external).unwrap();
+
+        let error = apply_official_account_patch(patch).unwrap_err();
+
+        assert!(matches!(error, AppError::StaleOperation));
+        assert_eq!(
+            fs::read_to_string(temp.path().join("config.toml")).unwrap(),
+            external
+        );
     }
 
     #[test]

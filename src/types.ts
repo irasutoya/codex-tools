@@ -326,7 +326,6 @@ export type DeviceAuthPollResult =
   | {
       status: "complete"
       account: OfficialAccountView
-      repair: RepairResult
     }
 
 export type ProviderTestResult = {
