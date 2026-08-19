@@ -20,6 +20,14 @@ use tauri::State;
 
 const QUOTA_REFRESH_CONCURRENCY: usize = 4;
 
+fn ensure_current_activation(activation: &ActivationLock, operation: u64) -> Result<(), AppError> {
+    if activation.is_current(operation) {
+        Ok(())
+    } else {
+        Err(AppError::StaleOperation)
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ProxyImportResult {
@@ -400,18 +408,19 @@ pub(crate) async fn connections_activate_account(
 ) -> Result<RepairResult, AppError> {
     let activation_operation = activation.begin_operation();
     let _guard = activation.0.lock().await;
-    if !activation.is_current(activation_operation) {
-        return Err(AppError::StaleOperation);
-    }
+    ensure_current_activation(&activation, activation_operation)?;
     ensure_codex_stopped(&store)?;
     sync_active_openai_credential(&store, &codex::home(&store.codex_home_setting()?))?;
     let saved = center.refresh_account(&store, &id).await?;
+    ensure_current_activation(&activation, activation_operation)?;
     let repair = activate_openai_record(
         &store,
         &manager,
         &ledger,
         &proxy,
         &installation_proxy,
+        &activation,
+        activation_operation,
         &saved,
     )
     .await?;
@@ -433,9 +442,7 @@ pub(crate) async fn connections_activate_official(
 ) -> Result<RepairResult, AppError> {
     let activation_operation = activation.begin_operation();
     let _guard = activation.0.lock().await;
-    if !activation.is_current(activation_operation) {
-        return Err(AppError::StaleOperation);
-    }
+    ensure_current_activation(&activation, activation_operation)?;
     ensure_codex_stopped(&store)?;
     let (home_setting, id) = store.read(|state| {
         let id = state
@@ -456,12 +463,15 @@ pub(crate) async fn connections_activate_official(
     let id =
         id.ok_or_else(|| AppError::InvalidConfig("请先在“账号与服务”中登录 OpenAI。".into()))?;
     let saved = center.refresh_account(&store, &id).await?;
+    ensure_current_activation(&activation, activation_operation)?;
     let repair = activate_openai_record(
         &store,
         &manager,
         &ledger,
         &proxy,
         &installation_proxy,
+        &activation,
+        activation_operation,
         &saved,
     )
     .await?;
@@ -515,6 +525,19 @@ mod tests {
     use super::*;
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
     use std::fs;
+
+    #[test]
+    fn stale_account_switch_is_rejected_after_an_async_boundary() {
+        let activation = ActivationLock::default();
+        let older = activation.begin_operation();
+        let newer = activation.begin_operation();
+
+        assert!(matches!(
+            ensure_current_activation(&activation, older),
+            Err(AppError::StaleOperation)
+        ));
+        assert!(ensure_current_activation(&activation, newer).is_ok());
+    }
 
     fn oauth_account(account_id: &str, subject: &str, email: &str) -> StoredOfficialAccount {
         let payload = URL_SAFE_NO_PAD.encode(

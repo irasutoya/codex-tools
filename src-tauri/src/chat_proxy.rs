@@ -3107,6 +3107,43 @@ mod tests {
         }
     }
 
+    fn read_http_request(stream: &mut std::net::TcpStream) -> String {
+        use std::io::Read;
+
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut request = Vec::new();
+        let mut chunk = [0_u8; 4096];
+        loop {
+            let read = stream.read(&mut chunk).unwrap();
+            if read == 0 {
+                break;
+            }
+            request.extend_from_slice(&chunk[..read]);
+            assert!(request.len() <= MAX_REQUEST_BODY_BYTES);
+
+            let Some(header_end) = request
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .map(|index| index + 4)
+            else {
+                continue;
+            };
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            let content_length = headers.lines().find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            });
+            if content_length.is_none_or(|length| request.len() >= header_end + length) {
+                break;
+            }
+        }
+        String::from_utf8_lossy(&request).into_owned()
+    }
+
     #[test]
     fn upstream_endpoint_respects_versioned_roots() {
         assert_eq!(
@@ -4383,11 +4420,9 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let upstream = std::thread::spawn(move || {
-            use std::io::{Read, Write};
+            use std::io::Write;
             let (mut stream, _) = listener.accept().unwrap();
-            let mut request = [0_u8; 4096];
-            let _ = stream.read(&mut request);
-            let request = String::from_utf8_lossy(&request);
+            let request = read_http_request(&mut stream);
             assert!(request.contains("chat/completions"));
             assert!(request.contains("Bearer secret"));
             assert!(request.contains("\"messages\""));
@@ -4476,10 +4511,9 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let upstream = std::thread::spawn(move || {
-            use std::io::{Read, Write};
+            use std::io::Write;
             let (mut stream, _) = listener.accept().unwrap();
-            let mut request = [0_u8; 4096];
-            let _ = stream.read(&mut request);
+            let _request = read_http_request(&mut stream);
             let body = r#"{"error":{"message":"invalid api key","type":"authentication_error","code":"invalid_api_key"}}"#;
             write!(
                 stream,
@@ -4513,12 +4547,10 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let upstream = std::thread::spawn(move || {
-            use std::io::{Read, Write};
-            let mut buf = [0_u8; 8192];
+            use std::io::Write;
             // 第一次请求：带 response_format，上游拒绝结构化输出。
             let (mut stream, _) = listener.accept().unwrap();
-            let _ = stream.read(&mut buf);
-            let request = String::from_utf8_lossy(&buf);
+            let request = read_http_request(&mut stream);
             assert!(request.contains("response_format"));
             let error_body = r#"{"error":{"code":400,"message":"invalid request","type":"invalid_request_error"}}"#;
             write!(
@@ -4530,8 +4562,7 @@ mod tests {
             .unwrap();
             // 第二次请求：降级后不带 response_format，schema 写进 system 提示词。
             let (mut stream, _) = listener.accept().unwrap();
-            let _ = stream.read(&mut buf);
-            let request = String::from_utf8_lossy(&buf);
+            let request = read_http_request(&mut stream);
             assert!(!request.contains("response_format"));
             assert!(request.contains("JSON Schema"));
             assert!(!request.contains("top-level fields: ok"));
@@ -4546,8 +4577,7 @@ mod tests {
             // The learned capability applies to later requests for the same
             // upstream/model, so they skip the known-invalid native attempt.
             let (mut stream, _) = listener.accept().unwrap();
-            let _ = stream.read(&mut buf);
-            let request = String::from_utf8_lossy(&buf);
+            let request = read_http_request(&mut stream);
             assert!(!request.contains("response_format"));
             assert!(request.contains("JSON Schema"));
             write!(
@@ -4610,10 +4640,9 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let upstream = std::thread::spawn(move || {
-            use std::io::{Read, Write};
+            use std::io::Write;
             let (mut stream, _) = listener.accept().unwrap();
-            let mut request = [0_u8; 4096];
-            let _ = stream.read(&mut request);
+            let _request = read_http_request(&mut stream);
             let chunks = [
                 r#"data: {"id":"chatcmpl-1","choices":[{"index":0,"delta":{"role":"assistant","content":"你"}}]}"#,
                 r#"data: {"id":"chatcmpl-1","choices":[{"index":0,"delta":{"content":"好"}}]}"#,
@@ -4683,10 +4712,9 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let total = 2000usize;
         let upstream = std::thread::spawn(move || {
-            use std::io::{Read, Write};
+            use std::io::Write;
             let (mut stream, _) = listener.accept().unwrap();
-            let mut request = [0_u8; 4096];
-            let _ = stream.read(&mut request);
+            let _request = read_http_request(&mut stream);
             let header =
                 "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n";
             stream.write_all(header.as_bytes()).unwrap();
@@ -4744,11 +4772,10 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let upstream = std::thread::spawn(move || {
-            use std::io::{Read, Write};
-            let mut buf = [0_u8; 65536];
+            use std::io::Write;
             // 第一轮：接收请求，返回流式 reasoning + 工具调用。
             let (mut stream, _) = listener.accept().unwrap();
-            let _ = stream.read(&mut buf);
+            let _request = read_http_request(&mut stream);
             let sse = [
                 r#"data: {"id":"c","choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"第一步思考"}}]}"#,
                 r#"data: {"id":"c","choices":[{"index":0,"delta":{"content":"好的"}}]}"#,
@@ -4766,10 +4793,8 @@ mod tests {
             .unwrap();
             drop(stream);
             // 第二轮：必须收到带 reasoning_content 的 assistant 工具调用消息。
-            buf = [0_u8; 65536];
             let (mut stream, _) = listener.accept().unwrap();
-            let read = stream.read(&mut buf).unwrap();
-            let request = String::from_utf8_lossy(&buf[..read]);
+            let request = read_http_request(&mut stream);
             let body: Value =
                 serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap_or("{}")).unwrap();
             let messages = body["messages"].as_array().unwrap();
@@ -4850,10 +4875,9 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let upstream = std::thread::spawn(move || {
-            use std::io::{Read, Write};
+            use std::io::Write;
             let (mut stream, _) = listener.accept().unwrap();
-            let mut request = [0_u8; 4096];
-            let _ = stream.read(&mut request);
+            let _request = read_http_request(&mut stream);
             let chunks = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\ndata: {\"choices\":[{\"delta\":{\"content\":\"你好\"}}]}\n\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"世界\"}}]}";
             write!(stream, "{}", chunks).unwrap();
             drop(stream);
@@ -4891,10 +4915,9 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let upstream = std::thread::spawn(move || {
-            use std::io::{Read, Write};
+            use std::io::Write;
             let (mut stream, _) = listener.accept().unwrap();
-            let mut request = [0_u8; 4096];
-            let _ = stream.read(&mut request);
+            let _request = read_http_request(&mut stream);
             stream
                 .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n")
                 .unwrap();
@@ -4928,10 +4951,9 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let upstream = std::thread::spawn(move || {
-            use std::io::{Read, Write};
+            use std::io::Write;
             let (mut stream, _) = listener.accept().unwrap();
-            let mut request = [0_u8; 4096];
-            let _ = stream.read(&mut request);
+            let _request = read_http_request(&mut stream);
             stream
                 .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n")
                 .unwrap();
@@ -4968,10 +4990,9 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let upstream = std::thread::spawn(move || {
-            use std::io::{Read, Write};
+            use std::io::Write;
             let (mut stream, _) = listener.accept().unwrap();
-            let mut request = [0_u8; 4096];
-            let _ = stream.read(&mut request);
+            let _request = read_http_request(&mut stream);
             write!(
                 stream,
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -5188,10 +5209,9 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let upstream = std::thread::spawn(move || {
-            use std::io::{Read, Write};
+            use std::io::Write;
             let (mut stream, _) = listener.accept().unwrap();
-            let mut request = [0_u8; 4096];
-            let _ = stream.read(&mut request);
+            let _request = read_http_request(&mut stream);
             let body = r#"{"id":"chatcmpl-9","object":"chat.completion","created":1700000000,"model":"deepseek-chat","choices":[{"index":0,"message":{"role":"assistant","content":"一次性结果","tool_calls":[{"id":"call_1","type":"function","function":{"name":"f","arguments":"{\"a\":1}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":4,"completion_tokens":6,"total_tokens":10}}"#;
             write!(
                 stream,
@@ -5252,10 +5272,9 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let upstream = std::thread::spawn(move || {
-            use std::io::{Read, Write};
+            use std::io::Write;
             let (mut stream, _) = listener.accept().unwrap();
-            let mut request = [0_u8; 4096];
-            let _ = stream.read(&mut request);
+            let _request = read_http_request(&mut stream);
             let body = r#"{"error":{"message":"bad model","type":"invalid_request_error"}}"#;
             write!(
                 stream,
@@ -5332,13 +5351,13 @@ mod tests {
         let upstream = std::thread::spawn(move || {
             use std::io::{Read, Write};
             let (mut stream, _) = listener.accept().unwrap();
-            let mut request = [0_u8; 4096];
-            let _ = stream.read(&mut request);
+            let _request = read_http_request(&mut stream);
             stream
                 .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{")
                 .unwrap();
+            let mut response = [0_u8; 1024];
             while stream
-                .read(&mut request)
+                .read(&mut response)
                 .map(|read| read > 0)
                 .unwrap_or(false)
             {}

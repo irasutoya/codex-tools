@@ -296,13 +296,14 @@ impl Store {
         &self,
         provider: ProviderProfile,
     ) -> Result<ProviderProfile, AppError> {
-        self.connections_save_provider_with_previous(provider)
+        self.connections_save_provider_with_previous(provider, false)
             .map(|(_, saved)| saved)
     }
 
     pub(crate) fn connections_save_provider_with_previous(
         &self,
         mut provider: ProviderProfile,
+        custom_models_explicit: bool,
     ) -> Result<(Option<ProviderProfile>, ProviderProfile), AppError> {
         if provider.id.trim().is_empty() {
             provider.id = uuid::Uuid::new_v4().to_string();
@@ -346,7 +347,7 @@ impl Store {
                     // 等新 `/models` 返回后再取交集，绝不能静默扩大为全选。
                     provider.models_dev_meta.clear();
                     // 自定义模型属于用户数据，不随服务源修改而清空。
-                    if provider.custom_models.is_empty() {
+                    if provider.custom_models.is_empty() && !custom_models_explicit {
                         provider.custom_models = existing.custom_models.clone();
                     }
                 } else {
@@ -358,7 +359,7 @@ impl Store {
                     }
                     // selected_models 是用户可编辑字段：None 明确表示清除旧筛选、
                     // 使用全部有效模型，不能像后端缓存字段一样从旧记录回填。
-                    if provider.custom_models.is_empty() {
+                    if provider.custom_models.is_empty() && !custom_models_explicit {
                         provider.custom_models = existing.custom_models.clone();
                     }
                     if provider.models_dev_meta.is_empty() {
@@ -640,7 +641,7 @@ impl Store {
                 .ok_or_else(|| {
                     AppError::InvalidConfig("OpenAI 账号不存在，可能已被删除。".into())
                 })?;
-            if existing.account_id != refreshed.account_id {
+            if !official_account_identity_matches(existing, &refreshed) {
                 return Err(AppError::InvalidConfig(
                     "OpenAI 返回的凭据属于其他账号，请重新进行官方授权。".into(),
                 ));
@@ -670,11 +671,23 @@ impl Store {
             ensure_official_account_capacity(&state.official_accounts, &incoming_accounts)?;
             let mut saved_accounts = Vec::with_capacity(incoming_accounts.len());
             for mut incoming in incoming_accounts {
-                if let Some(existing_index) = state
+                let active_account_id = matches!(state.active.kind, ActiveKind::Official)
+                    .then_some(state.active.account_id.as_deref())
+                    .flatten();
+                let existing_index = state
                     .official_accounts
                     .iter()
-                    .position(|saved| official_account_identity_matches(saved, &incoming))
-                {
+                    .position(|saved| {
+                        active_account_id == Some(saved.id.as_str())
+                            && official_account_identity_matches(saved, &incoming)
+                    })
+                    .or_else(|| {
+                        state
+                            .official_accounts
+                            .iter()
+                            .position(|saved| official_account_identity_matches(saved, &incoming))
+                    });
+                if let Some(existing_index) = existing_index {
                     let existing = &state.official_accounts[existing_index];
                     incoming.id = existing.id.clone();
                     incoming.created_at = existing.created_at;
@@ -687,6 +700,38 @@ impl Store {
                     incoming.updated_at = now;
                     state.official_accounts[existing_index] = incoming.clone();
                     let retained_id = incoming.id.clone();
+                    let duplicate_ids = state
+                        .official_accounts
+                        .iter()
+                        .filter(|saved| {
+                            saved.id != retained_id
+                                && official_account_identity_matches(saved, &incoming)
+                        })
+                        .map(|saved| saved.id.clone())
+                        .collect::<Vec<_>>();
+                    if !state
+                        .official_installation_id_settings
+                        .contains_key(&retained_id)
+                        && let Some(setting) = duplicate_ids
+                            .iter()
+                            .find_map(|id| state.official_installation_id_settings.get(id).cloned())
+                    {
+                        state
+                            .official_installation_id_settings
+                            .insert(retained_id.clone(), setting);
+                    }
+                    for duplicate_id in &duplicate_ids {
+                        state.official_installation_id_settings.remove(duplicate_id);
+                    }
+                    if matches!(state.active.kind, ActiveKind::Official)
+                        && state
+                            .active
+                            .account_id
+                            .as_ref()
+                            .is_some_and(|id| duplicate_ids.contains(id))
+                    {
+                        state.active.account_id = Some(retained_id.clone());
+                    }
                     state.official_accounts.retain(|saved| {
                         saved.id == retained_id
                             || !official_account_identity_matches(saved, &incoming)
@@ -817,7 +862,7 @@ impl Store {
                 .iter_mut()
                 .find(|account| account.id == id)
                 .ok_or_else(|| AppError::InvalidConfig("OpenAI 账号不存在，请重新登录。".into()))?;
-            if account.account_id != credential.tokens.account_id {
+            if !official_credential_identity_matches(account, credential) {
                 return Err(AppError::InvalidConfig(
                     "OpenAI 返回了其他账号的登录信息，请重新登录。".into(),
                 ));
@@ -848,6 +893,7 @@ impl Store {
                 provider_id: None,
                 account_id: Some(id.to_owned()),
             };
+            state.codex.last_managed_model = None;
             Ok(())
         })
     }
@@ -876,10 +922,14 @@ impl Store {
                 .or_default();
             setting.enabled = enabled;
             if enabled && setting.installation_id.is_none() {
-                setting.installation_id = Some(account_scoped_installation_id(&account.account_id));
+                setting.installation_id = Some(account_scoped_installation_id(
+                    &official_account_identity_scope(account),
+                ));
             }
             if enabled && setting.session_id.is_none() {
-                setting.session_id = Some(account_scoped_session_id(&account.account_id));
+                setting.session_id = Some(account_scoped_session_id(
+                    &official_account_identity_scope(account),
+                ));
             }
             Ok(account.clone())
         })
@@ -974,8 +1024,12 @@ fn effective_default_installation_id_setting(
     if account.device_session_convergence_available() {
         OfficialInstallationIdSetting {
             enabled: true,
-            installation_id: Some(account_scoped_installation_id(&account.account_id)),
-            session_id: Some(account_scoped_session_id(&account.account_id)),
+            installation_id: Some(account_scoped_installation_id(
+                &official_account_identity_scope(account),
+            )),
+            session_id: Some(account_scoped_session_id(&official_account_identity_scope(
+                account,
+            ))),
         }
     } else {
         OfficialInstallationIdSetting::default()
@@ -997,10 +1051,14 @@ fn effective_installation_id_setting(
         return setting;
     }
     if setting.enabled && setting.session_id.is_none() {
-        setting.session_id = Some(account_scoped_session_id(&account.account_id));
+        setting.session_id = Some(account_scoped_session_id(&official_account_identity_scope(
+            account,
+        )));
     }
     if setting.enabled && setting.installation_id.is_none() {
-        setting.installation_id = Some(account_scoped_installation_id(&account.account_id));
+        setting.installation_id = Some(account_scoped_installation_id(
+            &official_account_identity_scope(account),
+        ));
     }
     setting
 }
@@ -1521,6 +1579,76 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_merge_preserves_the_active_record_and_its_device_setting() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path().to_path_buf()).unwrap();
+        let original = store
+            .save_official_account(&identified_official_account(
+                "workspace-1",
+                "user-1",
+                "person@example.test",
+                "original",
+            ))
+            .unwrap();
+        let active_id = "active-duplicate".to_owned();
+        store
+            .update(|state| {
+                let mut duplicate = state.official_accounts[0].clone();
+                duplicate.id = active_id.clone();
+                state.official_accounts.push(duplicate);
+                state.active = ActiveState {
+                    kind: ActiveKind::Official,
+                    provider_id: None,
+                    account_id: Some(active_id.clone()),
+                };
+                state.official_installation_id_settings.insert(
+                    active_id.clone(),
+                    OfficialInstallationIdSetting {
+                        enabled: false,
+                        installation_id: Some("active-installation".into()),
+                        session_id: Some("active-session".into()),
+                    },
+                );
+                Ok(())
+            })
+            .unwrap();
+
+        let saved = store
+            .save_official_account(&identified_official_account(
+                "workspace-1",
+                "user-1",
+                "renamed@example.test",
+                "updated",
+            ))
+            .unwrap();
+        let state = store.snapshot().unwrap();
+
+        assert_eq!(saved.id, active_id);
+        assert_eq!(state.active.account_id.as_deref(), Some(active_id.as_str()));
+        assert_eq!(state.official_accounts.len(), 1);
+        assert!(
+            !state
+                .official_accounts
+                .iter()
+                .any(|account| account.id == original.id)
+        );
+        assert_eq!(
+            state
+                .official_installation_id_settings
+                .get(&active_id)
+                .unwrap()
+                .installation_id
+                .as_deref(),
+            Some("active-installation")
+        );
+        assert!(
+            !state
+                .official_installation_id_settings
+                .contains_key(&original.id)
+        );
+    }
+
+    #[test]
     fn official_account_save_keeps_different_users_in_the_same_workspace() {
         let temp = tempfile::tempdir().unwrap();
         let store = Store::open(temp.path().to_path_buf()).unwrap();
@@ -1548,6 +1676,10 @@ mod tests {
         let state = store.snapshot().unwrap();
         assert_eq!(state.official_accounts.len(), 2);
         assert_eq!(state.active.account_id.as_deref(), Some(first.id.as_str()));
+        assert_ne!(
+            effective_default_installation_id_setting(&state.official_accounts[0]).installation_id,
+            effective_default_installation_id_setting(&state.official_accounts[1]).installation_id
+        );
     }
 
     #[test]
@@ -1970,6 +2102,61 @@ mod tests {
     }
 
     #[test]
+    fn credential_updates_reject_a_different_user_in_the_same_workspace() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path().to_path_buf()).unwrap();
+        let saved = store
+            .save_official_account(&identified_official_account(
+                "shared-workspace",
+                "user-1",
+                "first@example.test",
+                "first",
+            ))
+            .unwrap();
+        let other = identified_official_account(
+            "shared-workspace",
+            "user-2",
+            "second@example.test",
+            "second",
+        );
+
+        assert!(
+            store
+                .sync_official_credential(&saved.id, &other.credential, other.expires_at)
+                .is_err()
+        );
+        assert!(
+            store
+                .save_refreshed_official_account(&saved.id, &other)
+                .is_err()
+        );
+        assert_eq!(
+            credential_subject(&store.official_account(&saved.id).unwrap().credential).as_deref(),
+            Some("user-1")
+        );
+    }
+
+    #[test]
+    fn official_activation_clears_the_managed_provider_model_atomically() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path().to_path_buf()).unwrap();
+        let saved = store
+            .save_official_account(&official_account("workspace-1", "official"))
+            .unwrap();
+        store
+            .save_last_managed_model(Some("third-party-model".into()))
+            .unwrap();
+
+        store
+            .connections_activate_official_account(&saved.id)
+            .unwrap();
+
+        let state = store.snapshot().unwrap();
+        assert_eq!(state.active.account_id.as_deref(), Some(saved.id.as_str()));
+        assert_eq!(state.codex.last_managed_model, None);
+    }
+
+    #[test]
     fn provider_requires_an_api_key_before_activation() {
         let temp = tempfile::tempdir().unwrap();
         let store = Store::open(temp.path().to_path_buf()).unwrap();
@@ -2129,6 +2316,31 @@ mod tests {
         // /models 同步数据被清空，但自定义模型保留。
         assert!(saved.available_models.is_empty());
         assert_eq!(saved.custom_models, vec!["custom-keep"]);
+    }
+
+    #[test]
+    fn explicitly_removing_all_custom_models_persists_an_empty_list() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path().to_path_buf()).unwrap();
+        let mut initial = provider("custom-delete");
+        initial.available_models = vec!["api-model".into()];
+        initial.custom_models = vec!["custom-remove".into()];
+        store.connections_save_provider(initial).unwrap();
+
+        let mut edited = store.provider_overview().unwrap().providers[0].clone();
+        edited.custom_models.clear();
+        let (_, saved) = store
+            .connections_save_provider_with_previous(edited, true)
+            .unwrap();
+
+        assert!(saved.custom_models.is_empty());
+        assert!(
+            store
+                .provider("custom-delete")
+                .unwrap()
+                .custom_models
+                .is_empty()
+        );
     }
 
     #[test]
@@ -2430,10 +2642,10 @@ mod tests {
         let first = Store::open(first_root.path().to_path_buf()).unwrap();
         let second = Store::open(second_root.path().to_path_buf()).unwrap();
         let first_account = first
-            .save_official_account(&official_account("shared", "first"))
+            .save_official_account(&official_account("shared", "same-user"))
             .unwrap();
         let second_account = second
-            .save_official_account(&rt_import_account("shared", "second"))
+            .save_official_account(&rt_import_account("shared", "same-user"))
             .unwrap();
         first
             .set_official_installation_id_unification(&first_account.id, true)

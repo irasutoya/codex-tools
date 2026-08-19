@@ -555,12 +555,10 @@ impl UsageLedger {
         let connection = self.open_connection().map_err(AppError::from)?;
         initialize_schema(&connection).map_err(AppError::from)?;
         let now = Utc::now().timestamp_millis();
-        for (local_account_id, external_account_id) in accounts {
-            if local_account_id.trim().is_empty() || external_account_id.trim().is_empty() {
+        for (local_account_id, canonical_account_id) in accounts {
+            if local_account_id.trim().is_empty() || canonical_account_id.trim().is_empty() {
                 continue;
             }
-            let canonical_account_id =
-                crate::models::canonical_official_account_id(external_account_id);
             connection
                 .execute(
                     "INSERT INTO account_identity_aliases(
@@ -570,7 +568,7 @@ impl UsageLedger {
                      ON CONFLICT(source_kind, provider_id, local_account_id) DO UPDATE SET
                         canonical_account_id = excluded.canonical_account_id,
                         identity_source = excluded.identity_source",
-                    params![local_account_id.trim(), canonical_account_id, now],
+                    params![local_account_id.trim(), canonical_account_id.trim(), now],
                 )
                 .map_err(|error| AppError::Internal(format!("保存账号归一化映射失败：{error}")))?;
         }

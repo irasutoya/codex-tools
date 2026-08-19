@@ -5,6 +5,7 @@ use crate::{
     installation_id_proxy::InstallationIdProxyRegistry,
     models::{ActiveKind, AppError, RepairResult, StoredOfficialAccount},
     provider_sync,
+    state::ActivationLock,
     storage::Store,
 };
 use std::fs;
@@ -72,7 +73,7 @@ pub(crate) fn sync_active_openai_credential(
             saved.credential.last_refresh.clone()
         };
     }
-    if saved.account_id == credential.tokens.account_id
+    if crate::models::official_credential_identity_matches(&saved, &credential)
         && saved.credential != credential
         && (untimestamped_personal_access_token
             || credential_is_strictly_newer(&credential, &saved.credential))
@@ -214,12 +215,15 @@ pub(crate) async fn sync_active_codex_configuration_with_installation_proxy(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)] // Coordinates the stores and relays that form one switch transaction.
 pub(crate) async fn activate_openai_record(
     store: &Store,
     manager: &ConfigManager,
     ledger: &crate::local_usage::UsageLedger,
     proxy: &ChatProxyRegistry,
     installation_proxy: &InstallationIdProxyRegistry,
+    activation: &ActivationLock,
+    activation_operation: u64,
     account: &StoredOfficialAccount,
 ) -> Result<RepairResult, AppError> {
     ensure_codex_stopped(store)?;
@@ -237,6 +241,9 @@ pub(crate) async fn activate_openai_record(
     // 切回 OpenAI 再切回第三方服务时，Codex 缓存的地址仍然有效。
     let result = async {
         let relay = official_relay_base_url(store, installation_proxy, account).await?;
+        if !activation.is_current(activation_operation) {
+            return Err(AppError::StaleOperation);
+        }
         if let Err(error) = codex::connections_activate_official_account_with_relay(
             &home,
             &account.credential,
@@ -276,8 +283,6 @@ pub(crate) async fn activate_openai_record(
     match result {
         Ok(mut repair) => {
             crate::confirm_pending(ledger, &pending_id, &mut repair);
-            // 已切回官方：不再存在本应用写入的第三方服务模型。
-            store.save_last_managed_model(None)?;
             Ok(repair)
         }
         Err(error) => {
@@ -342,7 +347,21 @@ mod tests {
         CodexAuthCredential, CodexAuthTokens, OfficialAccountSource, ProviderAccountQuota,
         ProviderApiType, ProviderProfile, token_local_identity,
     };
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
     use std::fs;
+
+    fn oauth_token(account_id: &str, subject: &str) -> String {
+        let payload = URL_SAFE_NO_PAD.encode(
+            serde_json::json!({
+                "sub": subject,
+                "chatgpt_account_id": account_id,
+                "email": format!("{subject}@example.test")
+            })
+            .to_string()
+            .as_bytes(),
+        );
+        format!("header.{payload}.signature")
+    }
 
     #[test]
     fn codex_mutation_gate_rejects_a_running_app() {
@@ -565,6 +584,67 @@ mod tests {
         assert_eq!(
             store.official_account(&saved.id).unwrap().credential,
             candidate
+        );
+    }
+
+    #[test]
+    fn active_sync_rejects_a_different_user_in_the_same_workspace() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex-home");
+        fs::create_dir_all(&home).unwrap();
+        let store = Store::open(temp.path().join("data")).unwrap();
+        let current_token = oauth_token("workspace", "user-1");
+        let current = CodexAuthCredential {
+            auth_mode: "chatgpt".into(),
+            openai_api_key: None,
+            tokens: CodexAuthTokens {
+                id_token: current_token.clone(),
+                access_token: current_token,
+                refresh_token: "refresh-user-1".into(),
+                account_id: "workspace".into(),
+            },
+            last_refresh: "2026-08-01T00:00:00Z".into(),
+        };
+        let saved = store
+            .save_official_account(&StoredOfficialAccount {
+                id: String::new(),
+                name: "User 1".into(),
+                remark: String::new(),
+                account_id: "workspace".into(),
+                email: "user-1@example.test".into(),
+                credential: current.clone(),
+                source: OfficialAccountSource::OpenAiOauth,
+                expires_at: None,
+                quota: ProviderAccountQuota::default(),
+                created_at: 0,
+                updated_at: 0,
+            })
+            .unwrap();
+        store
+            .connections_activate_official_account(&saved.id)
+            .unwrap();
+        let candidate_token = oauth_token("workspace", "user-2");
+        let candidate = CodexAuthCredential {
+            tokens: CodexAuthTokens {
+                id_token: candidate_token.clone(),
+                access_token: candidate_token,
+                refresh_token: "refresh-user-2".into(),
+                account_id: "workspace".into(),
+            },
+            last_refresh: "2026-08-02T00:00:00Z".into(),
+            ..current.clone()
+        };
+        fs::write(
+            home.join("auth.json"),
+            serde_json::to_vec_pretty(&candidate).unwrap(),
+        )
+        .unwrap();
+
+        sync_active_openai_credential(&store, &home).unwrap();
+
+        assert_eq!(
+            store.official_account(&saved.id).unwrap().credential,
+            current
         );
     }
 

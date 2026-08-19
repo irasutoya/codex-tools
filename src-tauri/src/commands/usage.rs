@@ -28,7 +28,7 @@ pub(crate) async fn usage_refresh(
         state
             .official_accounts
             .iter()
-            .map(|account| (account.id.clone(), account.account_id.clone()))
+            .map(|account| (account.id.clone(), canonical_official_account_id(account)))
             .collect::<Vec<_>>()
     })?;
     ledger.sync_official_account_identities(&official_account_identities)?;

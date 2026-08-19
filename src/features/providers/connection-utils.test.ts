@@ -41,14 +41,14 @@ const repair = (overrides: Partial<RepairResult> = {}): RepairResult => ({
 
 describe("providerSaveInputOf", () => {
   it("将默认全选明确序列化为 null", () => {
-    expect(
-      providerSaveInputOf(
-        makeProvider({
-          availableModels: ["a", "b"],
-          selectedModels: undefined,
-        })
-      ).selectedModels
-    ).toBeNull()
+    const input = providerSaveInputOf(
+      makeProvider({
+        availableModels: ["a", "b"],
+        selectedModels: undefined,
+      })
+    )
+    expect(input.selectedModels).toBeNull()
+    expect(input.customModels).toEqual([])
   })
 
   it("保留显式模型子集", () => {

@@ -115,7 +115,7 @@ fn activation_for_official(
         effective_at_ms,
         source_kind: UsageSourceKind::Official,
         provider_id: None,
-        account_id: Some(canonical_official_account_id(&account.account_id)),
+        account_id: Some(canonical_official_account_id(account)),
         model_provider: Some("openai".into()),
         display_name_snapshot: match account.source {
             OfficialAccountSource::OpenAiOauth => display_name.to_owned(),

@@ -34,13 +34,15 @@ pub(crate) async fn connections_save_provider(
     provider: ProviderSaveInput,
 ) -> Result<ProviderProfile, AppError> {
     let _model_transaction = activation.2.lock().await;
+    let custom_models_explicit = provider.custom_models.is_some();
     let provider = ProviderProfile::from(provider);
     if store.is_active_provider(&provider.id)? {
         ensure_codex_stopped(&store)?;
     }
     let (previous, saved_source, saved_revision, needs_model_refresh, was_active, saved) = {
         let _guard = activation.0.lock().await;
-        let (previous, saved) = store.connections_save_provider_with_previous(provider)?;
+        let (previous, saved) =
+            store.connections_save_provider_with_previous(provider, custom_models_explicit)?;
         let saved_source = ProviderSourceFingerprint::from_provider(&saved);
         let saved_revision = ProviderSnapshotRevision::from_provider(&saved);
         let was_active = store.is_active_provider(&saved.id)?;
@@ -533,17 +535,42 @@ struct SyncedProviderModels {
 
 fn validate_fresh_activation_models(
     refresh_error: Option<AppError>,
-    available_models: &[String],
+    provider: &ProviderProfile,
 ) -> Result<(), AppError> {
+    let selected = provider.selected_models.as_deref();
+    let custom_model_selected = provider.custom_models.iter().any(|model| {
+        !model.trim().is_empty()
+            && selected.is_none_or(|selected| selected.iter().any(|value| value == model))
+    });
+    let explicitly_custom_only = selected.is_some_and(|selected| {
+        !selected.is_empty()
+            && selected.iter().all(|model| {
+                provider
+                    .custom_models
+                    .iter()
+                    .any(|custom| custom == model && !custom.trim().is_empty())
+            })
+    });
     if let Some(error) = refresh_error {
         if matches!(error, AppError::StaleOperation) {
             return Err(error);
+        }
+        // A manually configured catalog is the explicit fallback for services
+        // that do not expose /models. Never trust stale API models after a
+        // failed refresh, but allow a custom-only provider to activate.
+        if custom_model_selected && (provider.available_models.is_empty() || explicitly_custom_only)
+        {
+            return Ok(());
         }
         return Err(AppError::InvalidConfig(format!(
             "无法获取此服务的最新模型，连接未切换；已保留原有模型缓存：{error}"
         )));
     }
-    if available_models.iter().all(|model| model.trim().is_empty()) {
+    let available_model_selected = provider.available_models.iter().any(|model| {
+        !model.trim().is_empty()
+            && selected.is_none_or(|selected| selected.iter().any(|value| value == model))
+    });
+    if !available_model_selected && !custom_model_selected {
         return Err(AppError::InvalidConfig(
             "此服务没有可用模型，无法激活。请检查 /models 接口后重试".into(),
         ));
@@ -738,7 +765,7 @@ pub(crate) async fn connections_activate(
         .await
         .err();
     let refreshed = store.provider(&id)?;
-    validate_fresh_activation_models(refresh_error, &refreshed.available_models)?;
+    validate_fresh_activation_models(refresh_error, &refreshed)?;
     let repair = {
         let _guard = activation.0.lock().await;
         if !activation.is_current(activation_operation) {
@@ -861,9 +888,10 @@ mod tests {
 
     #[test]
     fn activation_never_falls_back_to_cached_models_after_refresh_failure() {
+        let cached = provider("cached", "https://provider.example.test/v1", "cached-model");
         let error = validate_fresh_activation_models(
             Some(AppError::Internal("network down".into())),
-            &["cached-model".into()],
+            &cached,
         )
         .unwrap_err();
 
@@ -873,9 +901,40 @@ mod tests {
 
     #[test]
     fn activation_requires_a_non_empty_fresh_model_list() {
-        let error = validate_fresh_activation_models(None, &["  ".into()]).unwrap_err();
+        let blank = provider("blank", "https://provider.example.test/v1", "  ");
+        let error = validate_fresh_activation_models(None, &blank).unwrap_err();
         assert!(error.to_string().contains("没有可用模型"));
-        validate_fresh_activation_models(None, &["fresh-model".into()]).unwrap();
+        let fresh = provider("fresh", "https://provider.example.test/v1", "fresh-model");
+        validate_fresh_activation_models(None, &fresh).unwrap();
+    }
+
+    #[test]
+    fn custom_only_provider_can_activate_when_models_endpoint_is_unavailable() {
+        let mut custom = provider("custom", "https://provider.example.test/v1", "");
+        custom.available_models.clear();
+        custom.custom_models = vec!["manual-model".into()];
+        validate_fresh_activation_models(
+            Some(AppError::Internal("models endpoint unavailable".into())),
+            &custom,
+        )
+        .unwrap();
+
+        custom.available_models = vec!["stale-api-model".into()];
+        custom.selected_models = Some(vec!["manual-model".into()]);
+        validate_fresh_activation_models(
+            Some(AppError::Internal("models endpoint unavailable".into())),
+            &custom,
+        )
+        .unwrap();
+
+        custom.selected_models = Some(Vec::new());
+        assert!(
+            validate_fresh_activation_models(
+                Some(AppError::Internal("models endpoint unavailable".into())),
+                &custom,
+            )
+            .is_err()
+        );
     }
 
     #[tokio::test]

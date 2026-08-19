@@ -63,6 +63,7 @@ import {
   accountIsExpired,
   buildFallbackCandidates,
   emptyProvider,
+  effectiveModelCount,
   repairWarning,
   switchActiveConnection,
   type ConnectionKind,
@@ -482,8 +483,8 @@ export function ConnectionManagerSheet({
                         id={provider.id}
                         name={provider.name}
                         description={`${
-                          provider.availableModels?.length
-                            ? `${provider.availableModels.length} 个模型`
+                          effectiveModelCount(provider)
+                            ? `${effectiveModelCount(provider)} 个模型`
                             : "模型尚未同步"
                         } · ${provider.baseUrl}`}
                         active={provider.active}

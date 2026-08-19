@@ -68,8 +68,68 @@ pub(crate) fn token_local_identity(token: &str) -> String {
 
 /// Stable, non-reversible identity used by usage aggregation.  The external
 /// OpenAI account id is never exposed as the aggregation key returned to the UI.
-pub(crate) fn canonical_official_account_id(external_id: &str) -> String {
-    let digest = Sha256::digest(external_id.trim().as_bytes());
+pub(crate) fn credential_subject(credential: &CodexAuthCredential) -> Option<String> {
+    [
+        credential.tokens.id_token.as_str(),
+        credential.tokens.access_token.as_str(),
+    ]
+    .into_iter()
+    .filter_map(token_identity)
+    .find_map(|identity| identity.subject)
+}
+
+fn credential_email(credential: &CodexAuthCredential) -> Option<String> {
+    [
+        credential.tokens.id_token.as_str(),
+        credential.tokens.access_token.as_str(),
+    ]
+    .into_iter()
+    .filter_map(token_identity)
+    .find_map(|identity| identity.email)
+}
+
+/// Checks a credential update without allowing a workspace id shared by two
+/// users to stand in for user identity. Legacy credentials that both lack a
+/// subject retain their previous workspace-only behavior.
+pub(crate) fn official_credential_identity_matches(
+    account: &StoredOfficialAccount,
+    credential: &CodexAuthCredential,
+) -> bool {
+    if account.account_id.trim() != credential.tokens.account_id.trim() {
+        return false;
+    }
+    match (
+        credential_subject(&account.credential),
+        credential_subject(credential),
+    ) {
+        (Some(saved), Some(incoming)) => saved == incoming,
+        (None, None) => true,
+        _ => {
+            let saved_email = account.email.trim();
+            !saved_email.is_empty()
+                && credential_email(credential)
+                    .is_some_and(|email| saved_email.eq_ignore_ascii_case(email.trim()))
+        }
+    }
+}
+
+/// Stable account scope used for account-specific routing and aggregation.
+/// A ChatGPT account id identifies a workspace, so users in a shared workspace
+/// must also be separated by their token subject (or legacy email fallback).
+pub(crate) fn official_account_identity_scope(account: &StoredOfficialAccount) -> String {
+    let workspace = account.account_id.trim();
+    if let Some(subject) = credential_subject(&account.credential) {
+        return format!("{workspace}\0sub:{}", subject.trim());
+    }
+    let email = account.email.trim();
+    if !email.is_empty() {
+        return format!("{workspace}\0email:{}", email.to_lowercase());
+    }
+    workspace.to_owned()
+}
+
+pub(crate) fn canonical_official_account_id(account: &StoredOfficialAccount) -> String {
+    let digest = Sha256::digest(official_account_identity_scope(account).as_bytes());
     let short = digest[..12]
         .iter()
         .map(|byte| format!("{byte:02x}"))
@@ -123,13 +183,7 @@ pub(crate) fn token_identity(token: &str) -> Option<TokenIdentity> {
 }
 
 fn official_account_subject(account: &StoredOfficialAccount) -> Option<String> {
-    [
-        account.credential.tokens.id_token.as_str(),
-        account.credential.tokens.access_token.as_str(),
-    ]
-    .into_iter()
-    .filter_map(token_identity)
-    .find_map(|identity| identity.subject)
+    credential_subject(&account.credential)
 }
 
 /// Accounts are scoped to a ChatGPT workspace, then distinguished by the
@@ -248,7 +302,7 @@ pub struct ProviderSaveInput {
     pub selected_models: Option<Vec<String>>,
     /// 用户手动添加的自定义模型 id；随保存提交，刷新 /models 时不会被清空。
     #[serde(default)]
-    pub custom_models: Vec<String>,
+    pub custom_models: Option<Vec<String>>,
 }
 
 impl From<ProviderSaveInput> for ProviderProfile {
@@ -265,7 +319,7 @@ impl From<ProviderSaveInput> for ProviderProfile {
             model_context_windows: BTreeMap::new(),
             available_models: Vec::new(),
             selected_models: input.selected_models,
-            custom_models: input.custom_models,
+            custom_models: input.custom_models.unwrap_or_default(),
             models_dev_meta: BTreeMap::new(),
             api_type: input.api_type,
             api_key: input.api_key,

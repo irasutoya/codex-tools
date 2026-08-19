@@ -35,7 +35,7 @@ export function providerSaveInputOf(provider: Provider): ProviderSaveInput {
     enabled: provider.enabled,
     apiType: provider.apiType,
     selectedModels: provider.selectedModels ?? null,
-    customModels: provider.customModels,
+    customModels: provider.customModels ?? [],
     apiKey: provider.apiKey,
   }
 }
