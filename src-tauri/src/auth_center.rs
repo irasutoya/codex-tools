@@ -269,7 +269,7 @@ impl AuthCenter {
         let refreshed: TokenResponse = read_json_bounded(response, "登录凭据更新结果").await?;
         let tokens = merge_refreshed_tokens(refreshed, &account)?;
         let refreshed = account_from_tokens(tokens, Some(&account))?;
-        store.save_official_account(&refreshed)
+        store.save_refreshed_official_account(account_id, &refreshed)
     }
 
     pub async fn connections_import_cookie(
@@ -777,6 +777,7 @@ mod tests {
     #[test]
     fn extracts_namespaced_codex_claims() {
         let token = jwt(json!({
+            "sub": "user-1",
             "https://api.openai.com/auth": {
                 "chatgpt_account_id": "acct-1"
             },
@@ -786,6 +787,7 @@ mod tests {
             "exp": 1_800_000_000_i64
         }));
         let identity = token_identity(&token).unwrap();
+        assert_eq!(identity.subject.as_deref(), Some("user-1"));
         assert_eq!(identity.account_id.as_deref(), Some("acct-1"));
         assert_eq!(identity.email.as_deref(), Some("sakura@example.com"));
         assert_eq!(identity.expires_at, Some(1_800_000_000));

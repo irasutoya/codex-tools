@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react"
+import { useMemo, useRef, useState } from "react"
 import {
   Login03Icon,
   Refresh01Icon,
@@ -120,6 +120,7 @@ export function ConnectionManagerSheet({
   const [remarkDraft, setRemarkDraft] = useState("")
   const [providerDraft, setProviderDraft] = useState<Provider>(emptyProvider())
   const [providerEditorOpen, setProviderEditorOpen] = useState(false)
+  const latestSavedProviders = useRef(new Map<string, Provider>())
   const [deleteTarget, setDeleteTarget] = useState<DeleteTarget>()
   const [accountManagerOpen, setAccountManagerOpen] = useState(false)
 
@@ -202,10 +203,17 @@ export function ConnectionManagerSheet({
 
   const editProvider = (provider: Provider) => {
     if (pending) return
+    const cached = latestSavedProviders.current.get(provider.id)
+    const latest =
+      cached && cached.updatedAt >= provider.updatedAt ? cached : provider
     setProviderDraft({
-      ...provider,
-      headers: { ...provider.headers },
-      availableModels: [...(provider.availableModels ?? [])],
+      ...latest,
+      headers: { ...latest.headers },
+      availableModels: [...(latest.availableModels ?? [])],
+      customModels: [...(latest.customModels ?? [])],
+      selectedModels: latest.selectedModels
+        ? [...latest.selectedModels]
+        : undefined,
     })
     setProviderEditorOpen(true)
   }
@@ -606,7 +614,9 @@ export function ConnectionManagerSheet({
         onOpenChange={setProviderEditorOpen}
         provider={providerDraft}
         onProviderChange={setProviderDraft}
-        onSaved={() => {
+        onSaved={(saved) => {
+          latestSavedProviders.current.set(saved.id, saved)
+          setProviderDraft(saved)
           setProviderEditorOpen(false)
           onChanged()
         }}

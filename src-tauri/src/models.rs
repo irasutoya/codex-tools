@@ -11,6 +11,7 @@ pub(crate) const MAX_ACCOUNT_ID_CHARS: usize = 512;
 pub(crate) const MAX_CREDENTIAL_CHARS: usize = 262_144;
 const MAX_API_URL_CHARS: usize = 2_048;
 const MAX_API_KEY_CHARS: usize = 65_536;
+const MAX_MODEL_ID_CHARS: usize = 512;
 const MAX_CUSTOM_HEADERS: usize = 64;
 const MAX_HEADER_NAME_CHARS: usize = 256;
 const MAX_HEADER_VALUE_CHARS: usize = 8_192;
@@ -48,6 +49,7 @@ impl From<std::io::Error> for AppError {
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct TokenIdentity {
+    pub subject: Option<String>,
     pub account_id: Option<String>,
     pub email: Option<String>,
     pub expires_at: Option<i64>,
@@ -81,6 +83,12 @@ pub(crate) fn token_identity(token: &str) -> Option<TokenIdentity> {
     let claims: Value = serde_json::from_slice(&bytes).ok()?;
     let auth = claims.get("https://api.openai.com/auth");
     let profile = claims.get("https://api.openai.com/profile");
+    let subject = claims
+        .get("sub")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
     let account_id = claims
         .get("chatgpt_account_id")
         .and_then(Value::as_str)
@@ -107,10 +115,50 @@ pub(crate) fn token_identity(token: &str) -> Option<TokenIdentity> {
         .map(str::to_owned);
     let expires_at = claims.get("exp").and_then(Value::as_i64);
     Some(TokenIdentity {
+        subject,
         account_id,
         email,
         expires_at,
     })
+}
+
+fn official_account_subject(account: &StoredOfficialAccount) -> Option<String> {
+    [
+        account.credential.tokens.id_token.as_str(),
+        account.credential.tokens.access_token.as_str(),
+    ]
+    .into_iter()
+    .filter_map(token_identity)
+    .find_map(|identity| identity.subject)
+}
+
+/// Accounts are scoped to a ChatGPT workspace, then distinguished by the
+/// OpenAI user. Older credentials without a `sub` claim fall back to email;
+/// workspace-only matching is safe only when neither side has a user identity.
+pub(crate) fn official_account_identity_matches(
+    left: &StoredOfficialAccount,
+    right: &StoredOfficialAccount,
+) -> bool {
+    if left.account_id.trim() != right.account_id.trim() {
+        return false;
+    }
+
+    let left_subject = official_account_subject(left);
+    let right_subject = official_account_subject(right);
+    if let (Some(left_subject), Some(right_subject)) = (&left_subject, &right_subject) {
+        return left_subject == right_subject;
+    }
+
+    let left_email = left.email.trim();
+    let right_email = right.email.trim();
+    if !left_email.is_empty() && !right_email.is_empty() {
+        return left_email.eq_ignore_ascii_case(right_email);
+    }
+
+    left_subject.is_none()
+        && right_subject.is_none()
+        && left_email.is_empty()
+        && right_email.is_empty()
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -153,6 +201,10 @@ pub struct ProviderProfile {
     /// 写入 Codex 的模型列表；为空时默认使用全部 available_models。
     #[serde(default)]
     pub selected_models: Option<Vec<String>>,
+    /// 用户手动添加的自定义模型 id（独立于 /models 同步的 available_models）；
+    /// 与 available_models 一起构成该服务可写入 Codex 的“有效模型”。
+    #[serde(default)]
+    pub custom_models: Vec<String>,
     /// 从 models.dev（catalog.json）抓取的本服务商模型元数据（slug → 元数据）；
     /// 只在 id 与服务 `/models` 接口返回完全一致时保留，用于补充窗口/简介/名称。
     #[serde(default)]
@@ -191,8 +243,12 @@ pub struct ProviderSaveInput {
     pub api_type: ProviderApiType,
     #[serde(default)]
     pub api_key: Option<String>,
+    /// `null`（或兼容旧调用方时缺省）明确表示使用全部有效模型；数组表示指定子集。
     #[serde(default)]
     pub selected_models: Option<Vec<String>>,
+    /// 用户手动添加的自定义模型 id；随保存提交，刷新 /models 时不会被清空。
+    #[serde(default)]
+    pub custom_models: Vec<String>,
 }
 
 impl From<ProviderSaveInput> for ProviderProfile {
@@ -209,6 +265,7 @@ impl From<ProviderSaveInput> for ProviderProfile {
             model_context_windows: BTreeMap::new(),
             available_models: Vec::new(),
             selected_models: input.selected_models,
+            custom_models: input.custom_models,
             models_dev_meta: BTreeMap::new(),
             api_type: input.api_type,
             api_key: input.api_key,
@@ -269,6 +326,11 @@ impl ProviderProfile {
         }
         self.timeout_secs = self.timeout_secs.clamp(1, 600);
         validate_headers(&self.headers)?;
+        self.custom_models = Self::normalize_custom_models(
+            std::mem::take(&mut self.custom_models),
+            &self.available_models,
+            MAX_MODEL_ID_CHARS,
+        )?;
         if let Some(key) = self.api_key.as_deref() {
             let key = key.trim();
             if key.is_empty() {
@@ -279,6 +341,26 @@ impl ProviderProfile {
             }
         }
         Ok(())
+    }
+
+    fn normalize_custom_models(
+        raw: Vec<String>,
+        available: &[String],
+        max_chars: usize,
+    ) -> Result<Vec<String>, AppError> {
+        let available_set: std::collections::HashSet<&str> =
+            available.iter().map(String::as_str).collect();
+        let mut seen = std::collections::HashSet::new();
+        let mut result = Vec::new();
+        for value in raw {
+            let value = value.trim();
+            if value.is_empty() || available_set.contains(value) || !seen.insert(value.to_owned()) {
+                continue;
+            }
+            ensure_char_limit(value, max_chars, "自定义模型 ID 不能超过 512 个字符。")?;
+            result.push(value.to_owned());
+        }
+        Ok(result)
     }
 
     pub fn redacted(mut self) -> Self {
@@ -1400,6 +1482,7 @@ mod tests {
             model_context_windows: Default::default(),
             available_models: Default::default(),
             selected_models: None,
+            custom_models: Default::default(),
             models_dev_meta: Default::default(),
             api_type: ProviderApiType::Responses,
             api_key: Some("upstream-secret".into()),
@@ -1459,6 +1542,7 @@ mod tests {
             model_context_windows: Default::default(),
             available_models: Default::default(),
             selected_models: None,
+            custom_models: Default::default(),
             models_dev_meta: Default::default(),
             api_type: ProviderApiType::Responses,
             api_key: Some("x".repeat(MAX_API_KEY_CHARS + 1)),
@@ -1481,6 +1565,7 @@ mod tests {
             model_context_windows: Default::default(),
             available_models: Default::default(),
             selected_models: None,
+            custom_models: Default::default(),
             models_dev_meta: Default::default(),
             api_type: ProviderApiType::Responses,
             api_key: Some("x".repeat(MAX_API_KEY_CHARS + 1)),

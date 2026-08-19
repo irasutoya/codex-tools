@@ -16,6 +16,8 @@ export type Provider = {
   modelContextWindows?: Record<string, number>
   /** 服务 /models 接口返回的可用模型列表（保存服务时静默获取） */
   availableModels?: string[]
+  /** 用户手动添加的自定义模型 id；与 availableModels 一起构成有效模型 */
+  customModels?: string[]
   /** 写入 Codex 的模型列表；未设置时默认使用全部可用模型 */
   selectedModels?: string[]
   /** models.dev（models.json）匹配的模型元数据（slug → 元数据） */
@@ -35,9 +37,12 @@ export type ProviderSaveInput = Pick<
   | "timeoutSecs"
   | "enabled"
   | "apiType"
-  | "selectedModels"
+  | "customModels"
   | "apiKey"
->
+> & {
+  /** null 表示清除旧筛选并默认使用全部有效模型。 */
+  selectedModels: string[] | null
+}
 
 export type Dashboard = {
   providerCount: number

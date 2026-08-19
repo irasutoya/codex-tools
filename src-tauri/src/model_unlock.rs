@@ -142,17 +142,22 @@ pub(crate) fn build_model_catalog_with_windows_for_provider(
 
 fn build_provider_catalog(provider: &ProviderProfile) -> Vec<CodexModelInfo> {
     let mut by_slug = BTreeMap::new();
-    // 只包含服务 /models 接口返回的可用模型（id 与接口完全一致才算）。
-    // 展示名/上下文窗口/简介用 models.dev(catalog.json) 精确匹配补充；
-    // 用户手动填写的窗口只用于补充窗口值，不会凭空产生模型。
+    // 有效模型 = /models 同步的 available_models ∪ 用户手动添加的 custom_models。
+    // 展示名/上下文窗口/简介用 models.dev(catalog.json) 精确匹配补充；自定义模型
+    // 无元数据时回退默认窗口并以 slug 作为展示名。
     let available: std::collections::HashSet<&String> = provider.available_models.iter().collect();
+    let custom: std::collections::HashSet<&String> = provider.custom_models.iter().collect();
     let models: Vec<&String> = match provider.selected_models.as_deref() {
         Some([]) => Vec::new(),
         Some(selected) => selected
             .iter()
-            .filter(|model| available.contains(model))
+            .filter(|model| available.contains(model) || custom.contains(model))
             .collect(),
-        None => provider.available_models.iter().collect(),
+        None => provider
+            .available_models
+            .iter()
+            .chain(provider.custom_models.iter())
+            .collect(),
     };
     for slug in models {
         let slug = slug.trim();
@@ -859,6 +864,7 @@ mod tests {
                 vec![model.to_string()]
             },
             selected_models: None,
+            custom_models: Default::default(),
             models_dev_meta: Default::default(),
             api_type: ProviderApiType::Responses,
             api_key: Some("secret".into()),
@@ -1047,6 +1053,58 @@ mod tests {
         // 显式空选择表示不写入任何模型。
         provider.selected_models = Some(Vec::new());
         assert!(slugs(&provider).is_empty());
+    }
+    #[test]
+    fn custom_models_enter_catalog_without_selection() {
+        // 未设置 selected_models 时，有效模型 = available_models ∪ custom_models。
+        let mut provider = provider_with_models("provider", "model-a", &["model-a", "model-b"]);
+        provider.custom_models = vec!["custom-1".into(), "custom-2".into()];
+
+        let catalog = build_model_catalog_with_windows_for_provider(&provider);
+        let slugs: Vec<_> = catalog.iter().map(|model| model.slug.as_str()).collect();
+        // 目录按 slug 排序（内部 BTreeMap）。
+        assert_eq!(slugs, vec!["custom-1", "custom-2", "model-a", "model-b"]);
+        // 自定义模型无元数据：展示名用 slug、回退默认窗口。
+        let custom = catalog
+            .iter()
+            .find(|model| model.slug == "custom-1")
+            .unwrap();
+        assert_eq!(custom.display_name, "custom-1");
+        assert_eq!(custom.context_window, Some(128_000));
+    }
+
+    #[test]
+    fn custom_models_respect_selected_models() {
+        // 设置 selected_models 时只保留同时出现在有效集合（available ∪ custom）的项。
+        let mut provider = provider_with_models("provider", "model-a", &["model-a", "model-b"]);
+        provider.custom_models = vec!["custom-1".into()];
+        provider.selected_models =
+            Some(vec!["custom-1".into(), "custom-2".into(), "model-b".into()]);
+
+        let catalog = build_model_catalog_with_windows_for_provider(&provider);
+        let slugs: Vec<_> = catalog.iter().map(|model| model.slug.as_str()).collect();
+        // custom-2 不在有效集合内，被过滤；custom-1 是自定义模型，被保留。
+        assert_eq!(slugs, vec!["custom-1", "model-b"]);
+
+        // 显式空选择表示不写入任何模型（含自定义）。
+        provider.selected_models = Some(Vec::new());
+        assert!(build_model_catalog_with_windows_for_provider(&provider).is_empty());
+    }
+
+    #[test]
+    fn normalize_custom_models_drops_duplicates_and_blank() {
+        // 重复、空白、与 available_models 重复的自定义模型都被规范化掉。
+        let mut provider = provider_with_models("provider", "model-a", &["model-a"]);
+        provider.custom_models = vec![
+            "  custom-1  ".into(),
+            "custom-1".into(),
+            "".into(),
+            "   ".into(),
+            "model-a".into(),
+        ];
+
+        provider.normalize_and_validate().unwrap();
+        assert_eq!(provider.custom_models, vec!["custom-1"]);
     }
 
     #[test]

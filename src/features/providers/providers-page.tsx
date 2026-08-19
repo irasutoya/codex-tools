@@ -50,6 +50,7 @@ import {
 import {
   accountIsExpired,
   accountPlanText,
+  effectiveModelCount,
   quotaStatusText,
 } from "./connection-utils"
 import { ProviderEditorDialog } from "./provider-editor-dialog"
@@ -257,7 +258,8 @@ export function ProvidersPage({
         onOpenChange={setEditorOpen}
         provider={editor}
         onProviderChange={setEditor}
-        onSaved={() => {
+        onSaved={(saved) => {
+          setEditor(saved)
           setEditorOpen(false)
           onRefresh()
         }}
@@ -480,7 +482,7 @@ export function ProvidersPage({
           {!isAccount && (
             <Detail
               label="可用模型"
-              value={`${provider?.availableModels?.length ?? 0} 个`}
+              value={`${provider ? effectiveModelCount(provider) : 0} 个`}
             />
           )}
         </CardContent>
