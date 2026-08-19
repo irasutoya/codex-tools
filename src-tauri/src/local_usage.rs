@@ -530,10 +530,6 @@ impl UsageLedger {
                 hourly_trend,
             );
         }
-        if hourly_trend {
-            ensure_hourly_points(&mut points, &range);
-        }
-
         Ok(UsageTrend {
             range,
             points: points.into_values().collect(),
