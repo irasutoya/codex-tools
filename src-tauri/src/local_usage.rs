@@ -419,6 +419,9 @@ impl UsageLedger {
                 hourly_trend,
             );
         }
+        if hourly_trend {
+            ensure_hourly_points(&mut trend_points, &query.range);
+        }
 
         let last_refreshed_at_ms = connection
             .query_row(
@@ -526,6 +529,9 @@ impl UsageLedger {
                 row.source_kind,
                 hourly_trend,
             );
+        }
+        if hourly_trend {
+            ensure_hourly_points(&mut points, &range);
         }
 
         Ok(UsageTrend {
@@ -2677,6 +2683,30 @@ fn local_hour_start_ms(occurred_at_ms: i64) -> Option<i64> {
         .and_then(|value| value.with_second(0))
         .and_then(|value| value.with_nanosecond(0))
         .map(|value| value.timestamp_millis())
+}
+
+fn ensure_hourly_points(points: &mut BTreeMap<i64, UsageTrendPoint>, range: &UsageRange) {
+    let mut cursor = range.start_at_ms;
+    while cursor < range.end_at_ms {
+        if let Some(bucket_start) = local_hour_start_ms(cursor) {
+            points
+                .entry(bucket_start)
+                .or_insert_with(|| UsageTrendPoint {
+                    day_start_ms: bucket_start,
+                    tokens: TokenBreakdown::default(),
+                    requests: 0,
+                    estimated_cost_microusd: 0,
+                    unpriced_tokens: 0,
+                    partial_tokens: 0,
+                    unattributed_tokens: 0,
+                });
+        }
+        let next = cursor.saturating_add(60 * 60 * 1000);
+        if next <= cursor {
+            break;
+        }
+        cursor = next;
+    }
 }
 
 fn local_day_start_ms(occurred_at_ms: i64) -> Option<i64> {
