@@ -2022,7 +2022,9 @@ fn extract_tool_calls_from_content(content: &Value) -> Option<Value> {
     let parts = content.as_array()?;
     let mut calls = Vec::new();
     for part in parts {
-        let map = part.as_object()?;
+        let Some(map) = part.as_object() else {
+            continue;
+        };
         if map.get("type").and_then(Value::as_str) != Some("function_call") {
             continue;
         }
@@ -2534,7 +2536,7 @@ impl StreamTranslator {
             self.model.push_str(model);
         }
         if let Some(usage) = chunk.get("usage") {
-            self.saw_usage = ["prompt_tokens", "completion_tokens", "total_tokens"]
+            self.saw_usage |= ["prompt_tokens", "completion_tokens", "total_tokens"]
                 .into_iter()
                 .any(|key| usage.get(key).and_then(Value::as_u64).is_some());
             self.input_tokens = usage

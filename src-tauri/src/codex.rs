@@ -187,7 +187,11 @@ impl ConfigManager {
         let catalog =
             catalog_bytes(&model_unlock::build_model_catalog_with_windows_for_provider(provider));
         let mut document = parse_config_document(&original)?;
-        let effective_model = effective_provider_model(&document, &provider.available_models)?;
+        let candidate_models = provider
+            .selected_models
+            .as_deref()
+            .unwrap_or(&provider.available_models);
+        let effective_model = effective_provider_model(&document, candidate_models)?;
         apply_custom_fields(
             &mut document,
             &provider.name,
@@ -659,27 +663,24 @@ fn apply_custom_fields(
     Ok(())
 }
 
-/// 从服务 `/models` 缓存中选择本次配置要使用的模型。Codex 当前模型仍在
+/// 从候选模型列表中选择本次配置要使用的模型。Codex 当前模型仍在
 /// 列表中时保持不变，否则使用稳定排序后的首项。标准 `/models` 不声明
 /// “默认模型”，因此首项只是保证首次请求可用的确定性回退。
-fn effective_provider_model(
-    document: &DocumentMut,
-    available_models: &[String],
-) -> Result<String, AppError> {
+fn effective_provider_model(document: &DocumentMut, models: &[String]) -> Result<String, AppError> {
     let current = document
         .get("model")
         .and_then(Item::as_str)
         .map(str::trim)
         .filter(|model| !model.is_empty());
     if let Some(current) = current
-        && available_models
+        && models
             .iter()
             .map(|model| model.trim())
             .any(|model| model == current)
     {
         return Ok(current.to_owned());
     }
-    available_models
+    models
         .iter()
         .map(|model| model.trim())
         .find(|model| !model.is_empty())
@@ -1570,6 +1571,22 @@ model_providers = "invalid"
 
         let stale = r#"model = "other-provider-model""#.parse::<DocumentMut>().unwrap();
         assert_eq!(effective_provider_model(&stale, &models).unwrap(), "api-a");
+    }
+
+    #[test]
+    fn effective_model_respects_selected_subset() {
+        let current = r#"model = "api-b""#.parse::<DocumentMut>().unwrap();
+        let selected = vec!["api-a".into(), "api-c".into()];
+        assert_eq!(
+            effective_provider_model(&current, &selected).unwrap(),
+            "api-a"
+        );
+
+        let current_in_subset = r#"model = "api-c""#.parse::<DocumentMut>().unwrap();
+        assert_eq!(
+            effective_provider_model(&current_in_subset, &selected).unwrap(),
+            "api-c"
+        );
     }
 
     #[test]

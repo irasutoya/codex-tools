@@ -145,10 +145,15 @@ fn build_provider_catalog(provider: &ProviderProfile) -> Vec<CodexModelInfo> {
     // 只包含服务 /models 接口返回的可用模型（id 与接口完全一致才算）。
     // 展示名/上下文窗口/简介用 models.dev(catalog.json) 精确匹配补充；
     // 用户手动填写的窗口只用于补充窗口值，不会凭空产生模型。
-    let models = provider
-        .selected_models
-        .as_deref()
-        .unwrap_or(&provider.available_models);
+    let available: std::collections::HashSet<&String> = provider.available_models.iter().collect();
+    let models: Vec<&String> = match provider.selected_models.as_deref() {
+        Some([]) => Vec::new(),
+        Some(selected) => selected
+            .iter()
+            .filter(|model| available.contains(model))
+            .collect(),
+        None => provider.available_models.iter().collect(),
+    };
     for slug in models {
         let slug = slug.trim();
         if slug.is_empty() {
@@ -1012,6 +1017,36 @@ mod tests {
         provider.available_models.clear();
 
         assert!(build_model_catalog_with_windows_for_provider(&provider).is_empty());
+    }
+
+    #[test]
+    fn provider_catalog_filters_selected_models_to_available_ones() {
+        let mut provider =
+            provider_with_models("provider", "model-a", &["model-a", "model-b", "model-c"]);
+        // 未设置选择时使用全部可用模型。
+        let slugs = |provider: &ProviderProfile| {
+            build_model_catalog_with_windows_for_provider(provider)
+                .into_iter()
+                .map(|model| model.slug)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(slugs(&provider), vec!["model-a", "model-b", "model-c"]);
+
+        // 只选择可用模型的子集。
+        provider.selected_models = Some(vec!["model-c".into(), "model-a".into()]);
+        assert_eq!(slugs(&provider), vec!["model-a", "model-c"]);
+
+        // 选择列表中混入未同步/不可用的模型时应被过滤掉。
+        provider.selected_models = Some(vec![
+            "model-b".into(),
+            "removed-model".into(),
+            "model-a".into(),
+        ]);
+        assert_eq!(slugs(&provider), vec!["model-a", "model-b"]);
+
+        // 显式空选择表示不写入任何模型。
+        provider.selected_models = Some(Vec::new());
+        assert!(slugs(&provider).is_empty());
     }
 
     #[test]
