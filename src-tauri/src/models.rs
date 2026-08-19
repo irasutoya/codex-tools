@@ -150,6 +150,9 @@ pub struct ProviderProfile {
     /// 只保存接口实际返回的模型 id，是模型目录的唯一来源。
     #[serde(default)]
     pub available_models: Vec<String>,
+    /// 写入 Codex 的模型列表；为空时默认使用全部 available_models。
+    #[serde(default)]
+    pub selected_models: Option<Vec<String>>,
     /// 从 models.dev（catalog.json）抓取的本服务商模型元数据（slug → 元数据）；
     /// 只在 id 与服务 `/models` 接口返回完全一致时保留，用于补充窗口/简介/名称。
     #[serde(default)]
@@ -169,9 +172,8 @@ pub struct ProviderProfile {
     pub updated_at: i64,
 }
 
-/// WebView 保存第三方服务时唯一允许提交的字段。模型目录、模型元数据、
-/// active/hasApiKey 和时间戳全部由后端维护；即使旧前端仍携带这些字段，
-/// serde 也只会读取这里声明的可编辑字段。
+/// WebView 保存第三方服务时允许提交的字段。模型目录、模型元数据、
+/// active/hasApiKey 和时间戳全部由后端维护；模型选择可由用户编辑。
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderSaveInput {
@@ -189,6 +191,8 @@ pub struct ProviderSaveInput {
     pub api_type: ProviderApiType,
     #[serde(default)]
     pub api_key: Option<String>,
+    #[serde(default)]
+    pub selected_models: Option<Vec<String>>,
 }
 
 impl From<ProviderSaveInput> for ProviderProfile {
@@ -204,6 +208,7 @@ impl From<ProviderSaveInput> for ProviderProfile {
             model: String::new(),
             model_context_windows: BTreeMap::new(),
             available_models: Vec::new(),
+            selected_models: input.selected_models,
             models_dev_meta: BTreeMap::new(),
             api_type: input.api_type,
             api_key: input.api_key,
@@ -310,6 +315,7 @@ pub struct ProviderAccountQuota {
     #[serde(default)]
     pub status: QuotaStatus,
     pub data: Option<QuotaData>,
+    pub plan_type: Option<String>,
     pub fetched_at: Option<i64>,
     pub last_attempt_at: Option<i64>,
     pub error: Option<String>,
@@ -1393,6 +1399,7 @@ mod tests {
 
             model_context_windows: Default::default(),
             available_models: Default::default(),
+            selected_models: None,
             models_dev_meta: Default::default(),
             api_type: ProviderApiType::Responses,
             api_key: Some("upstream-secret".into()),
@@ -1451,6 +1458,7 @@ mod tests {
 
             model_context_windows: Default::default(),
             available_models: Default::default(),
+            selected_models: None,
             models_dev_meta: Default::default(),
             api_type: ProviderApiType::Responses,
             api_key: Some("x".repeat(MAX_API_KEY_CHARS + 1)),
@@ -1472,6 +1480,7 @@ mod tests {
 
             model_context_windows: Default::default(),
             available_models: Default::default(),
+            selected_models: None,
             models_dev_meta: Default::default(),
             api_type: ProviderApiType::Responses,
             api_key: Some("x".repeat(MAX_API_KEY_CHARS + 1)),

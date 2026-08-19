@@ -342,6 +342,7 @@ impl Store {
                 if model_source_changed {
                     provider.model_context_windows.clear();
                     provider.available_models.clear();
+                    provider.selected_models = None;
                     provider.models_dev_meta.clear();
                 } else {
                     if provider.model_context_windows.is_empty() {
@@ -349,6 +350,9 @@ impl Store {
                     }
                     if provider.available_models.is_empty() {
                         provider.available_models = existing.available_models.clone();
+                    }
+                    if provider.selected_models.is_none() {
+                        provider.selected_models = existing.selected_models.clone();
                     }
                     if provider.models_dev_meta.is_empty() {
                         provider.models_dev_meta = existing.models_dev_meta.clone();
@@ -434,6 +438,9 @@ impl Store {
             provider.available_models = models;
             provider.model_context_windows = windows;
             provider.models_dev_meta = meta;
+            if let Some(selected) = provider.selected_models.as_mut() {
+                selected.retain(|model| provider.available_models.contains(model));
+            }
             // 刷新模型列表时顺带清理尚未经过“保存服务”迁移的旧默认模型。
             provider.model.clear();
             Ok(Some(ProviderSnapshotRevision::from_provider(provider)))
@@ -1280,6 +1287,7 @@ mod tests {
 
             model_context_windows: Default::default(),
             available_models: Default::default(),
+            selected_models: None,
             models_dev_meta: Default::default(),
             api_type: ProviderApiType::Responses,
             api_key: Some("secret".into()),
@@ -1657,6 +1665,7 @@ mod tests {
 
                     model_context_windows: Default::default(),
                     available_models: Default::default(),
+                    selected_models: None,
                     models_dev_meta: Default::default(),
                     api_type: ProviderApiType::Responses,
                     api_key: Some("api-secret".into()),

@@ -597,7 +597,7 @@ pub fn inspect(codex_home: &Path) -> ConfigInspection {
                 active_provider: document
                     .get("model_provider")
                     .and_then(Item::as_str)
-                    .map(str::to_owned),
+                    .map(crate::provider_sync::normalize_provider),
                 managed_provider_present: custom.is_some(),
                 warnings: vec![],
             }
@@ -1018,6 +1018,7 @@ mod tests {
 
             model_context_windows: Default::default(),
             available_models: vec!["api-model".into()],
+            selected_models: None,
             models_dev_meta: Default::default(),
             api_type: ProviderApiType::Responses,
             api_key: Some("sk-direct-secret-value".into()),
@@ -1312,6 +1313,7 @@ private_setting = "must-also-not-enter-webview"
 
             model_context_windows: Default::default(),
             available_models: vec!["deepseek-chat".into()],
+            selected_models: None,
             models_dev_meta: Default::default(),
             api_type: ProviderApiType::Chat,
             api_key: Some("sk-real-provider-key".into()),

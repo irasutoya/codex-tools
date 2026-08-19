@@ -318,6 +318,13 @@ export function UsagePage({
       ) ?? [],
     [overview]
   )
+  const modelOptions = useMemo(
+    () =>
+      [...new Set((overview?.rows ?? []).map((row) => row.model))]
+        .filter((model) => model !== "多个模型")
+        .sort((left, right) => left.localeCompare(right)),
+    [overview]
+  )
 
   if (!overview && overviewError)
     return (
@@ -680,6 +687,7 @@ export function UsagePage({
         key={ruleOpen ? "open" : "closed"}
         open={ruleOpen}
         range={query.range}
+        modelOptions={modelOptions}
         onOpenChange={setRuleOpen}
         onSaved={() => {
           setRuleOpen(false)

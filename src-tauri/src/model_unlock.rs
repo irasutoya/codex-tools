@@ -145,7 +145,11 @@ fn build_provider_catalog(provider: &ProviderProfile) -> Vec<CodexModelInfo> {
     // 只包含服务 /models 接口返回的可用模型（id 与接口完全一致才算）。
     // 展示名/上下文窗口/简介用 models.dev(catalog.json) 精确匹配补充；
     // 用户手动填写的窗口只用于补充窗口值，不会凭空产生模型。
-    for slug in &provider.available_models {
+    let models = provider
+        .selected_models
+        .as_deref()
+        .unwrap_or(&provider.available_models);
+    for slug in models {
         let slug = slug.trim();
         if slug.is_empty() {
             continue;
@@ -849,6 +853,7 @@ mod tests {
             } else {
                 vec![model.to_string()]
             },
+            selected_models: None,
             models_dev_meta: Default::default(),
             api_type: ProviderApiType::Responses,
             api_key: Some("secret".into()),

@@ -17,7 +17,6 @@ const CACHE_RECHECK_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_ROLLOUT_INDEX_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_ROLLOUT_LINE_BYTES: usize = 256 * 1024;
 const MAX_SESSION_ID_CHARS: usize = 512;
-const MAX_SESSION_PROVIDER_CHARS: usize = 128;
 const MAX_SESSION_PATH_CHARS: usize = 4_096;
 
 #[derive(Clone, Default)]
@@ -139,9 +138,8 @@ fn rebuild_from_paths(
     for mut session in provider_sync::list_database_sessions_from_paths(database_paths)? {
         session.id = truncate_text(&session.id, MAX_SESSION_ID_CHARS);
         session.title = truncate_text(&session.title, 512);
-        session.provider = truncate_text(&session.provider, MAX_SESSION_PROVIDER_CHARS);
-        session.original_provider =
-            truncate_text(&session.original_provider, MAX_SESSION_PROVIDER_CHARS);
+        session.provider = provider_sync::normalize_provider(&session.provider);
+        session.original_provider = provider_sync::normalize_provider(&session.original_provider);
         session.cwd = truncate_text(&session.cwd, MAX_SESSION_PATH_CHARS);
         sessions.insert(session.id.clone(), session);
     }
@@ -197,12 +195,11 @@ fn rebuild_from_paths(
             continue;
         };
         let id = truncate_text(raw_id, MAX_SESSION_ID_CHARS);
-        let provider = truncate_text(
+        let provider = provider_sync::normalize_provider(
             metadata
                 .get("model_provider")
                 .and_then(Value::as_str)
                 .unwrap_or_default(),
-            MAX_SESSION_PROVIDER_CHARS,
         );
         let updated_at = fs::metadata(path)
             .ok()

@@ -441,6 +441,7 @@ mod tests {
 
                 model_context_windows: Default::default(),
                 available_models: Default::default(),
+                selected_models: None,
                 models_dev_meta: Default::default(),
                 api_type: ProviderApiType::Responses,
                 api_key: Some("secret".into()),

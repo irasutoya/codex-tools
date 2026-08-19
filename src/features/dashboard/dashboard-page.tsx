@@ -173,22 +173,24 @@ export function DashboardPage({
         </CardContent>
       </Card>
 
-      <Card size="sm" className="shrink-0">
-        <CardContent className="grid grid-cols-[minmax(0,1fr)_auto] items-end gap-4">
-          <Progress value={quota?.remainingPercent ?? 0}>
-            <ProgressLabel>Token 剩余额度</ProgressLabel>
-            <span className="ml-auto text-sm text-muted-foreground tabular-nums">
-              {quota ? `${quota.remainingPercent.toFixed(1)}%` : "暂不可用"}
-            </span>
-          </Progress>
-          <div className="text-right">
-            <div className="text-xs text-muted-foreground">重置日期</div>
-            <div className="mt-1 font-medium tabular-nums">
-              {formatDate(quota?.resetAt)}
+      {dashboard.activeKind === "official" && (
+        <Card size="sm" className="shrink-0">
+          <CardContent className="grid grid-cols-[minmax(0,1fr)_auto] items-end gap-4">
+            <Progress value={quota?.remainingPercent ?? 0}>
+              <ProgressLabel>Token 剩余额度</ProgressLabel>
+              <span className="ml-auto text-sm text-muted-foreground tabular-nums">
+                {quota ? `${quota.remainingPercent.toFixed(1)}%` : "暂不可用"}
+              </span>
+            </Progress>
+            <div className="text-right">
+              <div className="text-xs text-muted-foreground">重置日期</div>
+              <div className="mt-1 font-medium tabular-nums">
+                {formatDate(quota?.resetAt)}
+              </div>
             </div>
-          </div>
-        </CardContent>
-      </Card>
+          </CardContent>
+        </Card>
+      )}
     </div>
   )
 }

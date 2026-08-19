@@ -841,6 +841,7 @@ mod tests {
             model: String::new(),
             model_context_windows: BTreeMap::new(),
             available_models: vec![model.into()],
+            selected_models: None,
             models_dev_meta: BTreeMap::new(),
             api_type: ProviderApiType::Responses,
             api_key: Some("secret".into()),

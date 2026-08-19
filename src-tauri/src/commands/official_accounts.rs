@@ -325,7 +325,8 @@ async fn refresh_official_quota(
     match quota_result {
         Ok(data) => {
             snapshot.status = QuotaStatus::Success;
-            snapshot.data = Some(data);
+            snapshot.data = Some(data.data);
+            snapshot.plan_type = data.plan_type;
             snapshot.fetched_at = Some(now);
             snapshot.error = None;
         }

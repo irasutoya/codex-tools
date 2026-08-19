@@ -18,6 +18,13 @@ import {
   FieldLabel,
 } from "@/components/ui/field"
 import { Input } from "@/components/ui/input"
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select"
 import { Spinner } from "@/components/ui/spinner"
 import { Switch } from "@/components/ui/switch"
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group"
@@ -29,11 +36,13 @@ import type { BillingMode, PricingRule, UsageRange } from "@/types"
 export function PricingEditor({
   open,
   range,
+  modelOptions,
   onOpenChange,
   onSaved,
 }: {
   open: boolean
   range: UsageRange
+  modelOptions: string[]
   onOpenChange: (open: boolean) => void
   onSaved: () => void
 }) {
@@ -110,10 +119,29 @@ export function PricingEditor({
           <FieldGroup>
             <Field>
               <FieldLabel htmlFor="price-model">模型</FieldLabel>
+              {modelOptions.length > 0 && (
+                <Select
+                  value={modelOptions.includes(pattern) ? pattern : ""}
+                  onValueChange={(value) => {
+                    if (value) setPattern(value)
+                  }}
+                >
+                  <SelectTrigger className="w-full">
+                    <SelectValue placeholder="从已使用模型中选择" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {modelOptions.map((model) => (
+                      <SelectItem key={model} value={model}>
+                        {model}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              )}
               <Input
                 id="price-model"
                 value={pattern}
-                placeholder="gpt-5.6"
+                placeholder="也可以手动输入，例如 gpt-5.6"
                 onChange={(e) => setPattern(e.target.value)}
               />
             </Field>

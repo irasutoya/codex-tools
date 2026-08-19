@@ -1,6 +1,7 @@
 import { useState } from "react"
 
 import { Button } from "@/components/ui/button"
+import { Checkbox } from "@/components/ui/checkbox"
 import {
   Dialog,
   DialogBody,
@@ -54,6 +55,7 @@ export function ProviderEditorDialog({
         timeoutSecs: provider.timeoutSecs,
         enabled: provider.enabled,
         apiType: provider.apiType,
+        selectedModels: provider.selectedModels,
         apiKey: provider.apiKey,
       }
       await call("connections_save_provider", { provider: input })
@@ -69,6 +71,13 @@ export function ProviderEditorDialog({
       setSaving(false)
     }
   }
+
+  const availableModels = provider.availableModels ?? []
+  const allModelsSelected =
+    provider.selectedModels === undefined ||
+    availableModels.every((model) => provider.selectedModels?.includes(model))
+  const noModelsSelected =
+    availableModels.length > 0 && provider.selectedModels?.length === 0
 
   return (
     <Dialog
@@ -144,6 +153,62 @@ export function ProviderEditorDialog({
                 </SelectContent>
               </Select>
             </Field>
+            {provider.availableModels &&
+              provider.availableModels.length > 0 && (
+                <Field data-disabled={saving}>
+                  <div className="flex items-center justify-between gap-2">
+                    <FieldLabel>写入 Codex 的模型</FieldLabel>
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="ghost"
+                      disabled={saving || availableModels.length === 0}
+                      onClick={() =>
+                        update(
+                          "selectedModels",
+                          allModelsSelected ? [] : undefined
+                        )
+                      }
+                    >
+                      {allModelsSelected ? "取消全选" : "全选"}
+                    </Button>
+                  </div>
+                  <div className="max-h-48 space-y-1 overflow-y-auto rounded-xl border border-border/60 p-2">
+                    {availableModels.map((model) => {
+                      const selected =
+                        provider.selectedModels?.includes(model) ?? true
+                      return (
+                        <label
+                          key={model}
+                          className="flex items-center gap-2 rounded-lg px-2 py-1.5 text-sm hover:bg-muted/60"
+                        >
+                          <Checkbox
+                            checked={selected}
+                            disabled={saving}
+                            onCheckedChange={(checked) => {
+                              const current =
+                                provider.selectedModels ?? availableModels
+                              const next = checked
+                                ? [...new Set([...current, model])]
+                                : current.filter((value) => value !== model)
+                              update(
+                                "selectedModels",
+                                next.length === availableModels.length
+                                  ? undefined
+                                  : next
+                              )
+                            }}
+                          />
+                          <span className="truncate">{model}</span>
+                        </label>
+                      )
+                    })}
+                  </div>
+                  <div className="text-xs text-muted-foreground">
+                    默认全部选中，取消选择后仅将选中模型写入 Codex。
+                  </div>
+                </Field>
+              )}
           </FieldGroup>
         </DialogBody>
         <DialogFooter>
@@ -157,7 +222,9 @@ export function ProviderEditorDialog({
           </Button>
           <Button
             type="button"
-            disabled={saving || !provider.name || !provider.baseUrl}
+            disabled={
+              saving || !provider.name || !provider.baseUrl || noModelsSelected
+            }
             onClick={() => void save()}
           >
             {saving && <Spinner data-icon="inline-start" />}

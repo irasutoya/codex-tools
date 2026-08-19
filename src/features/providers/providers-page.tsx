@@ -47,7 +47,11 @@ import {
   refreshAccountQuota,
   testProviderConnection,
 } from "./connection-actions"
-import { accountIsExpired, quotaStatusText } from "./connection-utils"
+import {
+  accountIsExpired,
+  accountPlanText,
+  quotaStatusText,
+} from "./connection-utils"
 import { ProviderEditorDialog } from "./provider-editor-dialog"
 
 export function ProvidersPage({
@@ -312,9 +316,11 @@ export function ProvidersPage({
                 登录 OpenAI 账号，或连接兼容 Responses API 的服务。
               </EmptyDescription>
             </EmptyHeader>
-            <div className="flex gap-2">
+            <div className="grid w-full grid-cols-3 gap-2">
               <Button
                 type="button"
+                variant="outline"
+                className="min-w-0 px-2 text-xs"
                 disabled={Boolean(busy)}
                 onClick={() => openAccountLogin("browser")}
               >
@@ -324,6 +330,7 @@ export function ProvidersPage({
               <Button
                 type="button"
                 variant="outline"
+                className="min-w-0 px-2 text-xs"
                 disabled={Boolean(busy)}
                 onClick={() => openAccountLogin("cookie")}
               >
@@ -333,6 +340,7 @@ export function ProvidersPage({
               <Button
                 type="button"
                 variant="outline"
+                className="min-w-0 px-2 text-xs"
                 disabled={Boolean(busy)}
                 onClick={() => {
                   setEditor(emptyProvider())
@@ -361,44 +369,51 @@ export function ProvidersPage({
   return (
     <div className="flex min-h-full flex-col gap-3 px-3 pt-1 pb-3">
       <Card size="sm" className="shrink-0">
-        <CardContent className="flex flex-wrap items-center gap-2">
-          <div className="mr-auto flex min-w-40 flex-col gap-0.5">
+        <CardContent className="flex flex-col gap-2">
+          <div className="flex flex-col gap-0.5">
             <div className="text-sm font-medium">添加连接</div>
             <div className="text-xs text-muted-foreground">
               使用官方授权或 Cookie 登录 OpenAI，也可以连接兼容 API 服务。
             </div>
           </div>
-          <Button
-            type="button"
-            size="sm"
-            disabled={actionBusy}
-            onClick={() => openAccountLogin("browser")}
-          >
-            <HugeiconsIcon icon={Login03Icon} data-icon="inline-start" />
-            OpenAI 授权
-          </Button>
-          <Button
-            type="button"
-            size="sm"
-            variant="outline"
-            disabled={actionBusy}
-            onClick={() => {
-              setEditor(emptyProvider())
-              setEditorOpen(true)
-            }}
-          >
-            <HugeiconsIcon icon={Add01Icon} data-icon="inline-start" />
-            添加 API 服务
-          </Button>
-          <Button
-            type="button"
-            size="sm"
-            variant="ghost"
-            disabled={actionBusy}
-            onClick={() => openAccountLogin("cookie")}
-          >
-            导入 Cookie
-          </Button>
+          <div className="grid w-full grid-cols-3 gap-2">
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              className="min-w-0 px-2 text-xs"
+              disabled={actionBusy}
+              onClick={() => openAccountLogin("browser")}
+            >
+              <HugeiconsIcon icon={Login03Icon} data-icon="inline-start" />
+              OpenAI 授权
+            </Button>
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              className="min-w-0 px-2 text-xs"
+              disabled={actionBusy}
+              onClick={() => openAccountLogin("cookie")}
+            >
+              <HugeiconsIcon icon={Key01Icon} data-icon="inline-start" />
+              导入 Cookie
+            </Button>
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              className="min-w-0 px-2 text-xs"
+              disabled={actionBusy}
+              onClick={() => {
+                setEditor(emptyProvider())
+                setEditorOpen(true)
+              }}
+            >
+              <HugeiconsIcon icon={Add01Icon} data-icon="inline-start" />
+              添加 API 服务
+            </Button>
+          </div>
         </CardContent>
       </Card>
 
@@ -421,6 +436,9 @@ export function ProvidersPage({
           </div>
         </CardHeader>
         <CardContent className="grid grid-cols-2 gap-x-6 gap-y-4">
+          {isAccount && (
+            <Detail label="账号类型" value={accountPlanText(account!)} />
+          )}
           <Detail
             label="接入方式"
             value={
@@ -451,6 +469,12 @@ export function ProvidersPage({
             <Detail
               label="额度状态"
               value={quotaLabel(account, quota?.remainingPercent)}
+            />
+          )}
+          {isAccount && (
+            <Detail
+              label="额度重置时间"
+              value={formatDate(quota?.resetAt, true)}
             />
           )}
           {!isAccount && (

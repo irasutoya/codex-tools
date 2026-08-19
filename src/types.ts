@@ -16,6 +16,8 @@ export type Provider = {
   modelContextWindows?: Record<string, number>
   /** 服务 /models 接口返回的可用模型列表（保存服务时静默获取） */
   availableModels?: string[]
+  /** 写入 Codex 的模型列表；未设置时默认使用全部可用模型 */
+  selectedModels?: string[]
   /** models.dev（models.json）匹配的模型元数据（slug → 元数据） */
   modelsDevMeta?: Record<string, ProviderModelsDevMeta>
   apiKey?: string
@@ -33,6 +35,7 @@ export type ProviderSaveInput = Pick<
   | "timeoutSecs"
   | "enabled"
   | "apiType"
+  | "selectedModels"
   | "apiKey"
 >
 
@@ -228,6 +231,7 @@ export type QuotaData = {
 export type AccountQuota = {
   status: QuotaStatus
   data?: QuotaData
+  planType?: string
   fetchedAt?: number
   lastAttemptAt?: number
   error?: string

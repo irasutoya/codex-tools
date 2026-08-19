@@ -40,10 +40,16 @@ impl QuotaFetchError {
     }
 }
 
+#[derive(Debug)]
+pub struct QuotaFetchResult {
+    pub data: QuotaData,
+    pub plan_type: Option<String>,
+}
+
 pub async fn fetch_quota(
     client: &reqwest::Client,
     account: &StoredOfficialAccount,
-) -> Result<QuotaData, QuotaFetchError> {
+) -> Result<QuotaFetchResult, QuotaFetchError> {
     fetch_quota_from(client, account, OPENAI_USAGE_URL).await
 }
 
@@ -51,7 +57,7 @@ async fn fetch_quota_from(
     client: &reqwest::Client,
     account: &StoredOfficialAccount,
     endpoint: &str,
-) -> Result<QuotaData, QuotaFetchError> {
+) -> Result<QuotaFetchResult, QuotaFetchError> {
     let access_token = account.credential.tokens.access_token.trim();
     if access_token.is_empty() {
         return Err(QuotaFetchError::new(
@@ -119,7 +125,7 @@ async fn fetch_quota_from(
     }
 
     let payload = read_bounded_json(response).await?;
-    let quota =
+    let data =
         parse_quota_payload(&payload, chrono::Utc::now().timestamp()).map_err(
             |error| match error {
                 QuotaParseError::Unsupported(message) => {
@@ -130,7 +136,21 @@ async fn fetch_quota_from(
                 }
             },
         )?;
-    Ok(quota)
+    Ok(QuotaFetchResult {
+        data,
+        plan_type: parse_plan_type(&payload),
+    })
+}
+
+fn parse_plan_type(payload: &Value) -> Option<String> {
+    payload
+        .get("plan_type")
+        .or_else(|| payload.get("planType"))
+        .or_else(|| payload.get("data").and_then(|data| data.get("plan_type")))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
 }
 
 fn should_send_account_id(account: &StoredOfficialAccount) -> bool {
@@ -329,7 +349,12 @@ mod tests {
         .await
         .unwrap();
 
+        let QuotaFetchResult {
+            data: quota,
+            plan_type,
+        } = quota;
         let QuotaData::Windowed { primary, secondary } = quota;
+        assert_eq!(plan_type, None);
         assert_eq!(primary.unwrap().remaining_percent, 80.0);
         assert_eq!(secondary.unwrap().remaining_percent, 60.0);
         server.join().unwrap();

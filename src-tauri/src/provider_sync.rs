@@ -101,9 +101,17 @@ pub fn configured_provider(codex_home: &Path) -> String {
         .and_then(|doc| {
             doc.get("model_provider")
                 .and_then(toml_edit::Item::as_str)
-                .map(str::to_owned)
+                .map(normalize_provider)
         })
         .unwrap_or_else(|| "openai".into())
+}
+
+pub fn normalize_provider(value: &str) -> String {
+    if value.trim().is_empty() || value.eq_ignore_ascii_case("openai") {
+        "openai".into()
+    } else {
+        "custom".into()
+    }
 }
 
 pub fn repair(codex_home: &Path, target: &str) -> Result<RepairResult, AppError> {
@@ -177,7 +185,7 @@ pub fn list_database_sessions_from_paths(paths: &[PathBuf]) -> anyhow::Result<Ve
         let mut statement = db.prepare(&sql)?;
         let rows = statement.query_map([], |row| {
             let id: String = row.get(0)?;
-            let provider: String = row.get(2).unwrap_or_default();
+            let provider = normalize_provider(&row.get::<_, String>(2).unwrap_or_default());
             Ok(SessionSummary {
                 identity: format!("{}#{id}", path.display()),
                 id,

@@ -31,10 +31,7 @@ export function quotaStatusText(
   remainingPercent?: number
 ) {
   if (remainingPercent !== undefined) {
-    const refreshed = account.quota.fetchedAt
-      ? ` · ${formatDate(account.quota.fetchedAt, true)}`
-      : ""
-    return `剩余 ${remainingPercent.toFixed(1)}%${refreshed}`
+    return `剩余 ${remainingPercent.toFixed(1)}%`
   }
   switch (account.quota.status) {
     case "never":
@@ -55,7 +52,33 @@ export function quotaStatusText(
 export function accountDescription(account: OfficialAccountView) {
   const quota = quotaWindow(account.quota)
   const quotaText = quotaStatusText(account, quota?.remainingPercent)
-  return `${quotaText} · ${account.email || account.name || "OpenAI 账号"}`
+  const resetText = quota?.resetAt
+    ? ` · 重置 ${formatDate(quota.resetAt, true)}`
+    : ""
+  return `${accountPlanText(account)} · ${quotaText}${resetText} · ${account.email || account.name || "OpenAI 账号"}`
+}
+
+export function accountPlanText(account: OfficialAccountView) {
+  const planType = account.quota.planType?.trim()
+  if (!planType) return "OpenAI"
+  switch (planType.toLowerCase()) {
+    case "plus":
+      return "Plus"
+    case "pro":
+      return "Pro"
+    case "pro_5x":
+    case "pro-5x":
+      return "Pro 5x"
+    case "pro_20x":
+    case "pro-20x":
+      return "Pro 20x"
+    default:
+      return planType
+        .split(/[_-]+/)
+        .filter(Boolean)
+        .map((part) => part[0]?.toUpperCase() + part.slice(1).toLowerCase())
+        .join(" ")
+  }
 }
 
 export type FallbackCandidate = {
