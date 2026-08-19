@@ -1617,9 +1617,11 @@ mod tests {
         store
             .update_official_account_remark(&saved.id, "保留此备注".into())
             .unwrap();
-        let mut quota = ProviderAccountQuota::default();
-        quota.status = QuotaStatus::Success;
-        quota.fetched_at = Some(42);
+        let quota = ProviderAccountQuota {
+            status: QuotaStatus::Success,
+            fetched_at: Some(42),
+            ..Default::default()
+        };
         store.save_official_account_quota(&saved.id, quota).unwrap();
 
         let refreshed = store

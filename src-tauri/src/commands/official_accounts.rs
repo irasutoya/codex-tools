@@ -65,7 +65,7 @@ async fn connections_import_cookie_in_store(
     }
     let _guard = activation.0.lock().await;
     let home = codex::home(&store.codex_home_setting()?);
-    sync_active_openai_credential(&store, &home)?;
+    sync_active_openai_credential(store, &home)?;
     let total = imported.len();
     let detected_formats = imported
         .iter()
@@ -948,9 +948,11 @@ mod tests {
         let mut saved_account = account("cookie-account", "保留的备注");
         saved_account.email.clear();
         let saved = store.save_official_account(&saved_account).unwrap();
-        let mut quota = ProviderAccountQuota::default();
-        quota.status = QuotaStatus::Success;
-        quota.fetched_at = Some(42);
+        let quota = ProviderAccountQuota {
+            status: QuotaStatus::Success,
+            fetched_at: Some(42),
+            ..Default::default()
+        };
         store.save_official_account_quota(&saved.id, quota).unwrap();
         store
             .connections_activate_official_account(&saved.id)
