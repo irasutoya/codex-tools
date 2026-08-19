@@ -31,6 +31,7 @@ const dateTimeFormatter = new Intl.DateTimeFormat("zh-CN", {
   day: "2-digit",
   hour: "2-digit",
   minute: "2-digit",
+  hourCycle: "h23",
 })
 
 const percentFormatter = new Intl.NumberFormat("zh-CN", {

@@ -16,10 +16,11 @@ export type TrendSeriesPoint = {
 }
 
 export function trendPointsToSeries(
-  points: UsageTrendPoint[]
+  points: UsageTrendPoint[],
+  hourly = false
 ): TrendSeriesPoint[] {
   return points.map((point) => ({
-    date: formatDate(point.dayStartMs),
+    date: formatDate(point.dayStartMs, hourly),
     input: point.tokens.inputTokens,
     output: point.tokens.outputTokens + point.tokens.reasoningOutputTokens,
     cache: point.tokens.cachedInputTokens + point.tokens.cacheWriteInputTokens,

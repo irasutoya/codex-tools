@@ -119,7 +119,7 @@ export type UsageOverview = {
   collectionStartedAtMs?: number
   collectionStartedVersion?: string
   warnings: Array<{ path?: string; message: string }>
-  /** 与 totals 同一趟查询产出的按日趋势点，避免对同一范围重复全量扫描。 */
+  /** 与 totals 同一趟查询产出的趋势点，避免对同一范围重复全量扫描。 */
   trendPoints: UsageTrendPoint[]
 }
 

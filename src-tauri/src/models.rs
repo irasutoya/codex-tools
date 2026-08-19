@@ -786,7 +786,7 @@ pub struct UsageOverview {
     pub collection_started_at_ms: Option<i64>,
     pub collection_started_version: Option<String>,
     pub warnings: Vec<UsageWarning>,
-    /// 按本机自然日聚合的趋势点；与 totals 同一次查询产出，
+    /// 按本机自然日或小时聚合的趋势点；与 totals 同一次查询产出，
     /// 避免查询后再对同一范围做第二趟全量扫描。
     pub trend_points: Vec<UsageTrendPoint>,
 }

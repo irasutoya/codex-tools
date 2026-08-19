@@ -306,8 +306,8 @@ export function UsagePage({
   }
 
   const points = useMemo(
-    () => trendPointsToSeries(overview?.trendPoints ?? []),
-    [overview]
+    () => trendPointsToSeries(overview?.trendPoints ?? [], days === 1),
+    [days, overview]
   )
   const cacheRows = useMemo(
     () =>
@@ -399,7 +399,13 @@ export function UsagePage({
               margin={{ left: 4, right: 8, top: 4, bottom: 0 }}
             >
               <CartesianGrid vertical={false} strokeDasharray="4 4" />
-              <XAxis dataKey="date" tickLine={false} axisLine={false} />
+              <XAxis
+                dataKey="date"
+                tickLine={false}
+                axisLine={false}
+                interval={days === 1 ? "preserveStartEnd" : 0}
+                minTickGap={days === 1 ? 24 : 0}
+              />
               <YAxis
                 width={56}
                 tickLine={false}

@@ -17,7 +17,7 @@ use crate::{
         parse_line,
     },
 };
-use chrono::{Local, TimeZone, Utc};
+use chrono::{Local, TimeZone, Timelike, Utc};
 use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 use std::{
@@ -312,7 +312,8 @@ impl UsageLedger {
             partial_tokens: 0,
             unattributed_tokens: 0,
         };
-        // 与 totals 同一趟查询产出按日趋势，避免对同一范围做第二趟全量扫描。
+        // 与 totals 同一趟查询产出趋势，避免对同一范围做第二趟全量扫描。
+        let hourly_trend = range_is_single_local_day(&query.range);
         let mut trend_points = BTreeMap::<i64, UsageTrendPoint>::new();
 
         for row in rows {
@@ -408,13 +409,14 @@ impl UsageLedger {
                     .saturating_add(row.tokens.total_tokens);
             }
 
-            accumulate_day_point(
+            accumulate_trend_point(
                 &mut trend_points,
                 row.occurred_at_ms,
                 &row.tokens,
                 row.cost_status,
                 row.estimated_cost_microusd,
                 row.source_kind,
+                hourly_trend,
             );
         }
 
@@ -465,7 +467,7 @@ impl UsageLedger {
         })
     }
 
-    /// 按本机自然日聚合用量事件，返回趋势序列（受统计周期起点约束）。
+    /// 按本机自然日或小时聚合用量事件，返回趋势序列（受统计周期起点约束）。
     pub(crate) fn trend(&self, range: UsageRange) -> Result<UsageTrend, AppError> {
         range.validate()?;
         let connection = self.open_connection().map_err(AppError::from)?;
@@ -511,16 +513,18 @@ impl UsageLedger {
             .map_err(|error| AppError::Internal(format!("读取本机用量趋势失败：{error}")))?;
 
         let mut points = BTreeMap::<i64, UsageTrendPoint>::new();
+        let hourly_trend = range_is_single_local_day(&range);
         for row in rows {
             let row =
                 row.map_err(|error| AppError::Internal(format!("读取本机用量趋势失败：{error}")))?;
-            accumulate_day_point(
+            accumulate_trend_point(
                 &mut points,
                 row.occurred_at_ms,
                 &row.tokens,
                 row.cost_status,
                 row.estimated_cost_microusd,
                 row.source_kind,
+                hourly_trend,
             );
         }
 
@@ -2599,24 +2603,28 @@ fn add_tokens(target: &mut TokenBreakdown, source: &TokenBreakdown) {
     target.total_tokens = target.total_tokens.saturating_add(source.total_tokens);
 }
 
-/// 把时间戳归到本机自然日的起始时刻（毫秒）。
-/// 把单条用量事件累加到按本机自然日分桶的趋势点里（totals 与 trend
+/// 把单条用量事件累加到按本机自然日或小时分桶的趋势点里（totals 与 trend
 /// 共用同一套聚合规则，避免两趟查询产生不同口径）。
-fn accumulate_day_point(
+fn accumulate_trend_point(
     points: &mut BTreeMap<i64, UsageTrendPoint>,
     occurred_at_ms: i64,
     tokens: &TokenBreakdown,
     cost_status: CostStatus,
     estimated_cost_microusd: Option<u64>,
     source_kind: UsageSourceKind,
+    hourly: bool,
 ) {
-    let Some(day_start) = local_day_start_ms(occurred_at_ms) else {
+    let Some(bucket_start) = (if hourly {
+        local_hour_start_ms(occurred_at_ms)
+    } else {
+        local_day_start_ms(occurred_at_ms)
+    }) else {
         return;
     };
-    let point = match points.entry(day_start) {
+    let point = match points.entry(bucket_start) {
         Entry::Occupied(entry) => entry.into_mut(),
         Entry::Vacant(entry) => entry.insert(UsageTrendPoint {
-            day_start_ms: day_start,
+            day_start_ms: bucket_start,
             tokens: TokenBreakdown::default(),
             requests: 0,
             estimated_cost_microusd: 0,
@@ -2645,6 +2653,30 @@ fn accumulate_day_point(
             .unattributed_tokens
             .saturating_add(tokens.total_tokens);
     }
+}
+
+fn range_is_single_local_day(range: &UsageRange) -> bool {
+    let Some(start) = Local.timestamp_millis_opt(range.start_at_ms).single() else {
+        return false;
+    };
+    let Some(end) = Local
+        .timestamp_millis_opt(range.end_at_ms.saturating_sub(1))
+        .single()
+    else {
+        return false;
+    };
+    start.date_naive() == end.date_naive()
+}
+
+fn local_hour_start_ms(occurred_at_ms: i64) -> Option<i64> {
+    let local = Local.timestamp_millis_opt(occurred_at_ms).single()?;
+    // 在已有时间点上截断，保留该时间点的 UTC 偏移，避免 DST 回拨时
+    // 两个同名小时被合并，也避免把 DST 跳跃时刻错误地当成 UTC 时间。
+    local
+        .with_minute(0)
+        .and_then(|value| value.with_second(0))
+        .and_then(|value| value.with_nanosecond(0))
+        .map(|value| value.timestamp_millis())
 }
 
 fn local_day_start_ms(occurred_at_ms: i64) -> Option<i64> {
@@ -4125,6 +4157,36 @@ mod tests {
     #[test]
     fn out_of_range_timestamp_does_not_create_a_trend_point() {
         assert_eq!(super::local_day_start_ms(i64::MAX), None);
+    }
+
+    #[test]
+    fn hourly_trend_buckets_use_local_hour_boundaries() {
+        use chrono::{Local, TimeZone};
+
+        let first = Local
+            .with_ymd_and_hms(2026, 8, 1, 12, 15, 0)
+            .single()
+            .unwrap()
+            .timestamp_millis();
+        let same_hour = Local
+            .with_ymd_and_hms(2026, 8, 1, 12, 59, 59)
+            .single()
+            .unwrap()
+            .timestamp_millis();
+        let next_hour = Local
+            .with_ymd_and_hms(2026, 8, 1, 13, 0, 0)
+            .single()
+            .unwrap()
+            .timestamp_millis();
+
+        assert_eq!(
+            super::local_hour_start_ms(first),
+            super::local_hour_start_ms(same_hour)
+        );
+        assert_ne!(
+            super::local_hour_start_ms(first),
+            super::local_hour_start_ms(next_hour)
+        );
     }
 
     #[test]
