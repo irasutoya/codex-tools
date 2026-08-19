@@ -361,9 +361,9 @@ impl ProxyClient {
         let cached = self.cached.clone();
         tokio::task::spawn_blocking(move || {
             let snapshot = ClientCache::cached_snapshot();
-            let mut cached = cached.lock().map_err(|_| {
-                AppError::Internal("本机转换代理的网络客户端锁已损坏。".into())
-            })?;
+            let mut cached = cached
+                .lock()
+                .map_err(|_| AppError::Internal("本机转换代理的网络客户端锁已损坏。".into()))?;
             if let Some((cached_snapshot, client)) = cached.as_ref()
                 && cached_snapshot == &snapshot
             {
@@ -3902,9 +3902,11 @@ mod tests {
             &mut events,
         );
         assert!(error.is_some());
-        assert!(events_to_json(events)
-            .iter()
-            .any(|event| event["type"] == "response.failed"));
+        assert!(
+            events_to_json(events)
+                .iter()
+                .any(|event| event["type"] == "response.failed")
+        );
 
         let legacy = chat_to_responses_body(
             &json!({

@@ -37,13 +37,7 @@ import { type ConnectionKind } from "./connection-utils"
 
 export type PendingAction = {
   action:
-    | "activate"
-    | "delete"
-    | "quota"
-    | "login"
-    | "test"
-    | "models"
-    | "remark"
+    "activate" | "delete" | "quota" | "login" | "test" | "models" | "remark"
   id: string
 }
 
