@@ -123,33 +123,6 @@ npm run dist:mac:arm64
 
 项目仍处于早期预览阶段。请在 [Issues](https://github.com/irasutoya/codex-tools/issues) 中报告问题；提交前请移除 API Key、OAuth token、`auth.json`、`credentials.json` 与会话正文。
 
-## 更新记录
-
-### v0.7.6
-
-**新功能**
-
-- **模型选择**：第三方服务编辑器新增模型勾选列表，可选择写入 Codex 的模型子集；未设置时默认写入全部可用模型。
-- **账号套餐类型**：刷新额度时读取 OpenAI `plan_type`，在连接详情中展示 Plus / Pro / Pro 5x / Pro 20x 等套餐标识。
-- **Provider 标准化**：会话与概览中的 provider 字段统一归一化为 `openai` 或 `custom`，避免同义值不一致。
-- **概览额度卡片**：仅在当前激活连接为官方账号时显示 Token 剩余额度与重置日期。
-
-**改进**
-
-- 连接页面操作按钮改为三列网格布局，改善窄屏下的可读性。
-- 额度状态文本移除冗余的刷新时间后缀。
-
-**修复**
-
-- 修复流式响应转换中 `saw_usage` 标记被后续 chunk 覆盖导致 `response.completed` 事件丢失用量数据的问题。
-- 修复 Responses → Chat 转换中 `extract_tool_calls_from_content` 遇到非对象内容元素时中止提取，导致工具调用丢失的问题。
-- 修复模型目录写入时未按 `selected_models` 过滤不可用模型的问题。
-- 修复保存服务时模型源变更未清除 `selected_models` 的问题。
-
-### v0.7.5
-
-初始公开发布。
-
 ## 许可证
 
 [MIT](LICENSE)
