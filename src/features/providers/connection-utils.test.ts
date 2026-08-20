@@ -27,8 +27,6 @@ const makeAccount = (
   source: "open_ai_oauth",
   expiresAt: null,
   quota: { status: "never" },
-  deviceSessionConvergenceAvailable: false,
-  deviceSessionConvergenceEnabled: false,
   active: false,
   createdAt: 0,
   updatedAt: 0,

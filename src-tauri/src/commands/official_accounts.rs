@@ -181,8 +181,9 @@ async fn connections_refresh_login_in_store(
     proxy: &ChatProxyRegistry,
     id: &str,
 ) -> Result<OfficialAccountView, AppError> {
-    let saved = refresh_account_and_sync_active(store, center, manager, activation, proxy, id, true)
-        .await?;
+    let saved =
+        refresh_account_and_sync_active(store, center, manager, activation, proxy, id, true)
+            .await?;
     store.official_account_view(&saved.id)
 }
 

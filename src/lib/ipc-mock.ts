@@ -149,8 +149,6 @@ const mockAccounts: OfficialAccountView[] = [
     expiresAt: null,
     quota: mockQuota,
     active: true,
-    deviceSessionConvergenceAvailable: true,
-    deviceSessionConvergenceEnabled: true,
     createdAt: now - 60 * day,
     updatedAt: now,
   },
@@ -164,8 +162,6 @@ const mockAccounts: OfficialAccountView[] = [
     expiresAt: null,
     quota: { status: "never" },
     active: false,
-    deviceSessionConvergenceAvailable: false,
-    deviceSessionConvergenceEnabled: false,
     createdAt: now - 50 * day,
     updatedAt: now - 4 * day,
   },
@@ -594,16 +590,6 @@ export async function mockCall(
       })
       return accounts.map(({ account }) => account)
     }
-    case "connections_set_device_session_convergence": {
-      const { id, enabled } = args as { id: string; enabled: boolean }
-      const account = mockAccounts.find((candidate) => candidate.id === id)
-      if (!account) throw new Error(`账号不存在：${id}`)
-      if (enabled && !account.deviceSessionConvergenceAvailable) {
-        throw new Error("此账号不支持设备＋会话收敛。")
-      }
-      account.deviceSessionConvergenceEnabled = enabled
-      return structuredClone(account)
-    }
     case "connections_delete_account": {
       const { id } = args as { id: string }
       const index = mockAccounts.findIndex((account) => account.id === id)
@@ -707,8 +693,6 @@ export async function mockCall(
         expiresAt: null,
         quota: { status: "never" },
         active: false,
-        deviceSessionConvergenceAvailable: false,
-        deviceSessionConvergenceEnabled: false,
         createdAt: Date.now(),
         updatedAt: Date.now(),
       }

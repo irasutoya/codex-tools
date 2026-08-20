@@ -454,13 +454,6 @@ fn prepare_official_account_patch(
 }
 
 fn apply_official_account_patch(patch: OfficialAccountPatch) -> Result<(), AppError> {
-    apply_official_account_patch_checked(patch, || Ok(()))
-}
-
-fn apply_official_account_patch_checked(
-    patch: OfficialAccountPatch,
-    check_before_write: impl FnOnce() -> Result<(), AppError>,
-) -> Result<(), AppError> {
     let current = CodexFilesSnapshot {
         config: OptionalFileSnapshot::capture(
             patch.original.config.path.clone(),
@@ -485,7 +478,6 @@ fn apply_official_account_patch_checked(
         return Err(AppError::StaleOperation);
     }
 
-    check_before_write()?;
     let result = commit_codex_files(
         &patch.original.config.path,
         &patch.config_rendered,

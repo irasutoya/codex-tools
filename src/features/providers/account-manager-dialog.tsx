@@ -26,7 +26,6 @@ import {
 } from "@/components/ui/dialog"
 import { Input } from "@/components/ui/input"
 import { hiddenOverlayStyles } from "@/components/ui/overlay-styles"
-import { Switch } from "@/components/ui/switch"
 import { Spinner } from "@/components/ui/spinner"
 import {
   Table,
@@ -74,10 +73,6 @@ export function AccountManagerDialog({
 }: AccountManagerDialogProps) {
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
   const [drafts, setDrafts] = useState<Record<string, string>>({})
-  const [accountOverrides, setAccountOverrides] = useState<
-    Record<string, OfficialAccountView>
-  >({})
-  const [convergencePendingId, setConvergencePendingId] = useState<string>()
   const [deleteOpen, setDeleteOpen] = useState(false)
   const wasOpenRef = useRef(false)
   const {
@@ -95,7 +90,6 @@ export function AccountManagerDialog({
     const accountIds = new Set(accounts.map((account) => account.id))
     if (!wasOpenRef.current) {
       wasOpenRef.current = true
-      setAccountOverrides({})
       setSelectedIds(
         new Set(initialSelectedIds.filter((id) => accountIds.has(id)))
       )
@@ -118,27 +112,11 @@ export function AccountManagerDialog({
         ])
       )
     )
-    setAccountOverrides((current) =>
-      Object.fromEntries(
-        Object.entries(current).filter(([id, override]) => {
-          const account = accounts.find((candidate) => candidate.id === id)
-          return (
-            account &&
-            account.deviceSessionConvergenceEnabled !==
-              override.deviceSessionConvergenceEnabled
-          )
-        })
-      )
-    )
   }, [accounts, initialSelectedIds, open])
 
-  const displayedAccounts = useMemo(
-    () => accounts.map((account) => accountOverrides[account.id] ?? account),
-    [accountOverrides, accounts]
-  )
   const selectedAccounts = useMemo(
-    () => displayedAccounts.filter((account) => selectedIds.has(account.id)),
-    [displayedAccounts, selectedIds]
+    () => accounts.filter((account) => selectedIds.has(account.id)),
+    [accounts, selectedIds]
   )
   const selectedCount = selectedAccounts.length
   const allSelected = accounts.length > 0 && selectedCount === accounts.length
@@ -152,38 +130,7 @@ export function AccountManagerDialog({
       }),
     [accounts, drafts]
   )
-  const frozen = Boolean(busy) || Boolean(convergencePendingId)
-
-  const setDeviceSessionConvergence = async (
-    account: OfficialAccountView,
-    enabled: boolean
-  ) => {
-    if (frozen) return
-    setConvergencePendingId(account.id)
-    try {
-      const updated = await call("connections_set_device_session_convergence", {
-        id: account.id,
-        enabled,
-      })
-      setAccountOverrides((current) => ({
-        ...current,
-        [updated.id]: updated,
-      }))
-      toast.add({
-        title: enabled ? "设备＋会话收敛已开启" : "设备＋会话收敛已关闭",
-        type: "success",
-      })
-      onRefresh()
-    } catch (reason) {
-      toast.add({
-        title: "更新设备＋会话收敛失败",
-        description: errorMessage(reason),
-        type: "error",
-      })
-    } finally {
-      setConvergencePendingId(undefined)
-    }
-  }
+  const frozen = Boolean(busy)
 
   const close = () => {
     setDeleteOpen(false)
@@ -369,12 +316,11 @@ export function AccountManagerDialog({
                     </TableHead>
                     <TableHead>账号</TableHead>
                     <TableHead className="w-28">状态</TableHead>
-                    <TableHead className="w-36">设备＋会话收敛</TableHead>
-                    <TableHead className="w-[38%]">备注</TableHead>
+                    <TableHead>备注</TableHead>
                   </TableRow>
                 </TableHeader>
                 <TableBody>
-                  {displayedAccounts.map((account) => {
+                  {accounts.map((account) => {
                     const displayName = account.remark || account.name
                     const checked = selectedIds.has(account.id)
                     return (
@@ -407,21 +353,6 @@ export function AccountManagerDialog({
                             <Badge>当前账号</Badge>
                           ) : (
                             <Badge variant="outline">已保存</Badge>
-                          )}
-                        </TableCell>
-                        <TableCell>
-                          {account.deviceSessionConvergenceAvailable && (
-                            <Switch
-                              aria-label={`${displayName}的设备＋会话收敛`}
-                              checked={account.deviceSessionConvergenceEnabled}
-                              disabled={frozen}
-                              onCheckedChange={(enabled) =>
-                                void setDeviceSessionConvergence(
-                                  account,
-                                  enabled
-                                )
-                              }
-                            />
                           )}
                         </TableCell>
                         <TableCell>
