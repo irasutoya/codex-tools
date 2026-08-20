@@ -1019,21 +1019,14 @@ fn account_scoped_uuid(domain: &str, account_id: &str) -> String {
 }
 
 fn effective_default_installation_id_setting(
-    account: &StoredOfficialAccount,
+    _account: &StoredOfficialAccount,
 ) -> OfficialInstallationIdSetting {
-    if account.device_session_convergence_available() {
-        OfficialInstallationIdSetting {
-            enabled: true,
-            installation_id: Some(account_scoped_installation_id(
-                &official_account_identity_scope(account),
-            )),
-            session_id: Some(account_scoped_session_id(&official_account_identity_scope(
-                account,
-            ))),
-        }
-    } else {
-        OfficialInstallationIdSetting::default()
-    }
+    // Official OpenAI accounts must remain direct unless the user explicitly
+    // opts into device/session convergence. A process-local relay uses a
+    // dynamic port, so silently enabling it leaves Codex pointing at a stale
+    // localhost URL whenever Codex Tools is not running or restarts while
+    // Codex is open.
+    OfficialInstallationIdSetting::default()
 }
 
 fn effective_installation_id_setting(
@@ -1676,9 +1669,21 @@ mod tests {
         let state = store.snapshot().unwrap();
         assert_eq!(state.official_accounts.len(), 2);
         assert_eq!(state.active.account_id.as_deref(), Some(first.id.as_str()));
+        store
+            .set_official_installation_id_unification(&first.id, true)
+            .unwrap();
+        store
+            .set_official_installation_id_unification(&second.id, true)
+            .unwrap();
         assert_ne!(
-            effective_default_installation_id_setting(&state.official_accounts[0]).installation_id,
-            effective_default_installation_id_setting(&state.official_accounts[1]).installation_id
+            store
+                .official_installation_id_setting(&first.id)
+                .unwrap()
+                .installation_id,
+            store
+                .official_installation_id_setting(&second.id)
+                .unwrap()
+                .installation_id
         );
     }
 
@@ -2579,12 +2584,13 @@ mod tests {
             .save_official_account(&official_account("second", "two"))
             .unwrap();
 
-        assert!(
-            store
-                .official_installation_id_setting(&first.id)
-                .unwrap()
-                .enabled
-        );
+        let default = store.official_installation_id_setting(&first.id).unwrap();
+        assert!(!default.enabled);
+        assert!(default.installation_id.is_none());
+        assert!(default.session_id.is_none());
+        store
+            .set_official_installation_id_unification(&first.id, true)
+            .unwrap();
         let first_id = store
             .official_installation_id_setting(&first.id)
             .unwrap()
@@ -2743,7 +2749,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_eligible_rt_without_a_stored_setting_defaults_on_and_explicit_off_persists() {
+    fn eligible_rt_without_a_stored_setting_defaults_off_and_explicit_on_persists() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().to_path_buf();
         let store = Store::open(root.clone()).unwrap();
@@ -2751,17 +2757,19 @@ mod tests {
             .save_official_account(&rt_import_account("rt-account", "person"))
             .unwrap();
         let default = store.official_installation_id_setting(&account.id).unwrap();
-        assert!(default.enabled);
+        assert!(!default.enabled);
+        assert!(default.installation_id.is_none());
+        assert!(default.session_id.is_none());
         let view = store.official_account_view(&account.id).unwrap();
         assert!(view.device_session_convergence_available);
-        assert!(view.device_session_convergence_enabled);
+        assert!(!view.device_session_convergence_enabled);
 
         store
-            .set_official_installation_id_unification(&account.id, false)
+            .set_official_installation_id_unification(&account.id, true)
             .unwrap();
         let reopened = Store::open(root).unwrap();
         assert!(
-            !reopened
+            reopened
                 .official_installation_id_setting(&account.id)
                 .unwrap()
                 .enabled
@@ -2815,7 +2823,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_oauth_without_a_stored_setting_defaults_on_but_explicit_off_persists() {
+    fn oauth_without_a_stored_setting_defaults_off_but_explicit_on_persists() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().to_path_buf();
         let store = Store::open(root.clone()).unwrap();
@@ -2823,21 +2831,21 @@ mod tests {
             .save_official_account(&official_account("oauth", "person"))
             .unwrap();
         let default = store.official_installation_id_setting(&account.id).unwrap();
-        assert!(default.enabled);
-        assert!(default.installation_id.is_some());
-        assert!(default.session_id.is_some());
+        assert!(!default.enabled);
+        assert!(default.installation_id.is_none());
+        assert!(default.session_id.is_none());
         assert!(
-            store
+            !store
                 .official_account_view(&account.id)
                 .unwrap()
                 .device_session_convergence_enabled
         );
         store
-            .set_official_installation_id_unification(&account.id, false)
+            .set_official_installation_id_unification(&account.id, true)
             .unwrap();
         let reopened = Store::open(root).unwrap();
         assert!(
-            !reopened
+            reopened
                 .official_installation_id_setting(&account.id)
                 .unwrap()
                 .enabled

@@ -1020,7 +1020,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn active_oauth_reimport_defers_the_managed_relay_until_configuration_sync() {
+    async fn active_oauth_reimport_without_opt_in_stays_direct_after_configuration_sync() {
         let temp = tempfile::tempdir().unwrap();
         let home = temp.path().join("codex-home");
         fs::create_dir_all(&home).unwrap();
@@ -1061,7 +1061,7 @@ mod tests {
         let rt = store.official_account(&imported.accounts[0].id).unwrap();
         assert_eq!(rt.id, oauth.id);
         assert!(
-            store
+            !store
                 .official_installation_id_setting(&rt.id)
                 .unwrap()
                 .enabled
@@ -1083,13 +1083,16 @@ mod tests {
 
         let config = fs::read_to_string(home.join("config.toml")).unwrap();
         let document = config.parse::<toml_edit::DocumentMut>().unwrap();
-        assert_eq!(
-            document["model_provider"].as_str(),
-            Some(crate::codex::INSTALLATION_ID_RELAY_PROVIDER_ID)
+        assert!(document.get("model_provider").is_none());
+        assert!(
+            document
+                .get("model_providers")
+                .and_then(toml_edit::Item::as_table)
+                .is_none_or(|providers| {
+                    providers
+                        .get(crate::codex::INSTALLATION_ID_RELAY_PROVIDER_ID)
+                        .is_none()
+                })
         );
-        assert!(document["model_providers"][crate::codex::INSTALLATION_ID_RELAY_PROVIDER_ID]
-            ["base_url"]
-            .as_str()
-            .is_some_and(|url| url.starts_with("http://127.0.0.1:")));
     }
 }

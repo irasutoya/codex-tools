@@ -472,11 +472,7 @@ mod tests {
                 updated_at: 0,
             })
             .unwrap();
-        // This regression covers the explicit-off/direct path. OAuth accounts
-        // without a stored choice default to the local convergence relay.
-        store
-            .set_official_installation_id_unification(&saved.id, false)
-            .unwrap();
+        // OAuth accounts without an explicit convergence choice stay direct.
         store
             .connections_activate_official_account(&saved.id)
             .unwrap();
@@ -511,6 +507,87 @@ mod tests {
         let repaired: CodexAuthCredential =
             serde_json::from_slice(&fs::read(home.join("auth.json")).unwrap()).unwrap();
         assert_eq!(repaired, credential);
+    }
+
+    #[tokio::test]
+    async fn official_sync_removes_a_stale_relay_without_explicit_opt_in() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex-home");
+        fs::create_dir_all(&home).unwrap();
+        let store = Store::open(temp.path().join("data")).unwrap();
+        store
+            .update(|state| {
+                state.codex.home = home.display().to_string();
+                Ok(())
+            })
+            .unwrap();
+        let credential = CodexAuthCredential {
+            auth_mode: "chatgpt".into(),
+            openai_api_key: None,
+            tokens: CodexAuthTokens {
+                id_token: "id-secret".into(),
+                access_token: "access-secret".into(),
+                refresh_token: "refresh-secret".into(),
+                account_id: "workspace".into(),
+            },
+            last_refresh: "2026-07-15T00:00:00Z".into(),
+        };
+        let saved = store
+            .save_official_account(&StoredOfficialAccount {
+                id: String::new(),
+                name: "OpenAI".into(),
+                remark: String::new(),
+                account_id: "workspace".into(),
+                email: "person@example.test".into(),
+                credential: credential.clone(),
+                source: OfficialAccountSource::OpenAiOauth,
+                expires_at: None,
+                quota: ProviderAccountQuota::default(),
+                created_at: 0,
+                updated_at: 0,
+            })
+            .unwrap();
+        store
+            .connections_activate_official_account(&saved.id)
+            .unwrap();
+        fs::write(
+            home.join("config.toml"),
+            r#"model_provider = "codex_tools_openai_relay"
+[model_providers.codex_tools_openai_relay]
+name = "OpenAI"
+wire_api = "responses"
+requires_openai_auth = true
+base_url = "http://127.0.0.1:1/codex-tools-installation-id/stale"
+"#,
+        )
+        .unwrap();
+        fs::write(
+            home.join("auth.json"),
+            serde_json::to_vec_pretty(&credential).unwrap(),
+        )
+        .unwrap();
+
+        sync_active_codex_configuration(
+            &store,
+            &ConfigManager::default(),
+            &ChatProxyRegistry::default(),
+        )
+        .await
+        .unwrap();
+
+        let config = fs::read_to_string(home.join("config.toml")).unwrap();
+        let document = config.parse::<toml_edit::DocumentMut>().unwrap();
+        assert!(document.get("model_provider").is_none());
+        assert!(
+            document
+                .get("model_providers")
+                .and_then(toml_edit::Item::as_table)
+                .is_none_or(|providers| {
+                    providers
+                        .get(crate::codex::INSTALLATION_ID_RELAY_PROVIDER_ID)
+                        .is_none()
+                })
+        );
     }
 
     #[test]
