@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest"
 import {
   checkVersions,
   isValidSemver,
+  parseArgs,
   readCargoLockPackageVersion,
   readCargoPackageVersion,
 } from "./check-versions.mjs"
@@ -25,6 +26,32 @@ describe("isValidSemver", () => {
       expect(isValidSemver(version)).toBe(false)
     }
   )
+})
+
+describe("parseArgs", () => {
+  it.each([
+    [["--tag", "v1.2.3"], "v1.2.3"],
+    [["--tag=v1.2.3-rc.1"], "v1.2.3-rc.1"],
+  ])("reads a tag from %j", (args, tag) => {
+    expect(parseArgs(args)).toEqual({ tag })
+  })
+
+  it("allows no arguments", () => {
+    expect(parseArgs([])).toEqual({ tag: undefined })
+  })
+
+  it.each([
+    [["--unknown"], "未知参数：--unknown"],
+    [["release"], "不允许多余的位置参数：release"],
+    [["--tag", "v1.2.3", "extra"], "不允许多余的位置参数：extra"],
+    [["--tag"], "--tag 后必须提供标签"],
+    [["--tag="], "--tag 后必须提供标签"],
+    [["--tag", "--unknown"], "--tag 后必须提供标签"],
+    [["--tag", "v1.2.3", "--tag=v1.2.3"], "--tag 不能重复提供"],
+    [["--tag=v1.2.3", "--tag", "v1.2.3"], "--tag 不能重复提供"],
+  ])("rejects invalid arguments %j", (args, message) => {
+    expect(() => parseArgs(args)).toThrow(message)
+  })
 })
 
 describe("version sources", () => {

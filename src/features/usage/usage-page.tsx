@@ -95,7 +95,11 @@ export function UsagePage({
   groupBy: UsageGroupBy
 }) {
   const [tab, setTab] = useState("details")
-  const [selected, setSelected] = useState<UsageRow>()
+  const [selection, setSelection] = useState<{
+    row: UsageRow
+    query: UsageQuery
+    refreshRevision: number
+  }>()
   const [ruleOpen, setRuleOpen] = useState(false)
   const [busy, setBusy] = useState(false)
   const [officialCatalog, setOfficialCatalog] =
@@ -145,6 +149,11 @@ export function UsagePage({
     clearOverview()
   }, [clearOverview, query])
 
+  const selected =
+    selection?.query === query && selection.refreshRevision === refreshRevision
+      ? selection.row
+      : undefined
+
   const fetchRules = useCallback(() => call("usage_list_pricing_rules", {}), [])
   const {
     data: rules,
@@ -170,6 +179,7 @@ export function UsagePage({
             overviewRequestGate.isCurrent(request) &&
             activeQuery.current === requestedQuery
           ) {
+            setSelection(undefined)
             setOverview(next)
             return
           }
@@ -247,6 +257,7 @@ export function UsagePage({
   }, [reloadOverview])
 
   const refreshUsage = async () => {
+    setSelection(undefined)
     const requestedQuery = query
     const request = overviewRequestGate.begin("scan")
     currentScan.current = request
@@ -500,7 +511,9 @@ export function UsagePage({
                       variant="outline"
                       className="flex-nowrap"
                       render={<button type="button" />}
-                      onClick={() => setSelected(row)}
+                      onClick={() =>
+                        setSelection({ row, query, refreshRevision })
+                      }
                     >
                       <ItemContent>
                         <ItemTitle>
@@ -636,7 +649,9 @@ export function UsagePage({
                       variant="outline"
                       className="flex-nowrap"
                       render={<button type="button" />}
-                      onClick={() => setSelected(row)}
+                      onClick={() =>
+                        setSelection({ row, query, refreshRevision })
+                      }
                     >
                       <ItemContent>
                         <ItemTitle>
@@ -681,13 +696,14 @@ export function UsagePage({
       <UsageDetail
         row={selected}
         groupBy={groupBy}
-        onOpenChange={(open) => !open && setSelected(undefined)}
+        onOpenChange={(open) => !open && setSelection(undefined)}
       />
       <PricingEditor
         key={ruleOpen ? "open" : "closed"}
         open={ruleOpen}
         range={query.range}
         modelOptions={modelOptions}
+        rules={rules ?? []}
         onOpenChange={setRuleOpen}
         onSaved={() => {
           setRuleOpen(false)

@@ -35,6 +35,8 @@ struct PendingDeviceAuth {
     expires_at: i64,
     interval: Duration,
     next_poll_at: Instant,
+    exchange: Option<DevicePollResponse>,
+    completed: Option<Box<StoredOfficialAccount>>,
 }
 
 struct PendingPoll {
@@ -43,7 +45,9 @@ struct PendingPoll {
 }
 
 enum LocalPollState {
-    Ready(PendingPoll),
+    ReadyPoll(PendingPoll),
+    ReadyExchange(DevicePollResponse),
+    Complete(Box<StoredOfficialAccount>),
     Pending,
     Expired,
 }
@@ -61,6 +65,7 @@ pub(crate) enum DevicePollResult {
 pub struct AuthCenter {
     client: crate::network::ClientCache,
     pending: Mutex<HashMap<String, PendingDeviceAuth>>,
+    device_poll_lock: Mutex<()>,
     refresh_lock: Mutex<()>,
 }
 
@@ -75,7 +80,7 @@ struct DeviceStartResponse {
     expires_in: Option<u64>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct DevicePollResponse {
     authorization_code: String,
     code_verifier: String,
@@ -111,6 +116,7 @@ impl Default for AuthCenter {
         Self {
             client: crate::network::ClientCache::default(),
             pending: Mutex::new(HashMap::new()),
+            device_poll_lock: Mutex::new(()),
             refresh_lock: Mutex::new(()),
         }
     }
@@ -157,6 +163,8 @@ impl AuthCenter {
                 expires_at,
                 interval: Duration::from_secs(interval_secs),
                 next_poll_at: instant_now,
+                exchange: None,
+                completed: None,
             },
         );
 
@@ -170,45 +178,72 @@ impl AuthCenter {
     }
 
     pub async fn poll_openai(&self, operation_id: &str) -> Result<DevicePollResult, AppError> {
-        let poll = match self.poll_snapshot(operation_id).await? {
-            LocalPollState::Ready(poll) => poll,
+        let _guard = self.device_poll_lock.lock().await;
+        let state = self.poll_snapshot(operation_id).await?;
+        let code = match state {
+            LocalPollState::ReadyPoll(poll) => {
+                let http = self.client()?;
+                let response = http
+                    .post(DEVICE_POLL_URL)
+                    .json(&json!({
+                        "device_auth_id": poll.device_auth_id,
+                        "user_code": poll.user_code,
+                    }))
+                    .send()
+                    .await
+                    .map_err(safe_network_error)?;
+
+                match classify_poll_status(response.status()) {
+                    PollStatus::Pending => return Ok(DevicePollResult::Pending),
+                    PollStatus::Expired => {
+                        self.pending.lock().await.remove(operation_id);
+                        return Ok(DevicePollResult::Expired);
+                    }
+                    PollStatus::Failed(status) => {
+                        return Err(AppError::InvalidConfig(format!(
+                            "无法查询 OpenAI 授权状态（HTTP {status}），请稍后重试。"
+                        )));
+                    }
+                    PollStatus::Complete => {
+                        let code: DevicePollResponse =
+                            read_json_bounded(response, "授权结果").await?;
+                        if code.authorization_code.trim().is_empty()
+                            || code.code_verifier.trim().is_empty()
+                        {
+                            return Err(AppError::InvalidConfig(
+                                "OpenAI 返回的授权结果不完整，请重新获取授权码。".into(),
+                            ));
+                        }
+                        if let Some(state) = self.pending.lock().await.get_mut(operation_id) {
+                            state.exchange = Some(code.clone());
+                        }
+                        code
+                    }
+                }
+            }
+            LocalPollState::ReadyExchange(code) => code,
+            LocalPollState::Complete(account) => return Ok(DevicePollResult::Complete(account)),
             LocalPollState::Pending => return Ok(DevicePollResult::Pending),
             LocalPollState::Expired => return Ok(DevicePollResult::Expired),
         };
 
-        let http = self.client()?;
-        let response = http
-            .post(DEVICE_POLL_URL)
-            .json(&json!({
-                "device_auth_id": poll.device_auth_id,
-                "user_code": poll.user_code,
-            }))
-            .send()
-            .await
-            .map_err(safe_network_error)?;
+        let tokens = self.exchange_code(&code).await?;
+        let account = account_from_tokens(tokens, None)?;
+        let mut pending = self.pending.lock().await;
+        Ok(DevicePollResult::Complete(cache_completed_account(
+            &mut pending,
+            operation_id,
+            account,
+        )))
+    }
 
-        match classify_poll_status(response.status()) {
-            PollStatus::Pending => Ok(DevicePollResult::Pending),
-            PollStatus::Expired => {
-                self.pending.lock().await.remove(operation_id);
-                Ok(DevicePollResult::Expired)
-            }
-            PollStatus::Failed(status) => Err(AppError::InvalidConfig(format!(
-                "无法查询 OpenAI 授权状态（HTTP {status}），请稍后重试。"
-            ))),
-            PollStatus::Complete => {
-                let code: DevicePollResponse = read_json_bounded(response, "授权结果").await?;
-                if code.authorization_code.trim().is_empty() || code.code_verifier.trim().is_empty()
-                {
-                    return Err(AppError::InvalidConfig(
-                        "OpenAI 返回的授权结果不完整，请重新获取授权码。".into(),
-                    ));
-                }
-                let tokens = self.exchange_code(&code).await?;
-                let account = account_from_tokens(tokens, None)?;
-                self.pending.lock().await.remove(operation_id);
-                Ok(DevicePollResult::Complete(Box::new(account)))
-            }
+    pub async fn ack_openai(&self, operation_id: &str) {
+        let mut pending = self.pending.lock().await;
+        if pending
+            .get(operation_id)
+            .is_some_and(|state| state.completed.is_some())
+        {
+            pending.remove(operation_id);
         }
     }
 
@@ -370,15 +405,21 @@ impl AuthCenter {
         let Some(state) = pending.get_mut(operation_id) else {
             return Ok(LocalPollState::Expired);
         };
+        if let Some(account) = state.completed.as_ref() {
+            return Ok(LocalPollState::Complete(account.clone()));
+        }
         if state.is_expired(now, unix_now) {
             pending.remove(operation_id);
             return Ok(LocalPollState::Expired);
+        }
+        if let Some(code) = state.exchange.clone() {
+            return Ok(LocalPollState::ReadyExchange(code));
         }
         if now < state.next_poll_at {
             return Ok(LocalPollState::Pending);
         }
         state.next_poll_at = now + state.interval;
-        Ok(LocalPollState::Ready(PendingPoll {
+        Ok(LocalPollState::ReadyPoll(PendingPoll {
             device_auth_id: state.device_auth_id.clone(),
             user_code: state.user_code.clone(),
         }))
@@ -408,6 +449,19 @@ impl PendingDeviceAuth {
     fn is_expired(&self, now: Instant, unix_now: i64) -> bool {
         now >= self.deadline || unix_now >= self.expires_at
     }
+}
+
+fn cache_completed_account(
+    pending: &mut HashMap<String, PendingDeviceAuth>,
+    operation_id: &str,
+    account: StoredOfficialAccount,
+) -> Box<StoredOfficialAccount> {
+    let account = Box::new(account);
+    if let Some(state) = pending.get_mut(operation_id) {
+        state.completed = Some(account.clone());
+        state.exchange = None;
+    }
+    account
 }
 
 fn build_oauth_client(builder: reqwest::ClientBuilder) -> Result<reqwest::Client, reqwest::Error> {
@@ -829,6 +883,77 @@ mod tests {
         let center = AuthCenter::default();
         assert!(matches!(
             center.poll_snapshot("missing").await.unwrap(),
+            LocalPollState::Expired
+        ));
+    }
+
+    fn pending_device_auth(now: Instant) -> PendingDeviceAuth {
+        PendingDeviceAuth {
+            device_auth_id: "device".into(),
+            user_code: "code".into(),
+            deadline: now + Duration::from_secs(60),
+            expires_at: chrono::Utc::now().timestamp() + 60,
+            interval: Duration::from_secs(5),
+            next_poll_at: now,
+            exchange: None,
+            completed: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn cached_device_exchange_is_retried_without_polling() {
+        let center = AuthCenter::default();
+        let mut pending = pending_device_auth(Instant::now());
+        pending.exchange = Some(DevicePollResponse {
+            authorization_code: "authorization".into(),
+            code_verifier: "verifier".into(),
+        });
+        center
+            .pending
+            .lock()
+            .await
+            .insert("operation".into(), pending);
+
+        for _ in 0..2 {
+            assert!(matches!(
+                center.poll_snapshot("operation").await.unwrap(),
+                LocalPollState::ReadyExchange(code)
+                    if code.authorization_code == "authorization"
+                        && code.code_verifier == "verifier"
+            ));
+        }
+    }
+
+    #[test]
+    fn completed_exchange_is_returned_when_operation_was_replaced() {
+        let account = refresh_test_account(OfficialAccountSource::OpenAiOauth, "refresh", None);
+        let mut pending = HashMap::new();
+
+        let completed = cache_completed_account(&mut pending, "replaced", account.clone());
+
+        assert_eq!(*completed, account);
+        assert!(pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn completed_device_login_is_retained_until_ack() {
+        let center = AuthCenter::default();
+        let account = refresh_test_account(OfficialAccountSource::OpenAiOauth, "refresh", None);
+        let mut pending = pending_device_auth(Instant::now());
+        pending.completed = Some(Box::new(account.clone()));
+        center
+            .pending
+            .lock()
+            .await
+            .insert("operation".into(), pending);
+
+        assert!(matches!(
+            center.poll_snapshot("operation").await.unwrap(),
+            LocalPollState::Complete(completed) if *completed == account
+        ));
+        center.ack_openai("operation").await;
+        assert!(matches!(
+            center.poll_snapshot("operation").await.unwrap(),
             LocalPollState::Expired
         ));
     }

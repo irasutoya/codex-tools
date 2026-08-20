@@ -228,16 +228,37 @@ impl ConfigManager {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn apply(&self, operation_id: &str) -> Result<AppliedConfigPatch, AppError> {
-        self.apply_with_writer(operation_id, |path, bytes| {
-            atomic_write(path, bytes).map_err(AppError::from)
-        })
+        self.apply_checked(operation_id, || Ok(()))
     }
 
+    pub(crate) fn apply_checked(
+        &self,
+        operation_id: &str,
+        check_before_write: impl FnMut() -> Result<(), AppError>,
+    ) -> Result<AppliedConfigPatch, AppError> {
+        self.apply_with_writer_and_check(
+            operation_id,
+            |path, bytes| atomic_write(path, bytes).map_err(AppError::from),
+            check_before_write,
+        )
+    }
+
+    #[cfg(test)]
     fn apply_with_writer(
         &self,
         operation_id: &str,
+        write: impl FnMut(&Path, &[u8]) -> Result<(), AppError>,
+    ) -> Result<AppliedConfigPatch, AppError> {
+        self.apply_with_writer_and_check(operation_id, write, || Ok(()))
+    }
+
+    fn apply_with_writer_and_check(
+        &self,
+        operation_id: &str,
         mut write: impl FnMut(&Path, &[u8]) -> Result<(), AppError>,
+        mut check_before_write: impl FnMut() -> Result<(), AppError>,
     ) -> Result<AppliedConfigPatch, AppError> {
         let pending = self
             .pending
@@ -276,6 +297,10 @@ impl ConfigManager {
         })?;
         let _: serde_json::Map<String, serde_json::Value> =
             parse_auth_object(&pending.auth_rendered)?;
+        // 最终落盘前再次复核停止状态；快照复核与后续逐文件替换只能缩小
+        // 竞争窗口，不宣称提供跨进程事务或原子整组提交。守卫失败时尚未
+        // 写入任何文件，因此不能用旧快照回滚并覆盖外部刚完成的修改。
+        check_before_write()?;
         let apply_result = (|| {
             // 先写模型目录文件，再写 config.toml，保证 model_catalog_json 指向
             // 的内容在配置生效前已就绪；目录为空时不覆盖现有文件。
@@ -368,6 +393,7 @@ pub fn home(configured: &str) -> PathBuf {
         .join(".codex")
 }
 
+#[cfg(test)]
 pub fn connections_activate_official_account(
     codex_home: &Path,
     credential: &CodexAuthCredential,
@@ -375,6 +401,16 @@ pub fn connections_activate_official_account(
 ) -> Result<(), AppError> {
     let patch = prepare_official_account_patch(codex_home, credential, managed_model)?;
     apply_official_account_patch(patch)
+}
+
+pub(crate) fn connections_activate_official_account_checked(
+    codex_home: &Path,
+    credential: &CodexAuthCredential,
+    managed_model: Option<&str>,
+    check_before_write: impl FnOnce() -> Result<(), AppError>,
+) -> Result<(), AppError> {
+    let patch = prepare_official_account_patch(codex_home, credential, managed_model)?;
+    apply_official_account_patch_checked(patch, check_before_write)
 }
 
 fn prepare_official_account_patch(
@@ -428,7 +464,15 @@ fn prepare_official_account_patch(
     })
 }
 
+#[cfg(test)]
 fn apply_official_account_patch(patch: OfficialAccountPatch) -> Result<(), AppError> {
+    apply_official_account_patch_checked(patch, || Ok(()))
+}
+
+fn apply_official_account_patch_checked(
+    patch: OfficialAccountPatch,
+    check_before_write: impl FnOnce() -> Result<(), AppError>,
+) -> Result<(), AppError> {
     let current = CodexFilesSnapshot {
         config: OptionalFileSnapshot::capture(
             patch.original.config.path.clone(),
@@ -453,6 +497,7 @@ fn apply_official_account_patch(patch: OfficialAccountPatch) -> Result<(), AppEr
         return Err(AppError::StaleOperation);
     }
 
+    check_before_write()?;
     let result = commit_codex_files(
         &patch.original.config.path,
         &patch.config_rendered,

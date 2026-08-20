@@ -2,7 +2,7 @@ use crate::{
     activation::ensure_codex_stopped,
     codex,
     models::{AppError, PageResult, RepairResult, RepairScan, SessionSummary},
-    provider_sync,
+    platform, provider_sync,
     session_index::{self, SessionIndex},
     storage::Store,
 };
@@ -23,9 +23,18 @@ pub(crate) async fn repair_home(
     target_provider: String,
 ) -> Result<RepairResult, AppError> {
     ensure_codex_stopped(store)?;
-    tokio::task::spawn_blocking(move || provider_sync::repair(&home, &target_provider))
-        .await
-        .map_err(|error| AppError::Internal(error.to_string()))?
+    let configured_app = store.codex_app_setting()?;
+    let expected_configured_provider = provider_sync::configured_provider(&home);
+    tokio::task::spawn_blocking(move || {
+        provider_sync::repair_with_guard(&home, &target_provider, || {
+            if platform::codex_app_running(configured_app.as_deref()) {
+                return Ok(false);
+            }
+            Ok(provider_sync::configured_provider(&home) == expected_configured_provider)
+        })
+    })
+    .await
+    .map_err(|error| AppError::Internal(error.to_string()))?
 }
 
 pub(crate) async fn repair_home_after_activation(
@@ -35,9 +44,15 @@ pub(crate) async fn repair_home_after_activation(
 ) -> RepairResult {
     let result = match ensure_codex_stopped(store) {
         Ok(()) => {
+            let configured_app = store.codex_app_setting();
             let repair_target = target_provider.clone();
             tokio::task::spawn_blocking(move || {
-                provider_sync::repair_after_connection_switch(&home, &repair_target)
+                let configured_app = configured_app?;
+                provider_sync::repair_after_connection_switch_with_guard(
+                    &home,
+                    &repair_target,
+                    || Ok(!platform::codex_app_running(configured_app.as_deref())),
+                )
             })
             .await
             .map_err(|error| AppError::Internal(error.to_string()))

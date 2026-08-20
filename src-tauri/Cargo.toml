@@ -1,6 +1,6 @@
 [package]
 name = "codex-tools"
-version = "0.7.6"
+version = "0.7.7"
 edition = "2024"
 license = "MIT"
 description = "OpenAI Responses provider manager and session repair tool for Codex"

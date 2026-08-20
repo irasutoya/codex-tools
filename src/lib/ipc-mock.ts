@@ -21,9 +21,9 @@ import type {
   UsageOverview,
 } from "@/types"
 
-const mockEmptyConnections = new URLSearchParams(window.location.search).has(
-  "empty-connections"
-)
+const mockEmptyConnections =
+  typeof window !== "undefined" &&
+  new URLSearchParams(window.location.search).has("empty-connections")
 
 const now = Date.now()
 const day = 86_400_000
@@ -79,9 +79,20 @@ function mockModelsForProvider(provider: Provider) {
   return provider.apiType === "chat" ? ["qwen3-coder"] : ["gpt-5.6"]
 }
 
+export function filterMockSelectedModels(
+  selectedModels: string[] | null | undefined,
+  availableModels: string[]
+) {
+  return selectedModels == null
+    ? selectedModels
+    : selectedModels.filter((model) => availableModels.includes(model))
+}
+
 function refreshMockProviderModels(provider: Provider) {
   const models = mockModelsForProvider(provider)
   provider.availableModels = [...models]
+  const selected = filterMockSelectedModels(provider.selectedModels, models)
+  provider.selectedModels = selected ?? undefined
   provider.updatedAt = Date.now()
   return [...models]
 }
@@ -275,7 +286,7 @@ export async function mockCall(
   command: Command,
   args: unknown
 ): Promise<unknown> {
-  await new Promise((resolve) => window.setTimeout(resolve, 120))
+  await new Promise((resolve) => globalThis.setTimeout(resolve, 120))
   switch (command) {
     case "dashboard_get": {
       const activeAccount = mockEmptyConnections
@@ -622,6 +633,19 @@ export async function mockCall(
         existingIndex >= 0 ? mockProviders[existingIndex] : undefined
       const hasApiKey =
         Boolean(provider.apiKey?.trim()) || Boolean(existing?.hasApiKey)
+      const shouldRefreshModels =
+        !existing ||
+        existing.name !== provider.name ||
+        existing.baseUrl !== provider.baseUrl ||
+        existing.apiType !== provider.apiType ||
+        !sameHeaders(existing.headers, provider.headers) ||
+        Boolean(provider.apiKey?.trim())
+      const selectedModels =
+        provider.selectedModels === undefined &&
+        existing &&
+        !shouldRefreshModels
+          ? existing.selectedModels
+          : (provider.selectedModels ?? undefined)
       const saved: Provider = {
         ...existing,
         id: provider.id || `provider-${Date.now()}`,
@@ -634,19 +658,17 @@ export async function mockCall(
         apiType: provider.apiType,
         apiKey: undefined,
         hasApiKey,
-        availableModels: [...(existing?.availableModels ?? [])],
-        customModels: [...(provider.customModels ?? [])],
-        selectedModels: provider.selectedModels ?? undefined,
+        availableModels: shouldRefreshModels
+          ? []
+          : [...(existing?.availableModels ?? [])],
+        customModels: [
+          ...(provider.customModels ?? existing?.customModels ?? []),
+        ],
+        selectedModels:
+          selectedModels === undefined ? undefined : [...selectedModels],
         createdAt: existing?.createdAt ?? Date.now(),
         updatedAt: Date.now(),
       }
-      const shouldRefreshModels =
-        !existing ||
-        existing.name !== provider.name ||
-        existing.baseUrl !== provider.baseUrl ||
-        existing.apiType !== provider.apiType ||
-        !sameHeaders(existing.headers, provider.headers) ||
-        Boolean(provider.apiKey?.trim())
       if (hasApiKey && shouldRefreshModels) {
         refreshMockProviderModels(saved)
       }

@@ -104,9 +104,20 @@ jobs:
       - name: Generate checksums
         working-directory: release-artifacts
         run: sha256sum * > SHA256SUMS.txt
+      - name: Determine release type
+        id: release-type
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          core="${version%%+*}"
+          if [[ "$core" == *-* ]]; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
       - uses: softprops/action-gh-release@v2
         with:
           draft: true
-          prerelease: true
+          prerelease: ${{ steps.release-type.outputs.prerelease }}
           files: release-artifacts/*
           generate_release_notes: true

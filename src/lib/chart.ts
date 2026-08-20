@@ -15,6 +15,13 @@ export type TrendSeriesPoint = {
   cache: number
 }
 
+export function regularOutputTokens(
+  outputTokens: number,
+  reasoningOutputTokens: number
+) {
+  return Math.max(0, outputTokens - reasoningOutputTokens)
+}
+
 export function trendPointsToSeries(
   points: UsageTrendPoint[],
   hourly = false
@@ -22,7 +29,7 @@ export function trendPointsToSeries(
   return points.map((point) => ({
     date: formatDate(point.dayStartMs, hourly),
     input: point.tokens.inputTokens,
-    output: point.tokens.outputTokens + point.tokens.reasoningOutputTokens,
+    output: point.tokens.outputTokens,
     cache: point.tokens.cachedInputTokens + point.tokens.cacheWriteInputTokens,
   }))
 }
