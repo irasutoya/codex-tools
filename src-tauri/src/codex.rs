@@ -187,11 +187,20 @@ impl ConfigManager {
         let catalog =
             catalog_bytes(&model_unlock::build_model_catalog_with_windows_for_provider(provider));
         let mut document = parse_config_document(&original)?;
-        let candidate_models = provider
-            .selected_models
-            .as_deref()
-            .unwrap_or(&provider.available_models);
-        let effective_model = effective_provider_model(&document, candidate_models)?;
+        // 有效模型 = 选中的模型；未指定选择时 = available_models ∪ custom_models。
+        let candidate_models: Vec<String> = match provider.selected_models.as_deref() {
+            Some(selected) => selected.to_vec(),
+            None => {
+                let mut effective: Vec<String> = provider.available_models.clone();
+                for model in &provider.custom_models {
+                    if !effective.contains(model) {
+                        effective.push(model.clone());
+                    }
+                }
+                effective
+            }
+        };
+        let effective_model = effective_provider_model(&document, &candidate_models)?;
         apply_custom_fields(
             &mut document,
             &provider.name,
@@ -1020,6 +1029,7 @@ mod tests {
             model_context_windows: Default::default(),
             available_models: vec!["api-model".into()],
             selected_models: None,
+            custom_models: Default::default(),
             models_dev_meta: Default::default(),
             api_type: ProviderApiType::Responses,
             api_key: Some("sk-direct-secret-value".into()),
@@ -1315,6 +1325,7 @@ private_setting = "must-also-not-enter-webview"
             model_context_windows: Default::default(),
             available_models: vec!["deepseek-chat".into()],
             selected_models: None,
+            custom_models: Default::default(),
             models_dev_meta: Default::default(),
             api_type: ProviderApiType::Chat,
             api_key: Some("sk-real-provider-key".into()),
@@ -1393,6 +1404,29 @@ private_setting = "must-also-not-enter-webview"
                 .as_str(),
             Some("custom")
         );
+    }
+
+    #[test]
+    fn preview_custom_uses_custom_model_when_no_available_models() {
+        // 服务仅有自定义模型（无 /models 同步结果）时，candidate_models 仍能选出
+        // effective_model，预览可正常生成并应用到 Codex。
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex");
+        prepare_home(&home);
+        let mut provider = provider();
+        provider.available_models = Vec::new();
+        provider.custom_models = vec!["my-custom-model".into()];
+        let manager = ConfigManager::default();
+
+        let preview = manager
+            .preview_custom(&home, &provider, &direct_target(&provider.base_url))
+            .unwrap();
+        assert!(!preview.rendered.is_empty());
+        manager.apply(&preview.operation_id).unwrap();
+
+        let config = fs::read_to_string(home.join("config.toml")).unwrap();
+        let document: DocumentMut = config.parse().unwrap();
+        assert_eq!(document["model"].as_str(), Some("my-custom-model"));
     }
 
     #[test]

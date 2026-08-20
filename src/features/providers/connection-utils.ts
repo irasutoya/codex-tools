@@ -1,6 +1,11 @@
 import { formatDate, quotaWindow } from "@/lib/format"
 import { call } from "@/lib/ipc"
-import type { OfficialAccountView, Provider, RepairResult } from "@/types"
+import type {
+  OfficialAccountView,
+  Provider,
+  ProviderSaveInput,
+  RepairResult,
+} from "@/types"
 
 export type ConnectionKind = "account" | "provider"
 
@@ -19,11 +24,63 @@ export const emptyProvider = (): Provider => ({
   updatedAt: 0,
 })
 
+/** 将编辑器状态转换为保存 DTO；null 明确表示“全部有效模型”。 */
+export function providerSaveInputOf(provider: Provider): ProviderSaveInput {
+  return {
+    id: provider.id,
+    name: provider.name,
+    baseUrl: provider.baseUrl,
+    headers: { ...provider.headers },
+    timeoutSecs: provider.timeoutSecs,
+    enabled: provider.enabled,
+    apiType: provider.apiType,
+    selectedModels: provider.selectedModels ?? null,
+    customModels: provider.customModels ?? [],
+    apiKey: provider.apiKey,
+  }
+}
+
+/** 有效模型 = /models 同步模型 ∪ 自定义模型（保序去重）。 */
+export function effectiveModelsOf(provider: Provider): string[] {
+  const available = provider.availableModels ?? []
+  const custom = provider.customModels ?? []
+  return [...available, ...custom.filter((model) => !available.includes(model))]
+}
+
+/** 有效模型数 = /models 同步模型 ∪ 自定义模型（去重）。 */
+export function effectiveModelCount(provider: Provider) {
+  return effectiveModelsOf(provider).length
+}
+
+/** 将后端序列化的 null 统一转为 undefined，保持"未设置=全选"语义。 */
+function selectedModelsOf(provider: Provider): string[] | undefined {
+  return provider.selectedModels ?? undefined
+}
+
+/** 全选 = 未设置 selectedModels（默认写入全部），或所有有效模型均被选中。 */
+export function allModelsSelected(provider: Provider): boolean {
+  const selected = selectedModelsOf(provider)
+  if (selected === undefined) return true
+  return effectiveModelsOf(provider).every((model) => selected.includes(model))
+}
+
+/** 无选中 = 存在有效模型但 selectedModels 为空数组（此时禁止保存）。 */
+export function noModelsSelected(provider: Provider): boolean {
+  const selected = selectedModelsOf(provider)
+  return effectiveModelsOf(provider).length > 0 && selected?.length === 0
+}
+
 export function accountIsExpired(account: OfficialAccountView) {
   return (
     account.expiresAt != null &&
     account.expiresAt <= Math.floor(Date.now() / 1000)
   )
+}
+
+export const DEACTIVATED_WORKSPACE_CODE = "deactivated_workspace"
+
+export function accountWorkspaceIsDeactivated(account: OfficialAccountView) {
+  return account.quota.errorCode === DEACTIVATED_WORKSPACE_CODE
 }
 
 export function quotaStatusText(
@@ -32,6 +89,9 @@ export function quotaStatusText(
 ) {
   if (remainingPercent !== undefined) {
     return `剩余 ${remainingPercent.toFixed(1)}%`
+  }
+  if (account.quota.status !== "success" && account.quota.error) {
+    return account.quota.error
   }
   switch (account.quota.status) {
     case "never":
@@ -104,7 +164,9 @@ export function buildFallbackCandidates(
   excludedProviderId?: string
 ): FallbackCandidate[] {
   const remainingAccounts = accounts.filter(
-    (account) => !excludedAccountIds.has(account.id)
+    (account) =>
+      !excludedAccountIds.has(account.id) &&
+      !accountWorkspaceIsDeactivated(account)
   )
   const healthyAccounts = remainingAccounts.filter(
     (account) =>
@@ -152,4 +214,58 @@ export async function switchActiveConnection(
     }
   }
   return { error: lastError }
+}
+
+/** 在有效模型中切换某个模型的选中状态，返回新的 selectedModels。 */
+export function toggleModelSelected(
+  provider: Provider,
+  model: string,
+  checked: boolean
+): string[] | undefined {
+  const eff = effectiveModelsOf(provider)
+  const current = selectedModelsOf(provider) ?? eff
+  const next = checked
+    ? [...new Set([...current, model])]
+    : current.filter((value) => value !== model)
+  return next.length === eff.length ? undefined : next
+}
+
+/** 添加自定义模型并保持“默认写入”语义（合并 customModels + selectedModels）。 */
+export function addCustomModelTo(provider: Provider, model: string): Provider {
+  const prevEffective = effectiveModelsOf(provider)
+  const nextCustom = [...(provider.customModels ?? []), model]
+  let nextSelected = selectedModelsOf(provider)
+  // 新增的自定义模型默认写入 Codex（与“默认全选”一致）。
+  if (nextSelected !== undefined) {
+    const candidate = [...nextSelected, model]
+    nextSelected =
+      candidate.length === prevEffective.length + 1 ? undefined : candidate
+  }
+  return {
+    ...provider,
+    customModels: nextCustom,
+    selectedModels: nextSelected,
+  }
+}
+
+/** 移除自定义模型，并从 selectedModels 中同步剔除，必要时回退全选。 */
+export function removeCustomModelFrom(
+  provider: Provider,
+  model: string
+): Provider {
+  const prevEffective = effectiveModelsOf(provider)
+  const nextCustom = (provider.customModels ?? []).filter(
+    (value) => value !== model
+  )
+  let nextSelected = selectedModelsOf(provider)
+  if (nextSelected !== undefined) {
+    const filtered = nextSelected.filter((value) => value !== model)
+    nextSelected =
+      filtered.length === prevEffective.length - 1 ? undefined : filtered
+  }
+  return {
+    ...provider,
+    customModels: nextCustom,
+    selectedModels: nextSelected,
+  }
 }

@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react"
+import { useMemo, useRef, useState } from "react"
 import {
   Login03Icon,
   Refresh01Icon,
@@ -61,8 +61,10 @@ import { AccountManagerDialog } from "./account-manager-dialog"
 import {
   accountDescription,
   accountIsExpired,
+  accountWorkspaceIsDeactivated,
   buildFallbackCandidates,
   emptyProvider,
+  effectiveModelCount,
   repairWarning,
   switchActiveConnection,
   type ConnectionKind,
@@ -120,6 +122,7 @@ export function ConnectionManagerSheet({
   const [remarkDraft, setRemarkDraft] = useState("")
   const [providerDraft, setProviderDraft] = useState<Provider>(emptyProvider())
   const [providerEditorOpen, setProviderEditorOpen] = useState(false)
+  const latestSavedProviders = useRef(new Map<string, Provider>())
   const [deleteTarget, setDeleteTarget] = useState<DeleteTarget>()
   const [accountManagerOpen, setAccountManagerOpen] = useState(false)
 
@@ -202,10 +205,17 @@ export function ConnectionManagerSheet({
 
   const editProvider = (provider: Provider) => {
     if (pending) return
+    const cached = latestSavedProviders.current.get(provider.id)
+    const latest =
+      cached && cached.updatedAt >= provider.updatedAt ? cached : provider
     setProviderDraft({
-      ...provider,
-      headers: { ...provider.headers },
-      availableModels: [...(provider.availableModels ?? [])],
+      ...latest,
+      headers: { ...latest.headers },
+      availableModels: [...(latest.availableModels ?? [])],
+      customModels: [...(latest.customModels ?? [])],
+      selectedModels: latest.selectedModels
+        ? [...latest.selectedModels]
+        : undefined,
     })
     setProviderEditorOpen(true)
   }
@@ -332,6 +342,7 @@ export function ConnectionManagerSheet({
       accounts.map((account) => ({
         account,
         expired: accountIsExpired(account),
+        deactivated: accountWorkspaceIsDeactivated(account),
       })),
     [accounts]
   )
@@ -389,7 +400,7 @@ export function ConnectionManagerSheet({
                     {accountRows.length === 0 && (
                       <EmptyConnectionItem label="暂无 OpenAI 账号" />
                     )}
-                    {accountRows.map(({ account, expired }) => (
+                    {accountRows.map(({ account, expired, deactivated }) => (
                       <ConnectionItem
                         key={account.id}
                         kind="account"
@@ -402,9 +413,14 @@ export function ConnectionManagerSheet({
                           page === "providers" && selectedId === account.id
                         }
                         unavailable={
-                          expired || account.quota.status === "unauthorized"
+                          deactivated ||
+                          expired ||
+                          account.quota.status === "unauthorized"
                         }
-                        unavailableLabel="登录失效"
+                        unavailableLabel={
+                          deactivated ? "工作区已停用" : "登录失效"
+                        }
+                        activateDisabled={deactivated}
                         frozen={frozen}
                         pending={pending}
                         onView={() => {
@@ -474,8 +490,8 @@ export function ConnectionManagerSheet({
                         id={provider.id}
                         name={provider.name}
                         description={`${
-                          provider.availableModels?.length
-                            ? `${provider.availableModels.length} 个模型`
+                          effectiveModelCount(provider)
+                            ? `${effectiveModelCount(provider)} 个模型`
                             : "模型尚未同步"
                         } · ${provider.baseUrl}`}
                         active={provider.active}
@@ -606,7 +622,9 @@ export function ConnectionManagerSheet({
         onOpenChange={setProviderEditorOpen}
         provider={providerDraft}
         onProviderChange={setProviderDraft}
-        onSaved={() => {
+        onSaved={(saved) => {
+          latestSavedProviders.current.set(saved.id, saved)
+          setProviderDraft(saved)
           setProviderEditorOpen(false)
           onChanged()
         }}

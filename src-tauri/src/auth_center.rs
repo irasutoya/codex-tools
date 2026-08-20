@@ -1,7 +1,8 @@
 use crate::models::{
     AppError, CodexAuthCredential, CodexAuthTokens, MAX_ACCOUNT_ID_CHARS, MAX_CREDENTIAL_CHARS,
     MAX_DISPLAY_NAME_CHARS, OfficialAccountSource, OpenAiDeviceAuthorization, ProviderAccountQuota,
-    StoredOfficialAccount, ensure_char_limit, token_identity, token_local_identity,
+    StoredOfficialAccount, ensure_char_limit, official_account_identity_matches, token_identity,
+    token_local_identity,
 };
 use crate::proxy_import::ImportedProxyCredential;
 use crate::storage::Store;
@@ -269,7 +270,7 @@ impl AuthCenter {
         let refreshed: TokenResponse = read_json_bounded(response, "登录凭据更新结果").await?;
         let tokens = merge_refreshed_tokens(refreshed, &account)?;
         let refreshed = account_from_tokens(tokens, Some(&account))?;
-        store.save_official_account(&refreshed)
+        store.save_refreshed_official_account(account_id, &refreshed)
     }
 
     pub async fn connections_import_cookie(
@@ -549,7 +550,7 @@ fn account_from_tokens(
         last_refresh: now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
     };
 
-    Ok(StoredOfficialAccount {
+    let refreshed = StoredOfficialAccount {
         id: previous.map_or_else(String::new, |account| account.id.clone()),
         name: if email.is_empty() {
             previous.map_or_else(|| "OpenAI 账号".into(), |account| account.name.clone())
@@ -567,7 +568,13 @@ fn account_from_tokens(
         }),
         created_at: previous.map_or(now_timestamp, |account| account.created_at),
         updated_at: now_timestamp,
-    })
+    };
+    if previous.is_some_and(|previous| !official_account_identity_matches(previous, &refreshed)) {
+        return Err(AppError::InvalidConfig(
+            "OpenAI 返回的凭据属于其他用户，请重新进行官方授权。".into(),
+        ));
+    }
+    Ok(refreshed)
 }
 
 fn account_from_imported_tokens(
@@ -777,6 +784,7 @@ mod tests {
     #[test]
     fn extracts_namespaced_codex_claims() {
         let token = jwt(json!({
+            "sub": "user-1",
             "https://api.openai.com/auth": {
                 "chatgpt_account_id": "acct-1"
             },
@@ -786,6 +794,7 @@ mod tests {
             "exp": 1_800_000_000_i64
         }));
         let identity = token_identity(&token).unwrap();
+        assert_eq!(identity.subject.as_deref(), Some("user-1"));
         assert_eq!(identity.account_id.as_deref(), Some("acct-1"));
         assert_eq!(identity.email.as_deref(), Some("sakura@example.com"));
         assert_eq!(identity.expires_at, Some(1_800_000_000));
@@ -944,6 +953,53 @@ mod tests {
             refresh_token: "refresh-new".into(),
             expires_in: Some(3600),
         };
+        assert!(account_from_tokens(tokens, Some(&previous)).is_err());
+    }
+
+    #[test]
+    fn refresh_cannot_change_user_inside_the_same_workspace() {
+        let mut previous = StoredOfficialAccount {
+            id: "local-id".into(),
+            name: "old@example.com".into(),
+            remark: String::new(),
+            account_id: "shared-workspace".into(),
+            email: "old@example.com".into(),
+            credential: CodexAuthCredential {
+                auth_mode: "chatgpt".into(),
+                openai_api_key: None,
+                tokens: CodexAuthTokens {
+                    id_token: jwt(json!({
+                        "sub": "user-1",
+                        "chatgpt_account_id": "shared-workspace",
+                        "email": "old@example.com"
+                    })),
+                    access_token: String::new(),
+                    refresh_token: "refresh-old".into(),
+                    account_id: "shared-workspace".into(),
+                },
+                last_refresh: "2026-01-01T00:00:00Z".into(),
+            },
+            source: OfficialAccountSource::OpenAiOauth,
+            expires_at: None,
+            quota: ProviderAccountQuota::default(),
+            created_at: 1,
+            updated_at: 1,
+        };
+        previous.credential.tokens.access_token = previous.credential.tokens.id_token.clone();
+        let tokens = CompleteTokens {
+            id_token: jwt(json!({
+                "sub": "user-2",
+                "chatgpt_account_id": "shared-workspace",
+                "email": "old@example.com"
+            })),
+            access_token: jwt(json!({
+                "sub": "user-2",
+                "chatgpt_account_id": "shared-workspace"
+            })),
+            refresh_token: "refresh-new".into(),
+            expires_in: Some(3600),
+        };
+
         assert!(account_from_tokens(tokens, Some(&previous)).is_err());
     }
 

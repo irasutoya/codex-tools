@@ -296,13 +296,14 @@ impl Store {
         &self,
         provider: ProviderProfile,
     ) -> Result<ProviderProfile, AppError> {
-        self.connections_save_provider_with_previous(provider)
+        self.connections_save_provider_with_previous(provider, false)
             .map(|(_, saved)| saved)
     }
 
     pub(crate) fn connections_save_provider_with_previous(
         &self,
         mut provider: ProviderProfile,
+        custom_models_explicit: bool,
     ) -> Result<(Option<ProviderProfile>, ProviderProfile), AppError> {
         if provider.id.trim().is_empty() {
             provider.id = uuid::Uuid::new_v4().to_string();
@@ -342,8 +343,13 @@ impl Store {
                 if model_source_changed {
                     provider.model_context_windows.clear();
                     provider.available_models.clear();
-                    provider.selected_models = None;
+                    // 模型源变化只使 API 目录缓存失效；用户显式选择的子集必须保留，
+                    // 等新 `/models` 返回后再取交集，绝不能静默扩大为全选。
                     provider.models_dev_meta.clear();
+                    // 自定义模型属于用户数据，不随服务源修改而清空。
+                    if provider.custom_models.is_empty() && !custom_models_explicit {
+                        provider.custom_models = existing.custom_models.clone();
+                    }
                 } else {
                     if provider.model_context_windows.is_empty() {
                         provider.model_context_windows = existing.model_context_windows.clone();
@@ -351,8 +357,10 @@ impl Store {
                     if provider.available_models.is_empty() {
                         provider.available_models = existing.available_models.clone();
                     }
-                    if provider.selected_models.is_none() {
-                        provider.selected_models = existing.selected_models.clone();
+                    // selected_models 是用户可编辑字段：None 明确表示清除旧筛选、
+                    // 使用全部有效模型，不能像后端缓存字段一样从旧记录回填。
+                    if provider.custom_models.is_empty() && !custom_models_explicit {
+                        provider.custom_models = existing.custom_models.clone();
                     }
                     if provider.models_dev_meta.is_empty() {
                         provider.models_dev_meta = existing.models_dev_meta.clone();
@@ -439,7 +447,10 @@ impl Store {
             provider.model_context_windows = windows;
             provider.models_dev_meta = meta;
             if let Some(selected) = provider.selected_models.as_mut() {
-                selected.retain(|model| provider.available_models.contains(model));
+                selected.retain(|model| {
+                    provider.available_models.contains(model)
+                        || provider.custom_models.contains(model)
+                });
             }
             // 刷新模型列表时顺带清理尚未经过“保存服务”迁移的旧默认模型。
             provider.model.clear();
@@ -609,6 +620,43 @@ impl Store {
             .ok_or_else(|| AppError::Internal("OpenAI 账号保存结果为空。".into()))
     }
 
+    /// Updates credentials obtained by refreshing an existing OpenAI account.
+    ///
+    /// Account remarks and quota snapshots are edited through separate paths.
+    /// Resolve them from the latest durable record at commit time instead of
+    /// trusting the potentially stale account snapshot used for the network
+    /// request.
+    pub fn save_refreshed_official_account(
+        &self,
+        id: &str,
+        refreshed: &StoredOfficialAccount,
+    ) -> Result<StoredOfficialAccount, AppError> {
+        let mut refreshed = refreshed.clone();
+        normalize_official_account(&mut refreshed)?;
+        self.update(|state| {
+            let existing = state
+                .official_accounts
+                .iter_mut()
+                .find(|account| account.id == id)
+                .ok_or_else(|| {
+                    AppError::InvalidConfig("OpenAI 账号不存在，可能已被删除。".into())
+                })?;
+            if !official_account_identity_matches(existing, &refreshed) {
+                return Err(AppError::InvalidConfig(
+                    "OpenAI 返回的凭据属于其他账号，请重新进行官方授权。".into(),
+                ));
+            }
+
+            refreshed.id = existing.id.clone();
+            refreshed.remark = existing.remark.clone();
+            refreshed.quota = existing.quota.clone();
+            refreshed.created_at = existing.created_at;
+            refreshed.updated_at = chrono::Utc::now().timestamp();
+            *existing = refreshed.clone();
+            Ok(refreshed)
+        })
+    }
+
     pub fn save_official_accounts(
         &self,
         accounts: &[StoredOfficialAccount],
@@ -620,13 +668,26 @@ impl Store {
         let now = chrono::Utc::now().timestamp();
 
         self.update(move |state| {
+            ensure_official_account_capacity(&state.official_accounts, &incoming_accounts)?;
             let mut saved_accounts = Vec::with_capacity(incoming_accounts.len());
             for mut incoming in incoming_accounts {
-                if let Some(existing_index) = state
+                let active_account_id = matches!(state.active.kind, ActiveKind::Official)
+                    .then_some(state.active.account_id.as_deref())
+                    .flatten();
+                let existing_index = state
                     .official_accounts
                     .iter()
-                    .position(|saved| saved.account_id == incoming.account_id)
-                {
+                    .position(|saved| {
+                        active_account_id == Some(saved.id.as_str())
+                            && official_account_identity_matches(saved, &incoming)
+                    })
+                    .or_else(|| {
+                        state
+                            .official_accounts
+                            .iter()
+                            .position(|saved| official_account_identity_matches(saved, &incoming))
+                    });
+                if let Some(existing_index) = existing_index {
                     let existing = &state.official_accounts[existing_index];
                     incoming.id = existing.id.clone();
                     incoming.created_at = existing.created_at;
@@ -638,16 +699,42 @@ impl Store {
                     incoming.quota = existing.quota.clone();
                     incoming.updated_at = now;
                     state.official_accounts[existing_index] = incoming.clone();
-                    let mut kept_match = false;
+                    let retained_id = incoming.id.clone();
+                    let duplicate_ids = state
+                        .official_accounts
+                        .iter()
+                        .filter(|saved| {
+                            saved.id != retained_id
+                                && official_account_identity_matches(saved, &incoming)
+                        })
+                        .map(|saved| saved.id.clone())
+                        .collect::<Vec<_>>();
+                    if !state
+                        .official_installation_id_settings
+                        .contains_key(&retained_id)
+                        && let Some(setting) = duplicate_ids
+                            .iter()
+                            .find_map(|id| state.official_installation_id_settings.get(id).cloned())
+                    {
+                        state
+                            .official_installation_id_settings
+                            .insert(retained_id.clone(), setting);
+                    }
+                    for duplicate_id in &duplicate_ids {
+                        state.official_installation_id_settings.remove(duplicate_id);
+                    }
+                    if matches!(state.active.kind, ActiveKind::Official)
+                        && state
+                            .active
+                            .account_id
+                            .as_ref()
+                            .is_some_and(|id| duplicate_ids.contains(id))
+                    {
+                        state.active.account_id = Some(retained_id.clone());
+                    }
                     state.official_accounts.retain(|saved| {
-                        if saved.account_id != incoming.account_id {
-                            true
-                        } else if kept_match {
-                            false
-                        } else {
-                            kept_match = true;
-                            true
-                        }
+                        saved.id == retained_id
+                            || !official_account_identity_matches(saved, &incoming)
                     });
                     saved_accounts.push(incoming);
                     continue;
@@ -664,17 +751,25 @@ impl Store {
                 if incoming.created_at == 0 {
                     incoming.created_at = now;
                 }
-                if state.official_accounts.len() >= MAX_SAVED_OPENAI_ACCOUNTS {
-                    return Err(AppError::InvalidConfig(
-                        "最多可保存 500 个 OpenAI 账号，请先删除不再使用的账号。".into(),
-                    ));
-                }
                 incoming.updated_at = now;
                 state.official_accounts.push(incoming.clone());
                 saved_accounts.push(incoming);
             }
             Ok(saved_accounts)
         })
+    }
+
+    pub fn ensure_official_account_capacity(
+        &self,
+        accounts: &[StoredOfficialAccount],
+    ) -> Result<(), AppError> {
+        let mut incoming_accounts = accounts.to_vec();
+        for account in &mut incoming_accounts {
+            normalize_official_account(account)?;
+        }
+        self.read(|state| {
+            ensure_official_account_capacity(&state.official_accounts, &incoming_accounts)
+        })?
     }
 
     pub fn update_official_account_remark(
@@ -767,7 +862,7 @@ impl Store {
                 .iter_mut()
                 .find(|account| account.id == id)
                 .ok_or_else(|| AppError::InvalidConfig("OpenAI 账号不存在，请重新登录。".into()))?;
-            if account.account_id != credential.tokens.account_id {
+            if !official_credential_identity_matches(account, credential) {
                 return Err(AppError::InvalidConfig(
                     "OpenAI 返回了其他账号的登录信息，请重新登录。".into(),
                 ));
@@ -798,6 +893,7 @@ impl Store {
                 provider_id: None,
                 account_id: Some(id.to_owned()),
             };
+            state.codex.last_managed_model = None;
             Ok(())
         })
     }
@@ -826,10 +922,14 @@ impl Store {
                 .or_default();
             setting.enabled = enabled;
             if enabled && setting.installation_id.is_none() {
-                setting.installation_id = Some(account_scoped_installation_id(&account.account_id));
+                setting.installation_id = Some(account_scoped_installation_id(
+                    &official_account_identity_scope(account),
+                ));
             }
             if enabled && setting.session_id.is_none() {
-                setting.session_id = Some(account_scoped_session_id(&account.account_id));
+                setting.session_id = Some(account_scoped_session_id(
+                    &official_account_identity_scope(account),
+                ));
             }
             Ok(account.clone())
         })
@@ -924,8 +1024,12 @@ fn effective_default_installation_id_setting(
     if account.device_session_convergence_available() {
         OfficialInstallationIdSetting {
             enabled: true,
-            installation_id: Some(account_scoped_installation_id(&account.account_id)),
-            session_id: Some(account_scoped_session_id(&account.account_id)),
+            installation_id: Some(account_scoped_installation_id(
+                &official_account_identity_scope(account),
+            )),
+            session_id: Some(account_scoped_session_id(&official_account_identity_scope(
+                account,
+            ))),
         }
     } else {
         OfficialInstallationIdSetting::default()
@@ -947,12 +1051,37 @@ fn effective_installation_id_setting(
         return setting;
     }
     if setting.enabled && setting.session_id.is_none() {
-        setting.session_id = Some(account_scoped_session_id(&account.account_id));
+        setting.session_id = Some(account_scoped_session_id(&official_account_identity_scope(
+            account,
+        )));
     }
     if setting.enabled && setting.installation_id.is_none() {
-        setting.installation_id = Some(account_scoped_installation_id(&account.account_id));
+        setting.installation_id = Some(account_scoped_installation_id(
+            &official_account_identity_scope(account),
+        ));
     }
     setting
+}
+
+fn ensure_official_account_capacity(
+    existing: &[StoredOfficialAccount],
+    incoming: &[StoredOfficialAccount],
+) -> Result<(), AppError> {
+    let mut staged = existing.to_vec();
+    for account in incoming {
+        if !staged
+            .iter()
+            .any(|saved| official_account_identity_matches(saved, account))
+        {
+            staged.push(account.clone());
+        }
+    }
+    if staged.len() > MAX_SAVED_OPENAI_ACCOUNTS {
+        return Err(AppError::InvalidConfig(
+            "最多可保存 500 个 OpenAI 账号，请先删除不再使用的账号。".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn normalize_official_account(account: &mut StoredOfficialAccount) -> Result<(), AppError> {
@@ -1262,6 +1391,27 @@ mod tests {
         }
     }
 
+    fn identified_official_account(
+        account_id: &str,
+        subject: &str,
+        email: &str,
+        suffix: &str,
+    ) -> StoredOfficialAccount {
+        let mut account = official_account(account_id, suffix);
+        account.email = email.into();
+        let payload = URL_SAFE_NO_PAD.encode(
+            serde_json::json!({
+                "sub": subject,
+                "chatgpt_account_id": account_id,
+                "email": email
+            })
+            .to_string()
+            .as_bytes(),
+        );
+        account.credential.tokens.id_token = format!("header.{payload}.signature");
+        account
+    }
+
     fn rt_import_account(account_id: &str, suffix: &str) -> StoredOfficialAccount {
         let mut account = official_account(account_id, suffix);
         account.source = OfficialAccountSource::ProxyImport;
@@ -1288,6 +1438,7 @@ mod tests {
             model_context_windows: Default::default(),
             available_models: Default::default(),
             selected_models: None,
+            custom_models: Default::default(),
             models_dev_meta: Default::default(),
             api_type: ProviderApiType::Responses,
             api_key: Some("secret".into()),
@@ -1373,11 +1524,16 @@ mod tests {
     }
 
     #[test]
-    fn official_account_save_deduplicates_external_account_id() {
+    fn official_account_save_updates_only_the_same_workspace_user() {
         let temp = tempfile::tempdir().unwrap();
         let store = Store::open(temp.path().to_path_buf()).unwrap();
         let first = store
-            .save_official_account(&official_account("workspace-1", "first"))
+            .save_official_account(&identified_official_account(
+                "workspace-1",
+                "user-1",
+                "first@example.test",
+                "first",
+            ))
             .unwrap();
         store
             .update(|state| {
@@ -1391,7 +1547,12 @@ mod tests {
             })
             .unwrap();
         let second = store
-            .save_official_account(&official_account("workspace-1", "second"))
+            .save_official_account(&identified_official_account(
+                "workspace-1",
+                "user-1",
+                "renamed@example.test",
+                "second",
+            ))
             .unwrap();
 
         assert_eq!(second.id, first.id);
@@ -1407,13 +1568,234 @@ mod tests {
                 .contains("access-secret-second")
         );
 
-        let mut explicitly_annotated = official_account("workspace-1", "third");
+        let mut explicitly_annotated =
+            identified_official_account("workspace-1", "user-1", "third@example.test", "third");
         explicitly_annotated.remark = "新备注".into();
         explicitly_annotated.quota = ProviderAccountQuota::default();
         let third = store.save_official_account(&explicitly_annotated).unwrap();
         assert_eq!(third.remark, "保留的备注");
         assert_eq!(third.quota.status, QuotaStatus::Success);
         assert_eq!(third.quota.fetched_at, Some(42));
+    }
+
+    #[test]
+    fn duplicate_merge_preserves_the_active_record_and_its_device_setting() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path().to_path_buf()).unwrap();
+        let original = store
+            .save_official_account(&identified_official_account(
+                "workspace-1",
+                "user-1",
+                "person@example.test",
+                "original",
+            ))
+            .unwrap();
+        let active_id = "active-duplicate".to_owned();
+        store
+            .update(|state| {
+                let mut duplicate = state.official_accounts[0].clone();
+                duplicate.id = active_id.clone();
+                state.official_accounts.push(duplicate);
+                state.active = ActiveState {
+                    kind: ActiveKind::Official,
+                    provider_id: None,
+                    account_id: Some(active_id.clone()),
+                };
+                state.official_installation_id_settings.insert(
+                    active_id.clone(),
+                    OfficialInstallationIdSetting {
+                        enabled: false,
+                        installation_id: Some("active-installation".into()),
+                        session_id: Some("active-session".into()),
+                    },
+                );
+                Ok(())
+            })
+            .unwrap();
+
+        let saved = store
+            .save_official_account(&identified_official_account(
+                "workspace-1",
+                "user-1",
+                "renamed@example.test",
+                "updated",
+            ))
+            .unwrap();
+        let state = store.snapshot().unwrap();
+
+        assert_eq!(saved.id, active_id);
+        assert_eq!(state.active.account_id.as_deref(), Some(active_id.as_str()));
+        assert_eq!(state.official_accounts.len(), 1);
+        assert!(
+            !state
+                .official_accounts
+                .iter()
+                .any(|account| account.id == original.id)
+        );
+        assert_eq!(
+            state
+                .official_installation_id_settings
+                .get(&active_id)
+                .unwrap()
+                .installation_id
+                .as_deref(),
+            Some("active-installation")
+        );
+        assert!(
+            !state
+                .official_installation_id_settings
+                .contains_key(&original.id)
+        );
+    }
+
+    #[test]
+    fn official_account_save_keeps_different_users_in_the_same_workspace() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path().to_path_buf()).unwrap();
+        let first = store
+            .save_official_account(&identified_official_account(
+                "shared-workspace",
+                "user-1",
+                "first@example.test",
+                "first",
+            ))
+            .unwrap();
+        store
+            .connections_activate_official_account(&first.id)
+            .unwrap();
+        let second = store
+            .save_official_account(&identified_official_account(
+                "shared-workspace",
+                "user-2",
+                "first@example.test",
+                "second",
+            ))
+            .unwrap();
+
+        assert_ne!(second.id, first.id);
+        let state = store.snapshot().unwrap();
+        assert_eq!(state.official_accounts.len(), 2);
+        assert_eq!(state.active.account_id.as_deref(), Some(first.id.as_str()));
+        assert_ne!(
+            effective_default_installation_id_setting(&state.official_accounts[0]).installation_id,
+            effective_default_installation_id_setting(&state.official_accounts[1]).installation_id
+        );
+    }
+
+    #[test]
+    fn official_account_identity_falls_back_to_case_insensitive_email() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path().to_path_buf()).unwrap();
+        let mut first = official_account("shared-workspace", "first");
+        first.email = "Person@Example.Test".into();
+        let first = store.save_official_account(&first).unwrap();
+        let mut repeated = official_account("shared-workspace", "repeated");
+        repeated.email = "person@example.test".into();
+        let repeated = store.save_official_account(&repeated).unwrap();
+        let different = store
+            .save_official_account(&official_account("shared-workspace", "different"))
+            .unwrap();
+
+        assert_eq!(repeated.id, first.id);
+        assert_ne!(different.id, first.id);
+        assert_eq!(store.snapshot().unwrap().official_accounts.len(), 2);
+    }
+
+    #[test]
+    fn unidentified_import_does_not_overwrite_identified_workspace_users() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path().to_path_buf()).unwrap();
+        let identified = store
+            .save_official_account(&identified_official_account(
+                "shared-workspace",
+                "user-1",
+                "person@example.test",
+                "identified",
+            ))
+            .unwrap();
+        let mut unidentified = official_account("shared-workspace", "cookie");
+        unidentified.email.clear();
+        unidentified.credential.tokens.id_token.clear();
+        unidentified.credential.tokens.access_token = "opaque-cookie-access".into();
+        let first_import = store.save_official_account(&unidentified).unwrap();
+        unidentified.credential.tokens.access_token = "opaque-cookie-updated".into();
+        let repeated_import = store.save_official_account(&unidentified).unwrap();
+
+        assert_ne!(first_import.id, identified.id);
+        assert_eq!(repeated_import.id, first_import.id);
+        assert_eq!(store.snapshot().unwrap().official_accounts.len(), 2);
+        assert_eq!(
+            store
+                .official_account(&identified.id)
+                .unwrap()
+                .credential
+                .tokens
+                .access_token,
+            "access-secret-identified"
+        );
+    }
+
+    #[test]
+    fn credential_refresh_preserves_the_latest_remark_and_quota() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        let store = Store::open(root.clone()).unwrap();
+        let saved = store
+            .save_official_account(&official_account("workspace-1", "old"))
+            .unwrap();
+        let mut stale_refresh_result = saved.clone();
+        stale_refresh_result.credential.tokens.access_token = "access-refreshed".into();
+
+        store
+            .update_official_account_remark(&saved.id, "保留此备注".into())
+            .unwrap();
+        let quota = ProviderAccountQuota {
+            status: QuotaStatus::Success,
+            fetched_at: Some(42),
+            ..Default::default()
+        };
+        store.save_official_account_quota(&saved.id, quota).unwrap();
+
+        let refreshed = store
+            .save_refreshed_official_account(&saved.id, &stale_refresh_result)
+            .unwrap();
+
+        assert_eq!(refreshed.id, saved.id);
+        assert_eq!(refreshed.remark, "保留此备注");
+        assert_eq!(refreshed.quota.status, QuotaStatus::Success);
+        assert_eq!(refreshed.quota.fetched_at, Some(42));
+        assert_eq!(refreshed.credential.tokens.access_token, "access-refreshed");
+        drop(store);
+        let persisted = Store::open(root)
+            .unwrap()
+            .official_account(&saved.id)
+            .unwrap();
+        assert_eq!(persisted.remark, "保留此备注");
+        assert_eq!(persisted.quota.status, QuotaStatus::Success);
+    }
+
+    #[test]
+    fn credential_refresh_rejects_a_different_account_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path().to_path_buf()).unwrap();
+        let saved = store
+            .save_official_account(&official_account("workspace-1", "old"))
+            .unwrap();
+        store
+            .update_official_account_remark(&saved.id, "不能丢失".into())
+            .unwrap();
+        let mut other_account = saved.clone();
+        other_account.account_id = "workspace-2".into();
+        other_account.credential.tokens.account_id = "workspace-2".into();
+
+        assert!(
+            store
+                .save_refreshed_official_account(&saved.id, &other_account)
+                .is_err()
+        );
+        let persisted = store.official_account(&saved.id).unwrap();
+        assert_eq!(persisted.account_id, "workspace-1");
+        assert_eq!(persisted.remark, "不能丢失");
     }
 
     #[test]
@@ -1666,6 +2048,7 @@ mod tests {
                     model_context_windows: Default::default(),
                     available_models: Default::default(),
                     selected_models: None,
+                    custom_models: Default::default(),
                     models_dev_meta: Default::default(),
                     api_type: ProviderApiType::Responses,
                     api_key: Some("api-secret".into()),
@@ -1716,6 +2099,61 @@ mod tests {
             .connections_activate_official_account(&saved.id)
             .unwrap();
         assert!(store.delete_official_account(&saved.id).is_err());
+    }
+
+    #[test]
+    fn credential_updates_reject_a_different_user_in_the_same_workspace() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path().to_path_buf()).unwrap();
+        let saved = store
+            .save_official_account(&identified_official_account(
+                "shared-workspace",
+                "user-1",
+                "first@example.test",
+                "first",
+            ))
+            .unwrap();
+        let other = identified_official_account(
+            "shared-workspace",
+            "user-2",
+            "second@example.test",
+            "second",
+        );
+
+        assert!(
+            store
+                .sync_official_credential(&saved.id, &other.credential, other.expires_at)
+                .is_err()
+        );
+        assert!(
+            store
+                .save_refreshed_official_account(&saved.id, &other)
+                .is_err()
+        );
+        assert_eq!(
+            credential_subject(&store.official_account(&saved.id).unwrap().credential).as_deref(),
+            Some("user-1")
+        );
+    }
+
+    #[test]
+    fn official_activation_clears_the_managed_provider_model_atomically() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path().to_path_buf()).unwrap();
+        let saved = store
+            .save_official_account(&official_account("workspace-1", "official"))
+            .unwrap();
+        store
+            .save_last_managed_model(Some("third-party-model".into()))
+            .unwrap();
+
+        store
+            .connections_activate_official_account(&saved.id)
+            .unwrap();
+
+        let state = store.snapshot().unwrap();
+        assert_eq!(state.active.account_id.as_deref(), Some(saved.id.as_str()));
+        assert_eq!(state.codex.last_managed_model, None);
     }
 
     #[test]
@@ -1770,6 +2208,45 @@ mod tests {
     }
 
     #[test]
+    fn saving_all_models_clears_previous_selection_and_survives_reopen() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        let store = Store::open(root.clone()).unwrap();
+        let mut initial = provider("selection");
+        initial.available_models = vec!["model-a".into(), "model-b".into()];
+        initial.selected_models = Some(vec!["model-a".into()]);
+        store.connections_save_provider(initial).unwrap();
+
+        // ProviderSaveInput 的 null 会转换为 None，表示明确清除旧筛选。
+        let mut edited = store.provider_overview().unwrap().providers[0].clone();
+        edited.selected_models = None;
+        let saved = store.connections_save_provider(edited).unwrap();
+
+        assert_eq!(saved.selected_models, None);
+        drop(store);
+        let reopened = Store::open(root).unwrap();
+        let persisted = reopened.provider("selection").unwrap();
+        assert_eq!(persisted.selected_models, None);
+        assert_eq!(persisted.available_models, vec!["model-a", "model-b"]);
+    }
+
+    #[test]
+    fn saving_a_new_model_subset_replaces_the_previous_selection() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path().to_path_buf()).unwrap();
+        let mut initial = provider("selection-subset");
+        initial.available_models = vec!["model-a".into(), "model-b".into()];
+        initial.selected_models = Some(vec!["model-a".into()]);
+        store.connections_save_provider(initial).unwrap();
+
+        let mut edited = store.provider_overview().unwrap().providers[0].clone();
+        edited.selected_models = Some(vec!["model-b".into()]);
+        let saved = store.connections_save_provider(edited).unwrap();
+
+        assert_eq!(saved.selected_models, Some(vec!["model-b".into()]));
+    }
+
+    #[test]
     fn saving_provider_discards_legacy_manual_model() {
         let temp = tempfile::tempdir().unwrap();
         let store = Store::open(temp.path().to_path_buf()).unwrap();
@@ -1788,6 +2265,7 @@ mod tests {
         let store = Store::open(temp.path().to_path_buf()).unwrap();
         let mut initial = provider("catalog");
         initial.available_models = vec!["old-api-model".into()];
+        initial.selected_models = Some(vec!["old-api-model".into()]);
         initial.model_context_windows = BTreeMap::from([("old-api-model".into(), 128_000)]);
         initial.models_dev_meta =
             BTreeMap::from([("old-api-model".into(), ProviderModelsDevMeta::default())]);
@@ -1800,6 +2278,128 @@ mod tests {
         assert!(saved.available_models.is_empty());
         assert!(saved.model_context_windows.is_empty());
         assert!(saved.models_dev_meta.is_empty());
+        assert_eq!(saved.selected_models, Some(vec!["old-api-model".into()]));
+    }
+
+    #[test]
+    fn renaming_provider_preserves_selected_models_until_catalog_refresh() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path().to_path_buf()).unwrap();
+        let mut initial = provider("rename-selection");
+        initial.available_models = vec!["model-a".into(), "model-b".into()];
+        initial.selected_models = Some(vec!["model-b".into()]);
+        store.connections_save_provider(initial).unwrap();
+
+        let mut edited = store.provider_overview().unwrap().providers[0].clone();
+        edited.name = "新的显示名称".into();
+        let saved = store.connections_save_provider(edited).unwrap();
+
+        // 名称会影响 models.dev 匹配并触发目录刷新，但不能扩大用户的模型选择。
+        assert!(saved.available_models.is_empty());
+        assert_eq!(saved.selected_models, Some(vec!["model-b".into()]));
+    }
+
+    #[test]
+    fn changing_model_source_preserves_custom_models() {
+        // 自定义模型属于用户数据：修改服务地址（source 变化）时不清空。
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path().to_path_buf()).unwrap();
+        let mut initial = provider("custom-src");
+        initial.available_models = vec!["old-api-model".into()];
+        initial.custom_models = vec!["custom-keep".into()];
+        store.connections_save_provider(initial).unwrap();
+
+        let mut edited = store.provider_overview().unwrap().providers[0].clone();
+        edited.base_url = "https://new.example.test/v1".into();
+        let saved = store.connections_save_provider(edited).unwrap();
+
+        // /models 同步数据被清空，但自定义模型保留。
+        assert!(saved.available_models.is_empty());
+        assert_eq!(saved.custom_models, vec!["custom-keep"]);
+    }
+
+    #[test]
+    fn explicitly_removing_all_custom_models_persists_an_empty_list() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path().to_path_buf()).unwrap();
+        let mut initial = provider("custom-delete");
+        initial.available_models = vec!["api-model".into()];
+        initial.custom_models = vec!["custom-remove".into()];
+        store.connections_save_provider(initial).unwrap();
+
+        let mut edited = store.provider_overview().unwrap().providers[0].clone();
+        edited.custom_models.clear();
+        let (_, saved) = store
+            .connections_save_provider_with_previous(edited, true)
+            .unwrap();
+
+        assert!(saved.custom_models.is_empty());
+        assert!(
+            store
+                .provider("custom-delete")
+                .unwrap()
+                .custom_models
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn refresh_models_preserves_selected_custom_models() {
+        // 刷新 /models 时 selected_models 中已选的自定义模型被保留。
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path().to_path_buf()).unwrap();
+        let mut initial = provider("refresh-custom");
+        initial.available_models = vec!["api-model".into()];
+        initial.custom_models = vec!["custom-keep".into()];
+        initial.selected_models = Some(vec!["api-model".into(), "custom-keep".into()]);
+        let saved = store.connections_save_provider(initial).unwrap();
+        let source = ProviderSourceFingerprint::from_provider(&saved);
+
+        store
+            .update_provider_models_if_source_matches(
+                &saved.id,
+                &source,
+                None,
+                vec!["api-model".into()],
+                BTreeMap::new(),
+                BTreeMap::new(),
+            )
+            .unwrap();
+
+        let current = store.provider(&saved.id).unwrap();
+        // 刷新后 available 不再包含 custom-keep，但 selected_models 中它仍被保留。
+        assert_eq!(current.available_models, vec!["api-model"]);
+        assert_eq!(current.custom_models, vec!["custom-keep"]);
+        assert_eq!(
+            current.selected_models,
+            Some(vec!["api-model".into(), "custom-keep".into()])
+        );
+    }
+
+    #[test]
+    fn refresh_models_keeps_an_empty_intersection_explicit_instead_of_selecting_all() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path().to_path_buf()).unwrap();
+        let mut initial = provider("refresh-no-overlap");
+        initial.available_models = vec!["old-model".into()];
+        initial.selected_models = Some(vec!["old-model".into()]);
+        let saved = store.connections_save_provider(initial).unwrap();
+        let source = ProviderSourceFingerprint::from_provider(&saved);
+
+        store
+            .update_provider_models_if_source_matches(
+                &saved.id,
+                &source,
+                None,
+                vec!["new-model".into()],
+                BTreeMap::new(),
+                BTreeMap::new(),
+            )
+            .unwrap();
+
+        let current = store.provider(&saved.id).unwrap();
+        assert_eq!(current.available_models, vec!["new-model"]);
+        assert_eq!(current.selected_models, Some(Vec::new()));
     }
 
     #[test]
@@ -2042,10 +2642,10 @@ mod tests {
         let first = Store::open(first_root.path().to_path_buf()).unwrap();
         let second = Store::open(second_root.path().to_path_buf()).unwrap();
         let first_account = first
-            .save_official_account(&official_account("shared", "first"))
+            .save_official_account(&official_account("shared", "same-user"))
             .unwrap();
         let second_account = second
-            .save_official_account(&rt_import_account("shared", "second"))
+            .save_official_account(&rt_import_account("shared", "same-user"))
             .unwrap();
         first
             .set_official_installation_id_unification(&first_account.id, true)

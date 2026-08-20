@@ -635,6 +635,8 @@ export async function mockCall(
         apiKey: undefined,
         hasApiKey,
         availableModels: [...(existing?.availableModels ?? [])],
+        customModels: [...(provider.customModels ?? [])],
+        selectedModels: provider.selectedModels ?? undefined,
         createdAt: existing?.createdAt ?? Date.now(),
         updatedAt: Date.now(),
       }

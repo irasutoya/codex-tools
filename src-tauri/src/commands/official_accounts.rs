@@ -16,10 +16,17 @@ use crate::{
 };
 use futures_util::{StreamExt, TryStreamExt, stream};
 use serde::Serialize;
-use std::collections::HashSet;
 use tauri::State;
 
 const QUOTA_REFRESH_CONCURRENCY: usize = 4;
+
+fn ensure_current_activation(activation: &ActivationLock, operation: u64) -> Result<(), AppError> {
+    if activation.is_current(operation) {
+        Ok(())
+    } else {
+        Err(AppError::StaleOperation)
+    }
+}
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -29,14 +36,22 @@ pub(crate) struct ProxyImportResult {
 }
 
 #[tauri::command]
-#[allow(clippy::too_many_arguments)] // Tauri injects each managed state separately.
 pub(crate) async fn connections_import_cookie(
     store: State<'_, Store>,
     center: State<'_, AuthCenter>,
-    manager: State<'_, ConfigManager>,
     activation: State<'_, ActivationLock>,
-    proxy: State<'_, ChatProxyRegistry>,
-    installation_proxy: State<'_, InstallationIdProxyRegistry>,
+    name: Option<String>,
+    account_id: Option<String>,
+    content: String,
+) -> Result<ProxyImportResult, AppError> {
+    connections_import_cookie_in_store(&store, &center, &activation, name, account_id, content)
+        .await
+}
+
+async fn connections_import_cookie_in_store(
+    store: &Store,
+    center: &AuthCenter,
+    activation: &ActivationLock,
     name: Option<String>,
     account_id: Option<String>,
     content: String,
@@ -58,7 +73,7 @@ pub(crate) async fn connections_import_cookie(
     }
     let _guard = activation.0.lock().await;
     let home = codex::home(&store.codex_home_setting()?);
-    sync_active_openai_credential(&store, &home)?;
+    sync_active_openai_credential(store, &home)?;
     let total = imported.len();
     let detected_formats = imported
         .iter()
@@ -85,47 +100,8 @@ pub(crate) async fn connections_import_cookie(
                 .await?,
         );
     }
-    let existing_account_ids = store.read(|state| {
-        state
-            .official_accounts
-            .iter()
-            .map(|account| account.account_id.clone())
-            .collect::<HashSet<_>>()
-    })?;
-    let new_account_count = resolved_accounts
-        .iter()
-        .map(|account| account.account_id.clone())
-        .filter(|account_id| !existing_account_ids.contains(account_id))
-        .collect::<HashSet<_>>()
-        .len();
-    if existing_account_ids.len() + new_account_count > crate::storage::MAX_SAVED_OPENAI_ACCOUNTS {
-        return Err(AppError::InvalidConfig(
-            "导入后将超过 500 个 OpenAI 账号的保存上限，请先删除不再使用的账号。".into(),
-        ));
-    }
-    let active_account = store.read(|state| {
-        if !matches!(state.active.kind, ActiveKind::Official) {
-            return None;
-        }
-        let active_id = state.active.account_id.as_deref()?;
-        state
-            .official_accounts
-            .iter()
-            .find(|account| account.id == active_id)
-            .map(|account| (account.id.clone(), account.account_id.clone()))
-    })?;
-    let replaces_active = active_account.as_ref().is_some_and(|(id, account_id)| {
-        resolved_accounts
-            .iter()
-            .any(|account| account.id == *id || account.account_id == *account_id)
-    });
-    if replaces_active {
-        ensure_codex_stopped(&store)?;
-    }
+    store.ensure_official_account_capacity(&resolved_accounts)?;
     let saved_accounts = store.save_official_accounts(&resolved_accounts)?;
-    if replaces_active {
-        sync_active_imported_account(&store, &manager, &proxy, &installation_proxy).await?;
-    }
     for account in saved_accounts {
         accounts.push(store.official_account_view(&account.id)?);
     }
@@ -133,30 +109,6 @@ pub(crate) async fn connections_import_cookie(
         accounts,
         detected_formats,
     })
-}
-
-async fn sync_active_imported_account(
-    store: &Store,
-    manager: &ConfigManager,
-    proxy: &ChatProxyRegistry,
-    installation_proxy: &InstallationIdProxyRegistry,
-) -> Result<(), AppError> {
-    let is_active = store.read(|state| {
-        matches!(state.active.kind, ActiveKind::Official) && state.active.account_id.is_some()
-    })?;
-    if is_active {
-        // Reimports can replace an active refresh token. Use the same managed
-        // sync path as normal activation so an eligible RT account keeps its
-        // live relay instead of falling back to a direct Codex configuration.
-        sync_active_codex_configuration_with_installation_proxy(
-            store,
-            manager,
-            proxy,
-            installation_proxy,
-        )
-        .await?;
-    }
-    Ok(())
 }
 
 #[tauri::command]
@@ -312,6 +264,7 @@ async fn refresh_official_quota(
                 AppError::StaleOperation | AppError::Internal(_) => QuotaStatus::Error,
             };
             snapshot.error = Some(error.to_string());
+            snapshot.error_code = None;
             return store.save_official_account_quota(account_id, snapshot);
         }
     };
@@ -329,10 +282,12 @@ async fn refresh_official_quota(
             snapshot.plan_type = data.plan_type;
             snapshot.fetched_at = Some(now);
             snapshot.error = None;
+            snapshot.error_code = None;
         }
         Err(error) => {
             snapshot.status = error.status;
             snapshot.error = Some(error.message);
+            snapshot.error_code = error.code;
         }
     }
     store.save_official_account_quota(account_id, snapshot)
@@ -456,18 +411,20 @@ pub(crate) async fn connections_activate_account(
 ) -> Result<RepairResult, AppError> {
     let activation_operation = activation.begin_operation();
     let _guard = activation.0.lock().await;
-    if !activation.is_current(activation_operation) {
-        return Err(AppError::StaleOperation);
-    }
+    ensure_current_activation(&activation, activation_operation)?;
+    official_quota::ensure_account_usable(&store.official_account(&id)?)?;
     ensure_codex_stopped(&store)?;
     sync_active_openai_credential(&store, &codex::home(&store.codex_home_setting()?))?;
     let saved = center.refresh_account(&store, &id).await?;
+    ensure_current_activation(&activation, activation_operation)?;
     let repair = activate_openai_record(
         &store,
         &manager,
         &ledger,
         &proxy,
         &installation_proxy,
+        &activation,
+        activation_operation,
         &saved,
     )
     .await?;
@@ -489,10 +446,7 @@ pub(crate) async fn connections_activate_official(
 ) -> Result<RepairResult, AppError> {
     let activation_operation = activation.begin_operation();
     let _guard = activation.0.lock().await;
-    if !activation.is_current(activation_operation) {
-        return Err(AppError::StaleOperation);
-    }
-    ensure_codex_stopped(&store)?;
+    ensure_current_activation(&activation, activation_operation)?;
     let (home_setting, id) = store.read(|state| {
         let id = state
             .active
@@ -508,16 +462,21 @@ pub(crate) async fn connections_activate_official(
             });
         (state.codex.home.clone(), id)
     })?;
-    sync_active_openai_credential(&store, &codex::home(&home_setting))?;
     let id =
         id.ok_or_else(|| AppError::InvalidConfig("请先在“账号与服务”中登录 OpenAI。".into()))?;
+    official_quota::ensure_account_usable(&store.official_account(&id)?)?;
+    ensure_codex_stopped(&store)?;
+    sync_active_openai_credential(&store, &codex::home(&home_setting))?;
     let saved = center.refresh_account(&store, &id).await?;
+    ensure_current_activation(&activation, activation_operation)?;
     let repair = activate_openai_record(
         &store,
         &manager,
         &ledger,
         &proxy,
         &installation_proxy,
+        &activation,
+        activation_operation,
         &saved,
     )
     .await?;
@@ -572,13 +531,38 @@ mod tests {
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
     use std::fs;
 
-    fn claimed_token(account_id: &str) -> String {
+    #[test]
+    fn stale_account_switch_is_rejected_after_an_async_boundary() {
+        let activation = ActivationLock::default();
+        let older = activation.begin_operation();
+        let newer = activation.begin_operation();
+
+        assert!(matches!(
+            ensure_current_activation(&activation, older),
+            Err(AppError::StaleOperation)
+        ));
+        assert!(ensure_current_activation(&activation, newer).is_ok());
+    }
+
+    fn oauth_account(account_id: &str, subject: &str, email: &str) -> StoredOfficialAccount {
         let payload = URL_SAFE_NO_PAD.encode(
-            serde_json::json!({ "chatgpt_account_id": account_id })
-                .to_string()
-                .as_bytes(),
+            serde_json::json!({
+                "sub": subject,
+                "chatgpt_account_id": account_id,
+                "email": email
+            })
+            .to_string()
+            .as_bytes(),
         );
-        format!("header.{payload}.signature")
+        let token = format!("header.{payload}.signature");
+        let mut account = account(account_id, "");
+        account.name = email.into();
+        account.email = email.into();
+        account.source = OfficialAccountSource::OpenAiOauth;
+        account.credential.tokens.id_token = token.clone();
+        account.credential.tokens.access_token = token;
+        account.credential.tokens.refresh_token = format!("refresh-{subject}");
+        account
     }
 
     fn account(account_id: &str, remark: &str) -> StoredOfficialAccount {
@@ -619,6 +603,90 @@ mod tests {
             store.snapshot().unwrap().active.kind,
             ActiveKind::None
         ));
+    }
+
+    #[test]
+    fn completed_login_adds_a_different_user_in_the_active_workspace() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex-home");
+        let store = Store::open(temp.path().join("data")).unwrap();
+        store
+            .update(|state| {
+                state.codex.home = home.display().to_string();
+                Ok(())
+            })
+            .unwrap();
+        let active = store
+            .save_official_account(&oauth_account(
+                "shared-workspace",
+                "user-1",
+                "first@example.test",
+            ))
+            .unwrap();
+        store
+            .connections_activate_official_account(&active.id)
+            .unwrap();
+        codex::connections_activate_official_account(&home, &active.credential, None).unwrap();
+        let config_before = fs::read(home.join("config.toml")).unwrap();
+        let auth_before = fs::read(home.join("auth.json")).unwrap();
+
+        let added = save_completed_login(
+            &store,
+            &oauth_account("shared-workspace", "user-2", "second@example.test"),
+        )
+        .unwrap();
+
+        assert_ne!(added.id, active.id);
+        assert!(!added.active);
+        let state = store.snapshot().unwrap();
+        assert_eq!(state.official_accounts.len(), 2);
+        assert_eq!(state.active.account_id.as_deref(), Some(active.id.as_str()));
+        assert_eq!(fs::read(home.join("config.toml")).unwrap(), config_before);
+        assert_eq!(fs::read(home.join("auth.json")).unwrap(), auth_before);
+    }
+
+    #[test]
+    fn completed_login_updates_the_same_user_and_preserves_local_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex-home");
+        let store = Store::open(temp.path().join("data")).unwrap();
+        store
+            .update(|state| {
+                state.codex.home = home.display().to_string();
+                Ok(())
+            })
+            .unwrap();
+        let mut original = oauth_account("shared-workspace", "user-1", "first@example.test");
+        original.remark = "保留的备注".into();
+        original.quota.status = QuotaStatus::Success;
+        original.quota.fetched_at = Some(42);
+        let original = store.save_official_account(&original).unwrap();
+        store
+            .connections_activate_official_account(&original.id)
+            .unwrap();
+        codex::connections_activate_official_account(&home, &original.credential, None).unwrap();
+        let auth_before = fs::read(home.join("auth.json")).unwrap();
+        let mut refreshed = oauth_account("shared-workspace", "user-1", "renamed@example.test");
+        refreshed.credential.tokens.refresh_token = "refresh-updated".into();
+
+        let updated = save_completed_login(&store, &refreshed).unwrap();
+
+        assert_eq!(updated.id, original.id);
+        assert!(updated.active);
+        assert_eq!(updated.remark, "保留的备注");
+        assert_eq!(updated.quota.status, QuotaStatus::Success);
+        assert_eq!(updated.quota.fetched_at, Some(42));
+        assert_eq!(store.snapshot().unwrap().official_accounts.len(), 1);
+        assert_eq!(
+            store
+                .official_account(&original.id)
+                .unwrap()
+                .credential
+                .tokens
+                .refresh_token,
+            "refresh-updated"
+        );
+        assert_eq!(fs::read(home.join("auth.json")).unwrap(), auth_before);
     }
 
     #[tokio::test]
@@ -781,7 +849,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn active_account_refresh_and_reimport_paths_sync_cookie_to_codex() {
+    async fn active_account_refresh_syncs_cookie_to_codex() {
         let temp = tempfile::tempdir().unwrap();
         let home = temp.path().join("codex-home");
         let store = Store::open(temp.path().join("data")).unwrap();
@@ -842,29 +910,117 @@ mod tests {
 
         assert!(view.active);
         assert_eq!(view.remark, "备用账号");
-        let mut reimported = saved.clone();
-        reimported.id.clear();
-        reimported.remark.clear();
-        reimported.credential.tokens.access_token = "at-cookie-reimported".into();
-        reimported.credential.last_refresh = "2026-08-01T00:00:00Z".into();
-        let saved_reimport = store.save_official_account(&reimported).unwrap();
-        let manager = ConfigManager::default();
-        let proxy = ChatProxyRegistry::default();
-        let installation_proxy = InstallationIdProxyRegistry::default();
-        sync_active_imported_account(&store, &manager, &proxy, &installation_proxy)
-            .await
-            .unwrap();
-        let imported_view = store.official_account_view(&saved_reimport.id).unwrap();
-
-        assert!(imported_view.active);
-        assert_eq!(imported_view.remark, "备用账号");
         let auth: serde_json::Value =
             serde_json::from_slice(&fs::read(home.join("auth.json")).unwrap()).unwrap();
-        assert_eq!(auth["personal_access_token"], "at-cookie-reimported");
+        assert_eq!(auth["personal_access_token"], "at-cookie-secret");
     }
 
     #[tokio::test]
-    async fn active_oauth_to_eligible_rt_reimport_keeps_the_managed_relay() {
+    async fn cookie_import_saves_a_new_account_without_changing_active_codex_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex-home");
+        let store = Store::open(temp.path().join("data")).unwrap();
+        store
+            .update(|state| {
+                state.codex.home = home.display().to_string();
+                Ok(())
+            })
+            .unwrap();
+        let active = store
+            .save_official_account(&oauth_account(
+                "shared-workspace",
+                "active-user",
+                "active@example.test",
+            ))
+            .unwrap();
+        store
+            .connections_activate_official_account(&active.id)
+            .unwrap();
+        codex::connections_activate_official_account(&home, &active.credential, None).unwrap();
+        let config_before = fs::read(home.join("config.toml")).unwrap();
+        let auth_before = fs::read(home.join("auth.json")).unwrap();
+
+        let result = connections_import_cookie_in_store(
+            &store,
+            &AuthCenter::default(),
+            &ActivationLock::default(),
+            Some("新账号".into()),
+            Some("shared-workspace".into()),
+            "at-new-account".into(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.accounts.len(), 1);
+        assert!(!result.accounts[0].active);
+        assert_eq!(result.accounts[0].account_id, "shared-workspace");
+        assert_eq!(
+            store.snapshot().unwrap().active.account_id.as_deref(),
+            Some(active.id.as_str())
+        );
+        assert_eq!(fs::read(home.join("config.toml")).unwrap(), config_before);
+        assert_eq!(fs::read(home.join("auth.json")).unwrap(), auth_before);
+    }
+
+    #[tokio::test]
+    async fn active_cookie_reimport_only_updates_saved_credentials_and_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex-home");
+        let store = Store::open(temp.path().join("data")).unwrap();
+        store
+            .update(|state| {
+                state.codex.home = home.display().to_string();
+                Ok(())
+            })
+            .unwrap();
+        let mut saved_account = account("cookie-account", "保留的备注");
+        saved_account.email.clear();
+        let saved = store.save_official_account(&saved_account).unwrap();
+        let quota = ProviderAccountQuota {
+            status: QuotaStatus::Success,
+            fetched_at: Some(42),
+            ..Default::default()
+        };
+        store.save_official_account_quota(&saved.id, quota).unwrap();
+        store
+            .connections_activate_official_account(&saved.id)
+            .unwrap();
+        codex::connections_activate_official_account(&home, &saved.credential, None).unwrap();
+        let config_before = fs::read(home.join("config.toml")).unwrap();
+        let auth_before = fs::read(home.join("auth.json")).unwrap();
+
+        let result = connections_import_cookie_in_store(
+            &store,
+            &AuthCenter::default(),
+            &ActivationLock::default(),
+            Some("更新后的名称".into()),
+            Some("cookie-account".into()),
+            "at-cookie-reimported".into(),
+        )
+        .await
+        .unwrap();
+
+        let view = &result.accounts[0];
+        assert!(view.active);
+        assert_eq!(view.id, saved.id);
+        assert_eq!(view.remark, "保留的备注");
+        assert_eq!(view.quota.status, QuotaStatus::Success);
+        assert_eq!(view.quota.fetched_at, Some(42));
+        assert_eq!(
+            store
+                .official_account(&saved.id)
+                .unwrap()
+                .credential
+                .tokens
+                .access_token,
+            "at-cookie-reimported"
+        );
+        assert_eq!(fs::read(home.join("config.toml")).unwrap(), config_before);
+        assert_eq!(fs::read(home.join("auth.json")).unwrap(), auth_before);
+    }
+
+    #[tokio::test]
+    async fn active_oauth_reimport_defers_the_managed_relay_until_configuration_sync() {
         let temp = tempfile::tempdir().unwrap();
         let home = temp.path().join("codex-home");
         fs::create_dir_all(&home).unwrap();
@@ -875,22 +1031,34 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        let mut oauth = account("shared-account", "");
-        oauth.source = OfficialAccountSource::OpenAiOauth;
+        let mut oauth = oauth_account("shared-account", "shared-user", "shared@example.test");
         oauth.credential.tokens.refresh_token = "oauth-refresh".into();
         let oauth = store.save_official_account(&oauth).unwrap();
         store
             .connections_activate_official_account(&oauth.id)
             .unwrap();
+        codex::connections_activate_official_account(&home, &oauth.credential, None).unwrap();
+        let config_before = fs::read(home.join("config.toml")).unwrap();
+        let auth_before = fs::read(home.join("auth.json")).unwrap();
+        let content = serde_json::json!({
+            "access_token": "rt-access",
+            "refresh_token": "rt-refresh",
+            "id_token": oauth.credential.tokens.id_token,
+            "account_id": "shared-account"
+        })
+        .to_string();
 
-        let mut rt = oauth.clone();
-        rt.id.clear();
-        rt.source = OfficialAccountSource::ProxyImport;
-        rt.credential.tokens.access_token = "rt-access".into();
-        rt.credential.tokens.refresh_token = "rt-refresh".into();
-        rt.credential.tokens.id_token = claimed_token("shared-account");
-        rt.credential.last_refresh = "2026-08-01T00:00:00Z".into();
-        let rt = store.save_official_account(&rt).unwrap();
+        let imported = connections_import_cookie_in_store(
+            &store,
+            &AuthCenter::default(),
+            &ActivationLock::default(),
+            None,
+            None,
+            content,
+        )
+        .await
+        .unwrap();
+        let rt = store.official_account(&imported.accounts[0].id).unwrap();
         assert_eq!(rt.id, oauth.id);
         assert!(
             store
@@ -898,15 +1066,20 @@ mod tests {
                 .unwrap()
                 .enabled
         );
+        assert_eq!(fs::read(home.join("config.toml")).unwrap(), config_before);
+        assert_eq!(fs::read(home.join("auth.json")).unwrap(), auth_before);
 
         let manager = ConfigManager::default();
         let proxy = ChatProxyRegistry::default();
         let installation_proxy = InstallationIdProxyRegistry::default();
-        // `connections_import_cookie` invokes this same helper while holding
-        // its activation lock, which guards against a direct-config bypass.
-        sync_active_imported_account(&store, &manager, &proxy, &installation_proxy)
-            .await
-            .unwrap();
+        sync_active_codex_configuration_with_installation_proxy(
+            &store,
+            &manager,
+            &proxy,
+            &installation_proxy,
+        )
+        .await
+        .unwrap();
 
         let config = fs::read_to_string(home.join("config.toml")).unwrap();
         let document = config.parse::<toml_edit::DocumentMut>().unwrap();

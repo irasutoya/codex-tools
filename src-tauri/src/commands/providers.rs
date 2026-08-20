@@ -34,13 +34,15 @@ pub(crate) async fn connections_save_provider(
     provider: ProviderSaveInput,
 ) -> Result<ProviderProfile, AppError> {
     let _model_transaction = activation.2.lock().await;
+    let custom_models_explicit = provider.custom_models.is_some();
     let provider = ProviderProfile::from(provider);
     if store.is_active_provider(&provider.id)? {
         ensure_codex_stopped(&store)?;
     }
     let (previous, saved_source, saved_revision, needs_model_refresh, was_active, saved) = {
         let _guard = activation.0.lock().await;
-        let (previous, saved) = store.connections_save_provider_with_previous(provider)?;
+        let (previous, saved) =
+            store.connections_save_provider_with_previous(provider, custom_models_explicit)?;
         let saved_source = ProviderSourceFingerprint::from_provider(&saved);
         let saved_revision = ProviderSnapshotRevision::from_provider(&saved);
         let was_active = store.is_active_provider(&saved.id)?;
@@ -533,17 +535,42 @@ struct SyncedProviderModels {
 
 fn validate_fresh_activation_models(
     refresh_error: Option<AppError>,
-    available_models: &[String],
+    provider: &ProviderProfile,
 ) -> Result<(), AppError> {
+    let selected = provider.selected_models.as_deref();
+    let custom_model_selected = provider.custom_models.iter().any(|model| {
+        !model.trim().is_empty()
+            && selected.is_none_or(|selected| selected.iter().any(|value| value == model))
+    });
+    let explicitly_custom_only = selected.is_some_and(|selected| {
+        !selected.is_empty()
+            && selected.iter().all(|model| {
+                provider
+                    .custom_models
+                    .iter()
+                    .any(|custom| custom == model && !custom.trim().is_empty())
+            })
+    });
     if let Some(error) = refresh_error {
         if matches!(error, AppError::StaleOperation) {
             return Err(error);
+        }
+        // A manually configured catalog is the explicit fallback for services
+        // that do not expose /models. Never trust stale API models after a
+        // failed refresh, but allow a custom-only provider to activate.
+        if custom_model_selected && (provider.available_models.is_empty() || explicitly_custom_only)
+        {
+            return Ok(());
         }
         return Err(AppError::InvalidConfig(format!(
             "无法获取此服务的最新模型，连接未切换；已保留原有模型缓存：{error}"
         )));
     }
-    if available_models.iter().all(|model| model.trim().is_empty()) {
+    let available_model_selected = provider.available_models.iter().any(|model| {
+        !model.trim().is_empty()
+            && selected.is_none_or(|selected| selected.iter().any(|value| value == model))
+    });
+    if !available_model_selected && !custom_model_selected {
         return Err(AppError::InvalidConfig(
             "此服务没有可用模型，无法激活。请检查 /models 接口后重试".into(),
         ));
@@ -738,7 +765,7 @@ pub(crate) async fn connections_activate(
         .await
         .err();
     let refreshed = store.provider(&id)?;
-    validate_fresh_activation_models(refresh_error, &refreshed.available_models)?;
+    validate_fresh_activation_models(refresh_error, &refreshed)?;
     let repair = {
         let _guard = activation.0.lock().await;
         if !activation.is_current(activation_operation) {
@@ -767,8 +794,12 @@ pub(crate) async fn connections_activate(
         }
         let home = codex::home(&store.codex_home_setting()?);
         sync_active_openai_credential(&store, &home)?;
-        let repair_sessions =
-            provider_sync::configured_provider(&home) != codex::MANAGED_PROVIDER_ID;
+        let active_connection_changed = store.read(|state| {
+            !matches!(state.active.kind, ActiveKind::Provider)
+                || state.active.provider_id.as_deref() != Some(id.as_str())
+        })?;
+        let repair_sessions = active_connection_changed
+            || provider_sync::configured_provider(&home) != codex::MANAGED_PROVIDER_ID;
         let preview = manager.preview_custom(&home, &provider, &target)?;
         let pending_id = crate::begin_activation(
             &ledger,
@@ -842,6 +873,7 @@ mod tests {
             model_context_windows: BTreeMap::new(),
             available_models: vec![model.into()],
             selected_models: None,
+            custom_models: Default::default(),
             models_dev_meta: BTreeMap::new(),
             api_type: ProviderApiType::Responses,
             api_key: Some("secret".into()),
@@ -860,9 +892,10 @@ mod tests {
 
     #[test]
     fn activation_never_falls_back_to_cached_models_after_refresh_failure() {
+        let cached = provider("cached", "https://provider.example.test/v1", "cached-model");
         let error = validate_fresh_activation_models(
             Some(AppError::Internal("network down".into())),
-            &["cached-model".into()],
+            &cached,
         )
         .unwrap_err();
 
@@ -872,9 +905,97 @@ mod tests {
 
     #[test]
     fn activation_requires_a_non_empty_fresh_model_list() {
-        let error = validate_fresh_activation_models(None, &["  ".into()]).unwrap_err();
+        let blank = provider("blank", "https://provider.example.test/v1", "  ");
+        let error = validate_fresh_activation_models(None, &blank).unwrap_err();
         assert!(error.to_string().contains("没有可用模型"));
-        validate_fresh_activation_models(None, &["fresh-model".into()]).unwrap();
+        let fresh = provider("fresh", "https://provider.example.test/v1", "fresh-model");
+        validate_fresh_activation_models(None, &fresh).unwrap();
+    }
+
+    #[test]
+    fn custom_only_provider_can_activate_when_models_endpoint_is_unavailable() {
+        let mut custom = provider("custom", "https://provider.example.test/v1", "");
+        custom.available_models.clear();
+        custom.custom_models = vec!["manual-model".into()];
+        validate_fresh_activation_models(
+            Some(AppError::Internal("models endpoint unavailable".into())),
+            &custom,
+        )
+        .unwrap();
+
+        custom.available_models = vec!["stale-api-model".into()];
+        custom.selected_models = Some(vec!["manual-model".into()]);
+        validate_fresh_activation_models(
+            Some(AppError::Internal("models endpoint unavailable".into())),
+            &custom,
+        )
+        .unwrap();
+
+        custom.selected_models = Some(Vec::new());
+        assert!(
+            validate_fresh_activation_models(
+                Some(AppError::Internal("models endpoint unavailable".into())),
+                &custom,
+            )
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn active_provider_all_models_filter_resyncs_without_switching() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex-home");
+        std::fs::create_dir_all(&home).unwrap();
+        let store = Store::open(temp.path().join("data")).unwrap();
+        store
+            .update(|state| {
+                state.codex.home = home.display().to_string();
+                Ok(())
+            })
+            .unwrap();
+
+        let mut initial = provider("provider", "https://provider.example.test/v1", "model-a");
+        initial.available_models = vec!["model-a".into(), "model-b".into()];
+        initial.selected_models = Some(vec!["model-a".into()]);
+        let saved = store.connections_save_provider(initial).unwrap();
+        store.activate(&saved.id).unwrap();
+        let manager = ConfigManager::default();
+        let proxy = ChatProxyRegistry::default();
+        sync_active_codex_configuration(&store, &manager, &proxy)
+            .await
+            .unwrap();
+
+        let catalog_path = home
+            .join(crate::model_unlock::MODEL_CATALOG_DIR)
+            .join(crate::model_unlock::MODEL_CATALOG_FILE);
+        let catalog: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&catalog_path).unwrap()).unwrap();
+        let slugs = catalog["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|model| model["slug"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(slugs, vec!["model-a"]);
+
+        // 保存当前 Provider 的“全选”后直接同步，不切换 active Provider。
+        let mut edited = store.provider_overview().unwrap().providers[0].clone();
+        edited.selected_models = None;
+        store.connections_save_provider(edited).unwrap();
+        sync_active_codex_configuration(&store, &manager, &proxy)
+            .await
+            .unwrap();
+
+        let catalog: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(catalog_path).unwrap()).unwrap();
+        let slugs = catalog["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|model| model["slug"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(slugs, vec!["model-a", "model-b"]);
+        assert!(store.is_active_provider("provider").unwrap());
     }
 
     #[tokio::test]
@@ -1161,6 +1282,62 @@ mod tests {
             store.provider(&saved.id).unwrap().available_models,
             vec!["old-model"]
         );
+    }
+
+    #[tokio::test]
+    async fn active_refresh_with_no_selected_model_overlap_rolls_back_instead_of_selecting_all() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex-home");
+        std::fs::create_dir_all(&home).unwrap();
+        let store = Store::open(temp.path().join("data")).unwrap();
+        store
+            .update(|state| {
+                state.codex.home = home.display().to_string();
+                Ok(())
+            })
+            .unwrap();
+        let mut initial = provider("provider", "https://provider.example.test/v1", "old-model");
+        initial.selected_models = Some(vec!["old-model".into()]);
+        let saved = store.connections_save_provider(initial).unwrap();
+        store.activate(&saved.id).unwrap();
+        let manager = ConfigManager::default();
+        let proxy = ChatProxyRegistry::default();
+        sync_active_codex_configuration(&store, &manager, &proxy)
+            .await
+            .unwrap();
+        let (previous, starting_revision, was_active) =
+            store.provider_model_refresh_snapshot(&saved.id).unwrap();
+        assert!(was_active);
+        let source = ProviderSourceFingerprint::from_provider(&previous);
+        let refreshed_revision = store
+            .update_provider_models_if_source_matches(
+                &saved.id,
+                &source,
+                Some(&starting_revision),
+                vec!["new-model".into()],
+                BTreeMap::new(),
+                BTreeMap::new(),
+            )
+            .unwrap()
+            .unwrap();
+
+        let error = sync_active_provider_configuration(
+            &store,
+            &manager,
+            &ActivationLock::default(),
+            &proxy,
+            &InstallationIdProxyRegistry::default(),
+            &saved.id,
+            &previous,
+            &refreshed_revision,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("模型"));
+        let restored = store.provider(&saved.id).unwrap();
+        assert_eq!(restored.available_models, vec!["old-model"]);
+        assert_eq!(restored.selected_models, Some(vec!["old-model".into()]));
     }
 
     #[tokio::test]

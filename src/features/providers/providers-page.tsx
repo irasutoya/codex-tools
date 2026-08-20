@@ -50,6 +50,8 @@ import {
 import {
   accountIsExpired,
   accountPlanText,
+  accountWorkspaceIsDeactivated,
+  effectiveModelCount,
   quotaStatusText,
 } from "./connection-utils"
 import { ProviderEditorDialog } from "./provider-editor-dialog"
@@ -257,7 +259,8 @@ export function ProvidersPage({
         onOpenChange={setEditorOpen}
         provider={editor}
         onProviderChange={setEditor}
-        onSaved={() => {
+        onSaved={(saved) => {
+          setEditor(saved)
           setEditorOpen(false)
           onRefresh()
         }}
@@ -480,7 +483,7 @@ export function ProvidersPage({
           {!isAccount && (
             <Detail
               label="可用模型"
-              value={`${provider?.availableModels?.length ?? 0} 个`}
+              value={`${provider ? effectiveModelCount(provider) : 0} 个`}
             />
           )}
         </CardContent>
@@ -630,6 +633,7 @@ function quotaLabel(
 
 function credentialLabel(account: OfficialAccountView | undefined) {
   if (!account) return "—"
+  if (accountWorkspaceIsDeactivated(account)) return "工作区已停用"
   if (account.quota.status === "unauthorized") return "登录已失效"
   if (accountIsExpired(account)) return "登录已过期"
   return account.source === "proxy_import"
