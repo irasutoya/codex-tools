@@ -190,7 +190,7 @@ async fn rollback_active_save_after_model_failure(
 }
 
 /// 在持有 ActivationLock 时恢复 active Provider 的完整旧快照，并把 Codex
-/// 配置同步回旧连接。完整 snapshot revision CAS 失败表示已有更新完成，
+/// 配置同步回旧连接。完整 snapshot revision 的用户态检查失败表示已有更新完成，
 /// 绝不能用旧请求覆盖 timeout/enabled/模型缓存等后续提交。
 async fn restore_active_provider_save(
     store: &Store,
@@ -233,7 +233,7 @@ async fn apply_provider_configuration_and_record(
     operation_id: &str,
 ) -> Result<ProviderActivationRollback, AppError> {
     let previous_managed_model = store.last_managed_model()?;
-    let applied = match manager.apply(operation_id) {
+    let applied = match manager.apply_checked(operation_id, || ensure_codex_stopped(store)) {
         Ok(applied) => applied,
         Err(error) => {
             return Err(compensate_activation_failure_with_installation_proxy(
@@ -665,7 +665,7 @@ async fn preview_activation_in_transaction(
 ) -> Result<ConfigPatchPreview, AppError> {
     // 与 save/refresh/activate 使用相同锁序。必须先取得两把锁再读取
     // Provider 和 config/auth/catalog，否则旧 Provider 可能配上新文件快照，
-    // 后续 apply 的文件 CAS 仍会错误通过。
+    // 后续 apply 的用户态快照检查仍会错误通过。
     let _model_transaction = activation.2.lock().await;
     let _activation = activation.0.lock().await;
     let (home_setting, active_provider_id) = store.read(|state| {
@@ -702,7 +702,7 @@ pub(crate) async fn settings_apply_activation(
     }
     ensure_codex_stopped(&store)?;
     let previous_managed_model = store.last_managed_model()?;
-    let applied = manager.apply(&operation_id)?;
+    let applied = manager.apply_checked(&operation_id, || ensure_codex_stopped(&store))?;
     // 写入成功后记录 config.toml 当前的服务模型，供切换到 OpenAI 时精确清除。
     let home = codex::home(&store.codex_home_setting()?);
     if let Err(error) = record_written_model(&store, &home) {

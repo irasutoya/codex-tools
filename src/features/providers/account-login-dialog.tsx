@@ -29,6 +29,8 @@ import { Input } from "@/components/ui/input"
 import { Spinner } from "@/components/ui/spinner"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Textarea } from "@/components/ui/textarea"
+import { toast } from "@/components/ui/toast"
+import { errorMessage } from "@/lib/format"
 import type { DeviceAuthorization } from "@/types"
 
 const MAX_DISPLAY_NAME_LENGTH = 128
@@ -75,6 +77,19 @@ export function AccountLoginDialog({
   const [hasContent, setHasContent] = useState(false)
   const contentRef = useRef<HTMLTextAreaElement>(null)
   const busy = starting || polling || importing
+
+  const copyAuthorizationCode = async () => {
+    if (!authorization) return
+    try {
+      await navigator.clipboard.writeText(authorization.userCode)
+    } catch (reason) {
+      toast.add({
+        title: "复制失败",
+        description: errorMessage(reason),
+        type: "error",
+      })
+    }
+  }
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -162,9 +177,7 @@ export function AccountLoginDialog({
                     type="button"
                     size="sm"
                     variant="outline"
-                    onClick={() =>
-                      void navigator.clipboard.writeText(authorization.userCode)
-                    }
+                    onClick={() => void copyAuthorizationCode()}
                   >
                     <HugeiconsIcon icon={Copy01Icon} data-icon="inline-start" />
                     复制授权码

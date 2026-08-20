@@ -65,8 +65,9 @@ pub(crate) struct ProviderSourceFingerprint {
     api_key: Option<String>,
 }
 
-/// Provider 完整持久化快照的不可逆 revision，用于失败回滚 CAS。与 source
-/// fingerprint 不同，它会感知 timeout/enabled/模型缓存等任何后续提交。
+/// Provider 完整持久化快照的不可逆 revision，用于失败回滚前的用户态
+/// check-and-rename 检查。与 source fingerprint 不同，它会感知
+/// timeout/enabled/模型缓存等任何后续提交。
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct ProviderSnapshotRevision([u8; 32]);
 
@@ -310,7 +311,7 @@ impl Store {
         }
         self.update(move |state| {
             // existing 查找、脱敏字段合并、模型缓存决策和最终替换必须处于
-            // 同一 Store 事务，不能让锁外旧快照覆盖刚完成的模型 CAS。
+            // 同一 Store 事务，不能让锁外旧快照覆盖刚完成的 revision 检查与替换。
             let existing = state
                 .providers
                 .iter()
@@ -756,6 +757,21 @@ impl Store {
                 saved_accounts.push(incoming);
             }
             Ok(saved_accounts)
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn restore_official_accounts_if_matches(
+        &self,
+        expected: &[StoredOfficialAccount],
+        previous: &[StoredOfficialAccount],
+    ) -> Result<bool, AppError> {
+        self.update(|state| {
+            if state.official_accounts != expected {
+                return Ok(false);
+            }
+            state.official_accounts = previous.to_vec();
+            Ok(true)
         })
     }
 
@@ -1829,6 +1845,34 @@ mod tests {
     }
 
     #[test]
+    fn official_account_restore_requires_the_exact_saved_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path().to_path_buf()).unwrap();
+        let previous = store
+            .save_official_account(&official_account("workspace-1", "previous"))
+            .unwrap();
+        let saved = store
+            .save_official_account(&official_account("workspace-1", "replacement"))
+            .unwrap();
+        store
+            .update_official_account_remark(&saved.id, "concurrent".into())
+            .unwrap();
+
+        assert!(
+            !store
+                .restore_official_accounts_if_matches(
+                    std::slice::from_ref(&saved),
+                    std::slice::from_ref(&previous),
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            store.official_account(&saved.id).unwrap().remark,
+            "concurrent"
+        );
+    }
+
+    #[test]
     fn official_account_remark_is_trimmed_validated_and_persisted() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().to_path_buf();
@@ -2260,7 +2304,7 @@ mod tests {
     }
 
     #[test]
-    fn changing_model_source_discards_the_previous_api_catalog() {
+    fn changing_model_source_discards_catalog_but_keeps_and_filters_explicit_selection() {
         let temp = tempfile::tempdir().unwrap();
         let store = Store::open(temp.path().to_path_buf()).unwrap();
         let mut initial = provider("catalog");
@@ -2273,12 +2317,16 @@ mod tests {
 
         let mut edited = store.provider_overview().unwrap().providers[0].clone();
         edited.base_url = "https://new.example.test/v1".into();
+        edited.selected_models = Some(vec!["new-api-model".into(), "stale-model".into()]);
         let saved = store.connections_save_provider(edited).unwrap();
 
         assert!(saved.available_models.is_empty());
         assert!(saved.model_context_windows.is_empty());
         assert!(saved.models_dev_meta.is_empty());
-        assert_eq!(saved.selected_models, Some(vec!["old-api-model".into()]));
+        assert_eq!(
+            saved.selected_models,
+            Some(vec!["new-api-model".into(), "stale-model".into()])
+        );
     }
 
     #[test]
@@ -2354,7 +2402,10 @@ mod tests {
         initial.selected_models = Some(vec!["api-model".into(), "custom-keep".into()]);
         let saved = store.connections_save_provider(initial).unwrap();
         let source = ProviderSourceFingerprint::from_provider(&saved);
-
+        assert_eq!(
+            saved.selected_models,
+            Some(vec!["api-model".into(), "custom-keep".into()])
+        );
         store
             .update_provider_models_if_source_matches(
                 &saved.id,
@@ -2364,10 +2415,10 @@ mod tests {
                 BTreeMap::new(),
                 BTreeMap::new(),
             )
+            .unwrap()
             .unwrap();
 
         let current = store.provider(&saved.id).unwrap();
-        // 刷新后 available 不再包含 custom-keep，但 selected_models 中它仍被保留。
         assert_eq!(current.available_models, vec!["api-model"]);
         assert_eq!(current.custom_models, vec!["custom-keep"]);
         assert_eq!(
@@ -2395,6 +2446,7 @@ mod tests {
                 BTreeMap::new(),
                 BTreeMap::new(),
             )
+            .unwrap()
             .unwrap();
 
         let current = store.provider(&saved.id).unwrap();

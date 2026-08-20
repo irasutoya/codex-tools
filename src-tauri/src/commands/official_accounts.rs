@@ -75,6 +75,17 @@ async fn connections_import_cookie_in_store(
     let home = codex::home(&store.codex_home_setting()?);
     sync_active_openai_credential(store, &home)?;
     let total = imported.len();
+    if imported
+        .iter()
+        .any(|credential| credential.access_token.is_none())
+    {
+        let existing_count = store.read(|state| state.official_accounts.len())?;
+        if existing_count.saturating_add(total) > crate::storage::MAX_SAVED_OPENAI_ACCOUNTS {
+            return Err(AppError::InvalidConfig(
+                "导入后可能超过 500 个 OpenAI 账号的保存上限，请先删除不再使用的账号。".into(),
+            ));
+        }
+    }
     let detected_formats = imported
         .iter()
         .map(|item| item.source_format.label().to_string())
@@ -100,6 +111,9 @@ async fn connections_import_cookie_in_store(
                 .await?,
         );
     }
+    // Identity-aware storage treats a reimport as a credential update without
+    // changing the active Codex files. Capacity is checked conservatively both
+    // before and inside the atomic save transaction.
     store.ensure_official_account_capacity(&resolved_accounts)?;
     let saved_accounts = store.save_official_accounts(&resolved_accounts)?;
     for account in saved_accounts {
@@ -197,26 +211,55 @@ fn connections_update_account_remarks_in_store(
 pub(crate) async fn connections_refresh_login(
     store: State<'_, Store>,
     center: State<'_, AuthCenter>,
+    manager: State<'_, ConfigManager>,
     activation: State<'_, ActivationLock>,
+    proxy: State<'_, ChatProxyRegistry>,
+    installation_proxy: State<'_, InstallationIdProxyRegistry>,
     id: String,
 ) -> Result<OfficialAccountView, AppError> {
-    connections_refresh_login_in_store(&store, &center, &activation, &id).await
+    connections_refresh_login_in_store(
+        &store,
+        &center,
+        &manager,
+        &activation,
+        &proxy,
+        &installation_proxy,
+        &id,
+    )
+    .await
 }
 
 async fn connections_refresh_login_in_store(
     store: &Store,
     center: &AuthCenter,
+    manager: &ConfigManager,
     activation: &ActivationLock,
+    proxy: &ChatProxyRegistry,
+    installation_proxy: &InstallationIdProxyRegistry,
     id: &str,
 ) -> Result<OfficialAccountView, AppError> {
-    let saved = refresh_account_and_sync_active(store, center, activation, id, true).await?;
+    let saved = refresh_account_and_sync_active(
+        store,
+        center,
+        manager,
+        activation,
+        proxy,
+        installation_proxy,
+        id,
+        true,
+    )
+    .await?;
     store.official_account_view(&saved.id)
 }
 
+#[allow(clippy::too_many_arguments)] // Shared refresh path needs the managed Tauri services.
 async fn refresh_account_and_sync_active(
     store: &Store,
     center: &AuthCenter,
+    manager: &ConfigManager,
     activation: &ActivationLock,
+    proxy: &ChatProxyRegistry,
+    installation_proxy: &InstallationIdProxyRegistry,
     id: &str,
     force: bool,
 ) -> Result<StoredOfficialAccount, AppError> {
@@ -239,7 +282,13 @@ async fn refresh_account_and_sync_active(
         center.refresh_account(store, id).await?
     };
     if is_active {
-        codex::connections_activate_official_account(&home, &saved.credential, None)?;
+        sync_active_codex_configuration_with_installation_proxy(
+            store,
+            manager,
+            proxy,
+            installation_proxy,
+        )
+        .await?;
     }
     Ok(saved)
 }
@@ -380,6 +429,7 @@ pub(crate) async fn connections_login_poll(
         DevicePollResult::Complete(account) => {
             let _guard = activation.0.lock().await;
             let saved = save_completed_login(&store, &account)?;
+            center.ack_openai(&operation_id).await;
             Ok(OpenAiDevicePoll::Complete {
                 account: Box::new(saved),
             })
@@ -888,10 +938,16 @@ mod tests {
             .connections_activate_official_account(&saved.id)
             .unwrap();
 
+        let manager = ConfigManager::default();
+        let proxy = ChatProxyRegistry::default();
+        let installation_proxy = InstallationIdProxyRegistry::default();
         let refreshed = refresh_account_and_sync_active(
             &store,
             &AuthCenter::default(),
+            &manager,
             &ActivationLock::default(),
+            &proxy,
+            &installation_proxy,
             &saved.id,
             false,
         )
@@ -902,7 +958,10 @@ mod tests {
         let view = connections_refresh_login_in_store(
             &store,
             &AuthCenter::default(),
+            &manager,
             &ActivationLock::default(),
+            &proxy,
+            &installation_proxy,
             &saved.id,
         )
         .await

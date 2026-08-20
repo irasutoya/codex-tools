@@ -165,11 +165,12 @@ pub(crate) async fn sync_active_codex_configuration_with_installation_proxy(
             // 本应用上次写入的第三方服务模型；只有与最近一次写入记录一致
             // 才清除（用户手动设置的模型不受影响）。
             let managed_model = managed_model_to_remove(store, &home)?;
-            codex::connections_activate_official_account_with_relay(
+            codex::connections_activate_official_account_with_relay_checked(
                 &home,
                 &account.credential,
                 managed_model.as_deref(),
                 relay.as_deref(),
+                || ensure_codex_stopped(store),
             )?;
             store.save_last_managed_model(None)?;
             return Ok(());
@@ -197,7 +198,7 @@ pub(crate) async fn sync_active_codex_configuration_with_installation_proxy(
     let target = crate::chat_proxy::effective_base_url(&provider, proxy).await?;
     let preview = manager.preview_custom(&home, &provider, &target)?;
     let previous_managed_model = store.last_managed_model()?;
-    let applied = manager.apply(&preview.operation_id)?;
+    let applied = manager.apply_checked(&preview.operation_id, || ensure_codex_stopped(store))?;
     if let Err(error) = record_written_model(store, &home) {
         let files = manager.rollback_applied(applied);
         let managed_model = store.save_last_managed_model(previous_managed_model);
@@ -246,11 +247,12 @@ pub(crate) async fn activate_openai_record(
         if !activation.is_current(activation_operation) {
             return Err(AppError::StaleOperation);
         }
-        if let Err(error) = codex::connections_activate_official_account_with_relay(
+        if let Err(error) = codex::connections_activate_official_account_with_relay_checked(
             &home,
             &account.credential,
             managed_model.as_deref(),
             relay.as_deref(),
+            || ensure_codex_stopped(store),
         ) {
             return Err(compensate_activation_failure_with_installation_proxy(
                 store,

@@ -11,6 +11,43 @@ const semverPattern =
 
 export const isValidSemver = (version) => semverPattern.test(version)
 
+export function parseArgs(args) {
+  let tag
+
+  for (let index = 0; index < args.length; index += 1) {
+    const argument = args[index]
+
+    if (argument === "--tag") {
+      if (tag !== undefined) {
+        throw new Error("--tag 不能重复提供")
+      }
+
+      const value = args[index + 1]
+      if (!value || value.startsWith("-")) {
+        throw new Error("--tag 后必须提供标签")
+      }
+
+      tag = value
+      index += 1
+    } else if (argument.startsWith("--tag=")) {
+      if (tag !== undefined) {
+        throw new Error("--tag 不能重复提供")
+      }
+
+      tag = argument.slice("--tag=".length)
+      if (!tag) {
+        throw new Error("--tag 后必须提供标签")
+      }
+    } else if (argument.startsWith("-")) {
+      throw new Error(`未知参数：${argument}`)
+    } else {
+      throw new Error(`不允许多余的位置参数：${argument}`)
+    }
+  }
+
+  return { tag }
+}
+
 export function readCargoPackageVersion(toml) {
   const packageSection = toml.match(
     /^\[package\]\s*$([\s\S]*?)(?=^\[|(?![\s\S]))/m
@@ -61,17 +98,12 @@ function main() {
     throw new Error("无法读取 src-tauri/Cargo.toml 的 [package] version")
   }
 
-  const optionIndex = process.argv.indexOf("--tag")
-  if (optionIndex !== -1 && !process.argv[optionIndex + 1]) {
-    throw new Error("--tag 后必须提供标签")
-  }
-
+  const { tag: argumentTag } = parseArgs(process.argv.slice(2))
   const tag =
-    optionIndex === -1
-      ? process.env.GITHUB_REF_TYPE === "tag"
-        ? process.env.GITHUB_REF_NAME
-        : undefined
-      : process.argv[optionIndex + 1]
+    argumentTag ??
+    (process.env.GITHUB_REF_TYPE === "tag"
+      ? process.env.GITHUB_REF_NAME
+      : undefined)
   const expected = packageJson.version
   const versions = {
     "package.json": expected,

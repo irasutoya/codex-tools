@@ -21,9 +21,9 @@ import type {
   UsageOverview,
 } from "@/types"
 
-const mockEmptyConnections = new URLSearchParams(window.location.search).has(
-  "empty-connections"
-)
+const mockEmptyConnections =
+  typeof window !== "undefined" &&
+  new URLSearchParams(window.location.search).has("empty-connections")
 
 const now = Date.now()
 const day = 86_400_000
@@ -79,9 +79,20 @@ function mockModelsForProvider(provider: Provider) {
   return provider.apiType === "chat" ? ["qwen3-coder"] : ["gpt-5.6"]
 }
 
+export function filterMockSelectedModels(
+  selectedModels: string[] | null | undefined,
+  availableModels: string[]
+) {
+  return selectedModels == null
+    ? selectedModels
+    : selectedModels.filter((model) => availableModels.includes(model))
+}
+
 function refreshMockProviderModels(provider: Provider) {
   const models = mockModelsForProvider(provider)
   provider.availableModels = [...models]
+  const selected = filterMockSelectedModels(provider.selectedModels, models)
+  provider.selectedModels = selected ?? undefined
   provider.updatedAt = Date.now()
   return [...models]
 }
@@ -138,6 +149,8 @@ const mockAccounts: OfficialAccountView[] = [
     expiresAt: null,
     quota: mockQuota,
     active: true,
+    deviceSessionConvergenceAvailable: true,
+    deviceSessionConvergenceEnabled: true,
     createdAt: now - 60 * day,
     updatedAt: now,
   },
@@ -151,6 +164,8 @@ const mockAccounts: OfficialAccountView[] = [
     expiresAt: null,
     quota: { status: "never" },
     active: false,
+    deviceSessionConvergenceAvailable: false,
+    deviceSessionConvergenceEnabled: false,
     createdAt: now - 50 * day,
     updatedAt: now - 4 * day,
   },
@@ -275,7 +290,7 @@ export async function mockCall(
   command: Command,
   args: unknown
 ): Promise<unknown> {
-  await new Promise((resolve) => window.setTimeout(resolve, 120))
+  await new Promise((resolve) => globalThis.setTimeout(resolve, 120))
   switch (command) {
     case "dashboard_get": {
       const activeAccount = mockEmptyConnections
@@ -579,6 +594,16 @@ export async function mockCall(
       })
       return accounts.map(({ account }) => account)
     }
+    case "connections_set_device_session_convergence": {
+      const { id, enabled } = args as { id: string; enabled: boolean }
+      const account = mockAccounts.find((candidate) => candidate.id === id)
+      if (!account) throw new Error(`账号不存在：${id}`)
+      if (enabled && !account.deviceSessionConvergenceAvailable) {
+        throw new Error("此账号不支持设备＋会话收敛。")
+      }
+      account.deviceSessionConvergenceEnabled = enabled
+      return structuredClone(account)
+    }
     case "connections_delete_account": {
       const { id } = args as { id: string }
       const index = mockAccounts.findIndex((account) => account.id === id)
@@ -622,6 +647,19 @@ export async function mockCall(
         existingIndex >= 0 ? mockProviders[existingIndex] : undefined
       const hasApiKey =
         Boolean(provider.apiKey?.trim()) || Boolean(existing?.hasApiKey)
+      const shouldRefreshModels =
+        !existing ||
+        existing.name !== provider.name ||
+        existing.baseUrl !== provider.baseUrl ||
+        existing.apiType !== provider.apiType ||
+        !sameHeaders(existing.headers, provider.headers) ||
+        Boolean(provider.apiKey?.trim())
+      const selectedModels =
+        provider.selectedModels === undefined &&
+        existing &&
+        !shouldRefreshModels
+          ? existing.selectedModels
+          : (provider.selectedModels ?? undefined)
       const saved: Provider = {
         ...existing,
         id: provider.id || `provider-${Date.now()}`,
@@ -634,19 +672,17 @@ export async function mockCall(
         apiType: provider.apiType,
         apiKey: undefined,
         hasApiKey,
-        availableModels: [...(existing?.availableModels ?? [])],
-        customModels: [...(provider.customModels ?? [])],
-        selectedModels: provider.selectedModels ?? undefined,
+        availableModels: shouldRefreshModels
+          ? []
+          : [...(existing?.availableModels ?? [])],
+        customModels: [
+          ...(provider.customModels ?? existing?.customModels ?? []),
+        ],
+        selectedModels:
+          selectedModels === undefined ? undefined : [...selectedModels],
         createdAt: existing?.createdAt ?? Date.now(),
         updatedAt: Date.now(),
       }
-      const shouldRefreshModels =
-        !existing ||
-        existing.name !== provider.name ||
-        existing.baseUrl !== provider.baseUrl ||
-        existing.apiType !== provider.apiType ||
-        !sameHeaders(existing.headers, provider.headers) ||
-        Boolean(provider.apiKey?.trim())
       if (hasApiKey && shouldRefreshModels) {
         refreshMockProviderModels(saved)
       }
@@ -671,6 +707,8 @@ export async function mockCall(
         expiresAt: null,
         quota: { status: "never" },
         active: false,
+        deviceSessionConvergenceAvailable: false,
+        deviceSessionConvergenceEnabled: false,
         createdAt: Date.now(),
         updatedAt: Date.now(),
       }

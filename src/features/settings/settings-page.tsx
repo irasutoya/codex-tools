@@ -261,6 +261,7 @@ export function SettingsPage({
               取消
             </Button>
             <Button
+              disabled={Boolean(busy)}
               onClick={() =>
                 preview &&
                 void run(
@@ -333,7 +334,7 @@ function ConfigSection({
         )}
         <div className="flex gap-2">
           <Button
-            disabled={!overview.canPreviewCustom || busy === "preview"}
+            disabled={!overview.canPreviewCustom || Boolean(busy)}
             onClick={() => void onPreview()}
           >
             {busy === "preview" ? (
@@ -345,7 +346,7 @@ function ConfigSection({
           </Button>
           <Button
             variant="outline"
-            disabled={busy === "official"}
+            disabled={Boolean(busy)}
             onClick={onOfficial}
           >
             恢复 OpenAI 官方
@@ -514,12 +515,14 @@ function AppSection({
               <InputGroupInput
                 id="codex-path"
                 value={path}
+                disabled={Boolean(busy)}
                 placeholder="/Applications/Codex.app 或 .../Contents/MacOS/Codex"
                 onChange={(event) => setPath(event.target.value)}
               />
               <InputGroupAddon align="inline-end">
                 <InputGroupButton
                   size="sm"
+                  disabled={Boolean(busy)}
                   aria-label="手动选择 ChatGPT 或 Codex 执行程序"
                   onClick={() => void choose()}
                 >
@@ -540,13 +543,14 @@ function AppSection({
           </Field>
           <div className="flex gap-2">
             <Button
-              disabled={busy === "app"}
+              disabled={Boolean(busy)}
               onClick={() => onSave(path || null)}
             >
               {busy === "app" && <Spinner data-icon="inline-start" />}保存路径
             </Button>
             <Button
               variant="outline"
+              disabled={Boolean(busy)}
               onClick={() => {
                 setPath("")
                 onSave(null)
@@ -609,7 +613,7 @@ function UnlockSection({
         )}
         <div className="flex flex-wrap gap-2">
           <Button
-            disabled={busy === "unlock" || !status.appFound}
+            disabled={Boolean(busy) || !status.appFound}
             onClick={onUnlock}
           >
             {busy === "unlock" ? (
@@ -619,11 +623,7 @@ function UnlockSection({
             )}
             解锁模型
           </Button>
-          <Button
-            variant="outline"
-            disabled={busy === "debug"}
-            onClick={onDebug}
-          >
+          <Button variant="outline" disabled={Boolean(busy)} onClick={onDebug}>
             {busy === "debug" ? (
               <Spinner data-icon="inline-start" />
             ) : (
@@ -634,6 +634,7 @@ function UnlockSection({
           <Button
             size="icon"
             variant="ghost"
+            disabled={Boolean(busy)}
             aria-label="刷新状态"
             onClick={onRefresh}
           >

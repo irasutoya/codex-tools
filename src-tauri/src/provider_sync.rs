@@ -114,21 +114,40 @@ pub fn normalize_provider(value: &str) -> String {
     }
 }
 
+#[cfg(test)]
 pub fn repair(codex_home: &Path, target: &str) -> Result<RepairResult, AppError> {
-    repair_with_history_mode(codex_home, target, false)
+    repair_with_history_mode_and_guard(codex_home, target, false, || Ok(true))
 }
 
+#[cfg(test)]
 pub fn repair_after_connection_switch(
     codex_home: &Path,
     target: &str,
 ) -> Result<RepairResult, AppError> {
-    repair_with_history_mode(codex_home, target, true)
+    repair_with_history_mode_and_guard(codex_home, target, true, || Ok(true))
 }
 
-fn repair_with_history_mode(
+pub(crate) fn repair_with_guard(
+    codex_home: &Path,
+    target: &str,
+    may_write: impl FnMut() -> Result<bool, AppError>,
+) -> Result<RepairResult, AppError> {
+    repair_with_history_mode_and_guard(codex_home, target, false, may_write)
+}
+
+pub(crate) fn repair_after_connection_switch_with_guard(
+    codex_home: &Path,
+    target: &str,
+    may_write: impl FnMut() -> Result<bool, AppError>,
+) -> Result<RepairResult, AppError> {
+    repair_with_history_mode_and_guard(codex_home, target, true, may_write)
+}
+
+fn repair_with_history_mode_and_guard(
     codex_home: &Path,
     target: &str,
     force_portable_history: bool,
+    mut may_write: impl FnMut() -> Result<bool, AppError>,
 ) -> Result<RepairResult, AppError> {
     let target = target.trim();
     if !matches!(target, "openai" | "custom") {
@@ -145,14 +164,19 @@ fn repair_with_history_mode(
     let mut omitted_warnings = 0;
 
     for path in rollouts {
-        match repair_rollout(&path, target, force_portable_history) {
-            Ok((changed, metas)) => {
+        match repair_rollout(&path, target, force_portable_history, &mut may_write) {
+            Ok(RepairRollout::Modified(metas)) => {
                 result.session_meta_updated += metas;
-                if changed {
-                    result.files_modified += 1
-                } else {
-                    result.files_skipped += 1
-                }
+                result.files_modified += 1;
+            }
+            Ok(RepairRollout::Unchanged) => result.files_skipped += 1,
+            Ok(RepairRollout::Conflict(warning)) => {
+                result.files_skipped += 1;
+                push_warning(
+                    &mut result.warnings,
+                    &mut omitted_warnings,
+                    format!("{}：{warning}", path.display()),
+                );
             }
             Err(error) => {
                 result.files_failed += 1;
@@ -166,8 +190,16 @@ fn repair_with_history_mode(
     }
 
     for path in database_paths(codex_home) {
-        match repair_database(&path, target) {
-            Ok(rows) => result.rows_updated += rows,
+        match repair_database(&path, target, &mut may_write) {
+            Ok(Some(rows)) => result.rows_updated += rows,
+            Ok(None) => push_warning(
+                &mut result.warnings,
+                &mut omitted_warnings,
+                format!(
+                    "{}：Codex 已重新运行或修复目标已变化，数据库已跳过。",
+                    path.display()
+                ),
+            ),
             Err(error) => push_warning(
                 &mut result.warnings,
                 &mut omitted_warnings,
@@ -275,11 +307,19 @@ fn collect_databases(path: &Path, output: &mut Vec<PathBuf>) {
     }
 }
 
+#[derive(Debug)]
+enum RepairRollout {
+    Modified(usize),
+    Unchanged,
+    Conflict(&'static str),
+}
+
 fn repair_rollout(
     path: &Path,
     target: &str,
     force_portable_history: bool,
-) -> anyhow::Result<(bool, usize)> {
+    may_write: &mut impl FnMut() -> Result<bool, AppError>,
+) -> anyhow::Result<RepairRollout> {
     if fs::metadata(path)?.len() > MAX_REPAIR_ROLLOUT_BYTES {
         anyhow::bail!("会话文件超过 256 MB，已跳过以避免占用过多内存");
     }
@@ -346,10 +386,20 @@ fn repair_rollout(
             output.push_str(segment);
         }
     }
-    if changed && !atomic_write_if_unchanged(path, &original_bytes, output.as_bytes())? {
-        anyhow::bail!("Codex 正在更新这个会话，文件已保持原样。请关闭该会话后重试");
+    if !changed {
+        return Ok(RepairRollout::Unchanged);
     }
-    Ok((changed, meta_count))
+    if !may_write()? {
+        return Ok(RepairRollout::Conflict(
+            "Codex 已重新运行或修复目标已变化，文件已跳过。",
+        ));
+    }
+    if !atomic_write_if_unchanged(path, &original_bytes, output.as_bytes())? {
+        return Ok(RepairRollout::Conflict(
+            "Codex 正在更新这个会话，文件已保持原样。请关闭该会话后重试。",
+        ));
+    }
+    Ok(RepairRollout::Modified(meta_count))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -388,21 +438,31 @@ fn provider_scoped_history_item(record: &Value) -> HistoryItemAction {
     }
 }
 
-fn repair_database(path: &Path, target: &str) -> anyhow::Result<usize> {
+fn repair_database(
+    path: &Path,
+    target: &str,
+    may_write: &mut impl FnMut() -> Result<bool, AppError>,
+) -> anyhow::Result<Option<usize>> {
     let mut db = Connection::open(path)?;
     let Some((table, _, columns)) = session_table(&db)? else {
-        return Ok(0);
+        return Ok(Some(0));
     };
     if !columns.contains("model_provider") {
-        return Ok(0);
+        return Ok(Some(0));
+    }
+    if !may_write()? {
+        return Ok(None);
     }
     let transaction = db.transaction()?;
     let rows = transaction.execute(
         &format!("UPDATE {table} SET model_provider=?1 WHERE COALESCE(model_provider,'')<>?1"),
         [target],
     )?;
+    if !may_write()? {
+        return Ok(None);
+    }
     transaction.commit()?;
-    Ok(rows)
+    Ok(Some(rows))
 }
 
 fn inspect_database(path: &Path) -> anyhow::Result<Option<DatabaseInspection>> {
@@ -592,12 +652,32 @@ mod tests {
             serde_json::json!({"type":"session_meta","payload":{"id":"one","model_provider":"openai"}})
         );
         fs::write(&rollout, &original).unwrap();
-        let (changed, count) = repair_rollout(&rollout, "custom", false).unwrap();
+        let outcome = repair_rollout(&rollout, "custom", false, &mut || Ok(true)).unwrap();
 
-        assert!(changed);
-        assert_eq!(count, 1);
+        assert!(matches!(outcome, RepairRollout::Modified(1)));
         let repaired = fs::read_to_string(rollout).unwrap();
         assert!(repaired.ends_with(&format!("{unchanged}\n")));
+    }
+
+    #[test]
+    fn repair_reports_guard_conflict_as_skipped_without_writing() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex");
+        fs::create_dir_all(home.join("sessions")).unwrap();
+        let rollout = home.join("sessions/rollout.jsonl");
+        let original = format!(
+            "{}\n",
+            serde_json::json!({"type":"session_meta","payload":{"model_provider":"openai"}})
+        );
+        fs::write(&rollout, &original).unwrap();
+
+        let result = repair_with_guard(&home, "custom", || Ok(false)).unwrap();
+
+        assert_eq!(result.files_modified, 0);
+        assert_eq!(result.files_skipped, 1);
+        assert_eq!(result.files_failed, 0);
+        assert!(result.warnings[0].contains("已跳过"));
+        assert_eq!(fs::read_to_string(rollout).unwrap(), original);
     }
 
     #[test]
@@ -607,7 +687,10 @@ mod tests {
         let connection = Connection::open(&db).unwrap();
         connection.execute_batch("CREATE TABLE threads(id TEXT PRIMARY KEY, model_provider TEXT, title TEXT); INSERT INTO threads VALUES('one','other-provider','keep'); INSERT INTO threads VALUES('two','custom','same'); INSERT INTO threads VALUES('three',NULL,'missing');").unwrap();
         drop(connection);
-        assert_eq!(repair_database(&db, "custom").unwrap(), 2);
+        assert_eq!(
+            repair_database(&db, "custom", &mut || Ok(true)).unwrap(),
+            Some(2)
+        );
         let connection = Connection::open(db).unwrap();
         let providers = connection
             .prepare("SELECT model_provider FROM threads ORDER BY id")
@@ -739,7 +822,7 @@ mod tests {
         let file = fs::File::create(&rollout).unwrap();
         file.set_len(MAX_REPAIR_ROLLOUT_BYTES + 1).unwrap();
 
-        let error = repair_rollout(&rollout, "custom", false).unwrap_err();
+        let error = repair_rollout(&rollout, "custom", false, &mut || Ok(true)).unwrap_err();
 
         assert!(error.to_string().contains("超过 256 MB"));
     }

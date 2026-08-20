@@ -8,6 +8,7 @@ import {
   SheetHeader,
   SheetTitle,
 } from "@/components/ui/sheet"
+import { regularOutputTokens } from "@/lib/chart"
 import { cacheHitRate, formatInteger, formatPercent } from "@/lib/format"
 import type { UsageGroupBy, UsageRow } from "@/types"
 
@@ -30,7 +31,13 @@ export function UsageDetail({
     ["普通输入", display.tokens.inputTokens],
     ["缓存输入", display.tokens.cachedInputTokens],
     ["缓存写入", display.tokens.cacheWriteInputTokens],
-    ["普通输出", display.tokens.outputTokens],
+    [
+      "普通输出",
+      regularOutputTokens(
+        display.tokens.outputTokens,
+        display.tokens.reasoningOutputTokens
+      ),
+    ],
     ["推理输出", display.tokens.reasoningOutputTokens],
   ] as const
   return (

@@ -37,12 +37,14 @@ export function PricingEditor({
   open,
   range,
   modelOptions,
+  rules,
   onOpenChange,
   onSaved,
 }: {
   open: boolean
   range: UsageRange
   modelOptions: string[]
+  rules: PricingRule[]
   onOpenChange: (open: boolean) => void
   onSaved: () => void
 }) {
@@ -56,15 +58,25 @@ export function PricingEditor({
   const [cacheWriteIncluded, setCacheWriteIncluded] = useState(true)
   const [busy, setBusy] = useState(false)
 
+  const normalizedPattern = pattern.trim()
+
   const save = async () => {
     setBusy(true)
     const now = Date.now()
+    const existing = rules.find(
+      (candidate) =>
+        candidate.scopeKind === "global_model" &&
+        candidate.providerId === undefined &&
+        candidate.accountId === undefined &&
+        candidate.modelPattern === normalizedPattern &&
+        candidate.matchKind === "exact"
+    )
     const rule: PricingRule = {
-      id: `rule-${now}`,
-      version: 1,
+      id: existing?.id ?? "",
+      version: existing?.version ?? 1,
       active: true,
       scopeKind: "global_model",
-      modelPattern: pattern,
+      modelPattern: normalizedPattern,
       matchKind: "exact",
       billingMode,
       inputUsdPerMillion: billingMode === "token" ? input : undefined,
@@ -236,7 +248,10 @@ export function PricingEditor({
           >
             取消
           </Button>
-          <Button disabled={busy || !pattern} onClick={() => void save()}>
+          <Button
+            disabled={busy || !normalizedPattern}
+            onClick={() => void save()}
+          >
             {busy && <Spinner data-icon="inline-start" />}保存
           </Button>
         </DialogFooter>

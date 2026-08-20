@@ -195,28 +195,37 @@ pub fn codex_app_found(configured: Option<&str>) -> bool {
     codex_app_path(configured).is_some()
 }
 
-/// Codex 桌面应用当前是否在运行，用于阻止认证、配置和会话文件并发改写。
+/// Codex 桌面应用或 CLI 当前是否在运行，用于降低认证、配置和会话文件
+/// 与 Codex 并发改写的风险。
 pub fn codex_app_running(configured: Option<&str>) -> bool {
     #[cfg(target_os = "macos")]
     {
-        let path = codex_app_path(configured);
-        if path.as_deref().is_some_and(path_running) {
+        let app_path = codex_app_path(configured);
+        let cli_path = codex_cli_executable();
+        if app_path.as_deref().is_some_and(path_running) || path_running(Path::new(&cli_path)) {
             return true;
         }
-        ["Codex", "ChatGPT"].into_iter().any(process_named_running)
+        ["Codex", "ChatGPT", "codex"]
+            .into_iter()
+            .any(process_named_running)
     }
     #[cfg(windows)]
     {
-        let path = codex_app_path(configured);
-        if path
+        let app_path = codex_app_path(configured);
+        let cli_path = codex_cli_executable();
+        let configured_running = app_path
             .as_deref()
             .and_then(Path::file_name)
             .and_then(|name| name.to_str())
-            .is_some_and(process_named_running)
-        {
+            .is_some_and(process_named_running);
+        let cli_running = Path::new(&cli_path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(process_named_running);
+        if configured_running || cli_running {
             return true;
         }
-        ["Codex.exe", "ChatGPT.exe"]
+        ["Codex.exe", "codex.exe", "ChatGPT.exe"]
             .into_iter()
             .any(process_named_running)
     }
