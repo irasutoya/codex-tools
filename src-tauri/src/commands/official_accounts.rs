@@ -1,12 +1,8 @@
 use crate::{
-    activation::{
-        activate_openai_record, ensure_codex_stopped,
-        sync_active_codex_configuration_with_installation_proxy, sync_active_openai_credential,
-    },
+    activation::{activate_openai_record, ensure_codex_stopped, sync_active_openai_credential},
     auth_center::{AuthCenter, DevicePollResult},
     chat_proxy::ChatProxyRegistry,
     codex::{self, ConfigManager},
-    installation_id_proxy::InstallationIdProxyRegistry,
     local_usage::UsageLedger,
     models::*,
     official_quota, proxy_import,
@@ -122,48 +118,6 @@ pub(crate) fn connections_update_account_remark(
 }
 
 #[tauri::command]
-pub(crate) async fn connections_set_device_session_convergence(
-    store: State<'_, Store>,
-    manager: State<'_, ConfigManager>,
-    activation: State<'_, ActivationLock>,
-    proxy: State<'_, ChatProxyRegistry>,
-    installation_proxy: State<'_, InstallationIdProxyRegistry>,
-    id: String,
-    enabled: bool,
-) -> Result<OfficialAccountView, AppError> {
-    let _guard = activation.0.lock().await;
-    let previous = store.official_installation_id_setting(&id)?;
-    let saved = store.set_official_installation_id_unification(&id, enabled)?;
-    let active = store.read(|state| {
-        matches!(state.active.kind, ActiveKind::Official)
-            && state.active.account_id.as_deref() == Some(id.as_str())
-    })?;
-    if active
-        && let Err(error) = sync_active_codex_configuration_with_installation_proxy(
-            &store,
-            &manager,
-            &proxy,
-            &installation_proxy,
-        )
-        .await
-    {
-        // Persisted state and the live Codex config move together. If the
-        // reconfiguration fails, restore the prior setting and best-effort
-        // restore its prior direct/relay route before reporting the error.
-        let _ = store.set_official_installation_id_unification(&id, previous.enabled);
-        let _ = sync_active_codex_configuration_with_installation_proxy(
-            &store,
-            &manager,
-            &proxy,
-            &installation_proxy,
-        )
-        .await;
-        return Err(error);
-    }
-    store.official_account_view(&saved.id)
-}
-
-#[tauri::command]
 pub(crate) fn connections_update_account_remarks(
     store: State<'_, Store>,
     updates: Vec<AccountRemarkUpdate>,
@@ -185,10 +139,7 @@ fn connections_update_account_remarks_in_store(
         .into_iter()
         .map(|account| {
             let active = active_account_id.as_deref() == Some(account.id.as_str());
-            Ok(account.view(
-                active,
-                store.official_installation_id_setting(&account.id)?.enabled,
-            ))
+            Ok(account.view(active))
         })
         .collect()
 }
@@ -405,7 +356,6 @@ pub(crate) async fn connections_activate_account(
     ledger: State<'_, UsageLedger>,
     activation: State<'_, ActivationLock>,
     proxy: State<'_, ChatProxyRegistry>,
-    installation_proxy: State<'_, InstallationIdProxyRegistry>,
     index: State<'_, SessionIndex>,
     id: String,
 ) -> Result<RepairResult, AppError> {
@@ -422,7 +372,6 @@ pub(crate) async fn connections_activate_account(
         &manager,
         &ledger,
         &proxy,
-        &installation_proxy,
         &activation,
         activation_operation,
         &saved,
@@ -441,7 +390,6 @@ pub(crate) async fn connections_activate_official(
     ledger: State<'_, UsageLedger>,
     activation: State<'_, ActivationLock>,
     proxy: State<'_, ChatProxyRegistry>,
-    installation_proxy: State<'_, InstallationIdProxyRegistry>,
     index: State<'_, SessionIndex>,
 ) -> Result<RepairResult, AppError> {
     let activation_operation = activation.begin_operation();
@@ -474,7 +422,6 @@ pub(crate) async fn connections_activate_official(
         &manager,
         &ledger,
         &proxy,
-        &installation_proxy,
         &activation,
         activation_operation,
         &saved,
@@ -1017,82 +964,5 @@ mod tests {
         );
         assert_eq!(fs::read(home.join("config.toml")).unwrap(), config_before);
         assert_eq!(fs::read(home.join("auth.json")).unwrap(), auth_before);
-    }
-
-    #[tokio::test]
-    async fn active_oauth_reimport_without_opt_in_stays_direct_after_configuration_sync() {
-        let temp = tempfile::tempdir().unwrap();
-        let home = temp.path().join("codex-home");
-        fs::create_dir_all(&home).unwrap();
-        let store = Store::open(temp.path().join("data")).unwrap();
-        store
-            .update(|state| {
-                state.codex.home = home.display().to_string();
-                Ok(())
-            })
-            .unwrap();
-        let mut oauth = oauth_account("shared-account", "shared-user", "shared@example.test");
-        oauth.credential.tokens.refresh_token = "oauth-refresh".into();
-        let oauth = store.save_official_account(&oauth).unwrap();
-        store
-            .connections_activate_official_account(&oauth.id)
-            .unwrap();
-        codex::connections_activate_official_account(&home, &oauth.credential, None).unwrap();
-        let config_before = fs::read(home.join("config.toml")).unwrap();
-        let auth_before = fs::read(home.join("auth.json")).unwrap();
-        let content = serde_json::json!({
-            "access_token": "rt-access",
-            "refresh_token": "rt-refresh",
-            "id_token": oauth.credential.tokens.id_token,
-            "account_id": "shared-account"
-        })
-        .to_string();
-
-        let imported = connections_import_cookie_in_store(
-            &store,
-            &AuthCenter::default(),
-            &ActivationLock::default(),
-            None,
-            None,
-            content,
-        )
-        .await
-        .unwrap();
-        let rt = store.official_account(&imported.accounts[0].id).unwrap();
-        assert_eq!(rt.id, oauth.id);
-        assert!(
-            !store
-                .official_installation_id_setting(&rt.id)
-                .unwrap()
-                .enabled
-        );
-        assert_eq!(fs::read(home.join("config.toml")).unwrap(), config_before);
-        assert_eq!(fs::read(home.join("auth.json")).unwrap(), auth_before);
-
-        let manager = ConfigManager::default();
-        let proxy = ChatProxyRegistry::default();
-        let installation_proxy = InstallationIdProxyRegistry::default();
-        sync_active_codex_configuration_with_installation_proxy(
-            &store,
-            &manager,
-            &proxy,
-            &installation_proxy,
-        )
-        .await
-        .unwrap();
-
-        let config = fs::read_to_string(home.join("config.toml")).unwrap();
-        let document = config.parse::<toml_edit::DocumentMut>().unwrap();
-        assert!(document.get("model_provider").is_none());
-        assert!(
-            document
-                .get("model_providers")
-                .and_then(toml_edit::Item::as_table)
-                .is_none_or(|providers| {
-                    providers
-                        .get(crate::codex::INSTALLATION_ID_RELAY_PROVIDER_ID)
-                        .is_none()
-                })
-        );
     }
 }

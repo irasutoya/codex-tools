@@ -113,7 +113,7 @@ pub(crate) fn official_credential_identity_matches(
     }
 }
 
-/// Stable account scope used for account-specific routing and aggregation.
+/// Stable account scope used for account-specific aggregation.
 /// A ChatGPT account id identifies a workspace, so users in a shared workspace
 /// must also be separated by their token subject (or legacy email fallback).
 pub(crate) fn official_account_identity_scope(account: &StoredOfficialAccount) -> String {
@@ -588,10 +588,6 @@ pub struct OfficialAccountView {
     pub source: OfficialAccountSource,
     pub expires_at: Option<i64>,
     pub quota: ProviderAccountQuota,
-    /// Backend-derived availability: callers must not infer eligibility from
-    /// the import source because only refresh-token ChatGPT imports qualify.
-    pub device_session_convergence_available: bool,
-    pub device_session_convergence_enabled: bool,
     pub created_at: i64,
     pub updated_at: i64,
     pub active: bool,
@@ -605,33 +601,6 @@ pub struct ProviderOverview {
 }
 
 impl StoredOfficialAccount {
-    /// Whether this account can safely use the account-scoped device/session
-    /// relay. A ProxyImport must be a validated, refresh-token ChatGPT login;
-    /// raw access-token and personal-access-token imports are intentionally
-    /// excluded.
-    pub(crate) fn device_session_convergence_available(&self) -> bool {
-        match self.source {
-            OfficialAccountSource::OpenAiOauth => true,
-            OfficialAccountSource::ProxyImport => {
-                let claimed_account_matches = [
-                    self.credential.tokens.id_token.as_str(),
-                    self.credential.tokens.access_token.as_str(),
-                ]
-                .into_iter()
-                .filter_map(token_identity)
-                .filter_map(|identity| identity.account_id)
-                .any(|account_id| account_id.trim() == self.account_id.trim());
-                self.credential.auth_mode == "chatgpt"
-                    && !is_personal_access_token_credential(&self.credential)
-                    && !self.credential.tokens.refresh_token.trim().is_empty()
-                    && !self.account_id.trim().is_empty()
-                    && self.account_id.trim() == self.credential.tokens.account_id.trim()
-                    && claimed_account_matches
-                    && validate_official_credential(&self.credential).is_ok()
-            }
-        }
-    }
-
     pub fn display_name(&self) -> &str {
         let remark = self.remark.trim();
         if remark.is_empty() {
@@ -641,11 +610,7 @@ impl StoredOfficialAccount {
         }
     }
 
-    pub fn view(
-        &self,
-        active: bool,
-        device_session_convergence_enabled: bool,
-    ) -> OfficialAccountView {
+    pub fn view(&self, active: bool) -> OfficialAccountView {
         OfficialAccountView {
             id: self.id.clone(),
             name: self.name.clone(),
@@ -655,8 +620,6 @@ impl StoredOfficialAccount {
             source: self.source,
             expires_at: self.expires_at,
             quota: self.quota.clone(),
-            device_session_convergence_available: self.device_session_convergence_available(),
-            device_session_convergence_enabled,
             created_at: self.created_at,
             updated_at: self.updated_at,
             active,
@@ -721,19 +684,6 @@ pub struct AppConfig {
     pub providers: Vec<ProviderProfile>,
     #[serde(default)]
     pub official_accounts: Vec<StoredOfficialAccount>,
-    #[serde(default)]
-    pub official_installation_id_settings: BTreeMap<String, OfficialInstallationIdSetting>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct OfficialInstallationIdSetting {
-    #[serde(default)]
-    pub enabled: bool,
-    #[serde(default)]
-    pub installation_id: Option<String>,
-    #[serde(default)]
-    pub session_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1660,7 +1610,7 @@ mod tests {
 
     #[test]
     fn official_view_and_device_dtos_never_serialize_credentials() {
-        let view = official_account().view(true, false);
+        let view = official_account().view(true);
         assert_eq!(serde_json::to_value(&view).unwrap()["remark"], "日常开发");
         let values = [
             serde_json::to_value(&view).unwrap(),
@@ -1706,12 +1656,23 @@ mod tests {
     }
 
     #[test]
-    fn legacy_app_config_deserializes_without_device_session_settings() {
+    fn deleted_device_session_settings_are_ignored_as_legacy_data() {
         let restored: AppConfig = serde_json::from_value(serde_json::json!({
-            "codex": {}, "active": { "kind": "none" }, "providers": [], "officialAccounts": []
+            "codex": {},
+            "active": { "kind": "none" },
+            "providers": [],
+            "officialAccounts": [],
+            "officialInstallationIdSettings": {
+                "legacy": { "enabled": true, "installationId": "old", "sessionId": "old" }
+            }
         }))
         .unwrap();
-        assert!(restored.official_installation_id_settings.is_empty());
+        assert!(
+            serde_json::to_value(restored)
+                .unwrap()
+                .get("officialInstallationIdSettings")
+                .is_none()
+        );
     }
 
     #[test]
@@ -1829,53 +1790,6 @@ mod tests {
 
         assert!(!is_personal_access_token_credential(&credential));
         assert!(validate_official_credential(&credential).is_ok());
-    }
-
-    #[test]
-    fn only_verified_refresh_token_proxy_imports_are_convergence_eligible() {
-        fn claimed_token(account_id: &str) -> String {
-            let payload = URL_SAFE_NO_PAD.encode(
-                serde_json::json!({ "chatgpt_account_id": account_id })
-                    .to_string()
-                    .as_bytes(),
-            );
-            format!("header.{payload}.signature")
-        }
-
-        let eligible = StoredOfficialAccount {
-            id: String::new(),
-            name: "RT".into(),
-            remark: String::new(),
-            account_id: "workspace-account".into(),
-            email: String::new(),
-            credential: CodexAuthCredential {
-                tokens: CodexAuthTokens {
-                    id_token: claimed_token("workspace-account"),
-                    ..credential().tokens
-                },
-                ..credential()
-            },
-            source: OfficialAccountSource::ProxyImport,
-            expires_at: None,
-            quota: ProviderAccountQuota::default(),
-            created_at: 0,
-            updated_at: 0,
-        };
-        assert!(eligible.device_session_convergence_available());
-
-        let mut access_only = eligible.clone();
-        access_only.credential.tokens.refresh_token.clear();
-        assert!(!access_only.device_session_convergence_available());
-
-        let mut personal_token = eligible;
-        personal_token.credential.auth_mode = "personal_access_token".into();
-        assert!(!personal_token.device_session_convergence_available());
-
-        let mut mismatched_claim = personal_token;
-        mismatched_claim.credential.auth_mode = "chatgpt".into();
-        mismatched_claim.credential.tokens.refresh_token = "refresh-secret".into();
-        mismatched_claim.credential.tokens.id_token = claimed_token("different-account");
-        assert!(!mismatched_claim.device_session_convergence_available());
     }
 
     #[test]

@@ -1,6 +1,5 @@
 use crate::{json_store::JsonStore, models::*};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
@@ -22,8 +21,6 @@ struct AppFile {
     codex: CodexPreferences,
     #[serde(default)]
     active: ActiveState,
-    #[serde(default)]
-    official_installation_id_settings: BTreeMap<String, OfficialInstallationIdSetting>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -122,7 +119,6 @@ impl Store {
             active: app_file.active,
             providers,
             official_accounts: connections.official_accounts,
-            official_installation_id_settings: app_file.official_installation_id_settings,
         };
         if !path.exists() || !connections_path.exists() || !credentials_path.exists() {
             persist_files(&path, &connections_path, &credentials_path, &state)?;
@@ -532,14 +528,7 @@ impl Store {
             .map(|account| {
                 let active = matches!(state.active.kind, ActiveKind::Official)
                     && state.active.account_id.as_deref() == Some(account.id.as_str());
-                account.view(
-                    active,
-                    effective_installation_id_setting(
-                        account,
-                        state.official_installation_id_settings.get(&account.id),
-                    )
-                    .enabled,
-                )
+                account.view(active)
             })
             .collect();
         Ok(ProviderOverview {
@@ -589,14 +578,7 @@ impl Store {
             .ok_or_else(|| AppError::InvalidConfig("OpenAI 账号不存在，可能已被删除。".into()))?;
         let active = matches!(state.active.kind, ActiveKind::Official)
             && state.active.account_id.as_deref() == Some(account.id.as_str());
-        Ok(account.view(
-            active,
-            effective_installation_id_setting(
-                account,
-                state.official_installation_id_settings.get(&account.id),
-            )
-            .enabled,
-        ))
+        Ok(account.view(active))
     }
 
     /// Returns the sensitive stored record for backend-only auth operations.
@@ -709,20 +691,6 @@ impl Store {
                         })
                         .map(|saved| saved.id.clone())
                         .collect::<Vec<_>>();
-                    if !state
-                        .official_installation_id_settings
-                        .contains_key(&retained_id)
-                        && let Some(setting) = duplicate_ids
-                            .iter()
-                            .find_map(|id| state.official_installation_id_settings.get(id).cloned())
-                    {
-                        state
-                            .official_installation_id_settings
-                            .insert(retained_id.clone(), setting);
-                    }
-                    for duplicate_id in &duplicate_ids {
-                        state.official_installation_id_settings.remove(duplicate_id);
-                    }
                     if matches!(state.active.kind, ActiveKind::Official)
                         && state
                             .active
@@ -898,62 +866,6 @@ impl Store {
         })
     }
 
-    pub fn set_official_installation_id_unification(
-        &self,
-        id: &str,
-        enabled: bool,
-    ) -> Result<StoredOfficialAccount, AppError> {
-        self.update(|state| {
-            let account = state
-                .official_accounts
-                .iter()
-                .find(|account| account.id == id)
-                .ok_or_else(|| {
-                    AppError::InvalidConfig("OpenAI 账号不存在，可能已被删除。".into())
-                })?;
-            if enabled && !account.device_session_convergence_available() {
-                return Err(AppError::InvalidConfig(
-                    "设备＋会话收敛仅适用于 OpenAI 官方 OAuth 或已验证的 RT 导入账号。".into(),
-                ));
-            }
-            let setting = state
-                .official_installation_id_settings
-                .entry(id.to_owned())
-                .or_default();
-            setting.enabled = enabled;
-            if enabled && setting.installation_id.is_none() {
-                setting.installation_id = Some(account_scoped_installation_id(
-                    &official_account_identity_scope(account),
-                ));
-            }
-            if enabled && setting.session_id.is_none() {
-                setting.session_id = Some(account_scoped_session_id(
-                    &official_account_identity_scope(account),
-                ));
-            }
-            Ok(account.clone())
-        })
-    }
-
-    pub fn official_installation_id_setting(
-        &self,
-        id: &str,
-    ) -> Result<OfficialInstallationIdSetting, AppError> {
-        self.read(|state| {
-            let account = state
-                .official_accounts
-                .iter()
-                .find(|account| account.id == id)
-                .ok_or_else(|| {
-                    AppError::InvalidConfig("OpenAI 账号不存在，可能已被删除。".into())
-                })?;
-            Ok(effective_installation_id_setting(
-                account,
-                state.official_installation_id_settings.get(id),
-            ))
-        })?
-    }
-
     pub fn delete_official_account(&self, id: &str) -> Result<(), AppError> {
         self.delete_official_accounts(vec![id.to_owned()])
     }
@@ -988,72 +900,9 @@ impl Store {
             state
                 .official_accounts
                 .retain(|account| !ids.contains(&account.id));
-            state
-                .official_installation_id_settings
-                .retain(|id, _| !ids.contains(id));
             Ok(())
         })
     }
-}
-
-/// Deterministic, domain-separated UUID-shaped ID. The external account id is
-/// already the durable account key used by this app, so the same official
-/// account resolves to the same installation id on another device without
-/// exposing that account id in the outbound value.
-fn account_scoped_installation_id(account_id: &str) -> String {
-    account_scoped_uuid("codex-tools-installation-id-v1", account_id)
-}
-
-fn account_scoped_session_id(account_id: &str) -> String {
-    account_scoped_uuid("codex-tools-session-id-v1", account_id)
-}
-
-fn account_scoped_uuid(domain: &str, account_id: &str) -> String {
-    let digest = Sha256::digest([domain.as_bytes(), b"\0", account_id.trim().as_bytes()].concat());
-    let mut bytes: [u8; 16] = digest[..16]
-        .try_into()
-        .expect("SHA-256 prefix has 16 bytes");
-    bytes[6] = (bytes[6] & 0x0f) | 0x40;
-    bytes[8] = (bytes[8] & 0x3f) | 0x80;
-    uuid::Uuid::from_bytes(bytes).to_string()
-}
-
-fn effective_default_installation_id_setting(
-    _account: &StoredOfficialAccount,
-) -> OfficialInstallationIdSetting {
-    // Official OpenAI accounts must remain direct unless the user explicitly
-    // opts into device/session convergence. A process-local relay uses a
-    // dynamic port, so silently enabling it leaves Codex pointing at a stale
-    // localhost URL whenever Codex Tools is not running or restarts while
-    // Codex is open.
-    OfficialInstallationIdSetting::default()
-}
-
-fn effective_installation_id_setting(
-    account: &StoredOfficialAccount,
-    stored: Option<&OfficialInstallationIdSetting>,
-) -> OfficialInstallationIdSetting {
-    let mut setting = stored
-        .cloned()
-        .unwrap_or_else(|| effective_default_installation_id_setting(account));
-    if !account.device_session_convergence_available() {
-        // Keep a legacy stored value intact for a possible later credential
-        // repair, but never expose or route an ineligible account through the
-        // relay.
-        setting.enabled = false;
-        return setting;
-    }
-    if setting.enabled && setting.session_id.is_none() {
-        setting.session_id = Some(account_scoped_session_id(&official_account_identity_scope(
-            account,
-        )));
-    }
-    if setting.enabled && setting.installation_id.is_none() {
-        setting.installation_id = Some(account_scoped_installation_id(
-            &official_account_identity_scope(account),
-        ));
-    }
-    setting
 }
 
 fn ensure_official_account_capacity(
@@ -1146,7 +995,6 @@ fn persist_files(
     let app = AppFile {
         codex: state.codex.clone(),
         active: state.active.clone(),
-        official_installation_id_settings: state.official_installation_id_settings.clone(),
     };
     let mut providers = Vec::with_capacity(state.providers.len());
     let mut credentials = CredentialsFile::default();
@@ -1405,18 +1253,6 @@ mod tests {
         account
     }
 
-    fn rt_import_account(account_id: &str, suffix: &str) -> StoredOfficialAccount {
-        let mut account = official_account(account_id, suffix);
-        account.source = OfficialAccountSource::ProxyImport;
-        let payload = URL_SAFE_NO_PAD.encode(
-            serde_json::json!({ "chatgpt_account_id": account_id })
-                .to_string()
-                .as_bytes(),
-        );
-        account.credential.tokens.id_token = format!("header.{payload}.signature");
-        account
-    }
-
     fn provider(id: &str) -> ProviderProfile {
         ProviderProfile {
             id: id.into(),
@@ -1452,6 +1288,29 @@ mod tests {
             fs::read_to_string(temp.path().join("unrelated.txt")).unwrap(),
             "user data"
         );
+    }
+
+    #[test]
+    fn opening_legacy_app_data_drops_deleted_device_session_settings() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(
+            temp.path().join("app.json"),
+            r#"{
+  "codex": {},
+  "active": { "kind": "none" },
+  "officialInstallationIdSettings": {
+    "legacy": { "enabled": true, "installationId": "old", "sessionId": "old" }
+  }
+}"#,
+        )
+        .unwrap();
+
+        Store::open(temp.path().to_path_buf()).unwrap();
+
+        let persisted = fs::read_to_string(temp.path().join("app.json")).unwrap();
+        assert!(!persisted.contains("officialInstallationIdSettings"));
+        assert!(!persisted.contains("installationId"));
+        assert!(!persisted.contains("sessionId"));
     }
 
     #[cfg(unix)]
@@ -1572,7 +1431,7 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_merge_preserves_the_active_record_and_its_device_setting() {
+    fn duplicate_merge_preserves_the_active_record() {
         let temp = tempfile::tempdir().unwrap();
         let store = Store::open(temp.path().to_path_buf()).unwrap();
         let original = store
@@ -1594,14 +1453,6 @@ mod tests {
                     provider_id: None,
                     account_id: Some(active_id.clone()),
                 };
-                state.official_installation_id_settings.insert(
-                    active_id.clone(),
-                    OfficialInstallationIdSetting {
-                        enabled: false,
-                        installation_id: Some("active-installation".into()),
-                        session_id: Some("active-session".into()),
-                    },
-                );
                 Ok(())
             })
             .unwrap();
@@ -1624,20 +1475,6 @@ mod tests {
                 .official_accounts
                 .iter()
                 .any(|account| account.id == original.id)
-        );
-        assert_eq!(
-            state
-                .official_installation_id_settings
-                .get(&active_id)
-                .unwrap()
-                .installation_id
-                .as_deref(),
-            Some("active-installation")
-        );
-        assert!(
-            !state
-                .official_installation_id_settings
-                .contains_key(&original.id)
         );
     }
 
@@ -1669,22 +1506,6 @@ mod tests {
         let state = store.snapshot().unwrap();
         assert_eq!(state.official_accounts.len(), 2);
         assert_eq!(state.active.account_id.as_deref(), Some(first.id.as_str()));
-        store
-            .set_official_installation_id_unification(&first.id, true)
-            .unwrap();
-        store
-            .set_official_installation_id_unification(&second.id, true)
-            .unwrap();
-        assert_ne!(
-            store
-                .official_installation_id_setting(&first.id)
-                .unwrap()
-                .installation_id,
-            store
-                .official_installation_id_setting(&second.id)
-                .unwrap()
-                .installation_id
-        );
     }
 
     #[test]
@@ -2569,286 +2390,6 @@ mod tests {
                 .api_key
                 .as_deref(),
             Some("secret")
-        );
-    }
-
-    #[test]
-    fn installation_id_is_stable_per_account_and_persists_across_restart() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().to_path_buf();
-        let store = Store::open(root.clone()).unwrap();
-        let first = store
-            .save_official_account(&official_account("first", "one"))
-            .unwrap();
-        let second = store
-            .save_official_account(&official_account("second", "two"))
-            .unwrap();
-
-        let default = store.official_installation_id_setting(&first.id).unwrap();
-        assert!(!default.enabled);
-        assert!(default.installation_id.is_none());
-        assert!(default.session_id.is_none());
-        store
-            .set_official_installation_id_unification(&first.id, true)
-            .unwrap();
-        let first_id = store
-            .official_installation_id_setting(&first.id)
-            .unwrap()
-            .installation_id
-            .unwrap();
-        store
-            .set_official_installation_id_unification(&first.id, false)
-            .unwrap();
-        store
-            .set_official_installation_id_unification(&first.id, true)
-            .unwrap();
-        assert_eq!(
-            store
-                .official_installation_id_setting(&first.id)
-                .unwrap()
-                .installation_id
-                .as_deref(),
-            Some(first_id.as_str())
-        );
-        assert_ne!(
-            store
-                .set_official_installation_id_unification(&second.id, true)
-                .unwrap()
-                .id,
-            String::new()
-        );
-        let second_id = store
-            .official_installation_id_setting(&second.id)
-            .unwrap()
-            .installation_id
-            .unwrap();
-        assert_ne!(first_id, second_id);
-
-        let reopened = Store::open(root).unwrap();
-        assert_eq!(
-            reopened
-                .official_installation_id_setting(&first.id)
-                .unwrap()
-                .installation_id
-                .as_deref(),
-            Some(first_id.as_str())
-        );
-        assert!(
-            reopened
-                .official_installation_id_setting(&first.id)
-                .unwrap()
-                .enabled
-        );
-    }
-
-    #[test]
-    fn installation_id_is_deterministic_for_the_same_external_account_across_stores() {
-        let first_root = tempfile::tempdir().unwrap();
-        let second_root = tempfile::tempdir().unwrap();
-        let first = Store::open(first_root.path().to_path_buf()).unwrap();
-        let second = Store::open(second_root.path().to_path_buf()).unwrap();
-        let first_account = first
-            .save_official_account(&official_account("shared", "same-user"))
-            .unwrap();
-        let second_account = second
-            .save_official_account(&rt_import_account("shared", "same-user"))
-            .unwrap();
-        first
-            .set_official_installation_id_unification(&first_account.id, true)
-            .unwrap();
-        second
-            .set_official_installation_id_unification(&second_account.id, true)
-            .unwrap();
-
-        let first_id = first
-            .official_installation_id_setting(&first_account.id)
-            .unwrap()
-            .installation_id
-            .unwrap();
-        let second_id = second
-            .official_installation_id_setting(&second_account.id)
-            .unwrap()
-            .installation_id
-            .unwrap();
-        let first_session = first
-            .official_installation_id_setting(&first_account.id)
-            .unwrap()
-            .session_id
-            .unwrap();
-        let second_session = second
-            .official_installation_id_setting(&second_account.id)
-            .unwrap()
-            .session_id
-            .unwrap();
-        assert_eq!(first_id, second_id);
-        assert_eq!(first_session, second_session);
-        assert_ne!(first_id, first_session);
-        assert!(uuid::Uuid::parse_str(&first_id).is_ok());
-        assert!(uuid::Uuid::parse_str(&first_session).is_ok());
-    }
-
-    #[test]
-    fn deleting_an_official_account_removes_its_installation_id_setting() {
-        let temp = tempfile::tempdir().unwrap();
-        let store = Store::open(temp.path().to_path_buf()).unwrap();
-        let account = store
-            .save_official_account(&official_account("delete-me", "person"))
-            .unwrap();
-        store
-            .set_official_installation_id_unification(&account.id, true)
-            .unwrap();
-        store.delete_official_account(&account.id).unwrap();
-        assert!(
-            !store
-                .snapshot()
-                .unwrap()
-                .official_installation_id_settings
-                .contains_key(&account.id)
-        );
-    }
-
-    #[test]
-    fn convergence_rejects_access_only_and_personal_token_proxy_imports() {
-        let temp = tempfile::tempdir().unwrap();
-        let store = Store::open(temp.path().to_path_buf()).unwrap();
-        let mut account = official_account("cookie", "person");
-        account.source = OfficialAccountSource::ProxyImport;
-        account.credential.tokens.refresh_token.clear();
-        let account = store.save_official_account(&account).unwrap();
-        assert!(
-            store
-                .set_official_installation_id_unification(&account.id, true)
-                .is_err()
-        );
-        assert!(
-            !store
-                .official_installation_id_setting(&account.id)
-                .unwrap()
-                .enabled
-        );
-        assert!(
-            !store
-                .official_account_view(&account.id)
-                .unwrap()
-                .device_session_convergence_enabled
-        );
-
-        let mut personal_token = official_account("pat", "person");
-        personal_token.source = OfficialAccountSource::ProxyImport;
-        personal_token.credential.auth_mode = "personal_access_token".into();
-        personal_token.credential.tokens.id_token.clear();
-        personal_token.credential.tokens.refresh_token.clear();
-        personal_token.credential.tokens.access_token = "at-pat-secret".into();
-        personal_token.credential.last_refresh.clear();
-        let personal_token = store.save_official_account(&personal_token).unwrap();
-        assert!(
-            store
-                .set_official_installation_id_unification(&personal_token.id, true)
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn eligible_rt_without_a_stored_setting_defaults_off_and_explicit_on_persists() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().to_path_buf();
-        let store = Store::open(root.clone()).unwrap();
-        let account = store
-            .save_official_account(&rt_import_account("rt-account", "person"))
-            .unwrap();
-        let default = store.official_installation_id_setting(&account.id).unwrap();
-        assert!(!default.enabled);
-        assert!(default.installation_id.is_none());
-        assert!(default.session_id.is_none());
-        let view = store.official_account_view(&account.id).unwrap();
-        assert!(view.device_session_convergence_available);
-        assert!(!view.device_session_convergence_enabled);
-
-        store
-            .set_official_installation_id_unification(&account.id, true)
-            .unwrap();
-        let reopened = Store::open(root).unwrap();
-        assert!(
-            reopened
-                .official_installation_id_setting(&account.id)
-                .unwrap()
-                .enabled
-        );
-    }
-
-    #[test]
-    fn stored_enabled_rt_setting_is_effectively_off_after_it_becomes_ineligible() {
-        let temp = tempfile::tempdir().unwrap();
-        let store = Store::open(temp.path().to_path_buf()).unwrap();
-        let saved = store
-            .save_official_account(&rt_import_account("rt-account", "person"))
-            .unwrap();
-        store
-            .set_official_installation_id_unification(&saved.id, true)
-            .unwrap();
-        let mut access_only = saved;
-        access_only.credential.tokens.refresh_token.clear();
-        let saved = store.save_official_account(&access_only).unwrap();
-        assert!(
-            !store
-                .official_installation_id_setting(&saved.id)
-                .unwrap()
-                .enabled
-        );
-        let view = store.official_account_view(&saved.id).unwrap();
-        assert!(!view.device_session_convergence_available);
-        assert!(!view.device_session_convergence_enabled);
-    }
-
-    #[test]
-    fn rt_import_with_a_mismatched_token_claim_cannot_converge() {
-        let temp = tempfile::tempdir().unwrap();
-        let store = Store::open(temp.path().to_path_buf()).unwrap();
-        let mut account = rt_import_account("stored-account", "person");
-        let payload = URL_SAFE_NO_PAD.encode(
-            serde_json::json!({ "chatgpt_account_id": "claimed-account" })
-                .to_string()
-                .as_bytes(),
-        );
-        account.credential.tokens.id_token = format!("header.{payload}.signature");
-        let account = store.save_official_account(&account).unwrap();
-        assert!(
-            store
-                .set_official_installation_id_unification(&account.id, true)
-                .is_err()
-        );
-        let view = store.official_account_view(&account.id).unwrap();
-        assert!(!view.device_session_convergence_available);
-        assert!(!view.device_session_convergence_enabled);
-    }
-
-    #[test]
-    fn oauth_without_a_stored_setting_defaults_off_but_explicit_on_persists() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().to_path_buf();
-        let store = Store::open(root.clone()).unwrap();
-        let account = store
-            .save_official_account(&official_account("oauth", "person"))
-            .unwrap();
-        let default = store.official_installation_id_setting(&account.id).unwrap();
-        assert!(!default.enabled);
-        assert!(default.installation_id.is_none());
-        assert!(default.session_id.is_none());
-        assert!(
-            !store
-                .official_account_view(&account.id)
-                .unwrap()
-                .device_session_convergence_enabled
-        );
-        store
-            .set_official_installation_id_unification(&account.id, true)
-            .unwrap();
-        let reopened = Store::open(root).unwrap();
-        assert!(
-            reopened
-                .official_installation_id_setting(&account.id)
-                .unwrap()
-                .enabled
         );
     }
 }

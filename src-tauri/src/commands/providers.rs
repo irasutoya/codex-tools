@@ -1,13 +1,11 @@
 use crate::{
     activation::{
-        compensate_activation_failure_with_installation_proxy, ensure_codex_stopped,
-        record_written_model, sync_active_codex_configuration_with_installation_proxy,
-        sync_active_openai_credential,
+        compensate_activation_failure, ensure_codex_stopped, record_written_model,
+        sync_active_codex_configuration, sync_active_openai_credential,
     },
     chat_proxy::ChatProxyRegistry,
     codex::{self, AppliedConfigPatch, ConfigManager},
     commands::sessions::repair_home_after_activation,
-    installation_id_proxy::InstallationIdProxyRegistry,
     local_usage::UsageLedger,
     models::*,
     models_dev, provider_http, provider_sync,
@@ -29,7 +27,6 @@ pub(crate) async fn connections_save_provider(
     manager: State<'_, ConfigManager>,
     activation: State<'_, ActivationLock>,
     proxy: State<'_, ChatProxyRegistry>,
-    installation_proxy: State<'_, InstallationIdProxyRegistry>,
     client: State<'_, ApiClient>,
     provider: ProviderSaveInput,
 ) -> Result<ProviderProfile, AppError> {
@@ -56,13 +53,7 @@ pub(crate) async fn connections_save_provider(
         // 地址/Key/空缓存需要先完成 `/models` 刷新，不能把旧模型写给新服务。
         if was_active
             && !needs_model_refresh
-            && let Err(error) = sync_active_codex_configuration_with_installation_proxy(
-                &store,
-                &manager,
-                &proxy,
-                &installation_proxy,
-            )
-            .await
+            && let Err(error) = sync_active_codex_configuration(&store, &manager, &proxy).await
         {
             let Some(previous) = previous.as_ref() else {
                 return Err(error);
@@ -71,7 +62,6 @@ pub(crate) async fn connections_save_provider(
                 &store,
                 &manager,
                 &proxy,
-                &installation_proxy,
                 &saved_revision,
                 previous,
                 error,
@@ -108,13 +98,7 @@ pub(crate) async fn connections_save_provider(
                 if !store.provider_source_matches(&saved.id, &saved_source)? {
                     return Err(AppError::StaleOperation);
                 }
-                if let Err(error) = sync_active_codex_configuration_with_installation_proxy(
-                    &store,
-                    &manager,
-                    &proxy,
-                    &installation_proxy,
-                )
-                .await
+                if let Err(error) = sync_active_codex_configuration(&store, &manager, &proxy).await
                 {
                     let Some(previous) = previous.as_ref() else {
                         return Err(error);
@@ -123,7 +107,6 @@ pub(crate) async fn connections_save_provider(
                         &store,
                         &manager,
                         &proxy,
-                        &installation_proxy,
                         &synced.revision,
                         previous,
                         error,
@@ -145,7 +128,6 @@ pub(crate) async fn connections_save_provider(
                     &store,
                     &manager,
                     &proxy,
-                    &installation_proxy,
                     &saved_revision,
                     previous,
                     error,
@@ -164,7 +146,6 @@ async fn rollback_active_save_after_model_failure(
     store: &Store,
     manager: &ConfigManager,
     proxy: &ChatProxyRegistry,
-    installation_proxy: &InstallationIdProxyRegistry,
     saved_revision: &ProviderSnapshotRevision,
     previous: &ProviderProfile,
     error: AppError,
@@ -177,16 +158,7 @@ async fn rollback_active_save_after_model_failure(
     let failure = AppError::InvalidConfig(format!(
         "无法从更新后的服务获取模型列表，已保留原连接：{error}"
     ));
-    restore_active_provider_save(
-        store,
-        manager,
-        proxy,
-        installation_proxy,
-        saved_revision,
-        previous,
-        failure,
-    )
-    .await
+    restore_active_provider_save(store, manager, proxy, saved_revision, previous, failure).await
 }
 
 /// 在持有 ActivationLock 时恢复 active Provider 的完整旧快照，并把 Codex
@@ -196,7 +168,6 @@ async fn restore_active_provider_save(
     store: &Store,
     manager: &ConfigManager,
     proxy: &ChatProxyRegistry,
-    installation_proxy: &InstallationIdProxyRegistry,
     expected_revision: &ProviderSnapshotRevision,
     previous: &ProviderProfile,
     original_error: AppError,
@@ -206,14 +177,7 @@ async fn restore_active_provider_save(
         Err(restore) => AppError::Internal(format!(
             "{original_error}；恢复原服务数据失败，请重新选择连接：{restore}"
         )),
-        Ok(true) => match sync_active_codex_configuration_with_installation_proxy(
-            store,
-            manager,
-            proxy,
-            installation_proxy,
-        )
-        .await
-        {
+        Ok(true) => match sync_active_codex_configuration(store, manager, proxy).await {
             Ok(()) => original_error,
             Err(restore) => AppError::Internal(format!(
                 "{original_error}；原服务配置恢复失败，请重新选择连接：{restore}"
@@ -228,7 +192,6 @@ async fn apply_provider_configuration_and_record(
     store: &Store,
     manager: &ConfigManager,
     proxy: &ChatProxyRegistry,
-    installation_proxy: &InstallationIdProxyRegistry,
     home: &std::path::Path,
     operation_id: &str,
 ) -> Result<ProviderActivationRollback, AppError> {
@@ -236,14 +199,7 @@ async fn apply_provider_configuration_and_record(
     let applied = match manager.apply(operation_id) {
         Ok(applied) => applied,
         Err(error) => {
-            return Err(compensate_activation_failure_with_installation_proxy(
-                store,
-                manager,
-                proxy,
-                installation_proxy,
-                error,
-            )
-            .await);
+            return Err(compensate_activation_failure(store, manager, proxy, error).await);
         }
     };
     if let Err(error) = record_written_model(store, home) {
@@ -251,15 +207,7 @@ async fn apply_provider_configuration_and_record(
             applied,
             previous_managed_model,
         };
-        return Err(rollback_provider_activation(
-            store,
-            manager,
-            proxy,
-            installation_proxy,
-            rollback,
-            error,
-        )
-        .await);
+        return Err(rollback_provider_activation(store, manager, proxy, rollback, error).await);
     }
     Ok(ProviderActivationRollback {
         applied,
@@ -276,7 +224,6 @@ async fn rollback_provider_activation(
     store: &Store,
     manager: &ConfigManager,
     proxy: &ChatProxyRegistry,
-    installation_proxy: &InstallationIdProxyRegistry,
     rollback: ProviderActivationRollback,
     original_error: AppError,
 ) -> AppError {
@@ -289,11 +236,10 @@ async fn rollback_provider_activation(
                 .err()
                 .or_else(|| managed_model.err())
                 .unwrap_or_else(|| AppError::Internal("未知回滚错误".into()));
-            compensate_activation_failure_with_installation_proxy(
+            compensate_activation_failure(
                 store,
                 manager,
                 proxy,
-                installation_proxy,
                 AppError::Internal(format!(
                     "{original_error}；第三方配置回滚失败，请手动检查 Codex 配置：{rollback_error}"
                 )),
@@ -377,7 +323,6 @@ pub(crate) async fn connections_list_models(
     manager: State<'_, ConfigManager>,
     activation: State<'_, ActivationLock>,
     proxy: State<'_, ChatProxyRegistry>,
-    installation_proxy: State<'_, InstallationIdProxyRegistry>,
     id: String,
 ) -> Result<Vec<String>, AppError> {
     let _model_transaction = activation.2.lock().await;
@@ -409,7 +354,6 @@ pub(crate) async fn connections_list_models(
         &manager,
         &activation,
         &proxy,
-        &installation_proxy,
         was_active,
         &provider,
         &synced.revision,
@@ -426,7 +370,6 @@ pub(crate) async fn connections_refresh_models(
     manager: State<'_, ConfigManager>,
     activation: State<'_, ActivationLock>,
     proxy: State<'_, ChatProxyRegistry>,
-    installation_proxy: State<'_, InstallationIdProxyRegistry>,
 ) -> Result<Vec<String>, AppError> {
     let _model_transaction = activation.2.lock().await;
     let active = store.read(|state| state.active.clone())?;
@@ -451,7 +394,6 @@ pub(crate) async fn connections_refresh_models(
         &manager,
         &activation,
         &proxy,
-        &installation_proxy,
         was_active,
         &provider,
         &synced.revision,
@@ -466,7 +408,6 @@ async fn finish_provider_model_refresh(
     manager: &ConfigManager,
     activation: &ActivationLock,
     proxy: &ChatProxyRegistry,
-    installation_proxy: &InstallationIdProxyRegistry,
     was_active_at_start: bool,
     previous: &ProviderProfile,
     refreshed_revision: &ProviderSnapshotRevision,
@@ -481,7 +422,6 @@ async fn finish_provider_model_refresh(
         manager,
         activation,
         proxy,
-        installation_proxy,
         &previous.id,
         previous,
         refreshed_revision,
@@ -497,21 +437,13 @@ async fn sync_active_provider_configuration(
     manager: &ConfigManager,
     activation: &ActivationLock,
     proxy: &ChatProxyRegistry,
-    installation_proxy: &InstallationIdProxyRegistry,
     provider_id: &str,
     previous: &ProviderProfile,
     refreshed_revision: &ProviderSnapshotRevision,
 ) -> Result<(), AppError> {
     let _guard = activation.0.lock().await;
     if store.is_active_provider(provider_id)? {
-        if let Err(error) = sync_active_codex_configuration_with_installation_proxy(
-            store,
-            manager,
-            proxy,
-            installation_proxy,
-        )
-        .await
-        {
+        if let Err(error) = sync_active_codex_configuration(store, manager, proxy).await {
             return match store
                 .restore_provider_snapshot_if_revision_matches(refreshed_revision, previous)
             {
@@ -731,7 +663,6 @@ pub(crate) async fn connections_activate(
     ledger: State<'_, UsageLedger>,
     activation: State<'_, ActivationLock>,
     proxy: State<'_, ChatProxyRegistry>,
-    installation_proxy: State<'_, InstallationIdProxyRegistry>,
     client: State<'_, ApiClient>,
     index: State<'_, SessionIndex>,
     id: String,
@@ -810,23 +741,16 @@ pub(crate) async fn connections_activate(
                 &store,
                 &manager,
                 &proxy,
-                &installation_proxy,
                 &home,
                 &preview.operation_id,
             )
             .await?;
             if let Err(error) = store.activate(&id) {
                 return Err(rollback_provider_activation(
-                    &store,
-                    &manager,
-                    &proxy,
-                    &installation_proxy,
-                    rollback,
-                    error,
+                    &store, &manager, &proxy, rollback, error,
                 )
                 .await);
             }
-            installation_proxy.stop_all().await;
             // 转换代理保持运行：Codex 会缓存配置里的地址，端口必须在本机会话内
             // 保持稳定，切回其他服务再切回来时才能继续使用同一端口。
             let repair = if repair_sessions {
@@ -1037,7 +961,6 @@ mod tests {
             &store,
             &manager,
             &proxy,
-            &InstallationIdProxyRegistry::default(),
             &changed_revision,
             &previous,
             AppError::Internal("配置同步失败".into()),
@@ -1072,7 +995,6 @@ mod tests {
             &store,
             &manager,
             &proxy,
-            &InstallationIdProxyRegistry::default(),
             &home,
             &preview.operation_id,
         )
@@ -1127,7 +1049,6 @@ mod tests {
             &store,
             &manager,
             &proxy,
-            &InstallationIdProxyRegistry::default(),
             &home,
             &preview.operation_id,
         )
@@ -1183,7 +1104,6 @@ mod tests {
             &store,
             &manager,
             &proxy,
-            &InstallationIdProxyRegistry::default(),
             &home,
             &preview.operation_id,
         )
@@ -1191,15 +1111,8 @@ mod tests {
         .unwrap();
 
         let store_error = store.activate("missing-provider").unwrap_err();
-        let error = rollback_provider_activation(
-            &store,
-            &manager,
-            &proxy,
-            &InstallationIdProxyRegistry::default(),
-            rollback,
-            store_error,
-        )
-        .await;
+        let error =
+            rollback_provider_activation(&store, &manager, &proxy, rollback, store_error).await;
 
         assert!(error.to_string().contains("不存在"));
         assert_eq!(
@@ -1269,7 +1182,6 @@ mod tests {
             &manager,
             &ActivationLock::default(),
             &proxy,
-            &InstallationIdProxyRegistry::default(),
             &saved.id,
             &previous,
             &refreshed_revision,
@@ -1326,7 +1238,6 @@ mod tests {
             &manager,
             &ActivationLock::default(),
             &proxy,
-            &InstallationIdProxyRegistry::default(),
             &saved.id,
             &previous,
             &refreshed_revision,
@@ -1381,7 +1292,6 @@ mod tests {
             &ConfigManager::default(),
             &ActivationLock::default(),
             &ChatProxyRegistry::default(),
-            &InstallationIdProxyRegistry::default(),
             was_active,
             &previous,
             &refreshed_revision,
@@ -1432,7 +1342,6 @@ mod tests {
             &store,
             &ConfigManager::default(),
             &ChatProxyRegistry::default(),
-            &InstallationIdProxyRegistry::default(),
             &first_revision,
             &previous,
             AppError::StaleOperation,
@@ -1487,7 +1396,6 @@ mod tests {
             &store,
             &ConfigManager::default(),
             &ChatProxyRegistry::default(),
-            &InstallationIdProxyRegistry::default(),
             &first_revision,
             &previous,
             AppError::StaleOperation,
