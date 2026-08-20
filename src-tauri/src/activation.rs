@@ -147,10 +147,11 @@ pub(crate) async fn sync_active_codex_configuration(
             // 本应用上次写入的第三方服务模型；只有与最近一次写入记录一致
             // 才清除（用户手动设置的模型不受影响）。
             let managed_model = managed_model_to_remove(store, &home)?;
-            codex::connections_activate_official_account(
+            codex::connections_activate_official_account_checked(
                 &home,
                 &account.credential,
                 managed_model.as_deref(),
+                || ensure_codex_stopped(store),
             )?;
             store.save_last_managed_model(None)?;
             return Ok(());
@@ -219,10 +220,11 @@ pub(crate) async fn activate_openai_record(
         if !activation.is_current(activation_operation) {
             return Err(AppError::StaleOperation);
         }
-        if let Err(error) = codex::connections_activate_official_account(
+        if let Err(error) = codex::connections_activate_official_account_checked(
             &home,
             &account.credential,
             managed_model.as_deref(),
+            || ensure_codex_stopped(store),
         ) {
             return Err(compensate_activation_failure(store, manager, proxy, error).await);
         }

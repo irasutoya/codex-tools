@@ -393,6 +393,7 @@ pub fn home(configured: &str) -> PathBuf {
         .join(".codex")
 }
 
+#[cfg(test)]
 pub fn connections_activate_official_account(
     codex_home: &Path,
     credential: &CodexAuthCredential,
@@ -400,6 +401,16 @@ pub fn connections_activate_official_account(
 ) -> Result<(), AppError> {
     let patch = prepare_official_account_patch(codex_home, credential, managed_model)?;
     apply_official_account_patch(patch)
+}
+
+pub(crate) fn connections_activate_official_account_checked(
+    codex_home: &Path,
+    credential: &CodexAuthCredential,
+    managed_model: Option<&str>,
+    check_before_write: impl FnOnce() -> Result<(), AppError>,
+) -> Result<(), AppError> {
+    let patch = prepare_official_account_patch(codex_home, credential, managed_model)?;
+    apply_official_account_patch_checked(patch, check_before_write)
 }
 
 fn prepare_official_account_patch(
@@ -453,7 +464,15 @@ fn prepare_official_account_patch(
     })
 }
 
+#[cfg(test)]
 fn apply_official_account_patch(patch: OfficialAccountPatch) -> Result<(), AppError> {
+    apply_official_account_patch_checked(patch, || Ok(()))
+}
+
+fn apply_official_account_patch_checked(
+    patch: OfficialAccountPatch,
+    check_before_write: impl FnOnce() -> Result<(), AppError>,
+) -> Result<(), AppError> {
     let current = CodexFilesSnapshot {
         config: OptionalFileSnapshot::capture(
             patch.original.config.path.clone(),
@@ -478,6 +497,7 @@ fn apply_official_account_patch(patch: OfficialAccountPatch) -> Result<(), AppEr
         return Err(AppError::StaleOperation);
     }
 
+    check_before_write()?;
     let result = commit_codex_files(
         &patch.original.config.path,
         &patch.config_rendered,

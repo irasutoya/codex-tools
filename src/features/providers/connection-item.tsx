@@ -98,7 +98,7 @@ export const ConnectionItem = memo(function ConnectionItem({
       </ItemMedia>
       <ItemContent title={description}>
         <ItemTitle className="w-full">{name}</ItemTitle>
-        <ItemDescription className="truncate">{description}</ItemDescription>
+        <ItemDescription>{description}</ItemDescription>
       </ItemContent>
       <ItemActions className="max-w-full flex-wrap justify-end gap-1 self-start">
         {active && <Badge>当前</Badge>}
