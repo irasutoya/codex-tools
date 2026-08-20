@@ -1,12 +1,11 @@
 use crate::{
     activation::{
-        activate_openai_record, ensure_codex_stopped,
-        sync_active_codex_configuration_with_installation_proxy, sync_active_openai_credential,
+        activate_openai_record, ensure_codex_stopped, sync_active_codex_configuration,
+        sync_active_openai_credential,
     },
     auth_center::{AuthCenter, DevicePollResult},
     chat_proxy::ChatProxyRegistry,
     codex::{self, ConfigManager},
-    installation_id_proxy::InstallationIdProxyRegistry,
     local_usage::UsageLedger,
     models::*,
     official_quota, proxy_import,
@@ -136,48 +135,6 @@ pub(crate) fn connections_update_account_remark(
 }
 
 #[tauri::command]
-pub(crate) async fn connections_set_device_session_convergence(
-    store: State<'_, Store>,
-    manager: State<'_, ConfigManager>,
-    activation: State<'_, ActivationLock>,
-    proxy: State<'_, ChatProxyRegistry>,
-    installation_proxy: State<'_, InstallationIdProxyRegistry>,
-    id: String,
-    enabled: bool,
-) -> Result<OfficialAccountView, AppError> {
-    let _guard = activation.0.lock().await;
-    let previous = store.official_installation_id_setting(&id)?;
-    let saved = store.set_official_installation_id_unification(&id, enabled)?;
-    let active = store.read(|state| {
-        matches!(state.active.kind, ActiveKind::Official)
-            && state.active.account_id.as_deref() == Some(id.as_str())
-    })?;
-    if active
-        && let Err(error) = sync_active_codex_configuration_with_installation_proxy(
-            &store,
-            &manager,
-            &proxy,
-            &installation_proxy,
-        )
-        .await
-    {
-        // Persisted state and the live Codex config move together. If the
-        // reconfiguration fails, restore the prior setting and best-effort
-        // restore its prior direct/relay route before reporting the error.
-        let _ = store.set_official_installation_id_unification(&id, previous.enabled);
-        let _ = sync_active_codex_configuration_with_installation_proxy(
-            &store,
-            &manager,
-            &proxy,
-            &installation_proxy,
-        )
-        .await;
-        return Err(error);
-    }
-    store.official_account_view(&saved.id)
-}
-
-#[tauri::command]
 pub(crate) fn connections_update_account_remarks(
     store: State<'_, Store>,
     updates: Vec<AccountRemarkUpdate>,
@@ -199,10 +156,7 @@ fn connections_update_account_remarks_in_store(
         .into_iter()
         .map(|account| {
             let active = active_account_id.as_deref() == Some(account.id.as_str());
-            Ok(account.view(
-                active,
-                store.official_installation_id_setting(&account.id)?.enabled,
-            ))
+            Ok(account.view(active))
         })
         .collect()
 }
@@ -214,19 +168,9 @@ pub(crate) async fn connections_refresh_login(
     manager: State<'_, ConfigManager>,
     activation: State<'_, ActivationLock>,
     proxy: State<'_, ChatProxyRegistry>,
-    installation_proxy: State<'_, InstallationIdProxyRegistry>,
     id: String,
 ) -> Result<OfficialAccountView, AppError> {
-    connections_refresh_login_in_store(
-        &store,
-        &center,
-        &manager,
-        &activation,
-        &proxy,
-        &installation_proxy,
-        &id,
-    )
-    .await
+    connections_refresh_login_in_store(&store, &center, &manager, &activation, &proxy, &id).await
 }
 
 async fn connections_refresh_login_in_store(
@@ -235,20 +179,10 @@ async fn connections_refresh_login_in_store(
     manager: &ConfigManager,
     activation: &ActivationLock,
     proxy: &ChatProxyRegistry,
-    installation_proxy: &InstallationIdProxyRegistry,
     id: &str,
 ) -> Result<OfficialAccountView, AppError> {
-    let saved = refresh_account_and_sync_active(
-        store,
-        center,
-        manager,
-        activation,
-        proxy,
-        installation_proxy,
-        id,
-        true,
-    )
-    .await?;
+    let saved = refresh_account_and_sync_active(store, center, manager, activation, proxy, id, true)
+        .await?;
     store.official_account_view(&saved.id)
 }
 
@@ -259,7 +193,6 @@ async fn refresh_account_and_sync_active(
     manager: &ConfigManager,
     activation: &ActivationLock,
     proxy: &ChatProxyRegistry,
-    installation_proxy: &InstallationIdProxyRegistry,
     id: &str,
     force: bool,
 ) -> Result<StoredOfficialAccount, AppError> {
@@ -282,13 +215,7 @@ async fn refresh_account_and_sync_active(
         center.refresh_account(store, id).await?
     };
     if is_active {
-        sync_active_codex_configuration_with_installation_proxy(
-            store,
-            manager,
-            proxy,
-            installation_proxy,
-        )
-        .await?;
+        sync_active_codex_configuration(store, manager, proxy).await?;
     }
     Ok(saved)
 }
@@ -455,7 +382,6 @@ pub(crate) async fn connections_activate_account(
     ledger: State<'_, UsageLedger>,
     activation: State<'_, ActivationLock>,
     proxy: State<'_, ChatProxyRegistry>,
-    installation_proxy: State<'_, InstallationIdProxyRegistry>,
     index: State<'_, SessionIndex>,
     id: String,
 ) -> Result<RepairResult, AppError> {
@@ -472,7 +398,6 @@ pub(crate) async fn connections_activate_account(
         &manager,
         &ledger,
         &proxy,
-        &installation_proxy,
         &activation,
         activation_operation,
         &saved,
@@ -491,7 +416,6 @@ pub(crate) async fn connections_activate_official(
     ledger: State<'_, UsageLedger>,
     activation: State<'_, ActivationLock>,
     proxy: State<'_, ChatProxyRegistry>,
-    installation_proxy: State<'_, InstallationIdProxyRegistry>,
     index: State<'_, SessionIndex>,
 ) -> Result<RepairResult, AppError> {
     let activation_operation = activation.begin_operation();
@@ -524,7 +448,6 @@ pub(crate) async fn connections_activate_official(
         &manager,
         &ledger,
         &proxy,
-        &installation_proxy,
         &activation,
         activation_operation,
         &saved,
@@ -940,14 +863,12 @@ mod tests {
 
         let manager = ConfigManager::default();
         let proxy = ChatProxyRegistry::default();
-        let installation_proxy = InstallationIdProxyRegistry::default();
         let refreshed = refresh_account_and_sync_active(
             &store,
             &AuthCenter::default(),
             &manager,
             &ActivationLock::default(),
             &proxy,
-            &installation_proxy,
             &saved.id,
             false,
         )
@@ -961,7 +882,6 @@ mod tests {
             &manager,
             &ActivationLock::default(),
             &proxy,
-            &installation_proxy,
             &saved.id,
         )
         .await
@@ -1076,79 +996,5 @@ mod tests {
         );
         assert_eq!(fs::read(home.join("config.toml")).unwrap(), config_before);
         assert_eq!(fs::read(home.join("auth.json")).unwrap(), auth_before);
-    }
-
-    #[tokio::test]
-    async fn active_oauth_reimport_defers_the_managed_relay_until_configuration_sync() {
-        let temp = tempfile::tempdir().unwrap();
-        let home = temp.path().join("codex-home");
-        fs::create_dir_all(&home).unwrap();
-        let store = Store::open(temp.path().join("data")).unwrap();
-        store
-            .update(|state| {
-                state.codex.home = home.display().to_string();
-                Ok(())
-            })
-            .unwrap();
-        let mut oauth = oauth_account("shared-account", "shared-user", "shared@example.test");
-        oauth.credential.tokens.refresh_token = "oauth-refresh".into();
-        let oauth = store.save_official_account(&oauth).unwrap();
-        store
-            .connections_activate_official_account(&oauth.id)
-            .unwrap();
-        codex::connections_activate_official_account(&home, &oauth.credential, None).unwrap();
-        let config_before = fs::read(home.join("config.toml")).unwrap();
-        let auth_before = fs::read(home.join("auth.json")).unwrap();
-        let content = serde_json::json!({
-            "access_token": "rt-access",
-            "refresh_token": "rt-refresh",
-            "id_token": oauth.credential.tokens.id_token,
-            "account_id": "shared-account"
-        })
-        .to_string();
-
-        let imported = connections_import_cookie_in_store(
-            &store,
-            &AuthCenter::default(),
-            &ActivationLock::default(),
-            None,
-            None,
-            content,
-        )
-        .await
-        .unwrap();
-        let rt = store.official_account(&imported.accounts[0].id).unwrap();
-        assert_eq!(rt.id, oauth.id);
-        assert!(
-            store
-                .official_installation_id_setting(&rt.id)
-                .unwrap()
-                .enabled
-        );
-        assert_eq!(fs::read(home.join("config.toml")).unwrap(), config_before);
-        assert_eq!(fs::read(home.join("auth.json")).unwrap(), auth_before);
-
-        let manager = ConfigManager::default();
-        let proxy = ChatProxyRegistry::default();
-        let installation_proxy = InstallationIdProxyRegistry::default();
-        sync_active_codex_configuration_with_installation_proxy(
-            &store,
-            &manager,
-            &proxy,
-            &installation_proxy,
-        )
-        .await
-        .unwrap();
-
-        let config = fs::read_to_string(home.join("config.toml")).unwrap();
-        let document = config.parse::<toml_edit::DocumentMut>().unwrap();
-        assert_eq!(
-            document["model_provider"].as_str(),
-            Some(crate::codex::INSTALLATION_ID_RELAY_PROVIDER_ID)
-        );
-        assert!(document["model_providers"][crate::codex::INSTALLATION_ID_RELAY_PROVIDER_ID]
-            ["base_url"]
-            .as_str()
-            .is_some_and(|url| url.starts_with("http://127.0.0.1:")));
     }
 }

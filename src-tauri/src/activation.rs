@@ -2,7 +2,6 @@ use crate::{
     chat_proxy::ChatProxyRegistry,
     codex::{self, ConfigManager},
     commands::sessions::repair_home_after_activation,
-    installation_id_proxy::InstallationIdProxyRegistry,
     models::{ActiveKind, AppError, RepairResult, StoredOfficialAccount},
     provider_sync,
     state::ActivationLock,
@@ -127,26 +126,10 @@ fn managed_model_to_remove(
     Ok(recorded.filter(|record| current.as_deref() == Some(record.as_str())))
 }
 
-#[cfg(test)]
 pub(crate) async fn sync_active_codex_configuration(
     store: &Store,
     manager: &ConfigManager,
     proxy: &ChatProxyRegistry,
-) -> Result<(), AppError> {
-    sync_active_codex_configuration_with_installation_proxy(
-        store,
-        manager,
-        proxy,
-        &InstallationIdProxyRegistry::default(),
-    )
-    .await
-}
-
-pub(crate) async fn sync_active_codex_configuration_with_installation_proxy(
-    store: &Store,
-    manager: &ConfigManager,
-    proxy: &ChatProxyRegistry,
-    installation_proxy: &InstallationIdProxyRegistry,
 ) -> Result<(), AppError> {
     ensure_codex_stopped(store)?;
     let (home_setting, active) =
@@ -160,28 +143,20 @@ pub(crate) async fn sync_active_codex_configuration_with_installation_proxy(
             })?;
             let account = store.official_account(account_id)?;
             crate::official_quota::ensure_account_usable(&account)?;
-            let relay = official_relay_base_url(store, installation_proxy, &account).await?;
             // 启动修复路径：active 已指向 OpenAI，但 config.toml 可能仍残留
             // 本应用上次写入的第三方服务模型；只有与最近一次写入记录一致
             // 才清除（用户手动设置的模型不受影响）。
             let managed_model = managed_model_to_remove(store, &home)?;
-            codex::connections_activate_official_account_with_relay_checked(
+            codex::connections_activate_official_account(
                 &home,
                 &account.credential,
                 managed_model.as_deref(),
-                relay.as_deref(),
-                || ensure_codex_stopped(store),
             )?;
             store.save_last_managed_model(None)?;
             return Ok(());
         }
-        ActiveKind::None => {
-            installation_proxy.stop_all().await;
-            return Ok(());
-        }
-        ActiveKind::Provider => {
-            installation_proxy.stop_all().await;
-        }
+        ActiveKind::None => return Ok(()),
+        ActiveKind::Provider => {}
     }
 
     let provider_id = active.provider_id.as_deref().ok_or_else(|| {
@@ -217,13 +192,11 @@ pub(crate) async fn sync_active_codex_configuration_with_installation_proxy(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)] // Coordinates the stores and relays that form one switch transaction.
 pub(crate) async fn activate_openai_record(
     store: &Store,
     manager: &ConfigManager,
     ledger: &crate::local_usage::UsageLedger,
     proxy: &ChatProxyRegistry,
-    installation_proxy: &InstallationIdProxyRegistry,
     activation: &ActivationLock,
     activation_operation: u64,
     account: &StoredOfficialAccount,
@@ -243,35 +216,18 @@ pub(crate) async fn activate_openai_record(
     // 转换代理保持运行直到应用退出或服务被删除：端口在本机会话内保持稳定，
     // 切回 OpenAI 再切回第三方服务时，Codex 缓存的地址仍然有效。
     let result = async {
-        let relay = official_relay_base_url(store, installation_proxy, account).await?;
         if !activation.is_current(activation_operation) {
             return Err(AppError::StaleOperation);
         }
-        if let Err(error) = codex::connections_activate_official_account_with_relay_checked(
+        if let Err(error) = codex::connections_activate_official_account(
             &home,
             &account.credential,
             managed_model.as_deref(),
-            relay.as_deref(),
-            || ensure_codex_stopped(store),
         ) {
-            return Err(compensate_activation_failure_with_installation_proxy(
-                store,
-                manager,
-                proxy,
-                installation_proxy,
-                error,
-            )
-            .await);
+            return Err(compensate_activation_failure(store, manager, proxy, error).await);
         }
         if let Err(error) = store.connections_activate_official_account(&account.id) {
-            return Err(compensate_activation_failure_with_installation_proxy(
-                store,
-                manager,
-                proxy,
-                installation_proxy,
-                error,
-            )
-            .await);
+            return Err(compensate_activation_failure(store, manager, proxy, error).await);
         }
         let repair = if repair_sessions {
             repair_home_after_activation(store, home, "openai".into()).await
@@ -296,52 +252,18 @@ pub(crate) async fn activate_openai_record(
     }
 }
 
-pub(crate) async fn compensate_activation_failure_with_installation_proxy(
+pub(crate) async fn compensate_activation_failure(
     store: &Store,
     manager: &ConfigManager,
     proxy: &ChatProxyRegistry,
-    installation_proxy: &InstallationIdProxyRegistry,
     error: AppError,
 ) -> AppError {
-    match sync_active_codex_configuration_with_installation_proxy(
-        store,
-        manager,
-        proxy,
-        installation_proxy,
-    )
-    .await
-    {
+    match sync_active_codex_configuration(store, manager, proxy).await {
         Ok(()) => error,
         Err(rollback) => AppError::Internal(format!(
             "{error}；原来的 Codex 连接也未能恢复，请重新选择账号或服务：{rollback}"
         )),
     }
-}
-
-async fn official_relay_base_url(
-    store: &Store,
-    registry: &InstallationIdProxyRegistry,
-    account: &StoredOfficialAccount,
-) -> Result<Option<String>, AppError> {
-    let setting = store.official_installation_id_setting(&account.id)?;
-    if !setting.enabled {
-        registry.stop_all().await;
-        return Ok(None);
-    }
-    let installation_id = setting
-        .installation_id
-        .as_deref()
-        .ok_or_else(|| AppError::Internal("设备＋会话收敛已启用，但稳定设备标识缺失。".into()))?;
-    let session_id = setting
-        .session_id
-        .as_deref()
-        .ok_or_else(|| AppError::Internal("设备＋会话收敛已启用，但稳定会话标识缺失。".into()))?;
-    Ok(Some(
-        registry
-            .ensure(installation_id, session_id, &account.account_id)
-            .await?
-            .base_url,
-    ))
 }
 
 #[cfg(test)]
@@ -474,11 +396,7 @@ mod tests {
                 updated_at: 0,
             })
             .unwrap();
-        // This regression covers the explicit-off/direct path. OAuth accounts
-        // without a stored choice default to the local convergence relay.
-        store
-            .set_official_installation_id_unification(&saved.id, false)
-            .unwrap();
+        // Official accounts always use the direct OpenAI configuration.
         store
             .connections_activate_official_account(&saved.id)
             .unwrap();
@@ -513,6 +431,87 @@ mod tests {
         let repaired: CodexAuthCredential =
             serde_json::from_slice(&fs::read(home.join("auth.json")).unwrap()).unwrap();
         assert_eq!(repaired, credential);
+    }
+
+    #[tokio::test]
+    async fn official_sync_removes_a_stale_relay_from_the_deleted_feature() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex-home");
+        fs::create_dir_all(&home).unwrap();
+        let store = Store::open(temp.path().join("data")).unwrap();
+        store
+            .update(|state| {
+                state.codex.home = home.display().to_string();
+                Ok(())
+            })
+            .unwrap();
+        let credential = CodexAuthCredential {
+            auth_mode: "chatgpt".into(),
+            openai_api_key: None,
+            tokens: CodexAuthTokens {
+                id_token: "id-secret".into(),
+                access_token: "access-secret".into(),
+                refresh_token: "refresh-secret".into(),
+                account_id: "workspace".into(),
+            },
+            last_refresh: "2026-07-15T00:00:00Z".into(),
+        };
+        let saved = store
+            .save_official_account(&StoredOfficialAccount {
+                id: String::new(),
+                name: "OpenAI".into(),
+                remark: String::new(),
+                account_id: "workspace".into(),
+                email: "person@example.test".into(),
+                credential: credential.clone(),
+                source: OfficialAccountSource::OpenAiOauth,
+                expires_at: None,
+                quota: ProviderAccountQuota::default(),
+                created_at: 0,
+                updated_at: 0,
+            })
+            .unwrap();
+        store
+            .connections_activate_official_account(&saved.id)
+            .unwrap();
+        fs::write(
+            home.join("config.toml"),
+            r#"model_provider = "codex_tools_openai_relay"
+[model_providers.codex_tools_openai_relay]
+name = "OpenAI"
+wire_api = "responses"
+requires_openai_auth = true
+base_url = "http://127.0.0.1:1/codex-tools-installation-id/stale"
+"#,
+        )
+        .unwrap();
+        fs::write(
+            home.join("auth.json"),
+            serde_json::to_vec_pretty(&credential).unwrap(),
+        )
+        .unwrap();
+
+        sync_active_codex_configuration(
+            &store,
+            &ConfigManager::default(),
+            &ChatProxyRegistry::default(),
+        )
+        .await
+        .unwrap();
+
+        let config = fs::read_to_string(home.join("config.toml")).unwrap();
+        let document = config.parse::<toml_edit::DocumentMut>().unwrap();
+        assert!(document.get("model_provider").is_none());
+        assert!(
+            document
+                .get("model_providers")
+                .and_then(toml_edit::Item::as_table)
+                .is_none_or(|providers| {
+                    providers
+                        .get(crate::codex::LEGACY_OPENAI_RELAY_PROVIDER_ID)
+                        .is_none()
+                })
+        );
     }
 
     #[test]
