@@ -1,20 +1,22 @@
 use crate::models::{
-    OfficialAccountSource, QuotaData, QuotaStatus, QuotaWindow, StoredOfficialAccount,
+    AppError, OfficialAccountSource, QuotaData, QuotaStatus, QuotaWindow, StoredOfficialAccount,
 };
 use futures_util::StreamExt;
 use reqwest::header::{
-    ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue, REFERER, USER_AGENT,
+    ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue, REFERER, RETRY_AFTER, USER_AGENT,
 };
 use serde_json::Value;
 use std::time::Duration;
 
 const OPENAI_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 const MAX_QUOTA_RESPONSE_BYTES: usize = 256 * 1024;
+pub(crate) const DEACTIVATED_WORKSPACE_CODE: &str = "deactivated_workspace";
 
 #[derive(Debug)]
 pub struct QuotaFetchError {
     pub status: QuotaStatus,
     pub message: String,
+    pub code: Option<String>,
     retryable: bool,
 }
 
@@ -23,6 +25,7 @@ impl QuotaFetchError {
         Self {
             status,
             message: message.into(),
+            code: None,
             retryable: false,
         }
     }
@@ -31,6 +34,7 @@ impl QuotaFetchError {
         Self {
             status: QuotaStatus::Error,
             message: message.into(),
+            code: None,
             retryable: true,
         }
     }
@@ -38,6 +42,19 @@ impl QuotaFetchError {
     pub fn is_retryable(&self) -> bool {
         self.retryable
     }
+}
+
+pub(crate) fn account_workspace_is_deactivated(account: &StoredOfficialAccount) -> bool {
+    account.quota.error_code.as_deref() == Some(DEACTIVATED_WORKSPACE_CODE)
+}
+
+pub(crate) fn ensure_account_usable(account: &StoredOfficialAccount) -> Result<(), AppError> {
+    if account_workspace_is_deactivated(account) {
+        return Err(AppError::InvalidConfig(format!(
+            "账号所属工作区已停用（{DEACTIVATED_WORKSPACE_CODE}，HTTP 402），无法设为当前账号或启动 Codex，请更换账号或联系工作区管理员。"
+        )));
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -107,21 +124,19 @@ async fn fetch_quota_from(
     })?;
     let status = response.status();
     if !status.is_success() {
-        let (quota_status, message) = match status {
-            reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN => (
-                QuotaStatus::Unauthorized,
-                "OpenAI 拒绝了额度查询请求，登录凭据可能已失效或当前账号没有查询权限".to_string(),
-            ),
-            reqwest::StatusCode::TOO_MANY_REQUESTS => (
-                QuotaStatus::RateLimited,
-                "OpenAI 额度查询过于频繁，请稍后重试".to_string(),
-            ),
-            _ => (
-                QuotaStatus::Error,
-                format!("OpenAI 额度接口返回 HTTP {}", status.as_u16()),
-            ),
-        };
-        return Err(QuotaFetchError::new(quota_status, message));
+        let retry_after = response
+            .headers()
+            .get(RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty() && value.len() <= 64)
+            .map(str::to_owned);
+        let payload = read_optional_error_json(response).await;
+        return Err(classify_http_error(
+            status,
+            payload.as_ref(),
+            retry_after.as_deref(),
+        ));
     }
 
     let payload = read_bounded_json(response).await?;
@@ -140,6 +155,158 @@ async fn fetch_quota_from(
         data,
         plan_type: parse_plan_type(&payload),
     })
+}
+
+fn classify_http_error(
+    status: reqwest::StatusCode,
+    payload: Option<&Value>,
+    retry_after: Option<&str>,
+) -> QuotaFetchError {
+    let code = payload.and_then(extract_error_code);
+    let code_suffix = code
+        .as_deref()
+        .map(|code| format!("，错误代码：{code}"))
+        .unwrap_or_default();
+    let (quota_status, message) = match status.as_u16() {
+        400 => (
+            QuotaStatus::Error,
+            format!(
+                "OpenAI 无法处理额度请求（HTTP 400：请求或账号信息无效），请重新登录后再试{code_suffix}"
+            ),
+        ),
+        401 => (
+            QuotaStatus::Unauthorized,
+            format!(
+                "OpenAI 登录凭据无效、已过期或已被撤销（HTTP 401），请刷新登录或重新授权{code_suffix}"
+            ),
+        ),
+        402 if code.as_deref() == Some(DEACTIVATED_WORKSPACE_CODE) => (
+            QuotaStatus::Unauthorized,
+            format!(
+                "账号所属工作区已停用（{DEACTIVATED_WORKSPACE_CODE}，HTTP 402），无法查询额度或启动 Codex，请更换账号或联系工作区管理员。"
+            ),
+        ),
+        402 => (
+            QuotaStatus::Unauthorized,
+            format!(
+                "OpenAI 拒绝提供服务（HTTP 402：工作区、订阅或账单状态不允许访问），请检查账号状态或联系工作区管理员{code_suffix}"
+            ),
+        ),
+        403 => (
+            QuotaStatus::Unauthorized,
+            format!(
+                "OpenAI 拒绝访问（HTTP 403：账号无权限，或工作区/所在地区受限），请更换账号或联系管理员{code_suffix}"
+            ),
+        ),
+        404 => (
+            QuotaStatus::Error,
+            format!(
+                "OpenAI 额度资源不存在（HTTP 404），当前账号可能不支持额度查询，或客户端接口已过期{code_suffix}"
+            ),
+        ),
+        408 => (
+            QuotaStatus::Error,
+            format!("OpenAI 额度请求超时（HTTP 408），请稍后重试{code_suffix}"),
+        ),
+        409 => (
+            QuotaStatus::Error,
+            format!(
+                "OpenAI 拒绝额度请求（HTTP 409：账号或工作区状态冲突），请刷新登录后再试{code_suffix}"
+            ),
+        ),
+        422 => (
+            QuotaStatus::Error,
+            format!(
+                "OpenAI 无法处理当前账号的额度信息（HTTP 422），请重新登录或更换账号{code_suffix}"
+            ),
+        ),
+        429 if is_quota_exhausted_code(code.as_deref()) => (
+            QuotaStatus::RateLimited,
+            format!(
+                "OpenAI 额度、余额或工作区支出上限已用尽（HTTP 429），请等待额度重置或检查账单与用量上限{code_suffix}"
+            ),
+        ),
+        429 => {
+            let retry = retry_after
+                .map(|value| format!("；服务建议在 {value} 后重试"))
+                .unwrap_or_default();
+            (
+                QuotaStatus::RateLimited,
+                format!(
+                    "OpenAI 请求过于频繁（HTTP 429：触发速率限制），请稍后重试{retry}{code_suffix}"
+                ),
+            )
+        }
+        500 => (
+            QuotaStatus::Error,
+            format!("OpenAI 服务内部错误（HTTP 500），请稍后重试{code_suffix}"),
+        ),
+        502 => (
+            QuotaStatus::Error,
+            format!("OpenAI 网关返回无效响应（HTTP 502），请稍后重试{code_suffix}"),
+        ),
+        503 => (
+            QuotaStatus::Error,
+            format!("OpenAI 服务暂时过载或不可用（HTTP 503），请稍后重试{code_suffix}"),
+        ),
+        504 => (
+            QuotaStatus::Error,
+            format!("OpenAI 网关等待响应超时（HTTP 504），请稍后重试{code_suffix}"),
+        ),
+        value if (400..500).contains(&value) => (
+            QuotaStatus::Error,
+            format!("OpenAI 拒绝了额度请求（HTTP {value}：账号、权限或请求状态异常）{code_suffix}"),
+        ),
+        value if (500..600).contains(&value) => (
+            QuotaStatus::Error,
+            format!("OpenAI 服务暂时异常（HTTP {value}），请稍后重试{code_suffix}"),
+        ),
+        value => (
+            QuotaStatus::Error,
+            format!("OpenAI 额度服务返回异常响应（HTTP {value}）{code_suffix}"),
+        ),
+    };
+    QuotaFetchError {
+        status: quota_status,
+        message,
+        code,
+        retryable: false,
+    }
+}
+
+fn is_quota_exhausted_code(code: Option<&str>) -> bool {
+    matches!(
+        code,
+        Some(
+            "credit_balance_exhausted"
+                | "organization_spend_limit_exceeded"
+                | "project_spend_limit_exceeded"
+                | "organization_usage_limit_exceeded"
+                | "insufficient_quota"
+        )
+    )
+}
+
+fn extract_error_code(payload: &Value) -> Option<String> {
+    ["/detail/code", "/detail/error/code", "/error/code", "/code"]
+        .into_iter()
+        .find_map(|pointer| payload.pointer(pointer).and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|code| {
+            !code.is_empty()
+                && code.len() <= 128
+                && code
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric() || "_-.".contains(character))
+        })
+        .map(str::to_owned)
+}
+
+async fn read_optional_error_json(response: reqwest::Response) -> Option<Value> {
+    read_response_bytes(response)
+        .await
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
 }
 
 fn parse_plan_type(payload: &Value) -> Option<String> {
@@ -161,6 +328,12 @@ fn should_send_account_id(account: &StoredOfficialAccount) -> bool {
 }
 
 async fn read_bounded_json(response: reqwest::Response) -> Result<Value, QuotaFetchError> {
+    let bytes = read_response_bytes(response).await?;
+    serde_json::from_slice(&bytes)
+        .map_err(|_| QuotaFetchError::new(QuotaStatus::Error, "OpenAI 额度接口没有返回有效 JSON"))
+}
+
+async fn read_response_bytes(response: reqwest::Response) -> Result<Vec<u8>, QuotaFetchError> {
     let mut stream = response.bytes_stream();
     let mut bytes = Vec::new();
     while let Some(chunk) = stream.next().await {
@@ -174,8 +347,7 @@ async fn read_bounded_json(response: reqwest::Response) -> Result<Value, QuotaFe
         }
         bytes.extend_from_slice(&chunk);
     }
-    serde_json::from_slice(&bytes)
-        .map_err(|_| QuotaFetchError::new(QuotaStatus::Error, "OpenAI 额度接口没有返回有效 JSON"))
+    Ok(bytes)
 }
 
 #[derive(Debug)]
@@ -302,6 +474,27 @@ mod tests {
         (format!("http://{address}/usage"), server)
     }
 
+    fn serve_error_response(
+        status: &'static str,
+        headers: &'static str,
+        body: &'static str,
+    ) -> (String, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 8192];
+            let _ = stream.read(&mut request).unwrap();
+            write!(
+                stream,
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len(),
+            )
+            .unwrap();
+        });
+        (format!("http://{address}/usage"), server)
+    }
+
     fn account(source: OfficialAccountSource, account_id: &str) -> StoredOfficialAccount {
         StoredOfficialAccount {
             id: "saved-account".into(),
@@ -377,6 +570,83 @@ mod tests {
 
         assert_eq!(error.status, QuotaStatus::Unsupported);
         server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn preserves_deactivated_workspace_code_and_explains_http_402() {
+        let (endpoint, server) = serve_error_response(
+            "402 Payment Required",
+            "",
+            r#"{"detail":{"code":"deactivated_workspace"}}"#,
+        );
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+
+        let error = fetch_quota_from(
+            &client,
+            &account(OfficialAccountSource::OpenAiOauth, "workspace-1"),
+            &endpoint,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.status, QuotaStatus::Unauthorized);
+        assert_eq!(error.code.as_deref(), Some(DEACTIVATED_WORKSPACE_CODE));
+        assert!(error.message.contains("工作区已停用"));
+        assert!(error.message.contains("HTTP 402"));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn classifies_common_http_errors_with_actionable_messages() {
+        let cases = [
+            (401, QuotaStatus::Unauthorized, "登录凭据无效"),
+            (403, QuotaStatus::Unauthorized, "账号无权限"),
+            (404, QuotaStatus::Error, "额度资源不存在"),
+            (408, QuotaStatus::Error, "请求超时"),
+            (500, QuotaStatus::Error, "服务内部错误"),
+            (502, QuotaStatus::Error, "网关返回无效响应"),
+            (503, QuotaStatus::Error, "服务暂时过载或不可用"),
+            (504, QuotaStatus::Error, "网关等待响应超时"),
+            (418, QuotaStatus::Error, "账号、权限或请求状态异常"),
+        ];
+        for (status, expected_status, expected_text) in cases {
+            let error =
+                classify_http_error(reqwest::StatusCode::from_u16(status).unwrap(), None, None);
+            assert_eq!(error.status, expected_status, "HTTP {status}");
+            assert!(error.message.contains(expected_text), "{}", error.message);
+            assert!(error.message.contains(&format!("HTTP {status}")));
+        }
+    }
+
+    #[test]
+    fn distinguishes_rate_limit_from_exhausted_quota() {
+        let rate_limit =
+            classify_http_error(reqwest::StatusCode::TOO_MANY_REQUESTS, None, Some("30 秒"));
+        assert_eq!(rate_limit.status, QuotaStatus::RateLimited);
+        assert!(rate_limit.message.contains("触发速率限制"));
+        assert!(rate_limit.message.contains("30 秒"));
+
+        let exhausted = classify_http_error(
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            Some(&json!({"error": {"code": "project_spend_limit_exceeded"}})),
+            None,
+        );
+        assert_eq!(exhausted.status, QuotaStatus::RateLimited);
+        assert_eq!(
+            exhausted.code.as_deref(),
+            Some("project_spend_limit_exceeded")
+        );
+        assert!(exhausted.message.contains("支出上限已用尽"));
+    }
+
+    #[test]
+    fn rejects_deactivated_accounts_before_activation_or_launch() {
+        let mut saved = account(OfficialAccountSource::OpenAiOauth, "workspace-1");
+        saved.quota.error_code = Some(DEACTIVATED_WORKSPACE_CODE.into());
+
+        let error = ensure_account_usable(&saved).unwrap_err();
+
+        assert!(error.to_string().contains("无法设为当前账号或启动 Codex"));
     }
 
     #[test]

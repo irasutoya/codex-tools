@@ -352,6 +352,7 @@ pub(crate) async fn launch_with_debug(
 ) -> Result<ModelUnlockResult, AppError> {
     let context = model_catalog_write_context(store, activation).await?;
     let active_kind = context.active_kind;
+    ensure_active_official_account_usable(store, active_kind)?;
     let catalog = context.catalog;
     let configured = store.codex_app_setting()?;
     let empty_message = |active_kind| match active_kind {
@@ -415,6 +416,22 @@ pub(crate) async fn launch_with_debug(
         });
     }
     inject(port, &catalog).await
+}
+
+fn ensure_active_official_account_usable(
+    store: &Store,
+    active_kind: ActiveKind,
+) -> Result<(), AppError> {
+    if !matches!(active_kind, ActiveKind::Official) {
+        return Ok(());
+    }
+    let account_id = store
+        .read(|state| state.active.account_id.clone())?
+        .ok_or_else(|| {
+            AppError::InvalidConfig("当前 OpenAI 登录信息不完整，请重新登录。".into())
+        })?;
+    let account = store.official_account(&account_id)?;
+    crate::official_quota::ensure_account_usable(&account)
 }
 
 /// 连接 Codex 的调试端口，先写入模型目录，再执行解锁脚本并校验结果。
@@ -840,7 +857,10 @@ const UNLOCK_SCRIPT: &str = r#"(function () {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{ActiveKind, ActiveState, ProviderApiType, ProviderProfile};
+    use crate::models::{
+        ActiveKind, ActiveState, CodexAuthCredential, CodexAuthTokens, OfficialAccountSource,
+        ProviderAccountQuota, ProviderApiType, ProviderProfile, QuotaStatus, StoredOfficialAccount,
+    };
     use serde_json::json;
     use std::collections::BTreeMap;
     use std::io::{Read, Write};
@@ -878,6 +898,49 @@ mod tests {
         let mut provider = provider(id, model);
         provider.available_models = models.iter().map(|slug| slug.to_string()).collect();
         provider
+    }
+
+    #[test]
+    fn debug_launch_preflight_rejects_an_active_deactivated_workspace() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path().join("data")).unwrap();
+        let saved = store
+            .save_official_account(&StoredOfficialAccount {
+                id: String::new(),
+                name: "停用账号".into(),
+                remark: String::new(),
+                account_id: "workspace-1".into(),
+                email: "account@example.test".into(),
+                credential: CodexAuthCredential {
+                    auth_mode: "chatgpt".into(),
+                    openai_api_key: None,
+                    tokens: CodexAuthTokens {
+                        id_token: String::new(),
+                        access_token: "access-secret".into(),
+                        refresh_token: String::new(),
+                        account_id: "workspace-1".into(),
+                    },
+                    last_refresh: "2026-08-20T00:00:00Z".into(),
+                },
+                source: OfficialAccountSource::ProxyImport,
+                expires_at: None,
+                quota: ProviderAccountQuota {
+                    status: QuotaStatus::Unauthorized,
+                    error_code: Some(crate::official_quota::DEACTIVATED_WORKSPACE_CODE.into()),
+                    ..Default::default()
+                },
+                created_at: 0,
+                updated_at: 0,
+            })
+            .unwrap();
+        store
+            .connections_activate_official_account(&saved.id)
+            .unwrap();
+
+        let error = ensure_active_official_account_usable(&store, ActiveKind::Official)
+            .expect_err("停用工作区必须在启动 Codex 前被拦截");
+
+        assert!(error.to_string().contains("工作区已停用"));
     }
 
     #[test]

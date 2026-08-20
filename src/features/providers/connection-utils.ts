@@ -77,12 +77,21 @@ export function accountIsExpired(account: OfficialAccountView) {
   )
 }
 
+export const DEACTIVATED_WORKSPACE_CODE = "deactivated_workspace"
+
+export function accountWorkspaceIsDeactivated(account: OfficialAccountView) {
+  return account.quota.errorCode === DEACTIVATED_WORKSPACE_CODE
+}
+
 export function quotaStatusText(
   account: OfficialAccountView,
   remainingPercent?: number
 ) {
   if (remainingPercent !== undefined) {
     return `剩余 ${remainingPercent.toFixed(1)}%`
+  }
+  if (account.quota.status !== "success" && account.quota.error) {
+    return account.quota.error
   }
   switch (account.quota.status) {
     case "never":
@@ -155,7 +164,9 @@ export function buildFallbackCandidates(
   excludedProviderId?: string
 ): FallbackCandidate[] {
   const remainingAccounts = accounts.filter(
-    (account) => !excludedAccountIds.has(account.id)
+    (account) =>
+      !excludedAccountIds.has(account.id) &&
+      !accountWorkspaceIsDeactivated(account)
   )
   const healthyAccounts = remainingAccounts.filter(
     (account) =>

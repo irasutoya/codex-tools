@@ -1,17 +1,37 @@
 import { describe, expect, it } from "vitest"
 
-import type { Provider, RepairResult } from "@/types"
+import type { OfficialAccountView, Provider, RepairResult } from "@/types"
 
 import {
   addCustomModelTo,
   allModelsSelected,
+  accountWorkspaceIsDeactivated,
+  buildFallbackCandidates,
   effectiveModelsOf,
   noModelsSelected,
   providerSaveInputOf,
   removeCustomModelFrom,
   repairWarning,
+  quotaStatusText,
   toggleModelSelected,
 } from "./connection-utils"
+
+const makeAccount = (
+  overrides: Partial<OfficialAccountView> = {}
+): OfficialAccountView => ({
+  id: "a1",
+  name: "账号",
+  remark: "",
+  accountId: "workspace-1",
+  email: "account@example.com",
+  source: "open_ai_oauth",
+  expiresAt: null,
+  quota: { status: "never" },
+  active: false,
+  createdAt: 0,
+  updatedAt: 0,
+  ...overrides,
+})
 
 const makeProvider = (overrides: Partial<Provider> = {}): Provider => ({
   id: "p1",
@@ -74,6 +94,37 @@ describe("repairWarning", () => {
         repair({ filesFailed: 2, warnings: ["数据库被占用", "索引刷新失败"] })
       )
     ).toContain("2 个会话文件修复失败；数据库被占用；索引刷新失败")
+  })
+})
+
+describe("账号额度错误", () => {
+  it("优先展示后端给出的具体 HTTP 错误说明", () => {
+    const account = makeAccount({
+      quota: {
+        status: "rate_limited",
+        error: "OpenAI 请求过于频繁（HTTP 429：触发速率限制），请稍后重试",
+      },
+    })
+    expect(quotaStatusText(account)).toContain("HTTP 429：触发速率限制")
+  })
+
+  it("识别已停用工作区并从自动切换候选中排除", () => {
+    const deactivated = makeAccount({
+      id: "deactivated",
+      quota: {
+        status: "unauthorized",
+        errorCode: "deactivated_workspace",
+        error: "账号所属工作区已停用（HTTP 402）",
+      },
+    })
+    const usable = makeAccount({ id: "usable" })
+
+    expect(accountWorkspaceIsDeactivated(deactivated)).toBe(true)
+    expect(
+      buildFallbackCandidates([deactivated, usable], []).map(
+        (candidate) => candidate.id
+      )
+    ).toEqual(["usable"])
   })
 })
 

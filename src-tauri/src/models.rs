@@ -455,6 +455,8 @@ pub struct ProviderAccountQuota {
     pub fetched_at: Option<i64>,
     pub last_attempt_at: Option<i64>,
     pub error: Option<String>,
+    #[serde(default)]
+    pub error_code: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

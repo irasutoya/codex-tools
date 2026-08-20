@@ -159,6 +159,7 @@ pub(crate) async fn sync_active_codex_configuration_with_installation_proxy(
                 AppError::InvalidConfig("当前 OpenAI 登录信息不完整，请重新登录。".into())
             })?;
             let account = store.official_account(account_id)?;
+            crate::official_quota::ensure_account_usable(&account)?;
             let relay = official_relay_base_url(store, installation_proxy, &account).await?;
             // 启动修复路径：active 已指向 OpenAI，但 config.toml 可能仍残留
             // 本应用上次写入的第三方服务模型；只有与最近一次写入记录一致
@@ -226,6 +227,7 @@ pub(crate) async fn activate_openai_record(
     activation_operation: u64,
     account: &StoredOfficialAccount,
 ) -> Result<RepairResult, AppError> {
+    crate::official_quota::ensure_account_usable(account)?;
     ensure_codex_stopped(store)?;
     let home = codex::home(&store.codex_home_setting()?);
     let repair_sessions = provider_sync::configured_provider(&home) == codex::MANAGED_PROVIDER_ID;

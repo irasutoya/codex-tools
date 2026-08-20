@@ -794,8 +794,12 @@ pub(crate) async fn connections_activate(
         }
         let home = codex::home(&store.codex_home_setting()?);
         sync_active_openai_credential(&store, &home)?;
-        let repair_sessions =
-            provider_sync::configured_provider(&home) != codex::MANAGED_PROVIDER_ID;
+        let active_connection_changed = store.read(|state| {
+            !matches!(state.active.kind, ActiveKind::Provider)
+                || state.active.provider_id.as_deref() != Some(id.as_str())
+        })?;
+        let repair_sessions = active_connection_changed
+            || provider_sync::configured_provider(&home) != codex::MANAGED_PROVIDER_ID;
         let preview = manager.preview_custom(&home, &provider, &target)?;
         let pending_id = crate::begin_activation(
             &ledger,

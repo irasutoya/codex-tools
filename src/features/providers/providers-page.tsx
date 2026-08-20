@@ -50,6 +50,7 @@ import {
 import {
   accountIsExpired,
   accountPlanText,
+  accountWorkspaceIsDeactivated,
   effectiveModelCount,
   quotaStatusText,
 } from "./connection-utils"
@@ -632,6 +633,7 @@ function quotaLabel(
 
 function credentialLabel(account: OfficialAccountView | undefined) {
   if (!account) return "—"
+  if (accountWorkspaceIsDeactivated(account)) return "工作区已停用"
   if (account.quota.status === "unauthorized") return "登录已失效"
   if (accountIsExpired(account)) return "登录已过期"
   return account.source === "proxy_import"

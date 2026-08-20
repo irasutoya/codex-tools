@@ -61,6 +61,7 @@ import { AccountManagerDialog } from "./account-manager-dialog"
 import {
   accountDescription,
   accountIsExpired,
+  accountWorkspaceIsDeactivated,
   buildFallbackCandidates,
   emptyProvider,
   effectiveModelCount,
@@ -341,6 +342,7 @@ export function ConnectionManagerSheet({
       accounts.map((account) => ({
         account,
         expired: accountIsExpired(account),
+        deactivated: accountWorkspaceIsDeactivated(account),
       })),
     [accounts]
   )
@@ -398,7 +400,7 @@ export function ConnectionManagerSheet({
                     {accountRows.length === 0 && (
                       <EmptyConnectionItem label="暂无 OpenAI 账号" />
                     )}
-                    {accountRows.map(({ account, expired }) => (
+                    {accountRows.map(({ account, expired, deactivated }) => (
                       <ConnectionItem
                         key={account.id}
                         kind="account"
@@ -411,9 +413,14 @@ export function ConnectionManagerSheet({
                           page === "providers" && selectedId === account.id
                         }
                         unavailable={
-                          expired || account.quota.status === "unauthorized"
+                          deactivated ||
+                          expired ||
+                          account.quota.status === "unauthorized"
                         }
-                        unavailableLabel="登录失效"
+                        unavailableLabel={
+                          deactivated ? "工作区已停用" : "登录失效"
+                        }
+                        activateDisabled={deactivated}
                         frozen={frozen}
                         pending={pending}
                         onView={() => {

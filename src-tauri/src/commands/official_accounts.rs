@@ -264,6 +264,7 @@ async fn refresh_official_quota(
                 AppError::StaleOperation | AppError::Internal(_) => QuotaStatus::Error,
             };
             snapshot.error = Some(error.to_string());
+            snapshot.error_code = None;
             return store.save_official_account_quota(account_id, snapshot);
         }
     };
@@ -281,10 +282,12 @@ async fn refresh_official_quota(
             snapshot.plan_type = data.plan_type;
             snapshot.fetched_at = Some(now);
             snapshot.error = None;
+            snapshot.error_code = None;
         }
         Err(error) => {
             snapshot.status = error.status;
             snapshot.error = Some(error.message);
+            snapshot.error_code = error.code;
         }
     }
     store.save_official_account_quota(account_id, snapshot)
@@ -409,6 +412,7 @@ pub(crate) async fn connections_activate_account(
     let activation_operation = activation.begin_operation();
     let _guard = activation.0.lock().await;
     ensure_current_activation(&activation, activation_operation)?;
+    official_quota::ensure_account_usable(&store.official_account(&id)?)?;
     ensure_codex_stopped(&store)?;
     sync_active_openai_credential(&store, &codex::home(&store.codex_home_setting()?))?;
     let saved = center.refresh_account(&store, &id).await?;
@@ -443,7 +447,6 @@ pub(crate) async fn connections_activate_official(
     let activation_operation = activation.begin_operation();
     let _guard = activation.0.lock().await;
     ensure_current_activation(&activation, activation_operation)?;
-    ensure_codex_stopped(&store)?;
     let (home_setting, id) = store.read(|state| {
         let id = state
             .active
@@ -459,9 +462,11 @@ pub(crate) async fn connections_activate_official(
             });
         (state.codex.home.clone(), id)
     })?;
-    sync_active_openai_credential(&store, &codex::home(&home_setting))?;
     let id =
         id.ok_or_else(|| AppError::InvalidConfig("请先在“账号与服务”中登录 OpenAI。".into()))?;
+    official_quota::ensure_account_usable(&store.official_account(&id)?)?;
+    ensure_codex_stopped(&store)?;
+    sync_active_openai_credential(&store, &codex::home(&home_setting))?;
     let saved = center.refresh_account(&store, &id).await?;
     ensure_current_activation(&activation, activation_operation)?;
     let repair = activate_openai_record(

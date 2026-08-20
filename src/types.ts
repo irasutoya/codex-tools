@@ -240,6 +240,7 @@ export type AccountQuota = {
   fetchedAt?: number
   lastAttemptAt?: number
   error?: string
+  errorCode?: string
 }
 
 export type QuotaRefreshResult = {

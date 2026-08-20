@@ -115,6 +115,21 @@ pub fn normalize_provider(value: &str) -> String {
 }
 
 pub fn repair(codex_home: &Path, target: &str) -> Result<RepairResult, AppError> {
+    repair_with_history_mode(codex_home, target, false)
+}
+
+pub fn repair_after_connection_switch(
+    codex_home: &Path,
+    target: &str,
+) -> Result<RepairResult, AppError> {
+    repair_with_history_mode(codex_home, target, true)
+}
+
+fn repair_with_history_mode(
+    codex_home: &Path,
+    target: &str,
+    force_portable_history: bool,
+) -> Result<RepairResult, AppError> {
     let target = target.trim();
     if !matches!(target, "openai" | "custom") {
         return Err(AppError::InvalidConfig(
@@ -130,7 +145,7 @@ pub fn repair(codex_home: &Path, target: &str) -> Result<RepairResult, AppError>
     let mut omitted_warnings = 0;
 
     for path in rollouts {
-        match repair_rollout(&path, target) {
+        match repair_rollout(&path, target, force_portable_history) {
             Ok((changed, metas)) => {
                 result.session_meta_updated += metas;
                 if changed {
@@ -260,12 +275,27 @@ fn collect_databases(path: &Path, output: &mut Vec<PathBuf>) {
     }
 }
 
-fn repair_rollout(path: &Path, target: &str) -> anyhow::Result<(bool, usize)> {
+fn repair_rollout(
+    path: &Path,
+    target: &str,
+    force_portable_history: bool,
+) -> anyhow::Result<(bool, usize)> {
     if fs::metadata(path)?.len() > MAX_REPAIR_ROLLOUT_BYTES {
         anyhow::bail!("会话文件超过 256 MB，已跳过以避免占用过多内存");
     }
     let original_bytes = fs::read(path)?;
     let original = std::str::from_utf8(&original_bytes)?;
+    let portable_history = force_portable_history
+        || original.lines().any(|line| {
+            serde_json::from_str::<Value>(line).is_ok_and(|record| {
+                record.get("type").and_then(Value::as_str) == Some("session_meta")
+                    && record
+                        .pointer("/payload/model_provider")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        != target
+            })
+        });
     let mut changed = false;
     let mut meta_count = 0;
     let mut output = String::with_capacity(original.len());
@@ -280,6 +310,10 @@ fn repair_rollout(path: &Path, target: &str) -> anyhow::Result<(bool, usize)> {
             output.push_str(segment);
             continue;
         };
+        if portable_history && provider_scoped_history_item(&record) == HistoryItemAction::Drop {
+            changed = true;
+            continue;
+        }
         let mut record_changed = false;
         if record.get("type").and_then(Value::as_str) == Some("session_meta") {
             let original_provider = record
@@ -294,6 +328,17 @@ fn repair_rollout(path: &Path, target: &str) -> anyhow::Result<(bool, usize)> {
                 meta_count += 1;
             }
         }
+        if portable_history
+            && provider_scoped_history_item(&record) == HistoryItemAction::RemoveId
+            && record
+                .get_mut("payload")
+                .and_then(Value::as_object_mut)
+                .and_then(|payload| payload.remove("id"))
+                .is_some()
+        {
+            changed = true;
+            record_changed = true;
+        }
         if record_changed {
             output.push_str(&serde_json::to_string(&record)?);
             output.push_str(ending);
@@ -305,6 +350,42 @@ fn repair_rollout(path: &Path, target: &str) -> anyhow::Result<(bool, usize)> {
         anyhow::bail!("Codex 正在更新这个会话，文件已保持原样。请关闭该会话后重试");
     }
     Ok((changed, meta_count))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HistoryItemAction {
+    Keep,
+    RemoveId,
+    Drop,
+}
+
+fn provider_scoped_history_item(record: &Value) -> HistoryItemAction {
+    if record.get("type").and_then(Value::as_str) != Some("response_item") {
+        return HistoryItemAction::Keep;
+    }
+    let Some(payload) = record.get("payload") else {
+        return HistoryItemAction::Keep;
+    };
+    let item_type = payload
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    match item_type {
+        // Reasoning ciphertext and item references belong to the upstream that
+        // created them. They add no portable conversation text and cannot be
+        // replayed safely against a different Responses implementation.
+        "reasoning" | "item_reference" | "compaction" => HistoryItemAction::Drop,
+        // Model-produced messages and calls may carry provider-assigned IDs
+        // such as rs_*, fc_* or a third party's msg_*. The ID is optional when
+        // replaying the complete item, while call_id must remain for tool
+        // call/output pairing.
+        "message" if payload.get("role").and_then(Value::as_str) == Some("assistant") => {
+            HistoryItemAction::RemoveId
+        }
+        "function_call" | "custom_tool_call" => HistoryItemAction::RemoveId,
+        value if value.ends_with("_call") => HistoryItemAction::RemoveId,
+        _ => HistoryItemAction::Keep,
+    }
 }
 
 fn repair_database(path: &Path, target: &str) -> anyhow::Result<usize> {
@@ -511,7 +592,7 @@ mod tests {
             serde_json::json!({"type":"session_meta","payload":{"id":"one","model_provider":"openai"}})
         );
         fs::write(&rollout, &original).unwrap();
-        let (changed, count) = repair_rollout(&rollout, "custom").unwrap();
+        let (changed, count) = repair_rollout(&rollout, "custom", false).unwrap();
 
         assert!(changed);
         assert_eq!(count, 1);
@@ -577,6 +658,74 @@ mod tests {
     }
 
     #[test]
+    fn provider_change_removes_non_portable_response_ids_but_keeps_call_ids() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex");
+        fs::create_dir_all(home.join("sessions")).unwrap();
+        let rollout = home.join("sessions/rollout.jsonl");
+        let records = [
+            serde_json::json!({"type":"session_meta","payload":{"id":"one","model_provider":"custom"}}),
+            serde_json::json!({"type":"response_item","payload":{"type":"reasoning","id":"msg_wrong-for-reasoning","summary":[]}}),
+            serde_json::json!({"type":"response_item","payload":{"type":"message","id":"msg_other-provider","role":"assistant","content":[{"type":"output_text","text":"keep text"}]}}),
+            serde_json::json!({"type":"response_item","payload":{"type":"function_call","id":"msg_wrong-for-call","call_id":"call_keep","name":"exec","arguments":"{}"}}),
+            serde_json::json!({"type":"response_item","payload":{"type":"function_call_output","id":"fco_local","call_id":"call_keep","output":"keep output"}}),
+        ];
+        fs::write(
+            &rollout,
+            records
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n",
+        )
+        .unwrap();
+
+        let result = repair(&home, "openai").unwrap();
+
+        assert_eq!(result.files_modified, 1);
+        let repaired = fs::read_to_string(&rollout).unwrap();
+        assert!(!repaired.contains("msg_wrong-for-reasoning"));
+        assert!(!repaired.contains("msg_other-provider"));
+        assert!(!repaired.contains("msg_wrong-for-call"));
+        assert!(repaired.contains("keep text"));
+        assert!(repaired.contains("\"call_id\":\"call_keep\""));
+        assert!(repaired.contains("\"id\":\"fco_local\""));
+        assert!(repaired.contains("keep output"));
+    }
+
+    #[test]
+    fn third_party_to_third_party_switch_portabilizes_same_provider_family() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex");
+        fs::create_dir_all(home.join("sessions")).unwrap();
+        let rollout = home.join("sessions/rollout.jsonl");
+        fs::write(
+            &rollout,
+            format!(
+                "{}\n{}\n",
+                serde_json::json!({"type":"session_meta","payload":{"id":"one","model_provider":"custom"}}),
+                serde_json::json!({"type":"response_item","payload":{"type":"function_call","id":"msg_provider-a","call_id":"call_keep","name":"exec","arguments":"{}"}})
+            ),
+        )
+        .unwrap();
+
+        let normal = repair(&home, "custom").unwrap();
+        assert_eq!(normal.files_modified, 0);
+        assert!(
+            fs::read_to_string(&rollout)
+                .unwrap()
+                .contains("msg_provider-a")
+        );
+
+        let switched = repair_after_connection_switch(&home, "custom").unwrap();
+        assert_eq!(switched.files_modified, 1);
+        let repaired = fs::read_to_string(&rollout).unwrap();
+        assert!(!repaired.contains("msg_provider-a"));
+        assert!(repaired.contains("\"call_id\":\"call_keep\""));
+    }
+
+    #[test]
     fn repair_rejects_unmanaged_provider_targets() {
         let temp = tempfile::tempdir().unwrap();
         let error = repair(temp.path(), "third-party").unwrap_err();
@@ -590,7 +739,7 @@ mod tests {
         let file = fs::File::create(&rollout).unwrap();
         file.set_len(MAX_REPAIR_ROLLOUT_BYTES + 1).unwrap();
 
-        let error = repair_rollout(&rollout, "custom").unwrap_err();
+        let error = repair_rollout(&rollout, "custom", false).unwrap_err();
 
         assert!(error.to_string().contains("超过 256 MB"));
     }

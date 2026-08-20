@@ -33,7 +33,19 @@ pub(crate) async fn repair_home_after_activation(
     home: PathBuf,
     target_provider: String,
 ) -> RepairResult {
-    match repair_home(store, home, target_provider.clone()).await {
+    let result = match ensure_codex_stopped(store) {
+        Ok(()) => {
+            let repair_target = target_provider.clone();
+            tokio::task::spawn_blocking(move || {
+                provider_sync::repair_after_connection_switch(&home, &repair_target)
+            })
+            .await
+            .map_err(|error| AppError::Internal(error.to_string()))
+            .and_then(|result| result)
+        }
+        Err(error) => Err(error),
+    };
+    match result {
         Ok(result) => result,
         Err(error) => RepairResult {
             target_provider,
