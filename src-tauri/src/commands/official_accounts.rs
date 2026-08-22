@@ -6,6 +6,7 @@ use crate::{
     auth_center::{AuthCenter, DevicePollResult},
     chat_proxy::ChatProxyRegistry,
     codex::{self, ConfigManager},
+    json_store::JsonStore,
     local_usage::UsageLedger,
     models::*,
     official_quota, proxy_import,
@@ -15,6 +16,7 @@ use crate::{
 };
 use futures_util::{StreamExt, TryStreamExt, stream};
 use serde::Serialize;
+use std::path::Path;
 use tauri::State;
 
 const QUOTA_REFRESH_CONCURRENCY: usize = 4;
@@ -32,6 +34,71 @@ fn ensure_current_activation(activation: &ActivationLock, operation: u64) -> Res
 pub(crate) struct ProxyImportResult {
     pub accounts: Vec<OfficialAccountView>,
     pub detected_formats: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct AccountCredentialExport<'a> {
+    format: &'static str,
+    version: u8,
+    exported_at: String,
+    name: &'a str,
+    email: &'a str,
+    account_id: &'a str,
+    expires_at: Option<i64>,
+    tokens: AccountCredentialExportTokens<'a>,
+}
+
+#[derive(Serialize)]
+struct AccountCredentialExportTokens<'a> {
+    id_token: &'a str,
+    access_token: &'a str,
+    refresh_token: &'a str,
+}
+
+#[tauri::command]
+pub(crate) fn connections_export_account(
+    store: State<'_, Store>,
+    id: String,
+    path: String,
+) -> Result<(), AppError> {
+    connections_export_account_in_store(&store, &id, &path)
+}
+
+fn connections_export_account_in_store(
+    store: &Store,
+    id: &str,
+    path: &str,
+) -> Result<(), AppError> {
+    let path = path.trim();
+    if path.is_empty() {
+        return Err(AppError::InvalidConfig("导出路径不能为空。".into()));
+    }
+    let account = store.official_account(id)?;
+    if account.credential.tokens.refresh_token.trim().is_empty() {
+        return Err(AppError::InvalidConfig(
+            "该账号没有可用的 Refresh Token，无法导出登录凭据。".into(),
+        ));
+    }
+    let name = if account.remark.trim().is_empty() {
+        account.name.as_str()
+    } else {
+        account.remark.as_str()
+    };
+    let export = AccountCredentialExport {
+        format: "codex_tools_account",
+        version: 1,
+        exported_at: chrono::Utc::now().to_rfc3339(),
+        name,
+        email: &account.email,
+        account_id: &account.account_id,
+        expires_at: account.expires_at,
+        tokens: AccountCredentialExportTokens {
+            id_token: &account.credential.tokens.id_token,
+            access_token: &account.credential.tokens.access_token,
+            refresh_token: &account.credential.tokens.refresh_token,
+        },
+    };
+    JsonStore::write_atomic(Path::new(path), &export).map_err(AppError::from)
 }
 
 #[tauri::command]
@@ -563,6 +630,110 @@ mod tests {
             created_at: 0,
             updated_at: 0,
         }
+    }
+
+    #[test]
+    fn exported_account_round_trips_through_cookie_import_without_mutating_store() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path().join("data")).unwrap();
+        let mut saved_account = oauth_account("export-account", "export-user", "user@example.test");
+        saved_account.remark = "迁移账号".into();
+        saved_account.expires_at = Some(1_785_000_000);
+        let saved = store.save_official_account(&saved_account).unwrap();
+        let credentials_before = store.official_account(&saved.id).unwrap().credential;
+        let path = temp.path().join("account.json");
+
+        connections_export_account_in_store(&store, &saved.id, path.to_str().unwrap()).unwrap();
+
+        let exported = fs::read_to_string(&path).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&exported).unwrap();
+        assert_eq!(value["format"], "codex_tools_account");
+        assert_eq!(value["version"], 1);
+        assert_eq!(value["name"], "迁移账号");
+        assert_eq!(value["account_id"], "export-account");
+        assert_eq!(value["email"], "user@example.test");
+        assert_eq!(value["expires_at"], 1_785_000_000);
+        assert!(value["exported_at"].as_str().is_some());
+        assert!(value.get("id").is_none());
+        assert!(value.get("quota").is_none());
+
+        let mut imported = proxy_import::parse_proxy_credentials(&exported).unwrap();
+        assert_eq!(imported.len(), 1);
+        let imported = imported.remove(0);
+        assert_eq!(
+            imported.id_token.as_deref(),
+            Some(credentials_before.tokens.id_token.as_str())
+        );
+        assert_eq!(
+            imported.access_token.as_deref(),
+            Some(credentials_before.tokens.access_token.as_str())
+        );
+        assert_eq!(
+            imported.refresh_token.as_deref(),
+            Some(credentials_before.tokens.refresh_token.as_str())
+        );
+        assert_eq!(imported.account_id.as_deref(), Some("export-account"));
+        assert_eq!(imported.suggested_name.as_deref(), Some("迁移账号"));
+        assert_eq!(
+            store.official_account(&saved.id).unwrap().credential,
+            credentials_before
+        );
+    }
+
+    #[test]
+    fn account_export_rejects_invalid_requests_without_leaving_temporary_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path().join("data")).unwrap();
+        let saved = store
+            .save_official_account(&account("missing-refresh", ""))
+            .unwrap();
+        let missing_refresh_path = temp.path().join("missing-refresh.json");
+
+        let error = connections_export_account_in_store(
+            &store,
+            &saved.id,
+            missing_refresh_path.to_str().unwrap(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("Refresh Token"));
+        assert!(!missing_refresh_path.exists());
+        assert!(
+            connections_export_account_in_store(&store, "missing", " ")
+                .unwrap_err()
+                .to_string()
+                .contains("导出路径")
+        );
+        assert!(
+            connections_export_account_in_store(
+                &store,
+                "missing",
+                temp.path().join("missing-account.json").to_str().unwrap(),
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("账号不存在")
+        );
+
+        let mut exportable = oauth_account("exportable", "subject", "export@example.test");
+        exportable.remark.clear();
+        let exportable = store.save_official_account(&exportable).unwrap();
+        let unwritable_path = temp.path().join("directory-target");
+        fs::create_dir(&unwritable_path).unwrap();
+        assert!(
+            connections_export_account_in_store(
+                &store,
+                &exportable.id,
+                unwritable_path.to_str().unwrap(),
+            )
+            .is_err()
+        );
+        assert!(fs::read_dir(temp.path()).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".directory-target")
+        }));
     }
 
     #[test]

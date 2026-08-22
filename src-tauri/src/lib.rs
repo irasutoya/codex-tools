@@ -237,6 +237,7 @@ pub fn run() {
             commands::providers::connections_save_provider,
             commands::providers::connections_delete_provider,
             commands::official_accounts::connections_import_cookie,
+            commands::official_accounts::connections_export_account,
             commands::official_accounts::connections_login_start,
             commands::official_accounts::connections_login_poll,
             commands::official_accounts::connections_activate_account,

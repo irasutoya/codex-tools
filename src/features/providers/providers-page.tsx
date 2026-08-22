@@ -44,6 +44,7 @@ import {
   type AccountLoginMode,
 } from "./account-login-dialog"
 import {
+  exportAccountCredentials,
   refreshAccountQuota,
   testProviderConnection,
 } from "./connection-actions"
@@ -249,6 +250,27 @@ export function ProvidersPage({
       })
     } finally {
       end("import")
+    }
+  }
+
+  const exportAccount = async (id: string) => {
+    if (!begin("export")) return
+    try {
+      if (!(await exportAccountCredentials(id))) return
+      toast.add({
+        title: "登录凭据已导出",
+        description:
+          "请在新电脑中打开导出的 JSON 文件，完整复制其内容并粘贴到“导入 Cookie”。",
+        type: "success",
+      })
+    } catch (reason) {
+      toast.add({
+        title: "导出登录凭据失败",
+        description: errorMessage(reason),
+        type: "error",
+      })
+    } finally {
+      end("export")
     }
   }
 
@@ -528,6 +550,19 @@ export function ProvidersPage({
                   <HugeiconsIcon icon={Login03Icon} data-icon="inline-start" />
                 )}
                 更新登录凭据
+              </Button>
+              <Button
+                variant="outline"
+                disabled={actionBusy}
+                aria-busy={busy === "export"}
+                onClick={() => void exportAccount(item.id)}
+              >
+                {busy === "export" ? (
+                  <Spinner data-icon="inline-start" />
+                ) : (
+                  <HugeiconsIcon icon={Key01Icon} data-icon="inline-start" />
+                )}
+                导出登录凭据
               </Button>
             </>
           ) : (

@@ -566,6 +566,9 @@ export async function mockCall(
       account.updatedAt = Date.now()
       return account
     }
+    case "connections_export_account":
+      // 演示模式不写入本地文件，也不会构造或返回任何登录凭据。
+      return undefined
     case "connections_update_account_remark": {
       const { id, remark } = args as { id: string; remark: string }
       const account = mockAccounts.find((candidate) => candidate.id === id)

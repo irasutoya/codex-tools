@@ -50,6 +50,7 @@ type CommandMap = {
     { name?: string; accountId?: string; content: string },
     ProxyImportResult
   >
+  connections_export_account: CommandSpec<{ id: string; path: string }, void>
   connections_login_start: CommandSpec<undefined, DeviceAuthorization>
   connections_login_poll: CommandSpec<
     { operationId: string },

@@ -75,6 +75,7 @@ import {
   type PendingAction,
 } from "./connection-item"
 import {
+  exportAccountCredentials,
   refreshAccountQuota,
   testProviderConnection,
 } from "./connection-actions"
@@ -201,6 +202,28 @@ export function ConnectionManagerSheet({
       "账号备注已保存"
     )
     if (saved) setRemarkAccount(undefined)
+  }
+
+  const exportAccount = async (id: string) => {
+    const key: PendingAction = { action: "login", id }
+    if (!begin(key)) return
+    try {
+      if (!(await exportAccountCredentials(id))) return
+      toast.add({
+        title: "登录凭据已导出",
+        description:
+          "请在新电脑中打开导出的 JSON 文件，完整复制其内容并粘贴到“导入 Cookie”。",
+        type: "success",
+      })
+    } catch (reason) {
+      toast.add({
+        title: "导出登录凭据失败",
+        description: errorMessage(reason),
+        type: "error",
+      })
+    } finally {
+      end(key)
+    }
   }
 
   const editProvider = (provider: Provider) => {
@@ -462,6 +485,11 @@ export function ConnectionManagerSheet({
                                   }),
                                 "登录状态已刷新"
                               ),
+                          },
+                          {
+                            label: "导出登录凭据",
+                            icon: Login03Icon,
+                            onSelect: () => void exportAccount(account.id),
                           },
                         ]}
                       />
