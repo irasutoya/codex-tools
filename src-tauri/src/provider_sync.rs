@@ -135,14 +135,6 @@ pub(crate) fn repair_with_guard(
     repair_with_history_mode_and_guard(codex_home, target, false, may_write)
 }
 
-pub(crate) fn repair_after_connection_switch_with_guard(
-    codex_home: &Path,
-    target: &str,
-    may_write: impl FnMut() -> Result<bool, AppError>,
-) -> Result<RepairResult, AppError> {
-    repair_with_history_mode_and_guard(codex_home, target, true, may_write)
-}
-
 fn repair_with_history_mode_and_guard(
     codex_home: &Path,
     target: &str,
