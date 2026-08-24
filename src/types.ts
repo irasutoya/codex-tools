@@ -251,16 +251,29 @@ export type CredentialRefreshStatus =
   | "reauthentication_required"
   | "not_refreshable"
 
+export type LoginVerificationStatus =
+  "unknown" | "valid" | "invalid" | "workspace_or_permission" | "check_failed"
+
 export type CredentialRefreshState = {
   status: CredentialRefreshStatus
   lastAttemptAt?: number
   lastSuccessAt?: number
   nextRetryAt?: number
   retryCount?: number
+  lastRefreshAt?: number
+  lastSyncAt?: number
+  lastCheckAt?: number
+  verification?: LoginVerificationStatus
 }
 
 export type CredentialMaintenanceOutcome =
-  "refreshed" | "synced_from_codex" | "managed_by_codex" | "unchanged"
+  | "refreshed"
+  | "synced_from_codex"
+  | "managed_by_codex"
+  | "unchanged"
+  | "waiting_retry"
+  | "reauthentication_required"
+  | "not_refreshable"
 
 export type QuotaRefreshResult = {
   accountId: string
