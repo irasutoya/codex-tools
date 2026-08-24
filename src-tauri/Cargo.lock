@@ -561,7 +561,7 @@ dependencies = [
 
 [[package]]
 name = "codex-tools"
-version = "0.7.9"
+version = "0.7.10"
 dependencies = [
  "anyhow",
  "axum",
