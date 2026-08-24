@@ -1,6 +1,7 @@
 import { formatDate, quotaWindow } from "@/lib/format"
 import { call } from "@/lib/ipc"
 import type {
+  CredentialMaintenanceResult,
   OfficialAccountView,
   Provider,
   ProviderSaveInput,
@@ -75,6 +76,43 @@ export function accountIsExpired(account: OfficialAccountView) {
     account.expiresAt != null &&
     account.expiresAt <= Math.floor(Date.now() / 1000)
   )
+}
+
+/** 仅使用后端提供的脱敏维护状态；不得从前端推断或展示任何凭据内容。 */
+export function credentialRefreshText(account: OfficialAccountView) {
+  switch (account.credentialRefresh.status) {
+    case "healthy":
+      return "自动刷新正常"
+    case "managed_by_codex":
+      return "由 Codex 维护"
+    case "waiting_retry":
+      return "等待重试"
+    case "reauthentication_required":
+      return "需要重新登录"
+    case "not_refreshable":
+      return "不可自动刷新"
+    default:
+      return "等待首次检查"
+  }
+}
+
+/** 手动检查只报告实际 outcome，避免把 Codex 接管或无变更说成“已更新”。 */
+export function credentialMaintenanceMessage(
+  result: CredentialMaintenanceResult
+) {
+  if (result.account.credentialRefresh.status === "reauthentication_required") {
+    return "需要重新登录"
+  }
+  switch (result.outcome) {
+    case "refreshed":
+      return "已更新"
+    case "synced_from_codex":
+      return "已同步 Codex 最新凭据"
+    case "managed_by_codex":
+      return "由 Codex 维护"
+    case "unchanged":
+      return "状态已检查"
+  }
 }
 
 export const DEACTIVATED_WORKSPACE_CODE = "deactivated_workspace"

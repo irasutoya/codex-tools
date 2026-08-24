@@ -51,6 +51,8 @@ import {
   accountIsExpired,
   accountPlanText,
   accountWorkspaceIsDeactivated,
+  credentialMaintenanceMessage,
+  credentialRefreshText,
   effectiveModelCount,
   quotaStatusText,
 } from "./connection-utils"
@@ -457,6 +459,21 @@ export function ProvidersPage({
           {isAccount && (
             <Detail label="账号备注" value={account?.remark || "未设置"} />
           )}
+          {isAccount && (
+            <Detail label="自动维护" value={credentialRefreshText(account!)} />
+          )}
+          {isAccount && (
+            <Detail
+              label="最近维护"
+              value={formatDate(account?.credentialRefresh.lastAttemptAt, true)}
+            />
+          )}
+          {isAccount && account?.credentialRefresh.nextRetryAt && (
+            <Detail
+              label="下次重试"
+              value={formatDate(account.credentialRefresh.nextRetryAt, true)}
+            />
+          )}
           <Detail
             label="凭据状态"
             value={
@@ -518,7 +535,11 @@ export function ProvidersPage({
                   void run(
                     "login-refresh",
                     () => call("connections_refresh_login", { id: item.id }),
-                    { success: "登录凭据已更新", onSuccess: onRefresh }
+                    {
+                      success: "登录状态已检查",
+                      successDescription: credentialMaintenanceMessage,
+                      onSuccess: onRefresh,
+                    }
                   )
                 }
               >
@@ -527,7 +548,7 @@ export function ProvidersPage({
                 ) : (
                   <HugeiconsIcon icon={Login03Icon} data-icon="inline-start" />
                 )}
-                更新登录凭据
+                检查/更新登录
               </Button>
             </>
           ) : (
@@ -634,6 +655,15 @@ function quotaLabel(
 function credentialLabel(account: OfficialAccountView | undefined) {
   if (!account) return "—"
   if (accountWorkspaceIsDeactivated(account)) return "工作区已停用"
+  if (account.credentialRefresh.status === "reauthentication_required") {
+    return "需要重新登录"
+  }
+  if (account.credentialRefresh.status === "waiting_retry")
+    return "等待自动重试"
+  if (account.credentialRefresh.status === "managed_by_codex")
+    return "由 Codex 维护"
+  if (account.credentialRefresh.status === "not_refreshable")
+    return "不可自动刷新"
   if (account.quota.status === "unauthorized") return "登录已失效"
   if (accountIsExpired(account)) return "登录已过期"
   return account.source === "proxy_import"

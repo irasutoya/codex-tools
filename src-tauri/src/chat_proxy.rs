@@ -488,31 +488,31 @@ async fn send_chat_request(
     url: &str,
     config: &ProxyConfig,
     body: &Value,
-) -> Result<reqwest::Response, Response> {
+) -> Result<reqwest::Response, Box<Response>> {
     let request = apply_upstream_headers(client.post(url), config).json(body);
     let result = match tokio::time::timeout(config.timeout, request.send()).await {
         Ok(result) => result,
         Err(_) => {
-            return Err(error_response(
+            return Err(Box::new(error_response(
                 StatusCode::GATEWAY_TIMEOUT,
                 &format!(
                     "等待上游服务返回响应超时（{} 秒）。",
                     config.timeout.as_secs()
                 ),
-            ));
+            )));
         }
     };
     result.map_err(|error| {
         if error.is_timeout() {
-            error_response(
+            Box::new(error_response(
                 StatusCode::GATEWAY_TIMEOUT,
                 &format!("等待上游服务响应超时（{} 秒）。", config.timeout.as_secs()),
-            )
+            ))
         } else {
-            error_response(
+            Box::new(error_response(
                 StatusCode::BAD_GATEWAY,
                 &format!("无法连接上游服务：{error}"),
-            )
+            ))
         }
     })
 }
@@ -706,7 +706,7 @@ async fn handle_responses(
     let url = crate::provider_http::endpoint_for(&config.upstream_base, "chat/completions");
     let mut response = match send_chat_request(&client, &url, &config, chat_body).await {
         Ok(response) => response,
-        Err(error_response) => return error_response,
+        Err(error_response) => return *error_response,
     };
     let mut learn_prompt_capability = false;
     if !response.status().is_success() {
@@ -731,7 +731,7 @@ async fn handle_responses(
                     learn_prompt_capability = true;
                     response = retry;
                 }
-                Err(error_response) => return error_response,
+                Err(error_response) => return *error_response,
             }
         } else {
             return upstream_error_response(status, &detail);

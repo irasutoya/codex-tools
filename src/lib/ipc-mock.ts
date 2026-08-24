@@ -147,6 +147,7 @@ const mockAccounts: OfficialAccountView[] = [
     email: "work@example.com",
     source: "open_ai_oauth",
     expiresAt: null,
+    credentialRefresh: { status: "healthy" },
     quota: mockQuota,
     active: true,
     createdAt: now - 60 * day,
@@ -160,6 +161,7 @@ const mockAccounts: OfficialAccountView[] = [
     email: "me@example.com",
     source: "open_ai_oauth",
     expiresAt: null,
+    credentialRefresh: { status: "managed_by_codex" },
     quota: { status: "never" },
     active: false,
     createdAt: now - 50 * day,
@@ -564,7 +566,12 @@ export async function mockCall(
       const account = mockAccounts.find((candidate) => candidate.id === id)
       if (!account) throw new Error(`账号不存在：${id}`)
       account.updatedAt = Date.now()
-      return account
+      account.credentialRefresh = {
+        status: "healthy",
+        lastAttemptAt: Math.floor(Date.now() / 1000),
+        lastSuccessAt: Math.floor(Date.now() / 1000),
+      }
+      return { account, outcome: "refreshed" }
     }
     case "connections_update_account_remark": {
       const { id, remark } = args as { id: string; remark: string }
@@ -691,6 +698,7 @@ export async function mockCall(
         email: "",
         source: "proxy_import",
         expiresAt: null,
+        credentialRefresh: { status: "not_refreshable" },
         quota: { status: "never" },
         active: false,
         createdAt: Date.now(),

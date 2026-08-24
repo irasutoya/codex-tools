@@ -40,7 +40,7 @@ fn ensure_codex_stopped_with(
 pub(crate) fn sync_active_openai_credential(
     store: &Store,
     home: &std::path::Path,
-) -> Result<(), AppError> {
+) -> Result<bool, AppError> {
     let record_id = store.read(|state| {
         state
             .active
@@ -49,11 +49,11 @@ pub(crate) fn sync_active_openai_credential(
             .filter(|_| matches!(state.active.kind, ActiveKind::Official))
     })?;
     let Some(record_id) = record_id else {
-        return Ok(());
+        return Ok(false);
     };
     let mut credential = match codex::read_official_account(home) {
         Ok(Some(credential)) => credential,
-        Ok(None) | Err(AppError::InvalidConfig(_)) => return Ok(()),
+        Ok(None) | Err(AppError::InvalidConfig(_)) => return Ok(false),
         Err(error) => return Err(error),
     };
     let saved = store.official_account(&record_id)?;
@@ -77,9 +77,11 @@ pub(crate) fn sync_active_openai_credential(
         && (untimestamped_personal_access_token
             || credential_is_strictly_newer(&credential, &saved.credential))
     {
-        store.sync_official_credential(&record_id, &credential, saved.expires_at)?;
+        let expires_at = crate::models::credential_expires_at(&credential).or(saved.expires_at);
+        store.sync_official_credential(&record_id, &credential, expires_at)?;
+        return Ok(true);
     }
-    Ok(())
+    Ok(false)
 }
 
 fn credential_is_strictly_newer(

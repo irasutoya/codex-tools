@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core"
 import type {
   AccountQuota,
   CodexAppSetting,
+  CredentialMaintenanceResult,
   ConfigPatchPreview,
   Dashboard,
   DeviceAuthPollResult,
@@ -56,7 +57,10 @@ type CommandMap = {
     DeviceAuthPollResult
   >
   connections_activate_account: CommandSpec<{ id: string }, RepairResult>
-  connections_refresh_login: CommandSpec<{ id: string }, OfficialAccountView>
+  connections_refresh_login: CommandSpec<
+    { id: string },
+    CredentialMaintenanceResult
+  >
   connections_update_account_remark: CommandSpec<
     { id: string; remark: string },
     OfficialAccountView

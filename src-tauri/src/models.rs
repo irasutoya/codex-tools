@@ -182,6 +182,16 @@ pub(crate) fn token_identity(token: &str) -> Option<TokenIdentity> {
     })
 }
 
+/// auth.json 未保存 OAuth 的 expires_in；同步时仅从 JWT 的 exp 推断，
+/// 并优先使用 access token，再使用 id token。
+pub(crate) fn credential_expires_at(credential: &CodexAuthCredential) -> Option<i64> {
+    token_identity(&credential.tokens.access_token)
+        .and_then(|identity| identity.expires_at)
+        .or_else(|| {
+            token_identity(&credential.tokens.id_token).and_then(|identity| identity.expires_at)
+        })
+}
+
 fn official_account_subject(account: &StoredOfficialAccount) -> Option<String> {
     credential_subject(&account.credential)
 }
@@ -433,6 +443,50 @@ pub enum OfficialAccountSource {
     ProxyImport,
 }
 
+/// 凭据维护仅对前端公开状态和时间，不会序列化任何 Token 或错误响应内容。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CredentialRefreshStatus {
+    #[default]
+    Unknown,
+    Healthy,
+    ManagedByCodex,
+    WaitingRetry,
+    ReauthenticationRequired,
+    NotRefreshable,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialRefreshState {
+    #[serde(default)]
+    pub status: CredentialRefreshStatus,
+    #[serde(default)]
+    pub last_attempt_at: Option<i64>,
+    #[serde(default)]
+    pub last_success_at: Option<i64>,
+    #[serde(default)]
+    pub next_retry_at: Option<i64>,
+    #[serde(default)]
+    pub retry_count: u8,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CredentialMaintenanceOutcome {
+    Refreshed,
+    SyncedFromCodex,
+    ManagedByCodex,
+    Unchanged,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialMaintenanceResult {
+    pub account: OfficialAccountView,
+    pub outcome: CredentialMaintenanceOutcome,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum QuotaStatus {
@@ -587,6 +641,7 @@ pub struct OfficialAccountView {
     pub email: String,
     pub source: OfficialAccountSource,
     pub expires_at: Option<i64>,
+    pub credential_refresh: CredentialRefreshState,
     pub quota: ProviderAccountQuota,
     pub created_at: i64,
     pub updated_at: i64,
@@ -610,7 +665,11 @@ impl StoredOfficialAccount {
         }
     }
 
-    pub fn view(&self, active: bool) -> OfficialAccountView {
+    pub fn view_with_credential_refresh(
+        &self,
+        active: bool,
+        credential_refresh: CredentialRefreshState,
+    ) -> OfficialAccountView {
         OfficialAccountView {
             id: self.id.clone(),
             name: self.name.clone(),
@@ -619,6 +678,7 @@ impl StoredOfficialAccount {
             email: self.email.clone(),
             source: self.source,
             expires_at: self.expires_at,
+            credential_refresh,
             quota: self.quota.clone(),
             created_at: self.created_at,
             updated_at: self.updated_at,
@@ -684,6 +744,9 @@ pub struct AppConfig {
     pub providers: Vec<ProviderProfile>,
     #[serde(default)]
     pub official_accounts: Vec<StoredOfficialAccount>,
+    /// 独立保存维护元数据，避免把脱敏状态写入任一敏感凭据对象。
+    #[serde(default)]
+    pub credential_refresh: BTreeMap<String, CredentialRefreshState>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1610,7 +1673,8 @@ mod tests {
 
     #[test]
     fn official_view_and_device_dtos_never_serialize_credentials() {
-        let view = official_account().view(true);
+        let view = official_account()
+            .view_with_credential_refresh(true, CredentialRefreshState::default());
         assert_eq!(serde_json::to_value(&view).unwrap()["remark"], "日常开发");
         let values = [
             serde_json::to_value(&view).unwrap(),
@@ -1633,7 +1697,7 @@ mod tests {
             assert!(!serialized.contains("secret-id-token"));
             assert!(!serialized.contains("secret-access-token"));
             assert!(!serialized.contains("secret-refresh-token"));
-            assert!(!serialized.contains("credential"));
+            assert!(!serialized.contains("\"credential\":"));
             assert!(!serialized.contains("idToken"));
             assert!(!serialized.contains("accessToken"));
             assert!(!serialized.contains("refreshToken"));

@@ -26,7 +26,6 @@ const CODEX_ORIGINATOR: &str = "codex_cli_rs";
 const DEFAULT_DEVICE_LIFETIME_SECS: u64 = 15 * 60;
 const MAX_DEVICE_LIFETIME_SECS: u64 = 60 * 60;
 const MAX_OAUTH_RESPONSE_BYTES: usize = 64 * 1024;
-const ACCESS_TOKEN_REFRESH_WINDOW_SECS: i64 = 5 * 60;
 
 struct PendingDeviceAuth {
     device_auth_id: String,
@@ -109,6 +108,11 @@ struct CompleteTokens {
 enum AccountRefreshDecision {
     KeepCurrent,
     Refresh,
+}
+
+pub(crate) struct AccountRefreshResult {
+    pub account: StoredOfficialAccount,
+    pub refreshed: bool,
 }
 
 impl Default for AuthCenter {
@@ -252,19 +256,33 @@ impl AuthCenter {
         store: &Store,
         account_id: &str,
     ) -> Result<StoredOfficialAccount, AppError> {
-        self.refresh_account_with_policy(store, account_id, false)
-            .await
+        Ok(self
+            .refresh_account_with_policy(store, account_id, false)
+            .await?
+            .account)
     }
 
     /// Explicit login refresh requested by the user. Unlike activation/quota
     /// refreshes, an available refresh token is always exchanged, even while
     /// the current access token is still far from expiry.
+    #[cfg(test)]
     pub async fn refresh_login(
         &self,
         store: &Store,
         account_id: &str,
     ) -> Result<StoredOfficialAccount, AppError> {
-        self.refresh_account_with_policy(store, account_id, true)
+        Ok(self
+            .refresh_account_with_policy(store, account_id, true)
+            .await?
+            .account)
+    }
+
+    pub(crate) async fn refresh_account_for_maintenance(
+        &self,
+        store: &Store,
+        account_id: &str,
+    ) -> Result<AccountRefreshResult, AppError> {
+        self.refresh_account_with_policy(store, account_id, false)
             .await
     }
 
@@ -273,7 +291,7 @@ impl AuthCenter {
         store: &Store,
         account_id: &str,
         force: bool,
-    ) -> Result<StoredOfficialAccount, AppError> {
+    ) -> Result<AccountRefreshResult, AppError> {
         // Refresh tokens can rotate and are single-use. Keep the store reload,
         // exchange, and durable save in one shared critical section so a waiter
         // never consumes a stale snapshot after another refresh has completed.
@@ -282,7 +300,10 @@ impl AuthCenter {
         if refresh_decision(&account, force, chrono::Utc::now().timestamp())?
             == AccountRefreshDecision::KeepCurrent
         {
-            return Ok(account);
+            return Ok(AccountRefreshResult {
+                account,
+                refreshed: false,
+            });
         }
         let http = self.client()?;
         let response = http
@@ -296,16 +317,36 @@ impl AuthCenter {
             .await
             .map_err(safe_network_error)?;
 
-        if response.status() == StatusCode::UNAUTHORIZED {
+        if matches!(
+            response.status(),
+            StatusCode::BAD_REQUEST | StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+        ) {
             return Err(AppError::InvalidConfig(
                 "OpenAI 授权已过期，请重新登录。".into(),
             ));
         }
-        let response = require_success(response, "无法更新 OpenAI 登录凭据")?;
-        let refreshed: TokenResponse = read_json_bounded(response, "登录凭据更新结果").await?;
+        if response.status() == StatusCode::TOO_MANY_REQUESTS || response.status().is_server_error()
+        {
+            return Err(AppError::Internal(
+                "OpenAI 登录更新暂时不可用，将在稍后自动重试。".into(),
+            ));
+        }
+        if !response.status().is_success() {
+            return Err(AppError::Internal(
+                "OpenAI 登录更新暂时不可用，将在稍后自动重试。".into(),
+            ));
+        }
+        let refreshed: TokenResponse = read_json_bounded(response, "登录凭据更新结果")
+            .await
+            .map_err(|_| {
+                AppError::Internal("OpenAI 登录更新暂时不可用，将在稍后自动重试。".into())
+            })?;
         let tokens = merge_refreshed_tokens(refreshed, &account)?;
         let refreshed = account_from_tokens(tokens, Some(&account))?;
-        store.save_refreshed_official_account(account_id, &refreshed)
+        Ok(AccountRefreshResult {
+            account: store.save_refreshed_official_account(account_id, &refreshed)?,
+            refreshed: true,
+        })
     }
 
     pub async fn connections_import_cookie(
@@ -547,7 +588,7 @@ fn refresh_decision(
     }
     if force
         || account.expires_at.is_none_or(|expires_at| {
-            expires_at <= now.saturating_add(ACCESS_TOKEN_REFRESH_WINDOW_SECS)
+            expires_at <= now.saturating_add(crate::credential_maintenance::REFRESH_WINDOW_SECS)
         })
     {
         Ok(AccountRefreshDecision::Refresh)
@@ -968,7 +1009,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_login_refresh_forces_an_oauth_token_exchange() {
+    fn refresh_window_starts_two_days_before_expiry_and_force_still_refreshes() {
         let now: i64 = 1_000_000;
         let account = refresh_test_account(
             OfficialAccountSource::OpenAiOauth,
@@ -978,7 +1019,7 @@ mod tests {
 
         assert_eq!(
             refresh_decision(&account, false, now).unwrap(),
-            AccountRefreshDecision::KeepCurrent
+            AccountRefreshDecision::Refresh
         );
         assert_eq!(
             refresh_decision(&account, true, now).unwrap(),

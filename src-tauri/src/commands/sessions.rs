@@ -38,35 +38,16 @@ pub(crate) async fn repair_home(
 }
 
 pub(crate) async fn repair_home_after_activation(
-    store: &Store,
-    home: PathBuf,
+    _store: &Store,
+    _home: PathBuf,
     target_provider: String,
 ) -> RepairResult {
-    let result = match ensure_codex_stopped(store) {
-        Ok(()) => {
-            let configured_app = store.codex_app_setting();
-            let repair_target = target_provider.clone();
-            tokio::task::spawn_blocking(move || {
-                let configured_app = configured_app?;
-                provider_sync::repair_after_connection_switch_with_guard(
-                    &home,
-                    &repair_target,
-                    || Ok(!platform::codex_app_running(configured_app.as_deref())),
-                )
-            })
-            .await
-            .map_err(|error| AppError::Internal(error.to_string()))
-            .and_then(|result| result)
-        }
-        Err(error) => Err(error),
-    };
-    match result {
-        Ok(result) => result,
-        Err(error) => RepairResult {
-            target_provider,
-            warnings: vec![format!("会话归属未自动修复：{error}")],
-            ..RepairResult::default()
-        },
+    // Codex 近期以 JSONL 字节偏移和 ordinal 映射关联 thread_history_1.sqlite；
+    // 自动重序列化 rollout 会破坏该映射。账号/服务切换不得扫描或修复历史，
+    // 显式的 sessions_repair 仍保留为用户主动维护入口。
+    RepairResult {
+        target_provider,
+        ..RepairResult::default()
     }
 }
 
@@ -120,9 +101,62 @@ pub(crate) async fn sessions_list(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha256};
+    use std::fs;
+
+    fn sha256(bytes: &[u8]) -> String {
+        format!("{:x}", Sha256::digest(bytes))
+    }
 
     #[tokio::test]
-    async fn post_activation_repair_failure_is_returned_as_a_warning() {
+    async fn post_activation_switch_preserves_rollout_bytes_and_thread_history_sentinel() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex-home");
+        let sessions = home.join("sessions/2026/08/24");
+        let archived = home.join("archived_sessions/2026/08/24");
+        fs::create_dir_all(&sessions).unwrap();
+        fs::create_dir_all(&archived).unwrap();
+
+        let active_rollout = sessions.join("rollout.jsonl");
+        let archived_rollout = archived.join("rollout.jsonl");
+        let active_bytes = br#"{ "type": "session_meta", "payload": { "id": "active", "model_provider": "openai" } }
+{"type":"event_msg","payload":{"type":"user_message","message":"keep active ordinal"}}
+{"type":"response_item","payload":{"type":"message","id":"msg_active","role":"assistant","content":[]}}
+"#;
+        let archived_bytes =
+            br#"{"type":"session_meta","payload":{"id":"archived","model_provider":"openai"}}
+{"type":"event_msg","payload":{"type":"user_message","message":"keep archived ordinal"}}
+"#;
+        let thread_history = home.join("thread_history_1.sqlite");
+        let thread_history_bytes = b"thread-history-v1-byte-cursor-sentinel";
+        fs::write(&active_rollout, active_bytes).unwrap();
+        fs::write(&archived_rollout, archived_bytes).unwrap();
+        fs::write(&thread_history, thread_history_bytes).unwrap();
+
+        let store = Store::open(temp.path().join("data")).unwrap();
+        let repair = repair_home_after_activation(&store, home.clone(), "custom".into()).await;
+
+        assert_eq!(repair.files_scanned, 0);
+        assert_eq!(repair.files_modified, 0);
+        assert_eq!(fs::read(&active_rollout).unwrap(), active_bytes);
+        assert_eq!(
+            sha256(&fs::read(&active_rollout).unwrap()),
+            sha256(active_bytes)
+        );
+        assert_eq!(fs::read(&archived_rollout).unwrap(), archived_bytes);
+        assert_eq!(
+            sha256(&fs::read(&archived_rollout).unwrap()),
+            sha256(archived_bytes)
+        );
+        assert_eq!(fs::read(&thread_history).unwrap(), thread_history_bytes);
+        assert_eq!(
+            sha256(&fs::read(&thread_history).unwrap()),
+            sha256(thread_history_bytes)
+        );
+    }
+
+    #[tokio::test]
+    async fn post_activation_repair_is_a_noop() {
         let temp = tempfile::tempdir().unwrap();
         let store = Store::open(temp.path().join("data")).unwrap();
 
@@ -134,7 +168,7 @@ mod tests {
         .await;
 
         assert_eq!(result.target_provider, "unsupported");
-        assert_eq!(result.warnings.len(), 1);
-        assert!(result.warnings[0].contains("未自动修复"));
+        assert_eq!(result.files_scanned, 0);
+        assert!(result.warnings.is_empty());
     }
 }
