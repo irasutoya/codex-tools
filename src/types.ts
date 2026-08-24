@@ -243,6 +243,25 @@ export type AccountQuota = {
   errorCode?: string
 }
 
+export type CredentialRefreshStatus =
+  | "unknown"
+  | "healthy"
+  | "managed_by_codex"
+  | "waiting_retry"
+  | "reauthentication_required"
+  | "not_refreshable"
+
+export type CredentialRefreshState = {
+  status: CredentialRefreshStatus
+  lastAttemptAt?: number
+  lastSuccessAt?: number
+  nextRetryAt?: number
+  retryCount?: number
+}
+
+export type CredentialMaintenanceOutcome =
+  "refreshed" | "synced_from_codex" | "managed_by_codex" | "unchanged"
+
 export type QuotaRefreshResult = {
   accountId: string
   quota: AccountQuota
@@ -304,10 +323,16 @@ export type OfficialAccountView = {
   email: string
   source: "open_ai_oauth" | "proxy_import"
   expiresAt: number | null
+  credentialRefresh: CredentialRefreshState
   quota: AccountQuota
   active: boolean
   createdAt: number
   updatedAt: number
+}
+
+export type CredentialMaintenanceResult = {
+  account: OfficialAccountView
+  outcome: CredentialMaintenanceOutcome
 }
 
 export type ProxyImportResult = {

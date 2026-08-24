@@ -1,8 +1,5 @@
 use crate::{
-    activation::{
-        activate_openai_record, ensure_codex_stopped, sync_active_codex_configuration,
-        sync_active_openai_credential,
-    },
+    activation::{activate_openai_record, ensure_codex_stopped, sync_active_openai_credential},
     auth_center::{AuthCenter, DevicePollResult},
     chat_proxy::ChatProxyRegistry,
     codex::{self, ConfigManager},
@@ -147,17 +144,9 @@ fn connections_update_account_remarks_in_store(
     updates: Vec<AccountRemarkUpdate>,
 ) -> Result<Vec<OfficialAccountView>, AppError> {
     let saved = store.update_official_account_remarks(updates)?;
-    let active_account_id = store.read(|state| {
-        matches!(state.active.kind, ActiveKind::Official)
-            .then(|| state.active.account_id.clone())
-            .flatten()
-    })?;
     saved
         .into_iter()
-        .map(|account| {
-            let active = active_account_id.as_deref() == Some(account.id.as_str());
-            Ok(account.view(active))
-        })
+        .map(|account| store.official_account_view(&account.id))
         .collect()
 }
 
@@ -169,7 +158,7 @@ pub(crate) async fn connections_refresh_login(
     activation: State<'_, ActivationLock>,
     proxy: State<'_, ChatProxyRegistry>,
     id: String,
-) -> Result<OfficialAccountView, AppError> {
+) -> Result<CredentialMaintenanceResult, AppError> {
     connections_refresh_login_in_store(&store, &center, &manager, &activation, &proxy, &id).await
 }
 
@@ -180,45 +169,9 @@ async fn connections_refresh_login_in_store(
     activation: &ActivationLock,
     proxy: &ChatProxyRegistry,
     id: &str,
-) -> Result<OfficialAccountView, AppError> {
-    let saved =
-        refresh_account_and_sync_active(store, center, manager, activation, proxy, id, true)
-            .await?;
-    store.official_account_view(&saved.id)
-}
-
-#[allow(clippy::too_many_arguments)] // Shared refresh path needs the managed Tauri services.
-async fn refresh_account_and_sync_active(
-    store: &Store,
-    center: &AuthCenter,
-    manager: &ConfigManager,
-    activation: &ActivationLock,
-    proxy: &ChatProxyRegistry,
-    id: &str,
-    force: bool,
-) -> Result<StoredOfficialAccount, AppError> {
-    let _guard = activation.0.lock().await;
-    let is_active = store.read(|state| {
-        matches!(state.active.kind, ActiveKind::Official)
-            && state.active.account_id.as_deref() == Some(id)
-    })?;
-    if is_active {
-        ensure_codex_stopped(store)?;
-    }
-    let home = codex::home(&store.codex_home_setting()?);
-    // Codex may have rotated the active credential independently. Import that
-    // copy before exchanging its refresh token, then write the newly refreshed
-    // credential back after it has safely reached persistent storage.
-    sync_active_openai_credential(store, &home)?;
-    let saved = if force {
-        center.refresh_login(store, id).await?
-    } else {
-        center.refresh_account(store, id).await?
-    };
-    if is_active {
-        sync_active_codex_configuration(store, manager, proxy).await?;
-    }
-    Ok(saved)
+) -> Result<CredentialMaintenanceResult, AppError> {
+    crate::credential_maintenance::maintain_account(store, center, manager, activation, proxy, id)
+        .await
 }
 
 async fn refresh_official_quota(
@@ -826,6 +779,7 @@ mod tests {
     async fn active_account_refresh_syncs_cookie_to_codex() {
         let temp = tempfile::tempdir().unwrap();
         let home = temp.path().join("codex-home");
+        fs::create_dir_all(&home).unwrap();
         let store = Store::open(temp.path().join("data")).unwrap();
         store
             .update(|state| {
@@ -864,17 +818,10 @@ mod tests {
 
         let manager = ConfigManager::default();
         let proxy = ChatProxyRegistry::default();
-        let refreshed = refresh_account_and_sync_active(
-            &store,
-            &AuthCenter::default(),
-            &manager,
-            &ActivationLock::default(),
-            &proxy,
-            &saved.id,
-            false,
-        )
-        .await
-        .unwrap();
+        let refreshed = AuthCenter::default()
+            .refresh_account(&store, &saved.id)
+            .await
+            .unwrap();
         assert_eq!(refreshed.id, saved.id);
 
         let view = connections_refresh_login_in_store(
@@ -888,8 +835,8 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(view.active);
-        assert_eq!(view.remark, "备用账号");
+        assert!(view.account.active);
+        assert_eq!(view.account.remark, "备用账号");
         let auth: serde_json::Value =
             serde_json::from_slice(&fs::read(home.join("auth.json")).unwrap()).unwrap();
         assert_eq!(auth["personal_access_token"], "at-cookie-secret");

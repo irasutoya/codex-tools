@@ -63,6 +63,7 @@ import {
   accountIsExpired,
   accountWorkspaceIsDeactivated,
   buildFallbackCandidates,
+  credentialMaintenanceMessage,
   emptyProvider,
   effectiveModelCount,
   repairWarning,
@@ -450,7 +451,7 @@ export function ConnectionManagerSheet({
                               ),
                           },
                           {
-                            label: "刷新登录",
+                            label: "检查/更新登录",
                             icon: Login03Icon,
                             onSelect: () =>
                               void runAction(
@@ -460,7 +461,8 @@ export function ConnectionManagerSheet({
                                   call("connections_refresh_login", {
                                     id: account.id,
                                   }),
-                                "登录状态已刷新"
+                                "登录状态已检查",
+                                credentialMaintenanceMessage
                               ),
                           },
                         ]}

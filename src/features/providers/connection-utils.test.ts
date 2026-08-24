@@ -7,6 +7,8 @@ import {
   allModelsSelected,
   accountWorkspaceIsDeactivated,
   buildFallbackCandidates,
+  credentialMaintenanceMessage,
+  credentialRefreshText,
   effectiveModelsOf,
   noModelsSelected,
   providerSaveInputOf,
@@ -26,6 +28,7 @@ const makeAccount = (
   email: "account@example.com",
   source: "open_ai_oauth",
   expiresAt: null,
+  credentialRefresh: { status: "unknown" },
   quota: { status: "never" },
   active: false,
   createdAt: 0,
@@ -125,6 +128,33 @@ describe("账号额度错误", () => {
         (candidate) => candidate.id
       )
     ).toEqual(["usable"])
+  })
+})
+
+describe("凭据自动维护状态", () => {
+  it("只显示脱敏维护结果", () => {
+    expect(
+      credentialRefreshText(
+        makeAccount({ credentialRefresh: { status: "waiting_retry" } })
+      )
+    ).toBe("等待重试")
+  })
+
+  it("按实际 outcome 显示检查结果而非一律声称已更新", () => {
+    expect(
+      credentialMaintenanceMessage({
+        account: makeAccount({ credentialRefresh: { status: "healthy" } }),
+        outcome: "synced_from_codex",
+      })
+    ).toBe("已同步 Codex 最新凭据")
+    expect(
+      credentialMaintenanceMessage({
+        account: makeAccount({
+          credentialRefresh: { status: "reauthentication_required" },
+        }),
+        outcome: "unchanged",
+      })
+    ).toBe("需要重新登录")
   })
 })
 

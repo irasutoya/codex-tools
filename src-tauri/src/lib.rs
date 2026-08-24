@@ -3,6 +3,7 @@ mod auth_center;
 mod chat_proxy;
 mod codex;
 mod commands;
+mod credential_maintenance;
 mod json_store;
 mod local_usage;
 mod model_unlock;
@@ -29,6 +30,7 @@ use local_usage::UsageLedger;
 use models::*;
 use session_index::SessionIndex;
 use state::{ActivationLock, ApiClient};
+use std::time::Duration;
 use storage::Store;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
@@ -55,6 +57,20 @@ async fn sync_configured_provider(app: tauri::AppHandle) {
         let _ = reconcile_current_activation(&store, &ledger);
     } else {
         let _ = ledger.cancel_pending_activations();
+    }
+}
+
+/// 启动即执行一次，之后每分钟检查。实际刷新仍由维护器依据账号状态决定，
+/// 因而不会因为轮询而重复消耗轮换型 Refresh Token。
+async fn run_credential_maintenance(app: tauri::AppHandle) {
+    loop {
+        let store = app.state::<Store>();
+        let center = app.state::<AuthCenter>();
+        let manager = app.state::<ConfigManager>();
+        let activation = app.state::<ActivationLock>();
+        let proxy = app.state::<ChatProxyRegistry>();
+        credential_maintenance::run_once(&store, &center, &manager, &activation, &proxy).await;
+        tokio::time::sleep(Duration::from_secs(60)).await;
     }
 }
 
@@ -221,6 +237,8 @@ pub fn run() {
                 .build(app)?;
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(sync_configured_provider(handle));
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn(run_credential_maintenance(handle));
             Ok(())
         })
         .on_window_event(|window, event| {

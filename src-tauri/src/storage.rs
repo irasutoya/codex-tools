@@ -30,6 +30,8 @@ struct ConnectionsFile {
     providers: Vec<ProviderProfile>,
     #[serde(default)]
     official_accounts: Vec<StoredOfficialAccount>,
+    #[serde(default)]
+    credential_refresh: BTreeMap<String, CredentialRefreshState>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -120,6 +122,7 @@ impl Store {
             active: app_file.active,
             providers,
             official_accounts: connections.official_accounts,
+            credential_refresh: connections.credential_refresh,
         };
         if !path.exists() || !connections_path.exists() || !credentials_path.exists() {
             persist_files(&path, &connections_path, &credentials_path, &state)?;
@@ -529,7 +532,14 @@ impl Store {
             .map(|account| {
                 let active = matches!(state.active.kind, ActiveKind::Official)
                     && state.active.account_id.as_deref() == Some(account.id.as_str());
-                account.view(active)
+                account.view_with_credential_refresh(
+                    active,
+                    state
+                        .credential_refresh
+                        .get(&account.id)
+                        .cloned()
+                        .unwrap_or_default(),
+                )
             })
             .collect();
         Ok(ProviderOverview {
@@ -579,7 +589,56 @@ impl Store {
             .ok_or_else(|| AppError::InvalidConfig("OpenAI 账号不存在，可能已被删除。".into()))?;
         let active = matches!(state.active.kind, ActiveKind::Official)
             && state.active.account_id.as_deref() == Some(account.id.as_str());
-        Ok(account.view(active))
+        Ok(account.view_with_credential_refresh(
+            active,
+            state
+                .credential_refresh
+                .get(id)
+                .cloned()
+                .unwrap_or_default(),
+        ))
+    }
+
+    pub(crate) fn official_accounts_for_maintenance(
+        &self,
+    ) -> Result<Vec<(StoredOfficialAccount, CredentialRefreshState, bool)>, AppError> {
+        self.read(|state| {
+            Ok(state
+                .official_accounts
+                .iter()
+                .cloned()
+                .map(|account| {
+                    let active = matches!(state.active.kind, ActiveKind::Official)
+                        && state.active.account_id.as_deref() == Some(account.id.as_str());
+                    let refresh = state
+                        .credential_refresh
+                        .get(&account.id)
+                        .cloned()
+                        .unwrap_or_default();
+                    (account, refresh, active)
+                })
+                .collect())
+        })?
+    }
+
+    pub(crate) fn save_credential_refresh_state(
+        &self,
+        id: &str,
+        refresh: CredentialRefreshState,
+    ) -> Result<(), AppError> {
+        self.update(|state| {
+            if !state
+                .official_accounts
+                .iter()
+                .any(|account| account.id == id)
+            {
+                return Err(AppError::InvalidConfig(
+                    "OpenAI 账号不存在，可能已被删除。".into(),
+                ));
+            }
+            state.credential_refresh.insert(id.to_owned(), refresh);
+            Ok(())
+        })
     }
 
     /// Returns the sensitive stored record for backend-only auth operations.
@@ -636,6 +695,7 @@ impl Store {
             refreshed.created_at = existing.created_at;
             refreshed.updated_at = chrono::Utc::now().timestamp();
             *existing = refreshed.clone();
+            state.credential_refresh.remove(id);
             Ok(refreshed)
         })
     }
@@ -705,6 +765,12 @@ impl Store {
                         saved.id == retained_id
                             || !official_account_identity_matches(saved, &incoming)
                     });
+                    // 新设备登录/重新导入替换了凭据后，之前的“需要重新登录”
+                    // 或退避状态不再适用；只保留与仍存在账号关联的状态。
+                    state.credential_refresh.remove(&retained_id);
+                    for duplicate_id in duplicate_ids {
+                        state.credential_refresh.remove(&duplicate_id);
+                    }
                     saved_accounts.push(incoming);
                     continue;
                 }
@@ -857,6 +923,7 @@ impl Store {
             account.credential = credential.clone();
             account.expires_at = expires_at;
             account.updated_at = chrono::Utc::now().timestamp();
+            state.credential_refresh.remove(id);
             Ok(account.clone())
         })
     }
@@ -916,6 +983,7 @@ impl Store {
             state
                 .official_accounts
                 .retain(|account| !ids.contains(&account.id));
+            state.credential_refresh.retain(|id, _| !ids.contains(id));
             Ok(())
         })
     }
@@ -1036,6 +1104,7 @@ fn persist_files(
     let connections = ConnectionsFile {
         providers,
         official_accounts: state.official_accounts.clone(),
+        credential_refresh: state.credential_refresh.clone(),
     };
     JsonStore::write_atomic(app_path, &app)?;
     JsonStore::write_atomic(connections_path, &connections)?;
@@ -1891,7 +1960,7 @@ mod tests {
         assert_eq!(view.remark, "");
         let serialized = serde_json::to_string(&view).unwrap();
         assert!(serialized.contains("\"remark\":\"\""));
-        assert!(!serialized.contains("credential"));
+        assert!(!serialized.contains("\"credential\":"));
         assert!(!serialized.contains("access-secret"));
         assert!(!serialized.contains("refresh-secret"));
         assert!(!serialized.contains("id-secret"));
