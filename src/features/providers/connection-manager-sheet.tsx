@@ -451,7 +451,7 @@ export function ConnectionManagerSheet({
                               ),
                           },
                           {
-                            label: "检查/更新登录",
+                            label: "立即刷新登录",
                             icon: Login03Icon,
                             onSelect: () =>
                               void runAction(
@@ -461,7 +461,7 @@ export function ConnectionManagerSheet({
                                   call("connections_refresh_login", {
                                     id: account.id,
                                   }),
-                                "登录状态已检查",
+                                "登录维护已完成",
                                 credentialMaintenanceMessage
                               ),
                           },

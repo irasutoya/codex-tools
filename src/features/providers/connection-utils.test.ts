@@ -9,6 +9,7 @@ import {
   buildFallbackCandidates,
   credentialMaintenanceMessage,
   credentialRefreshText,
+  loginVerificationText,
   effectiveModelsOf,
   noModelsSelected,
   providerSaveInputOf,
@@ -140,6 +141,21 @@ describe("凭据自动维护状态", () => {
     ).toBe("等待重试")
   })
 
+  it("旧 healthy 没有真实刷新时间时不冒充自动刷新正常", () => {
+    expect(
+      credentialRefreshText(
+        makeAccount({ credentialRefresh: { status: "healthy" } })
+      )
+    ).toBe("未到刷新时间")
+    expect(
+      credentialRefreshText(
+        makeAccount({
+          credentialRefresh: { status: "healthy", lastRefreshAt: 1 },
+        })
+      )
+    ).toBe("自动刷新正常")
+  })
+
   it("按实际 outcome 显示检查结果而非一律声称已更新", () => {
     expect(
       credentialMaintenanceMessage({
@@ -155,6 +171,32 @@ describe("凭据自动维护状态", () => {
         outcome: "unchanged",
       })
     ).toBe("需要重新登录")
+  })
+
+  it("不可刷新时不误报未到刷新时间", () => {
+    expect(
+      credentialMaintenanceMessage({
+        account: makeAccount({
+          credentialRefresh: { status: "not_refreshable" },
+        }),
+        outcome: "not_refreshable",
+      })
+    ).toBe("不可自动刷新：缺少可刷新凭据")
+  })
+
+  it("不把本地维护成功误显示为在线登录有效", () => {
+    expect(
+      loginVerificationText(
+        makeAccount({ credentialRefresh: { status: "healthy" } })
+      )
+    ).toBe("尚未在线验证")
+    expect(
+      loginVerificationText(
+        makeAccount({
+          credentialRefresh: { status: "healthy", verification: "valid" },
+        })
+      )
+    ).toBe("在线验证有效")
   })
 })
 

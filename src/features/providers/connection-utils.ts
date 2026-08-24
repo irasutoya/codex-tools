@@ -82,7 +82,9 @@ export function accountIsExpired(account: OfficialAccountView) {
 export function credentialRefreshText(account: OfficialAccountView) {
   switch (account.credentialRefresh.status) {
     case "healthy":
-      return "自动刷新正常"
+      return account.credentialRefresh.lastRefreshAt
+        ? "自动刷新正常"
+        : "未到刷新时间"
     case "managed_by_codex":
       return "由 Codex 维护"
     case "waiting_retry":
@@ -92,7 +94,7 @@ export function credentialRefreshText(account: OfficialAccountView) {
     case "not_refreshable":
       return "不可自动刷新"
     default:
-      return "等待首次检查"
+      return "未到刷新时间"
   }
 }
 
@@ -103,15 +105,40 @@ export function credentialMaintenanceMessage(
   if (result.account.credentialRefresh.status === "reauthentication_required") {
     return "需要重新登录"
   }
+  if (result.account.credentialRefresh.status === "not_refreshable") {
+    return "不可自动刷新：缺少可刷新凭据"
+  }
   switch (result.outcome) {
     case "refreshed":
-      return "已更新"
+      return "登录凭据已刷新"
     case "synced_from_codex":
       return "已同步 Codex 最新凭据"
     case "managed_by_codex":
       return "由 Codex 维护"
     case "unchanged":
-      return "状态已检查"
+      return "未到自动刷新时间，已完成登录检查"
+    case "waiting_retry":
+      return "正在等待重试，未重复消耗登录凭据"
+    case "reauthentication_required":
+      return "需要重新登录"
+    case "not_refreshable":
+      return "不可自动刷新：缺少可刷新凭据"
+  }
+}
+
+/** 登录状态只能来自在线验证，不能由本地过期时间或维护成功推断。 */
+export function loginVerificationText(account: OfficialAccountView) {
+  switch (account.credentialRefresh.verification) {
+    case "valid":
+      return "在线验证有效"
+    case "invalid":
+      return "登录无效，需要重新登录"
+    case "workspace_or_permission":
+      return "工作区或权限限制"
+    case "check_failed":
+      return "在线检查失败"
+    default:
+      return "尚未在线验证"
   }
 }
 

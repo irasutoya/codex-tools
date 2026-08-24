@@ -456,6 +456,18 @@ pub enum CredentialRefreshStatus {
     NotRefreshable,
 }
 
+/// 在线登录检查与本地凭据维护分开记录。旧的 `healthy` 维护状态不会被当作有效登录。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LoginVerificationStatus {
+    #[default]
+    Unknown,
+    Valid,
+    Invalid,
+    WorkspaceOrPermission,
+    CheckFailed,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct CredentialRefreshState {
@@ -469,6 +481,14 @@ pub struct CredentialRefreshState {
     pub next_retry_at: Option<i64>,
     #[serde(default)]
     pub retry_count: u8,
+    #[serde(default)]
+    pub last_refresh_at: Option<i64>,
+    #[serde(default)]
+    pub last_sync_at: Option<i64>,
+    #[serde(default)]
+    pub last_check_at: Option<i64>,
+    #[serde(default)]
+    pub verification: LoginVerificationStatus,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -478,6 +498,9 @@ pub enum CredentialMaintenanceOutcome {
     SyncedFromCodex,
     ManagedByCodex,
     Unchanged,
+    WaitingRetry,
+    ReauthenticationRequired,
+    NotRefreshable,
 }
 
 #[derive(Debug, Clone, Serialize)]

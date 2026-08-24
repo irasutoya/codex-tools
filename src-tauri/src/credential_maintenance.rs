@@ -5,7 +5,8 @@ use crate::{
     codex::{self, ConfigManager},
     models::{
         AppError, CredentialMaintenanceOutcome, CredentialMaintenanceResult,
-        CredentialRefreshState, CredentialRefreshStatus, StoredOfficialAccount,
+        CredentialRefreshState, CredentialRefreshStatus, LoginVerificationStatus,
+        ProviderAccountQuota, QuotaStatus, StoredOfficialAccount,
     },
     state::ActivationLock,
     storage::Store,
@@ -44,6 +45,7 @@ pub(crate) fn maintenance_decision(
     account: &StoredOfficialAccount,
     state: &CredentialRefreshState,
     now: i64,
+    force: bool,
 ) -> MaintenanceDecision {
     if account.credential.tokens.refresh_token.trim().is_empty() {
         return MaintenanceDecision::NotRefreshable;
@@ -53,6 +55,9 @@ pub(crate) fn maintenance_decision(
     }
     if state.next_retry_at.is_some_and(|next| next > now) {
         return MaintenanceDecision::WaitingRetry;
+    }
+    if force {
+        return MaintenanceDecision::Refresh;
     }
     if needs_credential_refresh(account.expires_at, now) {
         return MaintenanceDecision::Refresh;
@@ -79,13 +84,17 @@ fn save_refresh_state_if_changed(
     Ok(())
 }
 
-pub(crate) fn healthy_state(now: i64) -> CredentialRefreshState {
+fn refreshed_state(previous: &CredentialRefreshState, now: i64) -> CredentialRefreshState {
     CredentialRefreshState {
         status: CredentialRefreshStatus::Healthy,
         last_attempt_at: Some(now),
         last_success_at: Some(now),
         next_retry_at: None,
         retry_count: 0,
+        last_refresh_at: Some(now),
+        last_sync_at: previous.last_sync_at,
+        last_check_at: previous.last_check_at,
+        verification: previous.verification,
     }
 }
 
@@ -98,6 +107,10 @@ fn retry_state(previous: &CredentialRefreshState, now: i64) -> CredentialRefresh
         last_success_at: previous.last_success_at,
         next_retry_at: Some(now.saturating_add(RETRY_DELAYS_SECS[index])),
         retry_count,
+        last_refresh_at: previous.last_refresh_at,
+        last_sync_at: previous.last_sync_at,
+        last_check_at: previous.last_check_at,
+        verification: previous.verification,
     }
 }
 
@@ -108,6 +121,10 @@ fn reauthentication_state(previous: &CredentialRefreshState, now: i64) -> Creden
         last_success_at: previous.last_success_at,
         next_retry_at: None,
         retry_count: previous.retry_count,
+        last_refresh_at: previous.last_refresh_at,
+        last_sync_at: previous.last_sync_at,
+        last_check_at: previous.last_check_at,
+        verification: previous.verification,
     }
 }
 
@@ -118,6 +135,10 @@ fn not_refreshable_state(previous: &CredentialRefreshState) -> CredentialRefresh
         last_success_at: previous.last_success_at,
         next_retry_at: None,
         retry_count: 0,
+        last_refresh_at: previous.last_refresh_at,
+        last_sync_at: previous.last_sync_at,
+        last_check_at: previous.last_check_at,
+        verification: previous.verification,
     }
 }
 
@@ -129,9 +150,13 @@ fn managed_by_codex_state(
     CredentialRefreshState {
         status: CredentialRefreshStatus::ManagedByCodex,
         last_attempt_at: previous.last_attempt_at,
-        last_success_at: synced.then_some(now).or(previous.last_success_at),
+        last_success_at: previous.last_success_at,
         next_retry_at: None,
         retry_count: 0,
+        last_refresh_at: previous.last_refresh_at,
+        last_sync_at: synced.then_some(now).or(previous.last_sync_at),
+        last_check_at: previous.last_check_at,
+        verification: previous.verification,
     }
 }
 
@@ -153,6 +178,29 @@ pub(crate) async fn maintain_account(
         activation,
         proxy,
         id,
+        false,
+        codex_is_running,
+    )
+    .await
+}
+
+/// 手动入口仅绕过到期阈值；已经生效的重试等待和重新登录状态仍然优先。
+pub(crate) async fn maintain_login(
+    store: &Store,
+    center: &AuthCenter,
+    manager: &ConfigManager,
+    activation: &ActivationLock,
+    proxy: &ChatProxyRegistry,
+    id: &str,
+) -> Result<CredentialMaintenanceResult, AppError> {
+    maintain_account_with_running(
+        store,
+        center,
+        manager,
+        activation,
+        proxy,
+        id,
+        true,
         codex_is_running,
     )
     .await
@@ -166,11 +214,12 @@ async fn maintain_account_with_running(
     activation: &ActivationLock,
     proxy: &ChatProxyRegistry,
     id: &str,
+    force: bool,
     running: impl FnOnce(Option<&str>) -> bool,
 ) -> Result<CredentialMaintenanceResult, AppError> {
     let _guard = activation.0.lock().await;
     let now = chrono::Utc::now().timestamp();
-    let (account, state, active) = store
+    let (account, mut state, active) = store
         .official_accounts_for_maintenance()?
         .into_iter()
         .find(|(account, _, _)| account.id == id)
@@ -198,8 +247,18 @@ async fn maintain_account_with_running(
 
     // 停止后先接收 Codex 最后的 auth.json，再决定是否需要轮换凭据。
     let synced = active && sync_active_openai_credential(store, &home)?;
+    if synced {
+        // 从 Codex 的 auth.json 接收了较新的凭据时，只更新时间戳；
+        // 刷新成功与在线验证的结论仍由各自路径维护。
+        let next = CredentialRefreshState {
+            last_sync_at: Some(now),
+            ..state
+        };
+        store.save_credential_refresh_state(&account.id, next.clone())?;
+        state = next;
+    }
     let account = store.official_account(&account.id)?;
-    let decision = maintenance_decision(&account, &state, now);
+    let decision = maintenance_decision(&account, &state, now, force);
     match decision {
         MaintenanceDecision::NotRefreshable => {
             save_refresh_state_if_changed(
@@ -209,24 +268,25 @@ async fn maintain_account_with_running(
                 not_refreshable_state(&state),
             )?;
         }
-        MaintenanceDecision::ReauthenticationRequired | MaintenanceDecision::WaitingRetry => {}
-        MaintenanceDecision::Unchanged => {
-            if state.status != CredentialRefreshStatus::Healthy {
-                save_refresh_state_if_changed(store, &account.id, &state, healthy_state(now))?;
-            }
-        }
+        MaintenanceDecision::ReauthenticationRequired
+        | MaintenanceDecision::WaitingRetry
+        | MaintenanceDecision::Unchanged => {}
         MaintenanceDecision::Refresh => {
             let attempted = CredentialRefreshState {
                 last_attempt_at: Some(now),
                 ..state.clone()
             };
             store.save_credential_refresh_state(&account.id, attempted)?;
-            match center
-                .refresh_account_for_maintenance(store, &account.id)
-                .await
-            {
+            match if force {
+                center.refresh_login(store, &account.id).await
+            } else {
+                center
+                    .refresh_account_for_maintenance(store, &account.id)
+                    .await
+            } {
                 Ok(result) if result.refreshed => {
-                    store.save_credential_refresh_state(&account.id, healthy_state(now))?;
+                    store
+                        .save_credential_refresh_state(&account.id, refreshed_state(&state, now))?;
                     if active {
                         sync_active_codex_configuration(store, manager, proxy).await?;
                     }
@@ -241,10 +301,18 @@ async fn maintain_account_with_running(
                         &account.id,
                         reauthentication_state(&state, now),
                     )?;
+                    return Ok(CredentialMaintenanceResult {
+                        account: store.official_account_view(&account.id)?,
+                        outcome: CredentialMaintenanceOutcome::ReauthenticationRequired,
+                    });
                 }
                 Err(error) => {
                     store.save_credential_refresh_state(&account.id, retry_state(&state, now))?;
-                    return Err(error);
+                    let _ = error;
+                    return Ok(CredentialMaintenanceResult {
+                        account: store.official_account_view(&account.id)?,
+                        outcome: CredentialMaintenanceOutcome::WaitingRetry,
+                    });
                 }
             }
         }
@@ -258,10 +326,54 @@ async fn maintain_account_with_running(
         account: store.official_account_view(&account.id)?,
         outcome: if synced {
             CredentialMaintenanceOutcome::SyncedFromCodex
+        } else if decision == MaintenanceDecision::WaitingRetry {
+            CredentialMaintenanceOutcome::WaitingRetry
+        } else if decision == MaintenanceDecision::ReauthenticationRequired {
+            CredentialMaintenanceOutcome::ReauthenticationRequired
+        } else if decision == MaintenanceDecision::NotRefreshable {
+            CredentialMaintenanceOutcome::NotRefreshable
         } else {
             CredentialMaintenanceOutcome::Unchanged
         },
     })
+}
+
+/// 只记录脱敏在线检查结论；它不改变刷新重试和成功时间。
+pub(crate) fn record_login_verification(
+    store: &Store,
+    id: &str,
+    quota: &ProviderAccountQuota,
+) -> Result<(), AppError> {
+    let now = chrono::Utc::now().timestamp();
+    let (_, previous, _) = store
+        .official_accounts_for_maintenance()?
+        .into_iter()
+        .find(|(account, _, _)| account.id == id)
+        .ok_or_else(|| AppError::InvalidConfig("OpenAI 账号不存在，可能已被删除。".into()))?;
+    let verification = match quota.status {
+        QuotaStatus::Success => LoginVerificationStatus::Valid,
+        QuotaStatus::Unauthorized
+            if quota
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("HTTP 402") || error.contains("HTTP 403")) =>
+        {
+            LoginVerificationStatus::WorkspaceOrPermission
+        }
+        QuotaStatus::Unauthorized => LoginVerificationStatus::Invalid,
+        QuotaStatus::RateLimited
+        | QuotaStatus::Error
+        | QuotaStatus::Unsupported
+        | QuotaStatus::Never => LoginVerificationStatus::CheckFailed,
+    };
+    store.save_credential_refresh_state(
+        id,
+        CredentialRefreshState {
+            last_check_at: Some(now),
+            verification,
+            ..previous
+        },
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -345,12 +457,12 @@ mod tests {
             ..CredentialRefreshState::default()
         };
         assert_eq!(
-            maintenance_decision(&account, &state, now),
+            maintenance_decision(&account, &state, now, false),
             MaintenanceDecision::Unchanged
         );
         state.last_attempt_at = Some(now - UNKNOWN_EXPIRY_RETRY_SECS);
         assert_eq!(
-            maintenance_decision(&account, &state, now),
+            maintenance_decision(&account, &state, now, false),
             MaintenanceDecision::Refresh
         );
     }
@@ -364,9 +476,84 @@ mod tests {
             ..CredentialRefreshState::default()
         };
         assert_eq!(
-            maintenance_decision(&account, &state, now),
+            maintenance_decision(&account, &state, now, false),
             MaintenanceDecision::ReauthenticationRequired
         );
+    }
+
+    #[test]
+    fn manual_refresh_bypasses_expiry_but_keeps_retry_and_reauthentication_gates() {
+        let now = 1_800_000_000;
+        let account = account(Some(now + 7 * 24 * 60 * 60));
+        let mut state = CredentialRefreshState::default();
+
+        assert_eq!(
+            maintenance_decision(&account, &state, now, true),
+            MaintenanceDecision::Refresh
+        );
+
+        state.next_retry_at = Some(now + 60);
+        assert_eq!(
+            maintenance_decision(&account, &state, now, true),
+            MaintenanceDecision::WaitingRetry
+        );
+
+        state.next_retry_at = None;
+        state.status = CredentialRefreshStatus::ReauthenticationRequired;
+        assert_eq!(
+            maintenance_decision(&account, &state, now, true),
+            MaintenanceDecision::ReauthenticationRequired
+        );
+    }
+
+    #[test]
+    fn online_verification_records_timestamp_without_claiming_refresh_success() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path().join("data")).unwrap();
+        let saved = store.save_official_account(&account(None)).unwrap();
+
+        for (quota, expected) in [
+            (
+                ProviderAccountQuota {
+                    status: QuotaStatus::Unauthorized,
+                    error: Some("HTTP 401".into()),
+                    ..ProviderAccountQuota::default()
+                },
+                LoginVerificationStatus::Invalid,
+            ),
+            (
+                ProviderAccountQuota {
+                    status: QuotaStatus::Unauthorized,
+                    error: Some("HTTP 402".into()),
+                    ..ProviderAccountQuota::default()
+                },
+                LoginVerificationStatus::WorkspaceOrPermission,
+            ),
+            (
+                ProviderAccountQuota {
+                    status: QuotaStatus::Unauthorized,
+                    error: Some("HTTP 403".into()),
+                    ..ProviderAccountQuota::default()
+                },
+                LoginVerificationStatus::WorkspaceOrPermission,
+            ),
+            (
+                ProviderAccountQuota {
+                    status: QuotaStatus::RateLimited,
+                    ..ProviderAccountQuota::default()
+                },
+                LoginVerificationStatus::CheckFailed,
+            ),
+        ] {
+            record_login_verification(&store, &saved.id, &quota).unwrap();
+            let state = store
+                .official_account_view(&saved.id)
+                .unwrap()
+                .credential_refresh;
+            assert_eq!(state.verification, expected);
+            assert!(state.last_check_at.is_some());
+            assert!(state.last_refresh_at.is_none());
+        }
     }
 
     #[tokio::test]
@@ -392,12 +579,16 @@ mod tests {
             &ActivationLock::default(),
             &ChatProxyRegistry::default(),
             &saved.id,
+            false,
             |_| false,
         )
         .await
         .unwrap();
 
-        assert_eq!(result.outcome, CredentialMaintenanceOutcome::Unchanged);
+        assert_eq!(
+            result.outcome,
+            CredentialMaintenanceOutcome::ReauthenticationRequired
+        );
         assert_eq!(result.account.credential_refresh, state);
     }
 
@@ -426,6 +617,7 @@ mod tests {
             &ActivationLock::default(),
             &ChatProxyRegistry::default(),
             &saved.id,
+            false,
             |_| true,
         )
         .await

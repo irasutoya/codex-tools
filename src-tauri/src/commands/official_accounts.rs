@@ -154,24 +154,42 @@ fn connections_update_account_remarks_in_store(
 pub(crate) async fn connections_refresh_login(
     store: State<'_, Store>,
     center: State<'_, AuthCenter>,
+    client: State<'_, ApiClient>,
     manager: State<'_, ConfigManager>,
     activation: State<'_, ActivationLock>,
     proxy: State<'_, ChatProxyRegistry>,
     id: String,
 ) -> Result<CredentialMaintenanceResult, AppError> {
-    connections_refresh_login_in_store(&store, &center, &manager, &activation, &proxy, &id).await
+    connections_refresh_login_in_store(&store, &center, &client, &manager, &activation, &proxy, &id)
+        .await
 }
 
 async fn connections_refresh_login_in_store(
     store: &Store,
     center: &AuthCenter,
+    _client: &ApiClient,
     manager: &ConfigManager,
     activation: &ActivationLock,
     proxy: &ChatProxyRegistry,
     id: &str,
 ) -> Result<CredentialMaintenanceResult, AppError> {
-    crate::credential_maintenance::maintain_account(store, center, manager, activation, proxy, id)
-        .await
+    let result = crate::credential_maintenance::maintain_login(
+        store, center, manager, activation, proxy, id,
+    )
+    .await?;
+    // 在线检查只复用现有安全额度请求，并单独存储结论；不会把本地刷新状态伪装成登录有效。
+    if !matches!(
+        result.outcome,
+        CredentialMaintenanceOutcome::WaitingRetry
+            | CredentialMaintenanceOutcome::ReauthenticationRequired
+    ) {
+        let quota = refresh_official_quota(store, center, _client, activation, id).await?;
+        crate::credential_maintenance::record_login_verification(store, id, &quota)?;
+    }
+    Ok(CredentialMaintenanceResult {
+        account: store.official_account_view(id)?,
+        outcome: result.outcome,
+    })
 }
 
 async fn refresh_official_quota(
@@ -824,7 +842,7 @@ mod tests {
             .unwrap();
         assert_eq!(refreshed.id, saved.id);
 
-        let view = connections_refresh_login_in_store(
+        let view = crate::credential_maintenance::maintain_login(
             &store,
             &AuthCenter::default(),
             &manager,

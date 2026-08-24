@@ -570,6 +570,9 @@ export async function mockCall(
         status: "healthy",
         lastAttemptAt: Math.floor(Date.now() / 1000),
         lastSuccessAt: Math.floor(Date.now() / 1000),
+        lastRefreshAt: Math.floor(Date.now() / 1000),
+        lastCheckAt: Math.floor(Date.now() / 1000),
+        verification: "valid",
       }
       return { account, outcome: "refreshed" }
     }

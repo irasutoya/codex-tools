@@ -262,19 +262,14 @@ impl AuthCenter {
             .account)
     }
 
-    /// Explicit login refresh requested by the user. Unlike activation/quota
-    /// refreshes, an available refresh token is always exchanged, even while
-    /// the current access token is still far from expiry.
-    #[cfg(test)]
-    pub async fn refresh_login(
+    /// 用户明确请求时强制交换 Refresh Token；仍复用同一把刷新锁。
+    pub(crate) async fn refresh_login(
         &self,
         store: &Store,
         account_id: &str,
-    ) -> Result<StoredOfficialAccount, AppError> {
-        Ok(self
-            .refresh_account_with_policy(store, account_id, true)
-            .await?
-            .account)
+    ) -> Result<AccountRefreshResult, AppError> {
+        self.refresh_account_with_policy(store, account_id, true)
+            .await
     }
 
     pub(crate) async fn refresh_account_for_maintenance(
@@ -1009,17 +1004,17 @@ mod tests {
     }
 
     #[test]
-    fn refresh_window_starts_two_days_before_expiry_and_force_still_refreshes() {
+    fn automatic_refresh_skips_a_far_future_expiry_but_manual_refresh_forces_exchange() {
         let now: i64 = 1_000_000;
         let account = refresh_test_account(
             OfficialAccountSource::OpenAiOauth,
             "refresh-token",
-            Some(now + 86_400),
+            Some(now + 7 * 86_400),
         );
 
         assert_eq!(
             refresh_decision(&account, false, now).unwrap(),
-            AccountRefreshDecision::Refresh
+            AccountRefreshDecision::KeepCurrent
         );
         assert_eq!(
             refresh_decision(&account, true, now).unwrap(),
@@ -1047,7 +1042,8 @@ mod tests {
             AuthCenter::default()
                 .refresh_login(&store, &saved.id)
                 .await
-                .unwrap(),
+                .unwrap()
+                .account,
             saved
         );
     }
