@@ -534,6 +534,35 @@ pub struct ProviderAccountQuota {
     pub error: Option<String>,
     #[serde(default)]
     pub error_code: Option<String>,
+    #[serde(default)]
+    pub estimates: Vec<QuotaEstimate>,
+}
+
+/// 本机依据已记录用量推算出的额度金额。它不是 OpenAI 返回的账单数据，
+/// 因此必须同时保存对应额度窗口的身份，避免跨窗口复用旧结论。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct QuotaEstimate {
+    pub window_seconds: i64,
+    pub reset_at: i64,
+    pub estimated_total_microusd: u64,
+    pub estimated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuotaEstimateWindowResult {
+    pub window_seconds: i64,
+    pub reset_at: i64,
+    pub success: bool,
+    pub estimate: Option<QuotaEstimate>,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuotaEstimateResult {
+    pub windows: Vec<QuotaEstimateWindowResult>,
 }
 
 #[derive(Debug, Clone, Serialize)]

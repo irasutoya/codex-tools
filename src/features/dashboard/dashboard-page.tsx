@@ -4,6 +4,7 @@ import { HugeiconsIcon } from "@hugeicons/react"
 import { CartesianGrid, Line, LineChart, XAxis, YAxis } from "recharts"
 
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
+import { Badge } from "@/components/ui/badge"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import {
   ChartContainer,
@@ -12,14 +13,13 @@ import {
   ChartTooltip,
   ChartTooltipContent,
 } from "@/components/ui/chart"
-import { Progress, ProgressLabel } from "@/components/ui/progress"
+import { Progress } from "@/components/ui/progress"
 import { Skeleton } from "@/components/ui/skeleton"
 import {
   formatDate,
   formatInteger,
   formatTokens,
   formatUsd,
-  quotaWindow,
   todayRange,
   tokenInput,
 } from "@/lib/format"
@@ -31,6 +31,10 @@ import {
 import { useAsync } from "@/hooks/use-async"
 import { call } from "@/lib/ipc"
 import type { Dashboard } from "@/types"
+import {
+  displayQuotaWindows,
+  type DisplayQuotaWindow,
+} from "@/features/providers/quota-estimate"
 
 export function DashboardPage({
   dashboard,
@@ -56,11 +60,14 @@ export function DashboardPage({
     () => trendPointsToSeries(usage?.trendPoints ?? []),
     [usage]
   )
-  const quota = quotaWindow(dashboard?.activeQuota)
+  const quotaWindows = displayQuotaWindows(dashboard?.activeQuota).sort(
+    (left, right) => left.windowSeconds - right.windowSeconds
+  )
 
   if (!dashboard || (!usage && !error)) {
     return (
-      <div className="grid min-h-full grid-rows-[minmax(240px,1fr)_80px] gap-3 px-3 pt-1 pb-3">
+      <div className="grid min-h-full grid-rows-[minmax(240px,1fr)_80px_80px] gap-3 px-3 pt-1 pb-3">
+        <Skeleton className="rounded-2xl" />
         <Skeleton className="rounded-2xl" />
         <Skeleton className="rounded-2xl" />
       </div>
@@ -175,22 +182,49 @@ export function DashboardPage({
 
       {dashboard.activeKind === "official" && (
         <Card size="sm" className="shrink-0">
-          <CardContent className="grid grid-cols-[minmax(0,1fr)_auto] items-end gap-4">
-            <Progress value={quota?.remainingPercent ?? 0}>
-              <ProgressLabel>Token 剩余额度</ProgressLabel>
-              <span className="ml-auto text-sm text-muted-foreground tabular-nums">
-                {quota ? `${quota.remainingPercent.toFixed(1)}%` : "暂不可用"}
-              </span>
-            </Progress>
-            <div className="text-right">
-              <div className="text-xs text-muted-foreground">重置日期</div>
-              <div className="mt-1 font-medium tabular-nums">
-                {formatDate(quota?.resetAt)}
-              </div>
-            </div>
+          <CardContent
+            className={
+              quotaWindows.length > 1
+                ? "grid min-w-0 grid-cols-2 gap-3"
+                : "grid min-w-0 gap-3"
+            }
+          >
+            {quotaWindows.length ? (
+              quotaWindows.map((quota) => (
+                <QuotaWindowCard
+                  key={`${quota.windowSeconds}-${quota.resetAt ?? "missing"}`}
+                  quota={quota}
+                />
+              ))
+            ) : (
+              <p className="text-xs text-muted-foreground">
+                {dashboard.activeQuota?.error || "额度暂不可用"}
+              </p>
+            )}
           </CardContent>
         </Card>
       )}
+    </div>
+  )
+}
+
+function QuotaWindowCard({ quota }: { quota: DisplayQuotaWindow }) {
+  return (
+    <div className="flex min-w-0 flex-col gap-1.5">
+      <div className="flex min-w-0 flex-wrap items-center gap-1.5 text-xs font-medium">
+        <Badge variant="outline">{quota.label}</Badge>
+        <span className="text-muted-foreground tabular-nums">
+          {quota.remainingPercent.toFixed(1)}% 可用
+        </span>
+      </div>
+      <Progress
+        value={quota.remainingPercent}
+        className="gap-0 [&_[data-slot=progress-track]]:h-1"
+        aria-label={`${quota.label} Token 可用额度`}
+      />
+      <div className="text-xs text-muted-foreground">
+        {quota.resetAt ? formatDate(quota.resetAt, true) : "—"} 重置
+      </div>
     </div>
   )
 }

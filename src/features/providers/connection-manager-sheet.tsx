@@ -3,9 +3,7 @@ import {
   Login03Icon,
   Refresh01Icon,
   TestTube01Icon,
-  UserMultipleIcon,
 } from "@hugeicons/core-free-icons"
-import { HugeiconsIcon } from "@hugeicons/react"
 
 import {
   AlertDialog,
@@ -18,6 +16,7 @@ import {
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog"
 import { Button } from "@/components/ui/button"
+import { Badge } from "@/components/ui/badge"
 import {
   Dialog,
   DialogBody,
@@ -47,7 +46,7 @@ import { Skeleton } from "@/components/ui/skeleton"
 import { Spinner } from "@/components/ui/spinner"
 import { hiddenOverlayStyles } from "@/components/ui/overlay-styles"
 import { toast } from "@/components/ui/toast"
-import { errorMessage } from "@/lib/format"
+import { errorMessage, formatDate } from "@/lib/format"
 import { useAsyncAction } from "@/hooks/use-async-action"
 import { call } from "@/lib/ipc"
 import type {
@@ -60,12 +59,14 @@ import type {
 import { AccountManagerDialog } from "./account-manager-dialog"
 import {
   accountDescription,
+  accountPlanText,
   accountIsExpired,
   accountWorkspaceIsDeactivated,
   buildFallbackCandidates,
   credentialMaintenanceMessage,
   emptyProvider,
   effectiveModelCount,
+  quotaStatusText,
   repairWarning,
   switchActiveConnection,
   type ConnectionKind,
@@ -76,10 +77,13 @@ import {
   type PendingAction,
 } from "./connection-item"
 import {
+  refreshAccountLogin,
   refreshAccountQuota,
+  syncProviderModels,
   testProviderConnection,
 } from "./connection-actions"
 import { ProviderEditorDialog } from "./provider-editor-dialog"
+import { displayQuotaWindows } from "./quota-estimate"
 
 type ConnectionPage = "dashboard" | "providers"
 
@@ -99,6 +103,80 @@ function truncateDeleteName(name: string) {
   return characters.length > DELETE_NAME_MAX_LENGTH
     ? `${characters.slice(0, DELETE_NAME_MAX_LENGTH).join("")}…`
     : name
+}
+
+function accountTitle(account: OfficialAccountView) {
+  return (
+    account.remark.trim() ||
+    account.name.trim() ||
+    account.email.trim() ||
+    "OpenAI 账号"
+  )
+}
+
+function AccountConnectionDetails({
+  account,
+}: {
+  account: OfficialAccountView
+}) {
+  const email = account.email.trim()
+  const quotaWindows = displayQuotaWindows(account.quota).sort(
+    (left, right) => left.windowSeconds - right.windowSeconds
+  )
+
+  return (
+    <div className="flex min-w-0 flex-col gap-1.5">
+      <div className="flex min-w-0 flex-wrap items-center gap-x-1.5 gap-y-0.5 text-xs text-muted-foreground">
+        <span className="min-w-0 break-words whitespace-normal">
+          {accountPlanText(account)}
+        </span>
+        {email && (
+          <>
+            <span aria-hidden="true">·</span>
+            <span className="min-w-0 break-words whitespace-normal">
+              {email}
+            </span>
+          </>
+        )}
+      </div>
+
+      {quotaWindows.length ? (
+        <div
+          className={
+            quotaWindows.length > 1
+              ? "grid min-w-0 grid-cols-2 gap-1.5"
+              : "grid min-w-0 gap-1.5"
+          }
+        >
+          {quotaWindows.map((quota) => (
+            <div
+              key={`${quota.windowSeconds}-${quota.resetAt ?? "missing"}`}
+              className="min-w-0 rounded-lg border border-border/70 bg-muted/30 px-2 py-1.5"
+            >
+              <div className="flex min-w-0 flex-wrap items-center gap-x-1.5 gap-y-0.5 text-xs">
+                <Badge
+                  variant="outline"
+                  className="h-4 px-1.5 text-[11px] leading-none"
+                >
+                  {quota.label}
+                </Badge>
+                <span className="min-w-0 break-words whitespace-normal tabular-nums">
+                  {quota.remainingPercent.toFixed(1)}% 可用
+                </span>
+              </div>
+              <div className="mt-0.5 min-w-0 text-[11px] leading-relaxed break-words whitespace-normal text-muted-foreground">
+                {quota.resetAt ? formatDate(quota.resetAt, true) : "—"} 重置
+              </div>
+            </div>
+          ))}
+        </div>
+      ) : (
+        <p className="min-w-0 text-xs leading-relaxed break-words whitespace-normal text-muted-foreground">
+          {quotaStatusText(account)}
+        </p>
+      )}
+    </div>
+  )
 }
 
 export function ConnectionManagerSheet({
@@ -390,10 +468,6 @@ export function ConnectionManagerSheet({
                       disabled={frozen || accounts.length === 0}
                       onClick={openBatchManager}
                     >
-                      <HugeiconsIcon
-                        icon={UserMultipleIcon}
-                        data-icon="inline-start"
-                      />
                       批量管理
                     </Button>
                   </div>
@@ -406,8 +480,9 @@ export function ConnectionManagerSheet({
                         key={account.id}
                         kind="account"
                         id={account.id}
-                        name={account.remark || account.name}
+                        name={accountTitle(account)}
                         description={accountDescription(account)}
+                        details={<AccountConnectionDetails account={account} />}
                         active={account.active}
                         canView={page === "providers"}
                         selected={
@@ -435,7 +510,7 @@ export function ConnectionManagerSheet({
                             active: account.active,
                             id: account.id,
                             kind: "account",
-                            name: account.remark || account.name,
+                            name: accountTitle(account),
                           })
                         }
                         moreActions={[
@@ -457,10 +532,7 @@ export function ConnectionManagerSheet({
                               void runAction(
                                 "login",
                                 account.id,
-                                () =>
-                                  call("connections_refresh_login", {
-                                    id: account.id,
-                                  }),
+                                () => refreshAccountLogin(account.id),
                                 "登录维护已完成",
                                 credentialMaintenanceMessage
                               ),
@@ -545,10 +617,7 @@ export function ConnectionManagerSheet({
                               void runAction(
                                 "models",
                                 provider.id,
-                                () =>
-                                  call("connections_list_models", {
-                                    id: provider.id,
-                                  }),
+                                () => syncProviderModels(provider.id),
                                 "模型已同步"
                               ),
                           },
@@ -692,20 +761,41 @@ export function ConnectionManagerSheet({
 function ConnectionListSkeleton() {
   return (
     <div className="flex flex-col gap-4" aria-label="正在读取连接">
-      {[0, 1].map((group) => (
-        <div key={group} className="flex flex-col gap-2">
-          <Skeleton className="h-3 w-20" />
-          {[0, 1].map((item) => (
-            <div key={item} className="flex items-center gap-2 px-1 py-1.5">
-              <Skeleton className="size-6 rounded-full" />
-              <div className="flex min-w-0 flex-1 flex-col gap-1.5">
-                <Skeleton className="h-3.5 w-24" />
-                <Skeleton className="h-3 w-full" />
+      <div className="flex flex-col gap-2">
+        <Skeleton className="h-3 w-20" />
+        {[0, 1].map((item) => (
+          <div key={item} className="flex items-start gap-2 px-1 py-1.5">
+            <Skeleton className="size-6 shrink-0 rounded-full" />
+            <div className="flex min-w-0 flex-1 flex-col gap-1.5">
+              <Skeleton className="h-3.5 w-32" />
+              <Skeleton className="h-3 w-40" />
+              <div className="grid grid-cols-2 gap-1.5">
+                {[0, 1].map((quota) => (
+                  <div
+                    key={quota}
+                    className="flex min-w-0 flex-col gap-1 rounded-lg border border-border/70 p-1.5"
+                  >
+                    <Skeleton className="h-3 w-14" />
+                    <Skeleton className="h-3 w-full" />
+                  </div>
+                ))}
               </div>
             </div>
-          ))}
-        </div>
-      ))}
+          </div>
+        ))}
+      </div>
+      <div className="flex flex-col gap-2">
+        <Skeleton className="h-3 w-20" />
+        {[0, 1].map((item) => (
+          <div key={item} className="flex items-center gap-2 px-1 py-1.5">
+            <Skeleton className="size-6 rounded-full" />
+            <div className="flex min-w-0 flex-1 flex-col gap-1.5">
+              <Skeleton className="h-3.5 w-24" />
+              <Skeleton className="h-3 w-full" />
+            </div>
+          </div>
+        ))}
+      </div>
     </div>
   )
 }

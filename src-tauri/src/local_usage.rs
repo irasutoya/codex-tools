@@ -1,9 +1,10 @@
 use crate::{
     models::{
         ActivationRecord, AppError, BillingMode, CostStatus, PricingMatchKind, PricingRule,
-        PricingScope, PricingScopeKind, RepriceResult, SavePricingRule, TokenBreakdown,
-        UsageGroupBy, UsageOverview, UsageQuery, UsageRange, UsageRefreshResult, UsageRow,
-        UsageSourceKind, UsageTotals, UsageTrend, UsageTrendPoint, UsageWarning,
+        PricingScope, PricingScopeKind, QuotaEstimate, QuotaEstimateWindowResult, RepriceResult,
+        SavePricingRule, TokenBreakdown, UsageGroupBy, UsageOverview, UsageQuery, UsageRange,
+        UsageRefreshResult, UsageRow, UsageSourceKind, UsageTotals, UsageTrend, UsageTrendPoint,
+        UsageWarning,
     },
     official_pricing::OfficialPricingCatalog,
     pricing::{
@@ -18,7 +19,7 @@ use crate::{
     },
 };
 use chrono::{Local, TimeZone, Timelike, Utc};
-use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, btree_map::Entry},
@@ -40,6 +41,27 @@ const PARSER_VERSION_METADATA_KEY: &str = "usage_parser_version";
 const COLLECTION_MODE: &str = "after_update";
 const COLLECTION_VERSION: &str = env!("CARGO_PKG_VERSION");
 const PARSER_VERSION: &str = "5";
+const UPSERT_USAGE_CURSOR_SQL: &str = r#"
+    INSERT INTO usage_cursors(
+        rollout_id, last_path, byte_offset, next_event_ordinal,
+        last_model, last_model_provider, usage_boundary_passed,
+        usage_boundary_state, subagent_boundary_mode,
+        file_length, file_modified_at_ms, prefix_sha256, updated_at_ms
+    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+    ON CONFLICT(rollout_id) DO UPDATE SET
+      last_path = excluded.last_path,
+      byte_offset = excluded.byte_offset,
+      next_event_ordinal = excluded.next_event_ordinal,
+      last_model = excluded.last_model,
+      last_model_provider = excluded.last_model_provider,
+      usage_boundary_passed = excluded.usage_boundary_passed,
+      usage_boundary_state = excluded.usage_boundary_state,
+      subagent_boundary_mode = excluded.subagent_boundary_mode,
+      file_length = excluded.file_length,
+      file_modified_at_ms = excluded.file_modified_at_ms,
+      prefix_sha256 = excluded.prefix_sha256,
+      updated_at_ms = excluded.updated_at_ms
+"#;
 
 struct BoundedLine {
     bytes: Vec<u8>,
@@ -91,6 +113,8 @@ fn read_bounded_line<R: BufRead>(
 #[derive(Clone)]
 pub(crate) struct UsageLedger {
     database_path: Arc<PathBuf>,
+    read_database_path: Option<Arc<PathBuf>>,
+    overlay_lock: Arc<Mutex<()>>,
     refresh_lock: Arc<Mutex<()>>,
 }
 
@@ -155,6 +179,21 @@ struct UsageAggregate {
     pricing_rule_version: Option<u64>,
 }
 
+struct QuotaEstimateAccumulator {
+    window_seconds: i64,
+    reset_at: i64,
+    used_percent: f64,
+    valid: bool,
+    events: u64,
+    cost_microusd: u64,
+    reason: Option<String>,
+}
+
+fn scaled_quota_estimate(cost_microusd: u64, used_percent: f64) -> Option<u64> {
+    let value = (cost_microusd as f64) * 100.0 / used_percent;
+    (value.is_finite() && value <= u64::MAX as f64).then(|| value.round() as u64)
+}
+
 #[derive(Debug, Clone)]
 struct ActivationSnapshot {
     effective_at_ms: i64,
@@ -183,17 +222,29 @@ enum AttributionOutcome {
 }
 
 impl UsageLedger {
+    #[cfg(test)]
     pub(crate) fn open(app_data_root: &Path) -> anyhow::Result<Self> {
+        Self::open_with_read_base(app_data_root, None)
+    }
+
+    pub(crate) fn open_with_read_base(
+        app_data_root: &Path,
+        read_data_root: Option<&Path>,
+    ) -> anyhow::Result<Self> {
         fs::create_dir_all(app_data_root)?;
         secure_directory(app_data_root)?;
         let database_path = app_data_root.join("usage.sqlite3");
         let ledger = Self {
             database_path: Arc::new(database_path),
+            read_database_path: read_data_root.map(|root| Arc::new(root.join("usage.sqlite3"))),
+            overlay_lock: Arc::new(Mutex::new(())),
             refresh_lock: Arc::new(Mutex::new(())),
         };
-        let connection = ledger.open_connection()?;
-        initialize_schema(&connection)?;
-        secure_file(&ledger.database_path)?;
+        if ledger.read_database_path.is_none() || ledger.database_path.exists() {
+            let connection = ledger.open_connection()?;
+            initialize_schema(&connection)?;
+            secure_file(&ledger.database_path)?;
+        }
         Ok(ledger)
     }
 
@@ -264,14 +315,26 @@ impl UsageLedger {
                 params![now_utc_ms.to_string()],
             )
             .map_err(|error| AppError::Internal(format!("保存本机用量刷新时间失败：{error}")))?;
+        connection
+            .execute(
+                "INSERT INTO usage_metadata(key, value) VALUES ('last_refresh_warning_count', ?1)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![
+                    result
+                        .warnings
+                        .len()
+                        .saturating_add(result.partial_lines)
+                        .to_string()
+                ],
+            )
+            .map_err(|error| AppError::Internal(format!("保存本机用量刷新告警失败：{error}")))?;
 
         Ok(result)
     }
 
     pub(crate) fn query(&self, query: UsageQuery) -> Result<UsageOverview, AppError> {
         query.range.validate()?;
-        let connection = self.open_connection().map_err(AppError::from)?;
-        initialize_schema(&connection).map_err(AppError::from)?;
+        let connection = self.open_read_connection().map_err(AppError::from)?;
 
         let collection_epoch = read_collection_epoch(&connection)?;
         let effective_start = collection_epoch
@@ -470,11 +533,164 @@ impl UsageLedger {
         })
     }
 
+    /// 单次读取目标账号最早额度窗口到现在的已归属事件，再对每个窗口聚合。
+    /// 此处绝不触发日志刷新、额度请求或价格网络刷新。
+    pub(crate) fn estimate_account_quota(
+        &self,
+        canonical_account_id: &str,
+        windows: &[(i64, i64, f64)],
+        now_utc_ms: i64,
+    ) -> Result<Vec<QuotaEstimateWindowResult>, AppError> {
+        if windows.is_empty() {
+            return Ok(vec![]);
+        }
+        let connection = self.open_read_connection().map_err(AppError::from)?;
+        let collection_epoch = read_collection_epoch(&connection)?;
+        let warning_count = read_metadata(&connection, "last_refresh_warning_count")?
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(0);
+        let earliest_start = windows
+            .iter()
+            .map(|(seconds, reset_at, _)| {
+                reset_at
+                    .saturating_mul(1_000)
+                    .saturating_sub(seconds.saturating_mul(1_000))
+            })
+            .min()
+            .unwrap_or(now_utc_ms);
+        let mut states = windows
+            .iter()
+            .map(
+                |(window_seconds, reset_at, used_percent)| QuotaEstimateAccumulator {
+                    window_seconds: *window_seconds,
+                    reset_at: *reset_at,
+                    used_percent: *used_percent,
+                    valid: true,
+                    events: 0,
+                    cost_microusd: 0,
+                    reason: None,
+                },
+            )
+            .collect::<Vec<_>>();
+
+        let mut statement = connection
+            .prepare(
+                "SELECT usage_events.occurred_at_ms, usage_events.cost_status,
+                        usage_events.estimated_cost_microusd
+                   FROM usage_events
+              LEFT JOIN account_identity_aliases
+                     ON account_identity_aliases.source_kind = usage_events.source_kind
+                    AND account_identity_aliases.provider_id IS usage_events.provider_id
+                    AND account_identity_aliases.local_account_id = usage_events.account_id
+                  WHERE usage_events.occurred_at_ms >= ?1
+                    AND usage_events.occurred_at_ms < ?2
+                    AND usage_events.source_kind = 'official'
+                    AND COALESCE(account_identity_aliases.canonical_account_id, usage_events.account_id) = ?3
+               ORDER BY usage_events.occurred_at_ms, usage_events.event_ordinal",
+            )
+            .map_err(|error| AppError::Internal(format!("读取额度估算用量失败：{error}")))?;
+        let rows = statement
+            .query_map(
+                params![earliest_start, now_utc_ms, canonical_account_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                    ))
+                },
+            )
+            .map_err(|error| AppError::Internal(format!("读取额度估算用量失败：{error}")))?;
+        for row in rows {
+            let (occurred_at_ms, cost_status, cost_microusd) =
+                row.map_err(|error| AppError::Internal(format!("读取额度估算用量失败：{error}")))?;
+            for state in &mut states {
+                let start = state
+                    .reset_at
+                    .saturating_mul(1_000)
+                    .saturating_sub(state.window_seconds.saturating_mul(1_000));
+                let end = state.reset_at.saturating_mul(1_000).min(now_utc_ms);
+                if occurred_at_ms < start || occurred_at_ms >= end {
+                    continue;
+                }
+                state.events = state.events.saturating_add(1);
+                if cost_status != "estimated" || cost_microusd.is_none() {
+                    state.valid = false;
+                    state.reason =
+                        Some("窗口内存在未完整定价、订阅、部分或未归属的本机用量。".into());
+                    continue;
+                }
+                state.cost_microusd = state
+                    .cost_microusd
+                    .saturating_add(cost_microusd.unwrap_or_default().max(0) as u64);
+            }
+        }
+
+        Ok(states
+            .into_iter()
+            .map(|state| {
+                let start = state
+                    .reset_at
+                    .saturating_mul(1_000)
+                    .saturating_sub(state.window_seconds.saturating_mul(1_000));
+                let reason = if state.used_percent < 10.0 {
+                    Some("额度已用比例低于 10%，样本不足，暂不估算。".into())
+                } else if warning_count > 0 {
+                    Some("最近一次本机用量刷新或解析有告警，请刷新并确认用量完整后再估算。".into())
+                } else if collection_epoch.is_none_or(|epoch| epoch > start) {
+                    Some("本机用量采集起点晚于该额度窗口起点，无法完整估算。".into())
+                } else if state.events == 0 {
+                    Some("该额度窗口内没有可用于估算的本机用量。".into())
+                } else if !state.valid {
+                    state.reason
+                } else {
+                    None
+                };
+                let estimated_total_microusd = if reason.is_none() {
+                    let Some(value) =
+                        scaled_quota_estimate(state.cost_microusd, state.used_percent)
+                    else {
+                        return QuotaEstimateWindowResult {
+                            window_seconds: state.window_seconds,
+                            reset_at: state.reset_at,
+                            success: false,
+                            estimate: None,
+                            reason: Some("估算金额超出可安全表示的范围。".into()),
+                        };
+                    };
+                    value
+                } else {
+                    0
+                };
+                match reason {
+                    Some(reason) => QuotaEstimateWindowResult {
+                        window_seconds: state.window_seconds,
+                        reset_at: state.reset_at,
+                        success: false,
+                        estimate: None,
+                        reason: Some(reason),
+                    },
+                    None => QuotaEstimateWindowResult {
+                        window_seconds: state.window_seconds,
+                        reset_at: state.reset_at,
+                        success: true,
+                        estimate: Some(QuotaEstimate {
+                            window_seconds: state.window_seconds,
+                            reset_at: state.reset_at,
+                            estimated_total_microusd,
+                            estimated_at: now_utc_ms / 1_000,
+                        }),
+                        reason: None,
+                    },
+                }
+            })
+            .collect())
+    }
+
     /// 按本机自然日或小时聚合用量事件，返回趋势序列（受统计周期起点约束）。
     pub(crate) fn trend(&self, range: UsageRange) -> Result<UsageTrend, AppError> {
         range.validate()?;
-        let connection = self.open_connection().map_err(AppError::from)?;
-        initialize_schema(&connection).map_err(AppError::from)?;
+        let connection = self.open_read_connection().map_err(AppError::from)?;
 
         let collection_epoch = read_collection_epoch(&connection)?;
         let effective_start = collection_epoch
@@ -645,8 +861,7 @@ impl UsageLedger {
         &self,
         scope: Option<PricingScope>,
     ) -> Result<Vec<PricingRule>, AppError> {
-        let connection = self.open_connection().map_err(AppError::from)?;
-        initialize_schema(&connection).map_err(AppError::from)?;
+        let connection = self.open_read_connection().map_err(AppError::from)?;
         let rules = load_pricing_rule_dtos(&connection)?;
         Ok(rules
             .into_iter()
@@ -664,8 +879,7 @@ impl UsageLedger {
     pub(crate) fn official_pricing_catalog(
         &self,
     ) -> Result<Option<OfficialPricingCatalog>, AppError> {
-        let connection = self.open_connection().map_err(AppError::from)?;
-        initialize_schema(&connection).map_err(AppError::from)?;
+        let connection = self.open_read_connection().map_err(AppError::from)?;
         load_official_catalog(&connection).map_err(AppError::from)
     }
 
@@ -1003,6 +1217,7 @@ impl UsageLedger {
     }
 
     fn open_connection(&self) -> anyhow::Result<Connection> {
+        self.ensure_overlay_database()?;
         let connection = Connection::open(self.database_path.as_ref())?;
         connection.execute_batch(
             "PRAGMA journal_mode = WAL;
@@ -1011,6 +1226,142 @@ impl UsageLedger {
         )?;
         Ok(connection)
     }
+
+    fn open_read_connection(&self) -> anyhow::Result<Connection> {
+        if self.database_path.exists() || self.read_database_path.is_none() {
+            return self.open_connection();
+        }
+        let Some(read_database_path) = self.read_database_path.as_deref() else {
+            unreachable!("只读基底路径已在前置条件中确认存在")
+        };
+        if read_database_path.is_file() {
+            let connection = open_read_only_connection(read_database_path)?;
+            validate_read_schema(&connection)?;
+            return Ok(connection);
+        }
+
+        // 未提供 usage.sqlite3 时仍保持纯读取：内存数据库只为返回空查询结果，
+        // 不会在覆盖层或只读基底创建任何文件。
+        let connection = Connection::open_in_memory()?;
+        initialize_schema(&connection)?;
+        Ok(connection)
+    }
+
+    fn ensure_overlay_database(&self) -> anyhow::Result<()> {
+        let _guard = self
+            .overlay_lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("本机用量覆盖层锁已损坏，请重启应用。"))?;
+        if self.database_path.exists() {
+            return Ok(());
+        }
+
+        let parent = self
+            .database_path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("本机用量覆盖层路径无效。"))?;
+        fs::create_dir_all(parent)?;
+        secure_directory(parent)?;
+
+        if let Some(read_database_path) = self
+            .read_database_path
+            .as_deref()
+            .filter(|path| path.is_file())
+        {
+            copy_read_database(read_database_path, self.database_path.as_ref())?;
+        } else {
+            drop(Connection::open(self.database_path.as_ref())?);
+        }
+        secure_file(&self.database_path)?;
+        Ok(())
+    }
+}
+
+fn open_read_only_connection(path: &Path) -> anyhow::Result<Connection> {
+    let wal_path = sqlite_sidecar_path(path, "-wal");
+    if wal_path.exists() {
+        let shm_path = sqlite_sidecar_path(path, "-shm");
+        if !wal_path.is_file() || !shm_path.is_file() {
+            anyhow::bail!(
+                "只读基底的本机用量数据库存在 WAL 但缺少可用的 -shm；为避免 SQLite 为读取创建或修改基底文件，测试版不会读取或分叉该数据库。"
+            )
+        }
+
+        // 已存在的 WAL 和 -shm 允许 SQLite 以严格只读模式读取最新提交；
+        // 不使用 immutable，以免忽略 WAL 中尚未 checkpoint 的数据。
+        let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        return Connection::open_with_flags(path, flags).map_err(Into::into);
+    }
+
+    // 没有 WAL 时继续使用 immutable，避免 SQLite 为普通只读连接创建空的
+    // -wal 或 -shm 文件。若基底随后出现 WAL，本次读取仍是安全的旧快照。
+    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
+        | OpenFlags::SQLITE_OPEN_NO_MUTEX
+        | OpenFlags::SQLITE_OPEN_URI;
+    Connection::open_with_flags(read_only_database_uri(path)?, flags).map_err(Into::into)
+}
+
+fn sqlite_sidecar_path(path: &Path, suffix: &str) -> PathBuf {
+    let mut sidecar = path.as_os_str().to_os_string();
+    sidecar.push(suffix);
+    PathBuf::from(sidecar)
+}
+
+fn read_only_database_uri(path: &Path) -> anyhow::Result<String> {
+    let path = fs::canonicalize(path)?;
+    let raw = path.to_string_lossy();
+    #[cfg(windows)]
+    let raw = raw.strip_prefix("\\\\?\\").unwrap_or(raw.as_ref());
+    let text = raw.replace('\\', "/");
+    let mut encoded = String::with_capacity(text.len());
+    for byte in text.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~' | b'/' | b':') {
+            encoded.push(char::from(byte));
+        } else {
+            use std::fmt::Write as _;
+            write!(&mut encoded, "%{byte:02X}").expect("写入 String 不会失败");
+        }
+    }
+    #[cfg(windows)]
+    {
+        Ok(format!("file:///{encoded}?mode=ro&immutable=1"))
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(format!("file://{encoded}?mode=ro&immutable=1"))
+    }
+}
+
+fn validate_read_schema(connection: &Connection) -> anyhow::Result<()> {
+    let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version > SCHEMA_VERSION {
+        anyhow::bail!("本机用量数据库版本较新，当前版本无法读取。")
+    }
+    if version < SCHEMA_VERSION {
+        anyhow::bail!("只读基底的本机用量数据库需要先分叉到覆盖层后才能安全迁移。")
+    }
+    Ok(())
+}
+
+fn copy_read_database(source_path: &Path, target_path: &Path) -> anyhow::Result<()> {
+    let source = open_read_only_connection(source_path)?;
+    let version: i64 = source.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version > SCHEMA_VERSION {
+        anyhow::bail!("本机用量数据库版本较新，当前版本无法分叉。")
+    }
+
+    let temporary = target_path.with_extension(format!("sqlite3.overlay-{}", Uuid::new_v4()));
+    let temporary_text = temporary.to_string_lossy().into_owned();
+    if let Err(error) = source.execute("VACUUM INTO ?1", params![temporary_text]) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error.into());
+    }
+    drop(source);
+    if let Err(error) = fs::rename(&temporary, target_path) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error.into());
+    }
+    Ok(())
 }
 
 fn initialize_schema(connection: &Connection) -> anyhow::Result<()> {
@@ -1408,25 +1759,7 @@ fn initialize_collection_epoch(
             .map_err(|error| AppError::Internal(format!("读取本机用量文件状态失败：{error}")))?;
         transaction
             .execute(
-                "INSERT INTO usage_cursors(
-                    rollout_id, last_path, byte_offset, next_event_ordinal,
-                    last_model, last_model_provider, usage_boundary_passed,
-                    usage_boundary_state, subagent_boundary_mode,
-                    file_length, file_modified_at_ms, prefix_sha256, updated_at_ms
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
-                 ON CONFLICT(rollout_id) DO UPDATE SET
-                   last_path = excluded.last_path,
-                   byte_offset = excluded.byte_offset,
-                   next_event_ordinal = excluded.next_event_ordinal,
-                   last_model = excluded.last_model,
-                   last_model_provider = excluded.last_model_provider,
-                   usage_boundary_passed = excluded.usage_boundary_passed,
-                   usage_boundary_state = excluded.usage_boundary_state,
-                   subagent_boundary_mode = excluded.subagent_boundary_mode,
-                   file_length = excluded.file_length,
-                   file_modified_at_ms = excluded.file_modified_at_ms,
-                   prefix_sha256 = excluded.prefix_sha256,
-                   updated_at_ms = excluded.updated_at_ms",
+                UPSERT_USAGE_CURSOR_SQL,
                 params![
                     rollout_id,
                     path.display().to_string(),
@@ -1710,25 +2043,7 @@ fn refresh_file(
     }
     transaction
         .execute(
-            "INSERT INTO usage_cursors(
-                rollout_id, last_path, byte_offset, next_event_ordinal,
-                last_model, last_model_provider, usage_boundary_passed,
-                usage_boundary_state, subagent_boundary_mode,
-                file_length, file_modified_at_ms, prefix_sha256, updated_at_ms
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
-             ON CONFLICT(rollout_id) DO UPDATE SET
-               last_path = excluded.last_path,
-               byte_offset = excluded.byte_offset,
-               next_event_ordinal = excluded.next_event_ordinal,
-               last_model = excluded.last_model,
-               last_model_provider = excluded.last_model_provider,
-               usage_boundary_passed = excluded.usage_boundary_passed,
-               usage_boundary_state = excluded.usage_boundary_state,
-               subagent_boundary_mode = excluded.subagent_boundary_mode,
-               file_length = excluded.file_length,
-               file_modified_at_ms = excluded.file_modified_at_ms,
-               prefix_sha256 = excluded.prefix_sha256,
-               updated_at_ms = excluded.updated_at_ms",
+            UPSERT_USAGE_CURSOR_SQL,
             params![
                 rollout_id,
                 path.display().to_string(),
@@ -2783,7 +3098,11 @@ fn u64_db(value: u64) -> Result<i64, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ActivationSnapshot, UsageLedger, file_modified_at_ms, read_bounded_line};
+    use super::{
+        ActivationSnapshot, COLLECTION_EPOCH_METADATA_KEY, UsageLedger, file_modified_at_ms,
+        open_read_only_connection, read_bounded_line, read_metadata, scaled_quota_estimate,
+        sqlite_sidecar_path,
+    };
     use crate::models::{
         ActivationRecord, AppError, BillingMode, CostStatus, PricingMatchKind, PricingScopeKind,
         SavePricingRule, UsageGroupBy, UsageQuery, UsageRange, UsageSourceKind,
@@ -2791,7 +3110,55 @@ mod tests {
     use crate::official_pricing::build_catalog;
     use crate::usage_log::{ParsedUsageEvent, TokenUsage, UsageQuality};
     use chrono::DateTime;
-    use std::{fs, io::Cursor, path::Path};
+    use rusqlite::{Connection, OpenFlags, params};
+    use std::{
+        collections::{BTreeMap, BTreeSet},
+        ffi::OsString,
+        fs,
+        io::Cursor,
+        path::Path,
+    };
+
+    struct SqliteBaseSnapshot {
+        files: BTreeMap<&'static str, Vec<u8>>,
+        directory_entries: BTreeSet<OsString>,
+    }
+
+    fn capture_sqlite_base_snapshot(root: &Path, database: &Path) -> SqliteBaseSnapshot {
+        let files = ["", "-wal", "-shm"]
+            .into_iter()
+            .map(|suffix| {
+                let path = if suffix.is_empty() {
+                    database.to_path_buf()
+                } else {
+                    sqlite_sidecar_path(database, suffix)
+                };
+                (suffix, fs::read(path).unwrap())
+            })
+            .collect();
+        let directory_entries = fs::read_dir(root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        SqliteBaseSnapshot {
+            files,
+            directory_entries,
+        }
+    }
+
+    fn assert_sqlite_base_unchanged(
+        before: &SqliteBaseSnapshot,
+        after: &SqliteBaseSnapshot,
+    ) {
+        assert!(
+            before.files == after.files,
+            "合成只读基底的 SQLite 文件内容发生变化"
+        );
+        assert!(
+            before.directory_entries == after.directory_entries,
+            "合成只读基底的目录文件集合发生变化"
+        );
+    }
 
     #[test]
     fn bounded_line_drains_oversized_records_without_retaining_them() {
@@ -2901,6 +3268,158 @@ mod tests {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, text).unwrap();
         path
+    }
+
+    #[test]
+    fn quota_estimate_scales_safely_and_rounds_to_nearest_microusd() {
+        assert_eq!(scaled_quota_estimate(250_000, 25.0), Some(1_000_000));
+        assert_eq!(scaled_quota_estimate(1, 30.0), Some(3));
+        assert_eq!(scaled_quota_estimate(u64::MAX, 0.000_000_1), None);
+    }
+
+    fn estimate_test_ledger() -> (tempfile::TempDir, UsageLedger) {
+        let temp = tempfile::tempdir().unwrap();
+        let ledger = UsageLedger::open(&temp.path().join("app")).unwrap();
+        (temp, ledger)
+    }
+
+    fn set_estimate_metadata(ledger: &UsageLedger, collection_epoch: i64, warning_count: usize) {
+        let connection = ledger.open_connection().unwrap();
+        connection
+            .execute(
+                "INSERT INTO usage_metadata(key, value) VALUES (?1, ?2)",
+                params![COLLECTION_EPOCH_METADATA_KEY, collection_epoch.to_string()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO usage_metadata(key, value) VALUES ('last_refresh_warning_count', ?1)",
+                params![warning_count.to_string()],
+            )
+            .unwrap();
+    }
+
+    fn insert_estimate_event(
+        ledger: &UsageLedger,
+        ordinal: i64,
+        occurred_at_ms: i64,
+        account_id: &str,
+        cost_status: &str,
+        cost_microusd: Option<i64>,
+    ) {
+        ledger
+            .open_connection()
+            .unwrap()
+            .execute(
+                "INSERT INTO usage_events(
+                    event_id, rollout_id, event_ordinal, occurred_at_ms, model, model_provider,
+                    source_kind, provider_id, account_id, source_name,
+                    input_tokens, cached_input_tokens, cache_write_input_tokens, output_tokens,
+                    reasoning_output_tokens, total_tokens, usage_quality, pricing_rule_id,
+                    pricing_rule_version, pricing_rule_name, estimated_cost_microusd, cost_status,
+                    created_at_ms
+                 ) VALUES (?1, 'estimate-rollout', ?2, ?3, 'gpt-5.6', NULL,
+                    'official', NULL, ?4, '测试账号', 1, 0, 0, 1, 0, 2, 'complete', NULL,
+                    NULL, NULL, ?5, ?6, ?3)",
+                params![
+                    format!("estimate-{ordinal}"),
+                    ordinal,
+                    occurred_at_ms,
+                    account_id,
+                    cost_microusd,
+                    cost_status
+                ],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn estimate_account_quota_isolates_accounts_and_aggregates_windows_in_one_scan() {
+        let (_temp, ledger) = estimate_test_ledger();
+        let now = 10_000_000_000_i64;
+        let reset_at = now / 1_000 + 3_600;
+        let seven_day_start = reset_at * 1_000 - 604_800_000;
+        set_estimate_metadata(&ledger, seven_day_start - 1, 0);
+        ledger
+            .sync_official_account_identities(&[
+                ("local-a".into(), "canonical-a".into()),
+                ("local-b".into(), "canonical-b".into()),
+            ])
+            .unwrap();
+        insert_estimate_event(&ledger, 1, now - 60_000, "local-a", "estimated", Some(250));
+        insert_estimate_event(
+            &ledger,
+            2,
+            now - 500_000_000,
+            "local-a",
+            "estimated",
+            Some(700),
+        );
+        insert_estimate_event(
+            &ledger,
+            3,
+            now - 60_000,
+            "local-b",
+            "estimated",
+            Some(9_999),
+        );
+
+        let result = ledger
+            .estimate_account_quota(
+                "canonical-a",
+                &[(18_000, reset_at, 25.0), (604_800, reset_at, 50.0)],
+                now,
+            )
+            .unwrap();
+
+        assert_eq!(result.len(), 2);
+        assert_eq!(
+            result[0]
+                .estimate
+                .as_ref()
+                .unwrap()
+                .estimated_total_microusd,
+            1_000
+        );
+        assert_eq!(
+            result[1]
+                .estimate
+                .as_ref()
+                .unwrap()
+                .estimated_total_microusd,
+            1_900
+        );
+    }
+
+    #[test]
+    fn estimate_account_quota_rejects_each_accuracy_gate() {
+        let now = 10_000_000_000_i64;
+        let reset_at = now / 1_000 + 3_600;
+        let start = reset_at * 1_000 - 18_000_000;
+        for (name, used_percent, collection_epoch, warning_count, cost_status, insert_event) in [
+            ("低比例", 9.9, start - 1, 0, "estimated", true),
+            ("采集过晚", 20.0, start + 1, 0, "estimated", true),
+            ("刷新告警", 20.0, start - 1, 1, "estimated", true),
+            ("未定价", 20.0, start - 1, 0, "unpriced", true),
+            ("部分", 20.0, start - 1, 0, "partial", true),
+            ("订阅", 20.0, start - 1, 0, "subscription", true),
+            ("未归属", 20.0, start - 1, 0, "unattributed", true),
+            ("无事件", 20.0, start - 1, 0, "estimated", false),
+        ] {
+            let (_temp, ledger) = estimate_test_ledger();
+            set_estimate_metadata(&ledger, collection_epoch, warning_count);
+            ledger
+                .sync_official_account_identities(&[("local-a".into(), "canonical-a".into())])
+                .unwrap();
+            if insert_event {
+                insert_estimate_event(&ledger, 1, now - 60_000, "local-a", cost_status, Some(100));
+            }
+            let result = ledger
+                .estimate_account_quota("canonical-a", &[(18_000, reset_at, used_percent)], now)
+                .unwrap();
+            assert!(!result[0].success, "{name} 应拒绝估算");
+            assert!(result[0].reason.is_some(), "{name} 应说明原因");
+        }
     }
 
     fn save_test_catalog(ledger: &UsageLedger) {
@@ -4006,6 +4525,133 @@ mod tests {
                 & 0o777,
             0o600
         );
+    }
+
+    #[test]
+    fn read_base_usage_database_stays_read_only_until_overlay_write() {
+        let temp = tempfile::tempdir().unwrap();
+        let base_root = temp.path().join("base");
+        let overlay_root = temp.path().join("overlay");
+        let base_ledger = UsageLedger::open(&base_root).unwrap();
+        let base_database = base_root.join("usage.sqlite3");
+        let base_wal = base_root.join("usage.sqlite3-wal");
+        base_ledger
+            .open_connection()
+            .unwrap()
+            .execute(
+                "INSERT INTO usage_metadata(key, value) VALUES ('base_marker', 'base-value')",
+                [],
+            )
+            .unwrap();
+        let base_before = fs::read(&base_database).unwrap();
+        let base_wal_before = fs::read(&base_wal).ok();
+
+        let ledger = UsageLedger::open_with_read_base(&overlay_root, Some(&base_root)).unwrap();
+        let connection = ledger.open_read_connection().unwrap();
+        assert_eq!(
+            read_metadata(&connection, "base_marker").unwrap(),
+            Some("base-value".into())
+        );
+        drop(connection);
+        assert!(!overlay_root.join("usage.sqlite3").exists());
+        assert_eq!(fs::read(&base_database).unwrap(), base_before);
+        assert_eq!(fs::read(&base_wal).ok(), base_wal_before);
+
+        ledger.cancel_pending_activations().unwrap();
+        let overlay_database = overlay_root.join("usage.sqlite3");
+        assert!(overlay_database.exists());
+        let overlay_connection = ledger.open_connection().unwrap();
+        assert_eq!(
+            read_metadata(&overlay_connection, "base_marker").unwrap(),
+            Some("base-value".into())
+        );
+        overlay_connection
+            .execute(
+                "INSERT INTO usage_metadata(key, value) VALUES ('overlay_marker', 'overlay-value')",
+                [],
+            )
+            .unwrap();
+        drop(overlay_connection);
+
+        let base_connection = open_read_only_connection(&base_database).unwrap();
+        assert_eq!(
+            read_metadata(&base_connection, "overlay_marker").unwrap(),
+            None
+        );
+        assert_eq!(
+            read_metadata(&base_connection, "base_marker").unwrap(),
+            Some("base-value".into())
+        );
+        assert_eq!(fs::read(&base_database).unwrap(), base_before);
+        assert_eq!(fs::read(&base_wal).ok(), base_wal_before);
+    }
+
+    #[test]
+    fn active_read_base_wal_is_read_and_forked_without_source_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let base_root = temp.path().join("base");
+        let overlay_root = temp.path().join("overlay");
+        let base_ledger = UsageLedger::open(&base_root).unwrap();
+        let base_database = base_root.join("usage.sqlite3");
+        let base_wal = sqlite_sidecar_path(&base_database, "-wal");
+        let base_shm = sqlite_sidecar_path(&base_database, "-shm");
+        let connection = base_ledger.open_connection().unwrap();
+        connection.pragma_update(None, "wal_autocheckpoint", 0).unwrap();
+        connection
+            .execute(
+                "INSERT INTO usage_metadata(key, value) VALUES ('wal_only_marker', 'wal-only-marker')",
+                [],
+            )
+            .unwrap();
+        assert!(base_wal.is_file());
+        assert!(base_shm.is_file());
+        assert!(
+            !fs::read(&base_database)
+                .unwrap()
+                .windows(b"wal-only-marker".len())
+                .any(|bytes| bytes == b"wal-only-marker"),
+            "合成 marker 不应已写回基底主数据库"
+        );
+        assert!(
+            fs::read(&base_wal)
+                .unwrap()
+                .windows(b"wal-only-marker".len())
+                .any(|bytes| bytes == b"wal-only-marker"),
+            "合成 marker 应只存在于 WAL"
+        );
+        let base_before = capture_sqlite_base_snapshot(&base_root, &base_database);
+
+        let strict_read_only = Connection::open_with_flags(
+            &base_database,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .unwrap();
+        assert_eq!(
+            read_metadata(&strict_read_only, "wal_only_marker").unwrap(),
+            Some("wal-only-marker".into())
+        );
+        drop(strict_read_only);
+
+        let ledger = UsageLedger::open_with_read_base(&overlay_root, Some(&base_root)).unwrap();
+        let read_connection = ledger.open_read_connection().unwrap();
+        assert_eq!(
+            read_metadata(&read_connection, "wal_only_marker").unwrap(),
+            Some("wal-only-marker".into())
+        );
+        drop(read_connection);
+        assert!(!overlay_root.join("usage.sqlite3").exists());
+
+        ledger.cancel_pending_activations().unwrap();
+        let overlay_connection = ledger.open_connection().unwrap();
+        assert_eq!(
+            read_metadata(&overlay_connection, "wal_only_marker").unwrap(),
+            Some("wal-only-marker".into())
+        );
+        drop(overlay_connection);
+
+        let base_after = capture_sqlite_base_snapshot(&base_root, &base_database);
+        assert_sqlite_base_unchanged(&base_before, &base_after);
+        drop(connection);
     }
 
     #[test]

@@ -20,6 +20,8 @@
   "type": "module",
   "scripts": {
     "dev": "tauri dev",
+    "dev:live": "node scripts/dev-live.mjs",
+    "dev:demo": "node scripts/dev-demo.mjs",
     "frontend:dev": "vite",
     "build": "vite build",
     "verify": "npm run version:check && npm run format:check && npm run lint && npm run typecheck && npm run test",

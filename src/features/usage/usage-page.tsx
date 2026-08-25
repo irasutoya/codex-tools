@@ -83,6 +83,13 @@ function refreshOfficialPricingOnce() {
   return automaticOfficialPricingSync
 }
 
+function officialPricingCatalogChanged(
+  previous: OfficialPricingCatalog | undefined,
+  next: OfficialPricingCatalog
+) {
+  return !previous || previous.contentSha256 !== next.contentSha256
+}
+
 export function UsagePage({
   refreshRevision,
   days,
@@ -201,15 +208,17 @@ export function UsagePage({
       if (!mounted.current) return undefined
       setOfficialCatalog(catalog)
       toast.add({ title: "官方价格已同步", type: "success" })
-      try {
-        await reloadOverview(activeQuery.current)
-      } catch (reason) {
-        if (!mounted.current) return catalog
-        toast.add({
-          title: "无法更新费用概览",
-          description: errorMessage(reason),
-          type: "error",
-        })
+      if (officialPricingCatalogChanged(officialCatalog, catalog)) {
+        try {
+          await reloadOverview(activeQuery.current)
+        } catch (reason) {
+          if (!mounted.current) return catalog
+          toast.add({
+            title: "无法更新费用概览",
+            description: errorMessage(reason),
+            type: "error",
+          })
+        }
       }
       return catalog
     } catch (reason) {
@@ -225,14 +234,18 @@ export function UsagePage({
     } finally {
       if (mounted.current) setSyncing(false)
     }
-  }, [reloadOverview])
+  }, [officialCatalog, reloadOverview])
 
   useEffect(() => {
     let cancelled = false
     void (async () => {
+      let cachedCatalog: OfficialPricingCatalog | undefined
       try {
         const cached = await call("usage_get_official_pricing")
-        if (!cancelled) setOfficialCatalog(cached)
+        if (!cancelled) {
+          setOfficialCatalog(cached)
+        }
+        cachedCatalog = cached
       } catch {
         // The network refresh below can still recover when no cache is present.
       }
@@ -242,10 +255,12 @@ export function UsagePage({
         if (cancelled) return
         setOfficialCatalog(catalog)
         setOfficialPricingError(undefined)
-        try {
-          await reloadOverview(activeQuery.current)
-        } catch {
-          // The catalog is still valid; the normal overview request can recover.
+        if (officialPricingCatalogChanged(cachedCatalog, catalog)) {
+          try {
+            await reloadOverview(activeQuery.current)
+          } catch {
+            // The catalog is still valid; the normal overview request can recover.
+          }
         }
       } catch (reason) {
         if (!cancelled) setOfficialPricingError(errorMessage(reason))

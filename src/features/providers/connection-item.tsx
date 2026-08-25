@@ -1,9 +1,8 @@
-import { memo } from "react"
+import { memo, type ReactNode } from "react"
 import {
   ApiIcon,
   Delete02Icon,
   Edit02Icon,
-  Key01Icon,
   MoreHorizontalIcon,
 } from "@hugeicons/core-free-icons"
 import { HugeiconsIcon } from "@hugeicons/react"
@@ -52,6 +51,7 @@ export const ConnectionItem = memo(function ConnectionItem({
   id,
   name,
   description,
+  details,
   active,
   canView,
   selected,
@@ -70,6 +70,7 @@ export const ConnectionItem = memo(function ConnectionItem({
   id: string
   name: string
   description: string
+  details?: ReactNode
   active: boolean
   canView: boolean
   selected: boolean
@@ -93,12 +94,34 @@ export const ConnectionItem = memo(function ConnectionItem({
       variant={active || selected ? "muted" : "outline"}
       aria-label={`${kind === "account" ? "账号" : "API 服务"} ${name}`}
     >
-      <ItemMedia variant="icon">
-        <HugeiconsIcon icon={kind === "account" ? Key01Icon : ApiIcon} />
-      </ItemMedia>
+      {kind === "provider" && (
+        <ItemMedia variant="icon">
+          <HugeiconsIcon icon={ApiIcon} />
+        </ItemMedia>
+      )}
       <ItemContent title={description}>
-        <ItemTitle className="w-full">{name}</ItemTitle>
-        <ItemDescription>{description}</ItemDescription>
+        <ItemTitle
+          className={
+            kind === "account"
+              ? "line-clamp-none w-full break-words whitespace-normal"
+              : "w-full"
+          }
+        >
+          {name}
+        </ItemTitle>
+        {details ? (
+          <>
+            <div
+              data-slot="item-description"
+              className="min-w-0 text-left text-sm font-normal text-muted-foreground"
+            >
+              {details}
+            </div>
+            <span className="sr-only">{description}</span>
+          </>
+        ) : (
+          <ItemDescription>{description}</ItemDescription>
+        )}
       </ItemContent>
       <ItemActions className="max-w-full flex-wrap justify-end gap-1 self-start">
         {active && <Badge>当前</Badge>}

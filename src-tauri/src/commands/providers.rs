@@ -16,6 +16,14 @@ use crate::{
 use std::collections::BTreeMap;
 use tauri::State;
 
+fn require_api_key(provider: &ProviderProfile) -> Result<&str, AppError> {
+    provider
+        .api_key
+        .as_deref()
+        .filter(|key| !key.trim().is_empty())
+        .ok_or_else(|| AppError::InvalidConfig("此服务还没有 API Key，请先编辑并填写。".into()))
+}
+
 #[tauri::command]
 pub(crate) fn connections_list(store: State<Store>) -> Result<ProviderOverview, AppError> {
     store.provider_overview()
@@ -271,21 +279,12 @@ pub(crate) async fn connections_test_provider(
 ) -> Result<ProviderTestResult, AppError> {
     let mut provider = store.provider(&id)?;
     provider.normalize_and_validate()?;
-    if provider
-        .api_key
-        .as_deref()
-        .is_none_or(|key| key.trim().is_empty())
-    {
-        return Err(AppError::InvalidConfig(
-            "此服务还没有 API Key，请先编辑并填写。".into(),
-        ));
-    }
+    let key = require_api_key(&provider)?;
     let endpoint = provider_http::models_endpoint(&provider.base_url);
     let mut request = client
         .current()?
         .get(&endpoint)
         .headers(provider_http::custom_headers(&provider)?);
-    let key = provider.api_key.as_deref().unwrap_or_default();
     request = request.bearer_auth(key);
     let response = tokio::time::timeout(
         std::time::Duration::from_secs(provider.timeout_secs),
@@ -332,15 +331,7 @@ pub(crate) async fn connections_list_models(
         ensure_codex_stopped(&store)?;
     }
     provider.normalize_and_validate()?;
-    if provider
-        .api_key
-        .as_deref()
-        .is_none_or(|key| key.trim().is_empty())
-    {
-        return Err(AppError::InvalidConfig(
-            "此服务还没有 API Key，请先编辑并填写。".into(),
-        ));
-    }
+    require_api_key(&provider)?;
     // 抓取 `/models` 可用模型并保存（含 models.dev 精确匹配的元数据）。
     let synced = sync_provider_models(
         &client.current()?,
@@ -683,15 +674,7 @@ pub(crate) async fn connections_activate(
             "所选第三方 API 服务已停用，请检查后重试。".into(),
         ));
     }
-    if candidate
-        .api_key
-        .as_deref()
-        .is_none_or(|key| key.trim().is_empty())
-    {
-        return Err(AppError::InvalidConfig(
-            "此服务还没有 API Key，请先编辑并填写。".into(),
-        ));
-    }
+    require_api_key(&candidate)?;
     let refresh_error = sync_provider_models(&client.current()?, &store, &candidate, None)
         .await
         .err();
@@ -710,15 +693,7 @@ pub(crate) async fn connections_activate(
                 "所选第三方 API 服务已停用，请检查后重试。".into(),
             ));
         }
-        if provider
-            .api_key
-            .as_deref()
-            .is_none_or(|key| key.trim().is_empty())
-        {
-            return Err(AppError::InvalidConfig(
-                "此服务还没有 API Key，请先编辑并填写。".into(),
-            ));
-        }
+        require_api_key(&provider)?;
         let target = crate::chat_proxy::effective_base_url(&provider, &proxy).await?;
         if !activation.is_current(activation_operation) {
             return Err(AppError::StaleOperation);

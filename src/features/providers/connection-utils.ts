@@ -1,4 +1,4 @@
-import { formatDate, quotaWindow } from "@/lib/format"
+import { formatDate } from "@/lib/format"
 import { call } from "@/lib/ipc"
 import type {
   CredentialMaintenanceResult,
@@ -7,6 +7,8 @@ import type {
   ProviderSaveInput,
   RepairResult,
 } from "@/types"
+
+import { displayQuotaWindows } from "./quota-estimate"
 
 export type ConnectionKind = "account" | "provider"
 
@@ -175,12 +177,20 @@ export function quotaStatusText(
 }
 
 export function accountDescription(account: OfficialAccountView) {
-  const quota = quotaWindow(account.quota)
-  const quotaText = quotaStatusText(account, quota?.remainingPercent)
-  const resetText = quota?.resetAt
-    ? ` · 重置 ${formatDate(quota.resetAt, true)}`
-    : ""
-  return `${accountPlanText(account)} · ${quotaText}${resetText} · ${account.email || account.name || "OpenAI 账号"}`
+  const quotaWindows = displayQuotaWindows(account.quota).sort(
+    (left, right) => left.windowSeconds - right.windowSeconds
+  )
+  const quotaText = quotaWindows.length
+    ? quotaWindows
+        .map(
+          (quota) =>
+            `${quota.label} 剩余 ${quota.remainingPercent.toFixed(1)}% · 重置 ${quota.resetAt ? formatDate(quota.resetAt, true) : "—"}`
+        )
+        .join("；")
+    : quotaStatusText(account)
+  const identityText =
+    account.email.trim() || account.name.trim() || "OpenAI 账号"
+  return `${accountPlanText(account)} · ${quotaText} · ${identityText}`
 }
 
 export function accountPlanText(account: OfficialAccountView) {

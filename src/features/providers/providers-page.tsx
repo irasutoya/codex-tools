@@ -27,8 +27,9 @@ import {
 } from "@/components/ui/empty"
 import { Spinner } from "@/components/ui/spinner"
 import { Skeleton } from "@/components/ui/skeleton"
+import { Progress } from "@/components/ui/progress"
 import { toast } from "@/components/ui/toast"
-import { errorMessage, formatDate, quotaWindow } from "@/lib/format"
+import { errorMessage, formatDate, formatUsd } from "@/lib/format"
 import { useAsyncAction } from "@/hooks/use-async-action"
 import { call } from "@/lib/ipc"
 import type {
@@ -44,7 +45,10 @@ import {
   type AccountLoginMode,
 } from "./account-login-dialog"
 import {
+  refreshAccountLogin,
   refreshAccountQuota,
+  estimateAccountQuota,
+  syncProviderModels,
   testProviderConnection,
 } from "./connection-actions"
 import {
@@ -56,6 +60,11 @@ import {
   quotaStatusText,
 } from "./connection-utils"
 import { ProviderEditorDialog } from "./provider-editor-dialog"
+import {
+  displayQuotaWindows,
+  hasCurrentQuotaEstimate,
+  quotaWindowEstimate,
+} from "./quota-estimate"
 
 export function ProvidersPage({
   connections,
@@ -75,6 +84,7 @@ export function ProvidersPage({
   const [loginError, setLoginError] = useState<string>()
   const [editor, setEditor] = useState<Provider>(emptyProvider())
   const [authorization, setAuthorization] = useState<DeviceAuthorization>()
+  const [estimating, setEstimating] = useState(false)
   const { busy, begin, end, run } = useAsyncAction<string>()
 
   const selected = useMemo(() => {
@@ -366,9 +376,38 @@ export function ProvidersPage({
   const item = selected.value
   const account = isAccount ? (item as OfficialAccountView) : undefined
   const provider = !isAccount ? (item as Provider) : undefined
-  const quota = quotaWindow(account?.quota)
   const displayName = account?.remark || item.name
-  const actionBusy = Boolean(busy)
+  const actionBusy = Boolean(busy) || estimating
+  const canEstimate = Boolean(
+    account && displayQuotaWindows(account.quota).length
+  )
+
+  const estimateQuota = async () => {
+    if (!account || estimating) return
+    setEstimating(true)
+    try {
+      const result = await estimateAccountQuota(account.id)
+      const failed = result.windows.filter((window) => !window.success)
+      toast.add({
+        title: failed.length ? "部分额度窗口未能估算" : "额度估算已更新",
+        description:
+          failed
+            .map((window) => window.reason)
+            .filter(Boolean)
+            .join("；") || undefined,
+        type: failed.length ? "error" : "success",
+      })
+      onRefresh()
+    } catch (reason) {
+      toast.add({
+        title: "额度估算失败",
+        description: errorMessage(reason),
+        type: "error",
+      })
+    } finally {
+      setEstimating(false)
+    }
+  }
 
   return (
     <div className="flex min-h-full flex-col gap-3 px-3 pt-1 pb-3">
@@ -422,112 +461,57 @@ export function ProvidersPage({
       </Card>
 
       <Card key={item.id} size="sm" className="shrink-0">
-        <CardHeader className="border-b">
-          <div className="flex items-center gap-2">
-            <CardTitle>{displayName}</CardTitle>
-            {item.active && (
-              <Badge>
-                <HugeiconsIcon icon={CheckmarkCircle02Icon} />
-                当前连接
-              </Badge>
-            )}
-            <Badge variant="outline">
-              {isAccount ? "OpenAI 账号" : "API 服务"}
-            </Badge>
-          </div>
-          <div className="text-sm text-muted-foreground">
-            {account?.email || provider?.baseUrl}
-          </div>
-        </CardHeader>
-        <CardContent className="grid grid-cols-2 gap-x-6 gap-y-4">
-          {isAccount && (
-            <Detail label="账号类型" value={accountPlanText(account!)} />
-          )}
-          <Detail
-            label="接入方式"
-            value={
-              isAccount
-                ? account?.source === "proxy_import"
-                  ? "Cookie 登录数据"
-                  : "OpenAI 官方授权"
-                : provider?.apiType === "chat"
+        {isAccount ? (
+          <AccountCardHeader account={account!} displayName={displayName} />
+        ) : (
+          <CardHeader className="border-b">
+            <div className="flex items-center gap-2">
+              <CardTitle>{displayName}</CardTitle>
+              {item.active && (
+                <Badge>
+                  <HugeiconsIcon icon={CheckmarkCircle02Icon} />
+                  当前连接
+                </Badge>
+              )}
+              <Badge variant="outline">API 服务</Badge>
+            </div>
+            <div className="text-sm text-muted-foreground">
+              {provider?.baseUrl}
+            </div>
+          </CardHeader>
+        )}
+        {isAccount ? (
+          <AccountDetailContent account={account!} />
+        ) : (
+          <CardContent className="grid grid-cols-2 gap-x-6 gap-y-4">
+            <Detail
+              label="接入方式"
+              value={
+                provider?.apiType === "chat"
                   ? "Chat Completions"
                   : "Responses API"
-            }
-          />
-          {isAccount && (
-            <Detail label="账号备注" value={account?.remark || "未设置"} />
-          )}
-          {isAccount && (
-            <Detail label="自动维护" value={credentialRefreshText(account!)} />
-          )}
-          {isAccount && (
-            <Detail
-              label="最近刷新尝试"
-              value={formatDate(account?.credentialRefresh.lastAttemptAt, true)}
+              }
             />
-          )}
-          {isAccount && (
             <Detail
-              label="最近刷新"
-              value={formatDate(account?.credentialRefresh.lastRefreshAt, true)}
+              label="凭据状态"
+              value={
+                provider?.hasApiKey ? "API Key 已保存" : "等待填写 API Key"
+              }
             />
-          )}
-          {isAccount && (
-            <Detail
-              label="最近同步"
-              value={formatDate(account?.credentialRefresh.lastSyncAt, true)}
-            />
-          )}
-          {isAccount && (
-            <Detail
-              label="最近检查"
-              value={formatDate(account?.credentialRefresh.lastCheckAt, true)}
-            />
-          )}
-          {isAccount && account?.credentialRefresh.nextRetryAt && (
-            <Detail
-              label="下次重试"
-              value={formatDate(account.credentialRefresh.nextRetryAt, true)}
-            />
-          )}
-          <Detail
-            label={isAccount ? "登录状态" : "凭据状态"}
-            value={
-              isAccount
-                ? credentialLabel(account)
-                : provider?.hasApiKey
-                  ? "API Key 已保存"
-                  : "等待填写 API Key"
-            }
-          />
-          <Detail
-            label={isAccount ? "账号资料更新" : "最近更新"}
-            value={formatDate(item.updatedAt, true)}
-          />
-          {isAccount && (
-            <Detail
-              label="额度状态"
-              value={quotaLabel(account, quota?.remainingPercent)}
-            />
-          )}
-          {isAccount && (
-            <Detail
-              label="额度重置时间"
-              value={formatDate(quota?.resetAt, true)}
-            />
-          )}
-          {!isAccount && (
+            <Detail label="最近更新" value={formatDate(item.updatedAt, true)} />
             <Detail
               label="可用模型"
               value={`${provider ? effectiveModelCount(provider) : 0} 个`}
             />
-          )}
-        </CardContent>
-        <CardFooter className="flex-wrap gap-2">
+          </CardContent>
+        )}
+        <CardFooter
+          className={isAccount ? "flex-wrap gap-2 py-2" : "flex-wrap gap-2"}
+        >
           {isAccount ? (
             <>
               <Button
+                size="sm"
                 disabled={actionBusy}
                 aria-busy={busy === "quota"}
                 onClick={() =>
@@ -537,24 +521,34 @@ export function ProvidersPage({
                   })
                 }
               >
-                {busy === "quota" ? (
-                  <Spinner data-icon="inline-start" />
-                ) : (
-                  <HugeiconsIcon
-                    icon={Refresh01Icon}
-                    data-icon="inline-start"
-                  />
-                )}
+                {busy === "quota" ? <Spinner data-icon="inline-start" /> : null}
                 刷新额度
               </Button>
               <Button
+                size="sm"
+                variant="outline"
+                disabled={actionBusy || !canEstimate}
+                aria-busy={estimating}
+                title={canEstimate ? undefined : "请先刷新额度"}
+                onClick={() => void estimateQuota()}
+              >
+                {estimating ? <Spinner data-icon="inline-start" /> : null}
+                {hasCurrentQuotaEstimate(
+                  account?.quota,
+                  account?.quota.estimates
+                )
+                  ? "重新估算"
+                  : "额度估算"}
+              </Button>
+              <Button
+                size="sm"
                 variant="outline"
                 disabled={actionBusy}
                 aria-busy={busy === "login-refresh"}
                 onClick={() =>
                   void run(
                     "login-refresh",
-                    () => call("connections_refresh_login", { id: item.id }),
+                    () => refreshAccountLogin(item.id),
                     {
                       success: "登录维护已完成",
                       successDescription: credentialMaintenanceMessage,
@@ -565,9 +559,7 @@ export function ProvidersPage({
               >
                 {busy === "login-refresh" ? (
                   <Spinner data-icon="inline-start" />
-                ) : (
-                  <HugeiconsIcon icon={Login03Icon} data-icon="inline-start" />
-                )}
+                ) : null}
                 立即刷新登录
               </Button>
             </>
@@ -598,11 +590,10 @@ export function ProvidersPage({
                 disabled={actionBusy}
                 aria-busy={busy === "models"}
                 onClick={() =>
-                  void run(
-                    "models",
-                    () => call("connections_list_models", { id: item.id }),
-                    { success: "模型已同步", onSuccess: onRefresh }
-                  )
+                  void run("models", () => syncProviderModels(item.id), {
+                    success: "模型已同步",
+                    onSuccess: onRefresh,
+                  })
                 }
               >
                 {busy === "models" ? (
@@ -646,35 +637,274 @@ function ProvidersLoading() {
         <CardHeader className="border-b">
           <Skeleton className="h-5 w-36" />
           <Skeleton className="h-3.5 w-56" />
+          <div className="flex flex-wrap gap-1.5">
+            <Skeleton className="h-5 w-24" />
+            <Skeleton className="h-5 w-28" />
+          </div>
         </CardHeader>
-        <CardContent className="grid grid-cols-2 gap-x-6 gap-y-4">
-          {Array.from({ length: 6 }, (_, index) => (
-            <div key={index} className="flex flex-col gap-1.5">
-              <Skeleton className="h-3 w-16" />
-              <Skeleton className="h-4 w-28" />
-            </div>
-          ))}
+        <CardContent className="flex flex-col gap-2">
+          <div className="flex items-center gap-1.5">
+            <Skeleton className="h-3.5 w-8" />
+          </div>
+          <div className="grid grid-cols-2 gap-2">
+            {Array.from({ length: 2 }, (_, index) => (
+              <div key={index} className="flex min-w-0 flex-col gap-1.5">
+                <div className="flex items-center gap-1.5">
+                  <Skeleton className="h-5 w-12" />
+                  <Skeleton className="h-3.5 w-16" />
+                </div>
+                <Skeleton className="h-1 w-full" />
+                <Skeleton className="h-3.5 w-32 max-w-full" />
+              </div>
+            ))}
+          </div>
+          <Skeleton className="h-3.5 w-52 max-w-full" />
+          <div className="grid min-w-0 grid-cols-3 gap-2">
+            {Array.from({ length: 3 }, (_, index) => (
+              <div key={index} className="flex min-w-0 items-center gap-1">
+                <Skeleton className="h-3.5 w-14" />
+                <Skeleton className="h-3.5 w-20 max-w-full" />
+              </div>
+            ))}
+          </div>
         </CardContent>
-        <CardFooter className="gap-2">
+        <CardFooter className="gap-2 py-2">
           <Skeleton className="h-8 w-24" />
           <Skeleton className="h-8 w-24" />
+          <Skeleton className="h-8 w-28" />
         </CardFooter>
       </Card>
     </div>
   )
 }
 
-function quotaLabel(
-  account: OfficialAccountView | undefined,
-  remainingPercent: number | undefined
-) {
-  if (!account) return "—"
-  return quotaStatusText(account, remainingPercent)
+type StatusBadgeVariant = "default" | "secondary" | "destructive" | "outline"
+
+function AccountCardHeader({
+  account,
+  displayName,
+}: {
+  account: OfficialAccountView
+  displayName: string
+}) {
+  const loginStatus = loginVerificationText(account)
+  const maintenanceStatus = credentialRefreshText(account)
+  const shortLoginStatus = shortLoginStatusText(account)
+  const shortMaintenanceStatus = shortMaintenanceStatusText(account)
+
+  return (
+    <CardHeader className="border-b">
+      <div className="flex flex-wrap items-center gap-2">
+        <CardTitle className="min-w-0 break-words">{displayName}</CardTitle>
+        {account.active && (
+          <Badge>
+            <HugeiconsIcon icon={CheckmarkCircle02Icon} />
+            当前连接
+          </Badge>
+        )}
+        <Badge variant="secondary">{accountPlanText(account)}</Badge>
+      </div>
+      <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-sm text-muted-foreground">
+        <span className="break-all">{account.email || "未提供邮箱"}</span>
+        <span aria-hidden="true">·</span>
+        <span>
+          {account.source === "proxy_import"
+            ? "Cookie 登录数据"
+            : "OpenAI 官方授权"}
+        </span>
+      </div>
+      <div className="flex min-w-0 flex-wrap items-center gap-1.5">
+        <Badge
+          variant={loginVerificationVariant(account)}
+          className="h-auto max-w-full justify-start px-1.5 py-0.5 text-left leading-tight break-words whitespace-normal"
+          aria-label={`登录状态：${loginStatus}`}
+        >
+          <span>{shortLoginStatus}</span>
+        </Badge>
+        <Badge
+          variant={credentialRefreshVariant(account)}
+          className="h-auto max-w-full justify-start px-1.5 py-0.5 text-left leading-tight break-words whitespace-normal"
+          aria-label={`自动维护：${maintenanceStatus}`}
+        >
+          <span>{shortMaintenanceStatus}</span>
+        </Badge>
+      </div>
+    </CardHeader>
+  )
 }
 
-function credentialLabel(account: OfficialAccountView | undefined) {
-  if (!account) return "—"
-  return loginVerificationText(account)
+function AccountDetailContent({ account }: { account: OfficialAccountView }) {
+  const quotaWindows = displayQuotaWindows(account.quota)
+
+  return (
+    <CardContent className="flex flex-col gap-1.5">
+      <section className="flex flex-col gap-1 border-t pt-1.5">
+        <div className="text-xs font-medium text-muted-foreground">额度</div>
+        {quotaWindows.length ? (
+          <div className="flex flex-col gap-1.5">
+            <div
+              className={
+                quotaWindows.length > 1
+                  ? "grid grid-cols-2 gap-2"
+                  : "grid gap-2"
+              }
+            >
+              {quotaWindows.map((quota) => {
+                const estimate = quotaWindowEstimate(
+                  account.quota.estimates ?? [],
+                  quota
+                )
+                return (
+                  <div
+                    key={`${quota.windowSeconds}-${quota.resetAt}`}
+                    className="flex min-w-0 flex-col gap-1.5"
+                  >
+                    <div className="flex min-w-0 flex-wrap items-center gap-1.5 text-xs font-medium">
+                      <Badge variant="outline">{quota.label}</Badge>
+                      <span className="text-muted-foreground tabular-nums">
+                        {quota.remainingPercent.toFixed(1)}% 可用
+                      </span>
+                    </div>
+                    <Progress
+                      value={quota.remainingPercent}
+                      className="gap-0 [&_[data-slot=progress-track]]:h-1"
+                      aria-label={`${quota.label} Token 可用额度`}
+                    />
+                    <div className="flex min-w-0 flex-wrap items-baseline gap-x-1 text-xs break-words text-muted-foreground">
+                      <span>{formatDate(quota.resetAt, true)} 重置</span>
+                      <span aria-hidden="true">·</span>
+                      <span>
+                        {estimate
+                          ? `估算 ${formatUsd(estimate.estimatedTotalMicrousd)}`
+                          : "尚未估算"}
+                      </span>
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
+            <p className="text-xs leading-relaxed text-muted-foreground">
+              本机估算，非官方账单。
+            </p>
+          </div>
+        ) : (
+          <Badge
+            variant={quotaBadgeVariant(account)}
+            className="h-auto max-w-full justify-start py-1 text-left leading-tight break-words whitespace-normal"
+          >
+            {quotaStatusText(account)}
+          </Badge>
+        )}
+      </section>
+
+      <section className="border-t pt-1.5">
+        <div className="grid min-w-0 grid-cols-3 gap-2">
+          <MaintenanceRecord
+            label="上次刷新"
+            value={formatDate(account.credentialRefresh.lastRefreshAt, true)}
+          />
+          <MaintenanceRecord
+            label="上次检查"
+            value={formatDate(account.credentialRefresh.lastCheckAt, true)}
+          />
+          <MaintenanceRecord
+            label="资料更新"
+            value={formatDate(account.updatedAt, true)}
+          />
+        </div>
+      </section>
+    </CardContent>
+  )
+}
+
+function MaintenanceRecord({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="flex min-w-0 items-baseline gap-1">
+      <span className="shrink-0 text-xs text-muted-foreground">{label}</span>
+      <span className="min-w-0 font-medium break-words tabular-nums">
+        {value}
+      </span>
+    </div>
+  )
+}
+
+function shortLoginStatusText(account: OfficialAccountView) {
+  switch (account.credentialRefresh.verification) {
+    case "valid":
+      return "登录有效"
+    case "invalid":
+      return "登录失效"
+    case "workspace_or_permission":
+      return "权限受限"
+    case "check_failed":
+      return "检查失败"
+    default:
+      return "未验证"
+  }
+}
+
+function shortMaintenanceStatusText(account: OfficialAccountView) {
+  switch (account.credentialRefresh.status) {
+    case "healthy":
+      return "维护正常"
+    case "managed_by_codex":
+      return "Codex 维护"
+    case "waiting_retry":
+      return "等待重试"
+    case "reauthentication_required":
+      return "需重新登录"
+    case "not_refreshable":
+      return "无法自动维护"
+    default:
+      return "等待维护"
+  }
+}
+
+function loginVerificationVariant(
+  account: OfficialAccountView
+): StatusBadgeVariant {
+  switch (account.credentialRefresh.verification) {
+    case "valid":
+      return "default"
+    case "invalid":
+    case "workspace_or_permission":
+    case "check_failed":
+      return "destructive"
+    default:
+      return "outline"
+  }
+}
+
+function credentialRefreshVariant(
+  account: OfficialAccountView
+): StatusBadgeVariant {
+  switch (account.credentialRefresh.status) {
+    case "healthy":
+    case "managed_by_codex":
+      return "secondary"
+    case "waiting_retry":
+    case "unknown":
+      return "outline"
+    case "reauthentication_required":
+    case "not_refreshable":
+      return "destructive"
+    default:
+      return "outline"
+  }
+}
+
+function quotaBadgeVariant(account: OfficialAccountView): StatusBadgeVariant {
+  switch (account.quota.status) {
+    case "unauthorized":
+    case "error":
+      return "destructive"
+    case "never":
+    case "rate_limited":
+    case "unsupported":
+    case "success":
+    default:
+      return "outline"
+  }
 }
 
 function Detail({ label, value }: { label: string; value: string }) {

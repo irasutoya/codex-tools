@@ -241,6 +241,26 @@ export type AccountQuota = {
   lastAttemptAt?: number
   error?: string
   errorCode?: string
+  estimates?: QuotaEstimate[]
+}
+
+export type QuotaEstimate = {
+  windowSeconds: number
+  resetAt: number
+  estimatedTotalMicrousd: number
+  estimatedAt: number
+}
+
+export type QuotaEstimateWindowResult = {
+  windowSeconds: number
+  resetAt: number
+  success: boolean
+  estimate?: QuotaEstimate
+  reason?: string
+}
+
+export type QuotaEstimateResult = {
+  windows: QuotaEstimateWindowResult[]
 }
 
 export type CredentialRefreshStatus =

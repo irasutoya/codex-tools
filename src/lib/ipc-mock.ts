@@ -24,6 +24,9 @@ import type {
 const mockEmptyConnections =
   typeof window !== "undefined" &&
   new URLSearchParams(window.location.search).has("empty-connections")
+const mockDualQuota =
+  typeof window !== "undefined" &&
+  new URLSearchParams(window.location.search).has("dual-quota")
 
 const now = Date.now()
 const day = 86_400_000
@@ -33,10 +36,21 @@ const mockQuota: AccountQuota = {
   data: {
     kind: "windowed",
     primary: {
-      usedPercent: 23.9,
-      remainingPercent: 76.1,
-      resetAt: Math.floor((now + 6 * day) / 1000),
+      usedPercent: mockDualQuota ? 42.5 : 23.9,
+      remainingPercent: mockDualQuota ? 57.5 : 76.1,
+      windowSeconds: mockDualQuota ? 18_000 : 604_800,
+      resetAt: Math.floor(
+        (now + (mockDualQuota ? 3 * 3_600_000 : 6 * day)) / 1000
+      ),
     },
+    ...(mockDualQuota && {
+      secondary: {
+        usedPercent: 68,
+        remainingPercent: 32,
+        windowSeconds: 604_800,
+        resetAt: Math.floor((now + 5 * day) / 1000),
+      },
+    }),
   },
 }
 
@@ -560,6 +574,54 @@ export async function mockCall(
       }
       if (account) account.quota = refreshedQuota
       return refreshedQuota
+    }
+    case "connections_estimate_quota": {
+      const { accountId } = args as { accountId: string }
+      const account = mockAccounts.find(
+        (candidate) => candidate.id === accountId
+      )
+      if (!account || account.quota.status !== "success") {
+        throw new Error("请先刷新额度。")
+      }
+      const windows: import("@/types").QuotaEstimateWindowResult[] = []
+      for (const [slot, window] of Object.entries({
+        primary: account.quota.data?.primary,
+        secondary: account.quota.data?.secondary,
+      })) {
+        if (!window?.resetAt) continue
+        const windowSeconds =
+          window.windowSeconds ?? (slot === "primary" ? 18_000 : 604_800)
+        if (window.usedPercent < 10) {
+          windows.push({
+            windowSeconds,
+            resetAt: window.resetAt,
+            success: false,
+            reason: "额度已用比例低于 10%，样本不足，暂不估算。",
+          })
+          continue
+        }
+        const estimate = {
+          windowSeconds,
+          resetAt: window.resetAt,
+          estimatedTotalMicrousd: 2_400_000,
+          estimatedAt: Math.floor(Date.now() / 1000),
+        }
+        account.quota.estimates = [
+          ...(account.quota.estimates ?? []).filter(
+            (item) =>
+              item.windowSeconds !== windowSeconds ||
+              item.resetAt !== window.resetAt
+          ),
+          estimate,
+        ]
+        windows.push({
+          windowSeconds,
+          resetAt: window.resetAt,
+          success: true,
+          estimate,
+        })
+      }
+      return { windows }
     }
     case "connections_refresh_login": {
       const { id } = args as { id: string }

@@ -4,7 +4,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     io::Write,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     sync::{Mutex, RwLock, RwLockReadGuard},
 };
 
@@ -45,6 +45,7 @@ struct CredentialsFile {
 
 pub struct Store {
     root: PathBuf,
+    read_root: Option<PathBuf>,
     path: PathBuf,
     connections_path: PathBuf,
     credentials_path: PathBuf,
@@ -94,50 +95,56 @@ impl ProviderSnapshotRevision {
 
 impl Store {
     pub fn new() -> anyhow::Result<Self> {
-        let root = data_root();
-        Self::open(root)
+        Self::open_with_read_base(data_root(), read_data_root())
     }
 
+    #[cfg(test)]
     pub fn open(root: PathBuf) -> anyhow::Result<Self> {
+        Self::open_with_read_base(root, None)
+    }
+
+    pub(crate) fn open_with_read_base(
+        root: PathBuf,
+        read_root: Option<PathBuf>,
+    ) -> anyhow::Result<Self> {
+        let read_root = read_root.filter(|path| !path.as_os_str().is_empty());
+        if read_root
+            .as_ref()
+            .is_some_and(|read_root| same_data_root(&root, read_root))
+        {
+            anyhow::bail!(
+                "CODEX_TOOLS_READ_DATA_DIR 必须与 CODEX_TOOLS_DATA_DIR 使用不同的数据目录。"
+            );
+        }
         fs::create_dir_all(&root)?;
         secure_directory(&root)?;
         let path = root.join("app.json");
         let connections_path = root.join("connections.json");
         let credentials_path = root.join("credentials.json");
-        let app_file = JsonStore::read_or_default(&path, AppFile::default)?;
-        let connections = JsonStore::read_or_default(&connections_path, ConnectionsFile::default)?;
-        let credentials = JsonStore::read_or_default(&credentials_path, CredentialsFile::default)?;
-        let mut providers = connections.providers;
-        for provider in &mut providers {
-            if let Some(key) = credentials.provider_api_keys.get(&provider.id) {
-                provider.api_key = Some(key.clone());
-                provider.has_api_key = true;
-            }
-            if let Some(headers) = credentials.provider_headers.get(&provider.id) {
-                provider.headers = headers.clone();
-            }
-        }
-        let state = AppConfig {
-            codex: app_file.codex,
-            active: app_file.active,
-            providers,
-            official_accounts: connections.official_accounts,
-            credential_refresh: connections.credential_refresh,
+        let local_state_present = state_files_present(&path, &connections_path, &credentials_path);
+        let source_root = if local_state_present {
+            &root
+        } else {
+            read_root.as_deref().unwrap_or(&root)
         };
-        if !path.exists() || !connections_path.exists() || !credentials_path.exists() {
+        let state = load_state_files(source_root)?;
+
+        if read_root.is_none() && !state_files_complete(&path, &connections_path, &credentials_path)
+        {
             persist_files(&path, &connections_path, &credentials_path, &state)?;
-        }
-        for name in [
-            "credentials.json",
-            "pricing.json",
-            "usage.json",
-            "sessions.json",
-            "cache.json",
-        ] {
-            JsonStore::ensure_object(&root.join(name))?;
+            for name in [
+                "credentials.json",
+                "pricing.json",
+                "usage.json",
+                "sessions.json",
+                "cache.json",
+            ] {
+                JsonStore::ensure_object(&root.join(name))?;
+            }
         }
         Ok(Self {
             root,
+            read_root,
             path,
             connections_path,
             credentials_path,
@@ -149,14 +156,62 @@ impl Store {
     pub fn root(&self) -> &Path {
         &self.root
     }
+
+    pub(crate) fn read_data_root(&self) -> Option<&Path> {
+        self.read_root.as_deref()
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }
 
     fn read_state(&self) -> Result<RwLockReadGuard<'_, AppConfig>, AppError> {
+        self.refresh_state_from_read_base()?;
         self.state
             .read()
             .map_err(|_| AppError::Internal("暂时无法读取应用数据，请重启应用后再试。".into()))
+    }
+
+    fn refresh_state_from_read_base(&self) -> Result<(), AppError> {
+        let Some(read_root) = self.read_root.as_deref() else {
+            return Ok(());
+        };
+        if self.local_state_present() {
+            return Ok(());
+        }
+
+        let _transaction = self
+            .persist_mutex
+            .lock()
+            .map_err(|_| AppError::Internal("暂时无法读取应用数据，请重启应用后再试。".into()))?;
+        if self.local_state_present() {
+            return Ok(());
+        }
+        let state =
+            load_state_files(read_root).map_err(|error| AppError::Internal(error.to_string()))?;
+        let mut guard = self
+            .state
+            .write()
+            .map_err(|_| AppError::Internal("暂时无法读取应用数据，请重启应用后再试。".into()))?;
+        *guard = state;
+        Ok(())
+    }
+
+    fn local_state_present(&self) -> bool {
+        state_files_present(&self.path, &self.connections_path, &self.credentials_path)
+    }
+
+    fn current_state_for_update(&self) -> Result<AppConfig, AppError> {
+        if let Some(read_root) = self.read_root.as_deref()
+            && !self.local_state_present()
+        {
+            return load_state_files(read_root)
+                .map_err(|error| AppError::Internal(error.to_string()));
+        }
+        self.state
+            .read()
+            .map(|state| state.clone())
+            .map_err(|_| AppError::Internal("暂时无法保存应用数据，请重启应用后再试。".into()))
     }
 
     pub(crate) fn read<T>(&self, project: impl FnOnce(&AppConfig) -> T) -> Result<T, AppError> {
@@ -228,7 +283,7 @@ impl Store {
 
         // 候选状态上的变更和 fsync 都不持有状态写锁，读操作在提交前
         // 继续看到稳定的旧状态。
-        let current = self.read_state()?.clone();
+        let current = self.current_state_for_update()?;
         let mut draft = current.clone();
         let result = mutate(&mut draft)?;
         if let Err(error) = persist_files(
@@ -899,6 +954,31 @@ impl Store {
         })
     }
 
+    /// 仅在某个窗口成功通过完整性门禁后更新该窗口；其它窗口和旧成功结论保持不变。
+    pub fn save_official_account_quota_estimates(
+        &self,
+        id: &str,
+        estimates: &[QuotaEstimate],
+    ) -> Result<(), AppError> {
+        self.update(|state| {
+            let account = state
+                .official_accounts
+                .iter_mut()
+                .find(|account| account.id == id)
+                .ok_or_else(|| {
+                    AppError::InvalidConfig("OpenAI 账号不存在，可能已被删除。".into())
+                })?;
+            for estimate in estimates {
+                account.quota.estimates.retain(|saved| {
+                    saved.window_seconds != estimate.window_seconds
+                        || saved.reset_at != estimate.reset_at
+                });
+                account.quota.estimates.push(estimate.clone());
+            }
+            Ok(())
+        })
+    }
+
     pub fn sync_official_credential(
         &self,
         id: &str,
@@ -1110,6 +1190,81 @@ fn persist_files(
     JsonStore::write_atomic(connections_path, &connections)?;
     JsonStore::write_atomic(credentials_path, &credentials)?;
     Ok(())
+}
+
+fn state_files_present(app_path: &Path, connections_path: &Path, credentials_path: &Path) -> bool {
+    app_path.exists() || connections_path.exists() || credentials_path.exists()
+}
+
+fn state_files_complete(app_path: &Path, connections_path: &Path, credentials_path: &Path) -> bool {
+    app_path.exists() && connections_path.exists() && credentials_path.exists()
+}
+
+fn load_state_files(root: &Path) -> anyhow::Result<AppConfig> {
+    let app_file = JsonStore::read_or_default(&root.join("app.json"), AppFile::default)?;
+    let connections =
+        JsonStore::read_or_default(&root.join("connections.json"), ConnectionsFile::default)?;
+    let credentials =
+        JsonStore::read_or_default(&root.join("credentials.json"), CredentialsFile::default)?;
+    let mut providers = connections.providers;
+    for provider in &mut providers {
+        if let Some(key) = credentials.provider_api_keys.get(&provider.id) {
+            provider.api_key = Some(key.clone());
+            provider.has_api_key = true;
+        }
+        if let Some(headers) = credentials.provider_headers.get(&provider.id) {
+            provider.headers = headers.clone();
+        }
+    }
+    Ok(AppConfig {
+        codex: app_file.codex,
+        active: app_file.active,
+        providers,
+        official_accounts: connections.official_accounts,
+        credential_refresh: connections.credential_refresh,
+    })
+}
+
+fn read_data_root() -> Option<PathBuf> {
+    std::env::var_os("CODEX_TOOLS_READ_DATA_DIR")
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+}
+
+fn same_data_root(first: &Path, second: &Path) -> bool {
+    let first = normalized_data_path(first);
+    let second = normalized_data_path(second);
+    #[cfg(windows)]
+    {
+        first
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&second.to_string_lossy())
+    }
+    #[cfg(not(windows))]
+    {
+        first == second
+    }
+}
+
+fn normalized_data_path(path: &Path) -> PathBuf {
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(path)
+    };
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            _ => normalized.push(component.as_os_str()),
+        }
+    }
+    normalized
 }
 
 pub fn data_root() -> PathBuf {
@@ -1373,6 +1528,54 @@ mod tests {
             fs::read_to_string(temp.path().join("unrelated.txt")).unwrap(),
             "user data"
         );
+    }
+
+    #[test]
+    fn read_base_updates_are_visible_until_overlay_state_forks() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().join("base");
+        let overlay = temp.path().join("overlay");
+        fs::create_dir_all(&base).unwrap();
+
+        let write_base = |home: &str| {
+            fs::write(
+                base.join("app.json"),
+                serde_json::json!({
+                    "codex": { "home": home },
+                    "active": { "kind": "none" }
+                })
+                .to_string(),
+            )
+            .unwrap();
+            fs::write(base.join("connections.json"), "{}").unwrap();
+            fs::write(base.join("credentials.json"), "{}").unwrap();
+        };
+
+        write_base("base-a");
+        let store = Store::open_with_read_base(overlay.clone(), Some(base.clone())).unwrap();
+        assert_eq!(store.codex_home_setting().unwrap(), "base-a");
+
+        write_base("base-b");
+        assert_eq!(store.codex_home_setting().unwrap(), "base-b");
+        let base_before_overlay_write = fs::read(base.join("app.json")).unwrap();
+
+        store
+            .update(|state| {
+                state.codex.home = "overlay".into();
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            fs::read(base.join("app.json")).unwrap(),
+            base_before_overlay_write
+        );
+
+        write_base("base-c");
+        assert_eq!(store.codex_home_setting().unwrap(), "overlay");
+        drop(store);
+
+        let reopened = Store::open_with_read_base(overlay, Some(base)).unwrap();
+        assert_eq!(reopened.codex_home_setting().unwrap(), "overlay");
     }
 
     #[test]
@@ -1683,6 +1886,47 @@ mod tests {
             .unwrap();
         assert_eq!(persisted.remark, "保留此备注");
         assert_eq!(persisted.quota.status, QuotaStatus::Success);
+    }
+
+    #[test]
+    fn quota_estimates_replace_only_successful_matching_windows() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path().to_path_buf()).unwrap();
+        let account = store
+            .save_official_account(&official_account("workspace-1", "estimate"))
+            .unwrap();
+        let five_hours = QuotaEstimate {
+            window_seconds: 18_000,
+            reset_at: 100,
+            estimated_total_microusd: 100,
+            estimated_at: 1,
+        };
+        let seven_days = QuotaEstimate {
+            window_seconds: 604_800,
+            reset_at: 200,
+            estimated_total_microusd: 200,
+            estimated_at: 1,
+        };
+        store
+            .save_official_account_quota_estimates(
+                &account.id,
+                &[five_hours.clone(), seven_days.clone()],
+            )
+            .unwrap();
+        let updated_five_hours = QuotaEstimate {
+            estimated_total_microusd: 150,
+            estimated_at: 2,
+            ..five_hours
+        };
+        // 只传入成功的 5H；未传入的 7D（例如本轮门禁失败）必须保留。
+        store
+            .save_official_account_quota_estimates(&account.id, &[updated_five_hours.clone()])
+            .unwrap();
+
+        let estimates = store.official_account(&account.id).unwrap().quota.estimates;
+        assert_eq!(estimates.len(), 2);
+        assert!(estimates.contains(&updated_five_hours));
+        assert!(estimates.contains(&seven_days));
     }
 
     #[test]

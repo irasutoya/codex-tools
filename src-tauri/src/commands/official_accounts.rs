@@ -16,12 +16,61 @@ use tauri::State;
 
 const QUOTA_REFRESH_CONCURRENCY: usize = 4;
 
+const FIVE_HOURS_SECONDS: i64 = 18_000;
+const SEVEN_DAYS_SECONDS: i64 = 604_800;
+
+/// 以服务返回的时长为准；旧响应缺少时长时才按 primary/secondary 兼容。
+/// primary 不存在时绝不凭空构造 5H 窗口。
+fn estimate_windows(quota: &ProviderAccountQuota) -> Vec<(i64, i64, f64)> {
+    let Some(QuotaData::Windowed { primary, secondary }) = quota.data.as_ref() else {
+        return vec![];
+    };
+    [
+        (primary.as_ref(), Some(FIVE_HOURS_SECONDS)),
+        (secondary.as_ref(), Some(SEVEN_DAYS_SECONDS)),
+    ]
+    .into_iter()
+    .filter_map(|(window, fallback_seconds)| {
+        let window = window?;
+        let window_seconds = window.window_seconds.or(fallback_seconds)?;
+        let reset_at = window.reset_at?;
+        (window_seconds > 0 && reset_at > 0).then_some((
+            window_seconds,
+            reset_at,
+            window.used_percent,
+        ))
+    })
+    .fold(Vec::new(), |mut windows, window| {
+        if !windows
+            .iter()
+            .any(|(seconds, reset_at, _)| *seconds == window.0 && *reset_at == window.1)
+        {
+            windows.push(window);
+        }
+        windows
+    })
+}
+
 fn ensure_current_activation(activation: &ActivationLock, operation: u64) -> Result<(), AppError> {
     if activation.is_current(operation) {
         Ok(())
     } else {
         Err(AppError::StaleOperation)
     }
+}
+
+fn apply_successful_quota_snapshot(
+    snapshot: &mut ProviderAccountQuota,
+    data: QuotaData,
+    plan_type: Option<String>,
+    now: i64,
+) {
+    snapshot.status = QuotaStatus::Success;
+    snapshot.data = Some(data);
+    snapshot.plan_type = plan_type;
+    snapshot.fetched_at = Some(now);
+    snapshot.error = None;
+    snapshot.error_code = None;
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -225,12 +274,7 @@ async fn refresh_official_quota(
     }
     match quota_result {
         Ok(data) => {
-            snapshot.status = QuotaStatus::Success;
-            snapshot.data = Some(data.data);
-            snapshot.plan_type = data.plan_type;
-            snapshot.fetched_at = Some(now);
-            snapshot.error = None;
-            snapshot.error_code = None;
+            apply_successful_quota_snapshot(&mut snapshot, data.data, data.plan_type, now);
         }
         Err(error) => {
             snapshot.status = error.status;
@@ -270,6 +314,44 @@ pub(crate) async fn connections_refresh_quota(
     account_id: String,
 ) -> Result<ProviderAccountQuota, AppError> {
     refresh_official_quota(&store, &center, &client, &activation, &account_id).await
+}
+
+#[tauri::command]
+pub(crate) async fn connections_estimate_quota(
+    store: State<'_, Store>,
+    ledger: State<'_, UsageLedger>,
+    account_id: String,
+) -> Result<QuotaEstimateResult, AppError> {
+    let account = store.official_account(&account_id)?;
+    if account.quota.status != QuotaStatus::Success {
+        return Err(AppError::InvalidConfig("请先刷新额度。".into()));
+    }
+    let windows = estimate_windows(&account.quota);
+    if windows.is_empty() {
+        return Err(AppError::InvalidConfig(
+            "当前额度窗口缺少可识别的时长或重置时间，暂无法估算。".into(),
+        ));
+    }
+    let canonical_account_id = canonical_official_account_id(&account);
+    // 与常规用量刷新使用同一套别名映射，避免不同本地账号互相混入。
+    ledger
+        .sync_official_account_identities(&[(account.id.clone(), canonical_account_id.clone())])?;
+    let now_utc_ms = chrono::Utc::now().timestamp_millis();
+    let ledger = ledger.inner().clone();
+    let results = tokio::task::spawn_blocking(move || {
+        ledger.estimate_account_quota(&canonical_account_id, &windows, now_utc_ms)
+    })
+    .await
+    .map_err(|error| AppError::Internal(error.to_string()))??;
+    let successful = results
+        .iter()
+        .filter_map(|result| result.success.then_some(result.estimate.clone()).flatten())
+        .collect::<Vec<_>>();
+    // 任何失败窗口都不触碰旧成功记录；仅成功窗口覆盖同一窗口身份的旧值。
+    if !successful.is_empty() {
+        store.save_official_account_quota_estimates(&account_id, &successful)?;
+    }
+    Ok(QuotaEstimateResult { windows: results })
 }
 
 #[tauri::command]
@@ -345,6 +427,39 @@ fn save_completed_login(
     store.official_account_view(&saved.id)
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn activate_resolved_official_account(
+    store: &Store,
+    center: &AuthCenter,
+    manager: &ConfigManager,
+    ledger: &UsageLedger,
+    activation: &ActivationLock,
+    proxy: &ChatProxyRegistry,
+    index: &SessionIndex,
+    activation_operation: u64,
+    id: &str,
+    home: &std::path::Path,
+) -> Result<RepairResult, AppError> {
+    ensure_current_activation(activation, activation_operation)?;
+    official_quota::ensure_account_usable(&store.official_account(id)?)?;
+    ensure_codex_stopped(store)?;
+    sync_active_openai_credential(store, home)?;
+    let saved = center.refresh_account(store, id).await?;
+    ensure_current_activation(activation, activation_operation)?;
+    let repair = activate_openai_record(
+        store,
+        manager,
+        ledger,
+        proxy,
+        activation,
+        activation_operation,
+        &saved,
+    )
+    .await?;
+    index.invalidate();
+    Ok(repair)
+}
+
 #[tauri::command]
 #[allow(clippy::too_many_arguments)] // Tauri injects each managed state separately.
 pub(crate) async fn connections_activate_account(
@@ -359,24 +474,20 @@ pub(crate) async fn connections_activate_account(
 ) -> Result<RepairResult, AppError> {
     let activation_operation = activation.begin_operation();
     let _guard = activation.0.lock().await;
-    ensure_current_activation(&activation, activation_operation)?;
-    official_quota::ensure_account_usable(&store.official_account(&id)?)?;
-    ensure_codex_stopped(&store)?;
-    sync_active_openai_credential(&store, &codex::home(&store.codex_home_setting()?))?;
-    let saved = center.refresh_account(&store, &id).await?;
-    ensure_current_activation(&activation, activation_operation)?;
-    let repair = activate_openai_record(
+    let home = codex::home(&store.codex_home_setting()?);
+    activate_resolved_official_account(
         &store,
+        &center,
         &manager,
         &ledger,
-        &proxy,
         &activation,
+        &proxy,
+        &index,
         activation_operation,
-        &saved,
+        &id,
+        &home,
     )
-    .await?;
-    index.invalidate();
-    Ok(repair)
+    .await
 }
 
 #[tauri::command]
@@ -410,23 +521,20 @@ pub(crate) async fn connections_activate_official(
     })?;
     let id =
         id.ok_or_else(|| AppError::InvalidConfig("请先在“账号与服务”中登录 OpenAI。".into()))?;
-    official_quota::ensure_account_usable(&store.official_account(&id)?)?;
-    ensure_codex_stopped(&store)?;
-    sync_active_openai_credential(&store, &codex::home(&home_setting))?;
-    let saved = center.refresh_account(&store, &id).await?;
-    ensure_current_activation(&activation, activation_operation)?;
-    let repair = activate_openai_record(
+    let home = codex::home(&home_setting);
+    activate_resolved_official_account(
         &store,
+        &center,
         &manager,
         &ledger,
-        &proxy,
         &activation,
+        &proxy,
+        &index,
         activation_operation,
-        &saved,
+        &id,
+        &home,
     )
-    .await?;
-    index.invalidate();
-    Ok(repair)
+    .await
 }
 
 #[tauri::command]
@@ -534,6 +642,83 @@ mod tests {
             created_at: 0,
             updated_at: 0,
         }
+    }
+
+    #[test]
+    fn estimate_windows_uses_explicit_duration_and_never_invents_missing_primary() {
+        let quota = ProviderAccountQuota {
+            status: QuotaStatus::Success,
+            data: Some(QuotaData::Windowed {
+                primary: None,
+                secondary: Some(QuotaWindow {
+                    used_percent: 20.0,
+                    remaining_percent: 80.0,
+                    window_seconds: Some(604_800),
+                    reset_at: Some(100),
+                }),
+            }),
+            ..Default::default()
+        };
+        assert_eq!(estimate_windows(&quota), vec![(604_800, 100, 20.0)]);
+    }
+
+    #[test]
+    fn estimate_windows_falls_back_only_for_existing_legacy_slots() {
+        let quota = ProviderAccountQuota {
+            status: QuotaStatus::Success,
+            data: Some(QuotaData::Windowed {
+                primary: Some(QuotaWindow {
+                    used_percent: 10.0,
+                    remaining_percent: 90.0,
+                    window_seconds: None,
+                    reset_at: Some(20),
+                }),
+                secondary: Some(QuotaWindow {
+                    used_percent: 20.0,
+                    remaining_percent: 80.0,
+                    window_seconds: None,
+                    reset_at: Some(30),
+                }),
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            estimate_windows(&quota),
+            vec![(18_000, 20, 10.0), (604_800, 30, 20.0)]
+        );
+    }
+
+    #[test]
+    fn successful_quota_refresh_keeps_existing_estimates() {
+        let estimate = QuotaEstimate {
+            window_seconds: FIVE_HOURS_SECONDS,
+            reset_at: 100,
+            estimated_total_microusd: 123,
+            estimated_at: 1,
+        };
+        let mut snapshot = ProviderAccountQuota {
+            estimates: vec![estimate.clone()],
+            error: Some("旧错误".into()),
+            ..Default::default()
+        };
+        apply_successful_quota_snapshot(
+            &mut snapshot,
+            QuotaData::Windowed {
+                primary: Some(QuotaWindow {
+                    used_percent: 20.0,
+                    remaining_percent: 80.0,
+                    window_seconds: Some(FIVE_HOURS_SECONDS),
+                    reset_at: Some(100),
+                }),
+                secondary: None,
+            },
+            Some("plus".into()),
+            42,
+        );
+        assert_eq!(snapshot.status, QuotaStatus::Success);
+        assert_eq!(snapshot.estimates, vec![estimate]);
+        assert_eq!(snapshot.fetched_at, Some(42));
+        assert!(snapshot.error.is_none());
     }
 
     #[test]

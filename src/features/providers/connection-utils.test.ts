@@ -5,6 +5,7 @@ import type { OfficialAccountView, Provider, RepairResult } from "@/types"
 import {
   addCustomModelTo,
   allModelsSelected,
+  accountDescription,
   accountWorkspaceIsDeactivated,
   buildFallbackCandidates,
   credentialMaintenanceMessage,
@@ -35,6 +36,25 @@ const makeAccount = (
   createdAt: 0,
   updatedAt: 0,
   ...overrides,
+})
+
+const makeQuotaWindow = (
+  windowSeconds: number,
+  remainingPercent: number,
+  resetAt?: number
+) => ({
+  usedPercent: 100 - remainingPercent,
+  remainingPercent,
+  windowSeconds,
+  ...(resetAt === undefined ? {} : { resetAt }),
+})
+
+const makeWindowedQuota = (
+  primary?: ReturnType<typeof makeQuotaWindow>,
+  secondary?: ReturnType<typeof makeQuotaWindow>
+): OfficialAccountView["quota"] => ({
+  status: "success",
+  data: { kind: "windowed", primary, secondary },
 })
 
 const makeProvider = (overrides: Partial<Provider> = {}): Provider => ({
@@ -129,6 +149,68 @@ describe("账号额度错误", () => {
         (candidate) => candidate.id
       )
     ).toEqual(["usable"])
+  })
+})
+
+describe("账号额度摘要", () => {
+  it.each([
+    {
+      name: "双窗口按 5H 后 7D 排序",
+      quota: makeWindowedQuota(
+        makeQuotaWindow(604_800, 20, 1_800_604_800),
+        makeQuotaWindow(18_000, 80, 1_800_018_000)
+      ),
+      expected: ["5H 剩余 80.0% · 重置", "7D 剩余 20.0% · 重置"],
+    },
+    {
+      name: "仅 5H",
+      quota: makeWindowedQuota(makeQuotaWindow(18_000, 75, 1_800_018_000)),
+      expected: ["5H 剩余 75.0% · 重置"],
+      absent: ["7D"],
+    },
+    {
+      name: "仅 7D",
+      quota: makeWindowedQuota(
+        undefined,
+        makeQuotaWindow(604_800, 65, 1_800_604_800)
+      ),
+      expected: ["7D 剩余 65.0% · 重置"],
+      absent: ["5H"],
+    },
+    {
+      name: "保留 0.0%",
+      quota: makeWindowedQuota(makeQuotaWindow(18_000, 0, 1_800_018_000)),
+      expected: ["5H 剩余 0.0% · 重置"],
+    },
+    {
+      name: "缺少 resetAt",
+      quota: makeWindowedQuota(makeQuotaWindow(18_000, 50)),
+      expected: ["5H 剩余 50.0% · 重置 —"],
+    },
+    {
+      name: "无窗口 never 状态",
+      quota: { status: "never" },
+      expected: ["尚未刷新"],
+    },
+    {
+      name: "错误状态保留后端错误",
+      quota: {
+        status: "error",
+        error: "额度接口暂时不可用（HTTP 500）",
+      },
+      expected: ["额度接口暂时不可用（HTTP 500）"],
+    },
+  ] as const)("$name", ({ quota, expected, absent = [] }) => {
+    const summary = accountDescription(makeAccount({ quota }))
+    const indexes = expected.map((fragment) => summary.indexOf(fragment))
+
+    expect(indexes.every((index) => index >= 0)).toBe(true)
+    for (let index = 1; index < indexes.length; index += 1) {
+      expect(indexes[index - 1]!).toBeLessThan(indexes[index]!)
+    }
+    for (const fragment of absent) {
+      expect(summary).not.toContain(fragment)
+    }
   })
 })
 
