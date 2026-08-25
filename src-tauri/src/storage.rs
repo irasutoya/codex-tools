@@ -1920,7 +1920,10 @@ mod tests {
         };
         // 只传入成功的 5H；未传入的 7D（例如本轮门禁失败）必须保留。
         store
-            .save_official_account_quota_estimates(&account.id, &[updated_five_hours.clone()])
+            .save_official_account_quota_estimates(
+                &account.id,
+                std::slice::from_ref(&updated_five_hours),
+            )
             .unwrap();
 
         let estimates = store.official_account(&account.id).unwrap().quota.estimates;

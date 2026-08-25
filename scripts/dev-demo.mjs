@@ -21,7 +21,9 @@ export function resolveTauriEntry() {
   const packagePath = require.resolve("@tauri-apps/cli/package.json")
   const packageJson = JSON.parse(readFileSync(packagePath, "utf8"))
   const bin =
-    typeof packageJson.bin === "string" ? packageJson.bin : packageJson.bin?.tauri
+    typeof packageJson.bin === "string"
+      ? packageJson.bin
+      : packageJson.bin?.tauri
   if (typeof bin !== "string" || !bin) {
     throw new Error("当前项目的 @tauri-apps/cli 未声明 tauri bin 入口。")
   }

@@ -189,6 +189,40 @@ struct QuotaEstimateAccumulator {
     reason: Option<String>,
 }
 
+enum ReadConnection {
+    Direct(Connection),
+    Snapshot {
+        connection: Option<Connection>,
+        snapshot_root: PathBuf,
+    },
+}
+
+impl std::ops::Deref for ReadConnection {
+    type Target = Connection;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Direct(connection) => connection,
+            Self::Snapshot { connection, .. } => {
+                connection.as_ref().expect("读取快照连接在释放前必须可用")
+            }
+        }
+    }
+}
+
+impl Drop for ReadConnection {
+    fn drop(&mut self) {
+        if let Self::Snapshot {
+            connection,
+            snapshot_root,
+        } = self
+        {
+            drop(connection.take());
+            let _ = fs::remove_dir_all(snapshot_root);
+        }
+    }
+}
+
 fn scaled_quota_estimate(cost_microusd: u64, used_percent: f64) -> Option<u64> {
     let value = (cost_microusd as f64) * 100.0 / used_percent;
     (value.is_finite() && value <= u64::MAX as f64).then(|| value.round() as u64)
@@ -1227,9 +1261,9 @@ impl UsageLedger {
         Ok(connection)
     }
 
-    fn open_read_connection(&self) -> anyhow::Result<Connection> {
+    fn open_read_connection(&self) -> anyhow::Result<ReadConnection> {
         if self.database_path.exists() || self.read_database_path.is_none() {
-            return self.open_connection();
+            return self.open_connection().map(ReadConnection::Direct);
         }
         let Some(read_database_path) = self.read_database_path.as_deref() else {
             unreachable!("只读基底路径已在前置条件中确认存在")
@@ -1244,7 +1278,7 @@ impl UsageLedger {
         // 不会在覆盖层或只读基底创建任何文件。
         let connection = Connection::open_in_memory()?;
         initialize_schema(&connection)?;
-        Ok(connection)
+        Ok(ReadConnection::Direct(connection))
     }
 
     fn ensure_overlay_database(&self) -> anyhow::Result<()> {
@@ -1277,59 +1311,45 @@ impl UsageLedger {
     }
 }
 
-fn open_read_only_connection(path: &Path) -> anyhow::Result<Connection> {
+fn open_read_only_connection(path: &Path) -> anyhow::Result<ReadConnection> {
     let wal_path = sqlite_sidecar_path(path, "-wal");
-    if wal_path.exists() {
-        let shm_path = sqlite_sidecar_path(path, "-shm");
-        if !wal_path.is_file() || !shm_path.is_file() {
-            anyhow::bail!(
-                "只读基底的本机用量数据库存在 WAL 但缺少可用的 -shm；为避免 SQLite 为读取创建或修改基底文件，测试版不会读取或分叉该数据库。"
-            )
-        }
-
-        // 已存在的 WAL 和 -shm 允许 SQLite 以严格只读模式读取最新提交；
-        // 不使用 immutable，以免忽略 WAL 中尚未 checkpoint 的数据。
-        let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
-        return Connection::open_with_flags(path, flags).map_err(Into::into);
+    let shm_path = sqlite_sidecar_path(path, "-shm");
+    if wal_path.exists() && (!wal_path.is_file() || !shm_path.is_file()) {
+        anyhow::bail!(
+            "只读基底的本机用量数据库存在 WAL 但缺少可用的 -shm；为避免 SQLite 为读取创建或修改基底文件，测试版不会读取或分叉该数据库。"
+        )
     }
 
-    // 没有 WAL 时继续使用 immutable，避免 SQLite 为普通只读连接创建空的
-    // -wal 或 -shm 文件。若基底随后出现 WAL，本次读取仍是安全的旧快照。
-    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
-        | OpenFlags::SQLITE_OPEN_NO_MUTEX
-        | OpenFlags::SQLITE_OPEN_URI;
-    Connection::open_with_flags(read_only_database_uri(path)?, flags).map_err(Into::into)
+    // SQLite 即使使用 READ_ONLY 打开活跃 WAL，也可能更新源 -shm；先复制到
+    // 临时快照再读取，既保留未 checkpoint 的 WAL 数据，也不触碰用户基底。
+    let snapshot_root =
+        std::env::temp_dir().join(format!("codex-tools-usage-read-{}", Uuid::new_v4()));
+    fs::create_dir(&snapshot_root)?;
+    secure_directory(&snapshot_root)?;
+    let result = (|| -> anyhow::Result<ReadConnection> {
+        let snapshot_database = snapshot_root.join("usage.sqlite3");
+        fs::copy(path, &snapshot_database)?;
+        if wal_path.exists() {
+            fs::copy(&wal_path, sqlite_sidecar_path(&snapshot_database, "-wal"))?;
+            fs::copy(&shm_path, sqlite_sidecar_path(&snapshot_database, "-shm"))?;
+        }
+        let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        let connection = Connection::open_with_flags(&snapshot_database, flags)?;
+        Ok(ReadConnection::Snapshot {
+            connection: Some(connection),
+            snapshot_root: snapshot_root.clone(),
+        })
+    })();
+    if result.is_err() {
+        let _ = fs::remove_dir_all(&snapshot_root);
+    }
+    result
 }
 
 fn sqlite_sidecar_path(path: &Path, suffix: &str) -> PathBuf {
     let mut sidecar = path.as_os_str().to_os_string();
     sidecar.push(suffix);
     PathBuf::from(sidecar)
-}
-
-fn read_only_database_uri(path: &Path) -> anyhow::Result<String> {
-    let path = fs::canonicalize(path)?;
-    let raw = path.to_string_lossy();
-    #[cfg(windows)]
-    let raw = raw.strip_prefix("\\\\?\\").unwrap_or(raw.as_ref());
-    let text = raw.replace('\\', "/");
-    let mut encoded = String::with_capacity(text.len());
-    for byte in text.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~' | b'/' | b':') {
-            encoded.push(char::from(byte));
-        } else {
-            use std::fmt::Write as _;
-            write!(&mut encoded, "%{byte:02X}").expect("写入 String 不会失败");
-        }
-    }
-    #[cfg(windows)]
-    {
-        Ok(format!("file:///{encoded}?mode=ro&immutable=1"))
-    }
-    #[cfg(not(windows))]
-    {
-        Ok(format!("file://{encoded}?mode=ro&immutable=1"))
-    }
 }
 
 fn validate_read_schema(connection: &Connection) -> anyhow::Result<()> {
@@ -3110,7 +3130,7 @@ mod tests {
     use crate::official_pricing::build_catalog;
     use crate::usage_log::{ParsedUsageEvent, TokenUsage, UsageQuality};
     use chrono::DateTime;
-    use rusqlite::{Connection, OpenFlags, params};
+    use rusqlite::params;
     use std::{
         collections::{BTreeMap, BTreeSet},
         ffi::OsString,
@@ -3146,10 +3166,7 @@ mod tests {
         }
     }
 
-    fn assert_sqlite_base_unchanged(
-        before: &SqliteBaseSnapshot,
-        after: &SqliteBaseSnapshot,
-    ) {
+    fn assert_sqlite_base_unchanged(before: &SqliteBaseSnapshot, after: &SqliteBaseSnapshot) {
         assert!(
             before.files == after.files,
             "合成只读基底的 SQLite 文件内容发生变化"
@@ -4596,7 +4613,9 @@ mod tests {
         let base_wal = sqlite_sidecar_path(&base_database, "-wal");
         let base_shm = sqlite_sidecar_path(&base_database, "-shm");
         let connection = base_ledger.open_connection().unwrap();
-        connection.pragma_update(None, "wal_autocheckpoint", 0).unwrap();
+        connection
+            .pragma_update(None, "wal_autocheckpoint", 0)
+            .unwrap();
         connection
             .execute(
                 "INSERT INTO usage_metadata(key, value) VALUES ('wal_only_marker', 'wal-only-marker')",
@@ -4620,17 +4639,6 @@ mod tests {
             "合成 marker 应只存在于 WAL"
         );
         let base_before = capture_sqlite_base_snapshot(&base_root, &base_database);
-
-        let strict_read_only = Connection::open_with_flags(
-            &base_database,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )
-        .unwrap();
-        assert_eq!(
-            read_metadata(&strict_read_only, "wal_only_marker").unwrap(),
-            Some("wal-only-marker".into())
-        );
-        drop(strict_read_only);
 
         let ledger = UsageLedger::open_with_read_base(&overlay_root, Some(&base_root)).unwrap();
         let read_connection = ledger.open_read_connection().unwrap();
