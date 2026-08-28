@@ -49,6 +49,7 @@ pub struct Store {
     path: PathBuf,
     connections_path: PathBuf,
     credentials_path: PathBuf,
+    tombstones_path: PathBuf,
     state: RwLock<AppConfig>,
     persist_mutex: Mutex<()>,
 }
@@ -121,17 +122,48 @@ impl Store {
         let path = root.join("app.json");
         let connections_path = root.join("connections.json");
         let credentials_path = root.join("credentials.json");
-        let local_state_present = state_files_present(&path, &connections_path, &credentials_path);
-        let source_root = if local_state_present {
+        let tombstones_path = root.join("deletion_tombstones.json");
+        // 内容状态和墓碑标记必须分别判定：仅有墓碑的覆盖目录仍要从 read_root
+        // 读取未删除内容，再以本地墓碑过滤，不能把它误当成完整本地状态。
+        let local_content_present =
+            state_files_present(&path, &connections_path, &credentials_path);
+        let local_tombstones_present = tombstones_path.exists();
+        let source_root = if local_content_present {
             &root
         } else {
             read_root.as_deref().unwrap_or(&root)
         };
-        let state = load_state_files(source_root)?;
+        let mut state = load_state_files(source_root)?;
+        // 本地墓碑文件一旦存在（即使为空）就是权威删除事实：空集合代表用户已
+        // 显式恢复，不能再与 read_root 中的过期墓碑做并集。
+        if local_tombstones_present && source_root != root.as_path() {
+            state.deletion_tombstones = load_deletion_tombstones(&tombstones_path)?;
+        }
+        let mut requires_persist = false;
+        // 当前目录可能被旧版重写过 connections.json；先清理已被墓碑覆盖的连接，
+        // 并修正因此产生的悬空 active 选择。
+        requires_persist |= remove_tombstoned_connections(&mut state);
 
-        if read_root.is_none() && !state_files_complete(&path, &connections_path, &credentials_path)
-        {
-            persist_files(&path, &connections_path, &credentials_path, &state)?;
+        // 每次加载后都归并当前根目录中已经写入的同身份重复记录；无重复状态
+        // 不会触发持久化。
+        requires_persist |= merge_current_duplicate_official_accounts(&mut state);
+
+        let files_incomplete = !state_files_complete(
+            &path,
+            &connections_path,
+            &credentials_path,
+            &tombstones_path,
+        );
+        if read_root.is_none() && (requires_persist || files_incomplete) {
+            persist_files(
+                &path,
+                &connections_path,
+                &credentials_path,
+                &tombstones_path,
+                &state,
+            )?;
+        }
+        if read_root.is_none() && files_incomplete {
             for name in [
                 "credentials.json",
                 "pricing.json",
@@ -148,6 +180,7 @@ impl Store {
             path,
             connections_path,
             credentials_path,
+            tombstones_path,
             state: RwLock::new(state),
             persist_mutex: Mutex::new(()),
         })
@@ -176,7 +209,7 @@ impl Store {
         let Some(read_root) = self.read_root.as_deref() else {
             return Ok(());
         };
-        if self.local_state_present() {
+        if self.local_content_present() {
             return Ok(());
         }
 
@@ -184,11 +217,16 @@ impl Store {
             .persist_mutex
             .lock()
             .map_err(|_| AppError::Internal("暂时无法读取应用数据，请重启应用后再试。".into()))?;
-        if self.local_state_present() {
+        if self.local_content_present() {
             return Ok(());
         }
-        let state =
+        let mut state =
             load_state_files(read_root).map_err(|error| AppError::Internal(error.to_string()))?;
+        if self.tombstones_path.exists() {
+            state.deletion_tombstones = load_deletion_tombstones(&self.tombstones_path)
+                .map_err(|error| AppError::Internal(error.to_string()))?;
+        }
+        remove_tombstoned_connections(&mut state);
         let mut guard = self
             .state
             .write()
@@ -197,16 +235,22 @@ impl Store {
         Ok(())
     }
 
-    fn local_state_present(&self) -> bool {
+    fn local_content_present(&self) -> bool {
         state_files_present(&self.path, &self.connections_path, &self.credentials_path)
     }
 
     fn current_state_for_update(&self) -> Result<AppConfig, AppError> {
         if let Some(read_root) = self.read_root.as_deref()
-            && !self.local_state_present()
+            && !self.local_content_present()
         {
-            return load_state_files(read_root)
-                .map_err(|error| AppError::Internal(error.to_string()));
+            let mut state = load_state_files(read_root)
+                .map_err(|error| AppError::Internal(error.to_string()))?;
+            if self.tombstones_path.exists() {
+                state.deletion_tombstones = load_deletion_tombstones(&self.tombstones_path)
+                    .map_err(|error| AppError::Internal(error.to_string()))?;
+            }
+            remove_tombstoned_connections(&mut state);
+            return Ok(state);
         }
         self.state
             .read()
@@ -290,15 +334,17 @@ impl Store {
             &self.path,
             &self.connections_path,
             &self.credentials_path,
+            &self.tombstones_path,
             &draft,
         ) {
-            // persist_files 依次替换三个 JSON；后续文件失败时，前面的文件
+            // persist_files 依次替换四个 JSON；后续文件失败时，前面的文件
             // 可能已写入候选状态。在同一持久化锁内尽力恢复当前快照，
             // 并始终把最初的持久化错误返回给调用方。
             let _ = persist_files(
                 &self.path,
                 &self.connections_path,
                 &self.credentials_path,
+                &self.tombstones_path,
                 &current,
             );
             return Err(AppError::Internal(error.to_string()));
@@ -452,6 +498,8 @@ impl Store {
                 }
                 state.providers.push(provider.clone());
             }
+            // 相同 id 的显式保存代表用户主动恢复，不能继续让旧删除操作阻止它。
+            state.deletion_tombstones.provider_ids.remove(&provider.id);
             Ok((existing, provider))
         })
     }
@@ -470,6 +518,7 @@ impl Store {
                     "第三方 API 服务不存在，可能已被删除。".into(),
                 ));
             }
+            state.deletion_tombstones.provider_ids.insert(id.to_owned());
             Ok(())
         })
     }
@@ -635,6 +684,46 @@ impl Store {
         })
     }
 
+    /// 会话修复未完成导致切换回滚时，把应用激活状态恢复为切换前的连接。
+    /// 目标连接必须在应用中仍然存在，避免把状态指向已删除的服务或账号。
+    pub(crate) fn restore_active_state(&self, previous: &ActiveState) -> Result<(), AppError> {
+        self.update(|state| {
+            match previous.kind {
+                ActiveKind::Provider => {
+                    let Some(id) = previous.provider_id.as_deref() else {
+                        return Err(AppError::InvalidConfig(
+                            "原连接信息不完整，无法恢复。".into(),
+                        ));
+                    };
+                    if !state.providers.iter().any(|provider| provider.id == id) {
+                        return Err(AppError::InvalidConfig(
+                            "原第三方 API 服务已不存在，无法恢复。".into(),
+                        ));
+                    }
+                }
+                ActiveKind::Official => {
+                    let Some(id) = previous.account_id.as_deref() else {
+                        return Err(AppError::InvalidConfig(
+                            "原账号信息不完整，无法恢复。".into(),
+                        ));
+                    };
+                    if !state
+                        .official_accounts
+                        .iter()
+                        .any(|account| account.id == id)
+                    {
+                        return Err(AppError::InvalidConfig(
+                            "原 OpenAI 账号已不存在，无法恢复。".into(),
+                        ));
+                    }
+                }
+                ActiveKind::None => {}
+            }
+            state.active = previous.clone();
+            Ok(())
+        })
+    }
+
     pub fn official_account_view(&self, id: &str) -> Result<OfficialAccountView, AppError> {
         let state = self.read_state()?;
         let account = state
@@ -769,6 +858,12 @@ impl Store {
             ensure_official_account_capacity(&state.official_accounts, &incoming_accounts)?;
             let mut saved_accounts = Vec::with_capacity(incoming_accounts.len());
             for mut incoming in incoming_accounts {
+                // 相同 canonical 身份的显式登录是主动恢复，即使本地 record id 与
+                // 已删除的历史记录不同，也必须允许其重新出现。
+                state
+                    .deletion_tombstones
+                    .official_account_ids
+                    .remove(&canonical_official_account_id(&incoming));
                 let active_account_id = matches!(state.active.kind, ActiveKind::Official)
                     .then_some(state.active.account_id.as_deref())
                     .flatten();
@@ -796,15 +891,24 @@ impl Store {
                     // the last quota snapshot. Quota has its own dedicated update path.
                     incoming.quota = existing.quota.clone();
                     incoming.updated_at = now;
-                    state.official_accounts[existing_index] = incoming.clone();
                     let retained_id = incoming.id.clone();
-                    let duplicate_ids = state
+                    let duplicate_accounts = state
                         .official_accounts
                         .iter()
                         .filter(|saved| {
                             saved.id != retained_id
                                 && official_account_identity_matches(saved, &incoming)
                         })
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    // 已有历史重复项也可能拥有另一份备注、额度或维护状态。保存新凭据时，
+                    // 保留本次传入的凭据，同时以同一套合并规则补全其他字段。
+                    for duplicate in &duplicate_accounts {
+                        incoming = merge_legacy_official_account(&incoming, duplicate);
+                    }
+                    state.official_accounts[existing_index] = incoming.clone();
+                    let duplicate_ids = duplicate_accounts
+                        .iter()
                         .map(|saved| saved.id.clone())
                         .collect::<Vec<_>>();
                     if matches!(state.active.kind, ActiveKind::Official)
@@ -820,11 +924,23 @@ impl Store {
                         saved.id == retained_id
                             || !official_account_identity_matches(saved, &incoming)
                     });
-                    // 新设备登录/重新导入替换了凭据后，之前的“需要重新登录”
-                    // 或退避状态不再适用；只保留与仍存在账号关联的状态。
-                    state.credential_refresh.remove(&retained_id);
+                    // 维护状态由本地 id 关联；把重复项的时间线合并到保留 id，
+                    // 既不留下悬挂配置，也不因为去重抹去有效的检查/成功记录。
                     for duplicate_id in duplicate_ids {
-                        state.credential_refresh.remove(&duplicate_id);
+                        if let Some(duplicate_refresh) =
+                            state.credential_refresh.remove(&duplicate_id)
+                        {
+                            let merged_refresh = state
+                                .credential_refresh
+                                .get(&retained_id)
+                                .map(|saved| {
+                                    merge_credential_refresh_state(saved, &duplicate_refresh)
+                                })
+                                .unwrap_or(duplicate_refresh);
+                            state
+                                .credential_refresh
+                                .insert(retained_id.clone(), merged_refresh);
+                        }
                     }
                     saved_accounts.push(incoming);
                     continue;
@@ -979,6 +1095,32 @@ impl Store {
         })
     }
 
+    /// 新一轮估算开始时，先撤销这些当前窗口的旧金额；失败时绝不保留可展示的旧结论。
+    pub fn clear_official_account_quota_estimates(
+        &self,
+        id: &str,
+        windows: &[(i64, i64)],
+    ) -> Result<(), AppError> {
+        if windows.is_empty() {
+            return Ok(());
+        }
+        self.update(|state| {
+            let account = state
+                .official_accounts
+                .iter_mut()
+                .find(|account| account.id == id)
+                .ok_or_else(|| {
+                    AppError::InvalidConfig("OpenAI 账号不存在，可能已被删除。".into())
+                })?;
+            account.quota.estimates.retain(|estimate| {
+                !windows.iter().any(|(window_seconds, reset_at)| {
+                    estimate.window_seconds == *window_seconds && estimate.reset_at == *reset_at
+                })
+            });
+            Ok(())
+        })
+    }
+
     pub fn sync_official_credential(
         &self,
         id: &str,
@@ -1036,12 +1178,30 @@ impl Store {
     pub fn delete_official_accounts(&self, ids: Vec<String>) -> Result<(), AppError> {
         self.update(|state| {
             let ids = ids.into_iter().collect::<BTreeSet<_>>();
+            let deleted_accounts = state
+                .official_accounts
+                .iter()
+                .filter(|account| ids.contains(&account.id))
+                .cloned()
+                .collect::<Vec<_>>();
+            let deleted_identity_ids = deleted_accounts
+                .iter()
+                .map(canonical_official_account_id)
+                .collect::<BTreeSet<_>>();
             if matches!(state.active.kind, ActiveKind::Official)
                 && state
                     .active
                     .account_id
                     .as_ref()
-                    .is_some_and(|id| ids.contains(id))
+                    .and_then(|id| {
+                        state
+                            .official_accounts
+                            .iter()
+                            .find(|account| &account.id == id)
+                    })
+                    .is_some_and(|account| {
+                        deleted_identity_ids.contains(&canonical_official_account_id(account))
+                    })
             {
                 return Err(AppError::InvalidConfig(
                     "正在使用这个 OpenAI 账号，请先切换后再删除。".into(),
@@ -1060,10 +1220,24 @@ impl Store {
                 ));
             }
 
-            state
+            let removed_ids = state
                 .official_accounts
-                .retain(|account| !ids.contains(&account.id));
-            state.credential_refresh.retain(|id, _| !ids.contains(id));
+                .iter()
+                .filter(|account| {
+                    deleted_identity_ids.contains(&canonical_official_account_id(account))
+                })
+                .map(|account| account.id.clone())
+                .collect::<BTreeSet<_>>();
+            state.official_accounts.retain(|account| {
+                !deleted_identity_ids.contains(&canonical_official_account_id(account))
+            });
+            state
+                .credential_refresh
+                .retain(|id, _| !removed_ids.contains(id));
+            state
+                .deletion_tombstones
+                .official_account_ids
+                .extend(deleted_identity_ids);
             Ok(())
         })
     }
@@ -1154,6 +1328,7 @@ fn persist_files(
     app_path: &Path,
     connections_path: &Path,
     credentials_path: &Path,
+    tombstones_path: &Path,
     state: &AppConfig,
 ) -> anyhow::Result<()> {
     let app = AppFile {
@@ -1189,6 +1364,7 @@ fn persist_files(
     JsonStore::write_atomic(app_path, &app)?;
     JsonStore::write_atomic(connections_path, &connections)?;
     JsonStore::write_atomic(credentials_path, &credentials)?;
+    JsonStore::write_atomic(tombstones_path, &state.deletion_tombstones)?;
     Ok(())
 }
 
@@ -1196,8 +1372,16 @@ fn state_files_present(app_path: &Path, connections_path: &Path, credentials_pat
     app_path.exists() || connections_path.exists() || credentials_path.exists()
 }
 
-fn state_files_complete(app_path: &Path, connections_path: &Path, credentials_path: &Path) -> bool {
-    app_path.exists() && connections_path.exists() && credentials_path.exists()
+fn state_files_complete(
+    app_path: &Path,
+    connections_path: &Path,
+    credentials_path: &Path,
+    tombstones_path: &Path,
+) -> bool {
+    app_path.exists()
+        && connections_path.exists()
+        && credentials_path.exists()
+        && tombstones_path.exists()
 }
 
 fn load_state_files(root: &Path) -> anyhow::Result<AppConfig> {
@@ -1222,7 +1406,64 @@ fn load_state_files(root: &Path) -> anyhow::Result<AppConfig> {
         providers,
         official_accounts: connections.official_accounts,
         credential_refresh: connections.credential_refresh,
+        deletion_tombstones: load_deletion_tombstones(&root.join("deletion_tombstones.json"))?,
     })
+}
+
+fn load_deletion_tombstones(path: &Path) -> anyhow::Result<DeletionTombstones> {
+    JsonStore::read_or_default(path, DeletionTombstones::default)
+}
+
+/// 删除事实只保存本地 provider id 或官方账号的不可逆 canonical id。加载和
+/// 旧版重写后都以它为准；同时清理被删除记录留下的维护状态与悬空 active 引用。
+fn remove_tombstoned_connections(state: &mut AppConfig) -> bool {
+    let mut changed = false;
+    let provider_count = state.providers.len();
+    state.providers.retain(|provider| {
+        !state
+            .deletion_tombstones
+            .provider_ids
+            .contains(&provider.id)
+    });
+    changed |= state.providers.len() != provider_count;
+
+    let mut removed_account_ids = BTreeSet::new();
+    state.official_accounts.retain(|account| {
+        let deleted = state
+            .deletion_tombstones
+            .official_account_ids
+            .contains(&canonical_official_account_id(account));
+        if deleted {
+            removed_account_ids.insert(account.id.clone());
+        }
+        !deleted
+    });
+    if !removed_account_ids.is_empty() {
+        changed = true;
+        state
+            .credential_refresh
+            .retain(|id, _| !removed_account_ids.contains(id));
+    }
+
+    let dangling_active = match state.active.kind {
+        ActiveKind::Provider => !state
+            .active
+            .provider_id
+            .as_ref()
+            .is_some_and(|id| state.providers.iter().any(|provider| &provider.id == id)),
+        ActiveKind::Official => !state.active.account_id.as_ref().is_some_and(|id| {
+            state
+                .official_accounts
+                .iter()
+                .any(|account| &account.id == id)
+        }),
+        ActiveKind::None => false,
+    };
+    if dangling_active {
+        state.active = ActiveState::default();
+        changed = true;
+    }
+    changed
 }
 
 fn read_data_root() -> Option<PathBuf> {
@@ -1267,6 +1508,240 @@ fn normalized_data_path(path: &Path) -> PathBuf {
     normalized
 }
 
+fn merge_current_duplicate_official_accounts(state: &mut AppConfig) -> bool {
+    let mut merged_accounts = Vec::with_capacity(state.official_accounts.len());
+    let mut retained_ids = BTreeMap::new();
+    let active_account_id = matches!(state.active.kind, ActiveKind::Official)
+        .then_some(state.active.account_id.as_deref())
+        .flatten();
+
+    for account in std::mem::take(&mut state.official_accounts) {
+        if let Some(index) = merged_accounts
+            .iter()
+            .position(|saved: &StoredOfficialAccount| {
+                official_account_identity_matches(saved, &account)
+            })
+        {
+            let active_duplicate = active_account_id == Some(account.id.as_str());
+            let existing = merged_accounts[index].clone();
+            let replacement = if active_duplicate {
+                merge_legacy_official_account(&account, &existing)
+            } else {
+                merge_legacy_official_account(&existing, &account)
+            };
+            let previous = std::mem::replace(&mut merged_accounts[index], replacement);
+            let retained_id = merged_accounts[index].id.clone();
+            retained_ids.insert(previous.id, retained_id.clone());
+            retained_ids.insert(account.id, retained_id);
+        } else {
+            merged_accounts.push(account);
+        }
+    }
+    state.official_accounts = merged_accounts;
+
+    for (duplicate_id, retained_id) in &retained_ids {
+        if duplicate_id == retained_id {
+            continue;
+        }
+        if let Some(duplicate_refresh) = state.credential_refresh.remove(duplicate_id) {
+            let merged_refresh = state
+                .credential_refresh
+                .get(retained_id)
+                .map(|saved| merge_credential_refresh_state(saved, &duplicate_refresh))
+                .unwrap_or(duplicate_refresh);
+            state
+                .credential_refresh
+                .insert(retained_id.clone(), merged_refresh);
+        }
+    }
+    if matches!(state.active.kind, ActiveKind::Official) {
+        if let Some(retained_id) = state
+            .active
+            .account_id
+            .as_ref()
+            .and_then(|id| retained_ids.get(id))
+        {
+            state.active.account_id = Some(retained_id.clone());
+        }
+    }
+
+    !retained_ids.is_empty()
+}
+
+fn merge_legacy_official_account(
+    current: &StoredOfficialAccount,
+    legacy: &StoredOfficialAccount,
+) -> StoredOfficialAccount {
+    let legacy_is_newer = account_updated_at(legacy) > account_updated_at(current);
+    let (newer, older) = if legacy_is_newer {
+        (legacy, current)
+    } else {
+        (current, legacy)
+    };
+    let mut merged = newer.clone();
+    // 当前目录的本地 id 是稳定的 UI / active 引用，始终保留它。
+    merged.id = current.id.clone();
+    // 登录/刷新不会有意清空这些展示字段；两侧有值时保留更新较新的一个。
+    merged.name = preferred_nonempty(&newer.name, &older.name);
+    merged.email = preferred_nonempty(&newer.email, &older.email);
+    merged.account_id = preferred_nonempty(&newer.account_id, &older.account_id);
+    merged.remark = merge_account_remark(&current.remark, &legacy.remark, legacy_is_newer);
+    merged.quota = merge_account_quota(&current.quota, &legacy.quota);
+    merged.created_at = earliest_positive_timestamp(current.created_at, legacy.created_at);
+    merged.updated_at = current.updated_at.max(legacy.updated_at);
+    merged
+}
+
+fn account_updated_at(account: &StoredOfficialAccount) -> i64 {
+    if account.updated_at > 0 {
+        account.updated_at
+    } else {
+        account.expires_at.unwrap_or_default()
+    }
+}
+
+fn preferred_nonempty(preferred: &str, fallback: &str) -> String {
+    if preferred.trim().is_empty() {
+        fallback.to_owned()
+    } else {
+        preferred.to_owned()
+    }
+}
+
+fn merge_account_remark(current: &str, legacy: &str, legacy_is_newer: bool) -> String {
+    let current = current.trim();
+    let legacy = legacy.trim();
+    if current.is_empty() || current == legacy {
+        return legacy.to_owned();
+    }
+    if legacy.is_empty() {
+        return current.to_owned();
+    }
+    if current.lines().any(|line| line == legacy) {
+        return current.to_owned();
+    }
+    let combined = format!("{current}\n{legacy}");
+    if combined.chars().count() <= MAX_ACCOUNT_REMARK_CHARS {
+        combined
+    } else if legacy_is_newer {
+        legacy.to_owned()
+    } else {
+        current.to_owned()
+    }
+}
+
+fn merge_account_quota(
+    current: &ProviderAccountQuota,
+    legacy: &ProviderAccountQuota,
+) -> ProviderAccountQuota {
+    let legacy_is_newer = quota_updated_at(legacy) > quota_updated_at(current)
+        || (quota_updated_at(legacy) == quota_updated_at(current)
+            && !quota_is_meaningful(current)
+            && quota_is_meaningful(legacy));
+    let (newer, older) = if legacy_is_newer {
+        (legacy, current)
+    } else {
+        (current, legacy)
+    };
+    let mut merged = newer.clone();
+    if merged.data.is_none() {
+        merged.data = older.data.clone();
+    }
+    if merged.plan_type.is_none() {
+        merged.plan_type = older.plan_type.clone();
+    }
+    if merged.error.is_none() {
+        merged.error = older.error.clone();
+    }
+    if merged.error_code.is_none() {
+        merged.error_code = older.error_code.clone();
+    }
+    merged.fetched_at = max_optional_timestamp(current.fetched_at, legacy.fetched_at);
+    merged.last_attempt_at =
+        max_optional_timestamp(current.last_attempt_at, legacy.last_attempt_at);
+    for estimate in &older.estimates {
+        if let Some(saved) = merged.estimates.iter_mut().find(|saved| {
+            saved.window_seconds == estimate.window_seconds && saved.reset_at == estimate.reset_at
+        }) {
+            if estimate.estimated_at > saved.estimated_at {
+                *saved = estimate.clone();
+            }
+        } else {
+            merged.estimates.push(estimate.clone());
+        }
+    }
+    merged
+}
+
+fn quota_updated_at(quota: &ProviderAccountQuota) -> i64 {
+    quota
+        .fetched_at
+        .into_iter()
+        .chain(quota.last_attempt_at)
+        .max()
+        .unwrap_or_default()
+}
+
+fn quota_is_meaningful(quota: &ProviderAccountQuota) -> bool {
+    !matches!(quota.status, QuotaStatus::Never)
+        || quota.data.is_some()
+        || quota.plan_type.is_some()
+        || quota.fetched_at.is_some()
+        || quota.last_attempt_at.is_some()
+        || quota.error.is_some()
+        || quota.error_code.is_some()
+        || !quota.estimates.is_empty()
+}
+
+fn max_optional_timestamp(left: Option<i64>, right: Option<i64>) -> Option<i64> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.max(right)),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    }
+}
+
+fn earliest_positive_timestamp(left: i64, right: i64) -> i64 {
+    match (left, right) {
+        (0, value) | (value, 0) => value,
+        (left, right) => left.min(right),
+    }
+}
+
+fn merge_credential_refresh_state(
+    current: &CredentialRefreshState,
+    legacy: &CredentialRefreshState,
+) -> CredentialRefreshState {
+    let legacy_is_newer =
+        credential_refresh_updated_at(legacy) > credential_refresh_updated_at(current);
+    let newer = if legacy_is_newer { legacy } else { current };
+    CredentialRefreshState {
+        status: newer.status,
+        last_attempt_at: max_optional_timestamp(current.last_attempt_at, legacy.last_attempt_at),
+        last_success_at: max_optional_timestamp(current.last_success_at, legacy.last_success_at),
+        next_retry_at: max_optional_timestamp(current.next_retry_at, legacy.next_retry_at),
+        retry_count: current.retry_count.max(legacy.retry_count),
+        last_refresh_at: max_optional_timestamp(current.last_refresh_at, legacy.last_refresh_at),
+        last_sync_at: max_optional_timestamp(current.last_sync_at, legacy.last_sync_at),
+        last_check_at: max_optional_timestamp(current.last_check_at, legacy.last_check_at),
+        verification: newer.verification,
+    }
+}
+
+fn credential_refresh_updated_at(refresh: &CredentialRefreshState) -> i64 {
+    [
+        refresh.last_attempt_at,
+        refresh.last_success_at,
+        refresh.last_refresh_at,
+        refresh.last_sync_at,
+        refresh.last_check_at,
+    ]
+    .into_iter()
+    .flatten()
+    .max()
+    .unwrap_or_default()
+}
+
 pub fn data_root() -> PathBuf {
     if let Some(value) = std::env::var_os("CODEX_TOOLS_DATA_DIR") {
         return PathBuf::from(value);
@@ -1280,20 +1755,17 @@ pub fn data_root() -> PathBuf {
     }
     #[cfg(not(target_os = "macos"))]
     {
-        // 优先用户数据目录（Windows 的 %APPDATA% / Linux 的 ~/.local/share），
-        // 避免应用安装在 Program Files 等只读位置时无法写入；
-        // 旧版本把数据放在可执行文件旁的 data/ 目录，仍存在时继续使用（兼容迁移）。
-        let preferred = dirs::data_dir().map(|dir| dir.join("io.github.irasutoya.codex-tools"));
-        let legacy = std::env::current_exe()
-            .ok()
-            .and_then(|path| path.parent().map(Path::to_path_buf))
-            .map(|dir| dir.join("data"));
-        match (preferred, legacy) {
-            (Some(preferred), Some(legacy)) if !preferred.exists() && legacy.exists() => legacy,
-            (Some(preferred), _) => preferred,
-            (None, legacy) => legacy.unwrap_or_else(|| PathBuf::from(".")),
-        }
+        // 保持旧版安装布局：数据库位于可执行文件同级的 data/ 目录。
+        // 覆盖安装只替换程序文件，仍读取原目录，因此无需迁移或复制数据。
+        executable_data_root(std::env::current_exe().ok().as_deref())
     }
+}
+
+fn executable_data_root(executable: Option<&Path>) -> PathBuf {
+    executable
+        .and_then(Path::parent)
+        .map(|directory| directory.join("data"))
+        .unwrap_or_else(|| PathBuf::from(".").join("data"))
 }
 
 fn mark_active_profile(state: &AppConfig, profile: &mut ProviderProfile) {
@@ -1493,6 +1965,136 @@ mod tests {
         account
     }
 
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn executable_data_root_uses_installed_app_sibling_data_directory() {
+        let root = executable_data_root(Some(Path::new(
+            "C:/Users/mihai/AppData/Local/Codex Tools/codex-tools.exe",
+        )));
+
+        assert_eq!(
+            root,
+            PathBuf::from("C:/Users/mihai/AppData/Local/Codex Tools/data")
+        );
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn executable_data_root_falls_back_to_relative_data_directory() {
+        assert_eq!(executable_data_root(None), PathBuf::from(".").join("data"));
+    }
+
+    #[test]
+    fn reopening_current_state_deduplicates_without_a_legacy_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        let store = Store::open(root.clone()).unwrap();
+        store
+            .update(|state| {
+                let mut first = identified_official_account(
+                    "shared-workspace",
+                    "same-person",
+                    "person@example.test",
+                    "first",
+                );
+                first.id = "stale-record".into();
+                first.remark = "旧备注".into();
+                first.created_at = 10;
+                first.updated_at = 10;
+                first.quota = ProviderAccountQuota {
+                    status: QuotaStatus::Success,
+                    fetched_at: Some(10),
+                    estimates: vec![QuotaEstimate {
+                        window_seconds: 18_000,
+                        reset_at: 100,
+                        estimated_total_microusd: 100,
+                        estimated_at: 10,
+                    }],
+                    ..Default::default()
+                };
+                let mut active = first.clone();
+                active.id = "active-record".into();
+                active.credential.tokens.access_token = "active-newer-credential".into();
+                active.remark = "活动备注".into();
+                active.updated_at = 20;
+                active.quota = ProviderAccountQuota {
+                    status: QuotaStatus::Success,
+                    fetched_at: Some(20),
+                    estimates: vec![QuotaEstimate {
+                        window_seconds: 604_800,
+                        reset_at: 200,
+                        estimated_total_microusd: 200,
+                        estimated_at: 20,
+                    }],
+                    ..Default::default()
+                };
+                state.providers.push(provider("unrelated-provider"));
+                state.official_accounts = vec![first, active];
+                state.active = ActiveState {
+                    kind: ActiveKind::Official,
+                    provider_id: None,
+                    account_id: Some("active-record".into()),
+                };
+                state.credential_refresh.insert(
+                    "stale-record".into(),
+                    CredentialRefreshState {
+                        last_success_at: Some(30),
+                        ..Default::default()
+                    },
+                );
+                state.credential_refresh.insert(
+                    "active-record".into(),
+                    CredentialRefreshState {
+                        last_check_at: Some(40),
+                        ..Default::default()
+                    },
+                );
+                Ok(())
+            })
+            .unwrap();
+        drop(store);
+
+        let reopened = Store::open(root.clone()).unwrap();
+        let state = reopened.snapshot().unwrap();
+        assert_eq!(state.providers.len(), 1);
+        assert_eq!(state.official_accounts.len(), 1);
+        assert_eq!(state.active.account_id.as_deref(), Some("active-record"));
+        let merged = &state.official_accounts[0];
+        assert_eq!(merged.id, "active-record");
+        assert_eq!(
+            merged.credential.tokens.access_token,
+            "active-newer-credential"
+        );
+        assert_eq!(merged.remark, "活动备注\n旧备注");
+        assert_eq!(merged.created_at, 10);
+        assert_eq!(merged.updated_at, 20);
+        assert_eq!(merged.quota.fetched_at, Some(20));
+        assert_eq!(merged.quota.estimates.len(), 2);
+        assert_eq!(
+            state
+                .credential_refresh
+                .get("active-record")
+                .and_then(|refresh| refresh.last_success_at),
+            Some(30)
+        );
+        assert_eq!(
+            state
+                .credential_refresh
+                .get("active-record")
+                .and_then(|refresh| refresh.last_check_at),
+            Some(40)
+        );
+        assert!(!state.credential_refresh.contains_key("stale-record"));
+        let once_reopened = serde_json::to_value(&state).unwrap();
+        drop(reopened);
+
+        let reopened_again = Store::open(root).unwrap();
+        assert_eq!(
+            serde_json::to_value(reopened_again.snapshot().unwrap()).unwrap(),
+            once_reopened
+        );
+    }
+
     fn provider(id: &str) -> ProviderProfile {
         ProviderProfile {
             id: id.into(),
@@ -1515,6 +2117,225 @@ mod tests {
             created_at: 0,
             updated_at: 0,
         }
+    }
+
+    #[test]
+    fn provider_deletion_tombstone_survives_old_connections_rewrite() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        let store = Store::open(root.clone()).unwrap();
+        let mut retained = provider("retained");
+        retained
+            .headers
+            .insert("x-retained".into(), "preserve".into());
+        store.connections_save_provider(retained).unwrap();
+        store
+            .connections_save_provider(provider("deleted"))
+            .unwrap();
+        store.connections_save_provider(provider("other")).unwrap();
+        store.connections_delete_provider("deleted").unwrap();
+
+        fs::write(
+            root.join("connections.json"),
+            serde_json::to_vec(&ConnectionsFile {
+                providers: vec![provider("retained"), provider("deleted"), provider("other")],
+                ..Default::default()
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let reopened = Store::open(root.clone()).unwrap();
+        let state = reopened.snapshot().unwrap();
+        assert_eq!(
+            state
+                .providers
+                .iter()
+                .map(|provider| provider.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["retained", "other"]
+        );
+        assert_eq!(
+            reopened
+                .provider("retained")
+                .unwrap()
+                .headers
+                .get("x-retained"),
+            Some(&"preserve".to_owned())
+        );
+        assert!(root.join("deletion_tombstones.json").exists());
+
+        reopened
+            .connections_save_provider(provider("deleted"))
+            .unwrap();
+        assert!(
+            !reopened
+                .snapshot()
+                .unwrap()
+                .deletion_tombstones
+                .provider_ids
+                .contains("deleted")
+        );
+        drop(reopened);
+        let recovered = Store::open(root).unwrap();
+        assert_eq!(recovered.snapshot().unwrap().providers.len(), 3);
+    }
+
+    #[test]
+    fn official_deletion_tombstone_blocks_legacy_identity_and_allows_relogin() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        let store = Store::open(root.clone()).unwrap();
+        let deleted = store
+            .save_official_account(&identified_official_account(
+                "shared-workspace",
+                "deleted-person",
+                "person@example.test",
+                "deleted",
+            ))
+            .unwrap();
+        let retained = store
+            .save_official_account(&identified_official_account(
+                "shared-workspace",
+                "other-person",
+                "person@example.test",
+                "retained",
+            ))
+            .unwrap();
+        store.delete_official_account(&deleted.id).unwrap();
+
+        let mut revived = identified_official_account(
+            "shared-workspace",
+            "deleted-person",
+            "person@example.test",
+            "legacy-record",
+        );
+        revived.id = "legacy-record".into();
+        fs::write(
+            root.join("connections.json"),
+            serde_json::to_vec(&ConnectionsFile {
+                official_accounts: vec![revived, retained.clone()],
+                ..Default::default()
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            root.join("app.json"),
+            serde_json::json!({
+                "codex": {},
+                "active": { "kind": "official", "accountId": "legacy-record" }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let reopened = Store::open(root.clone()).unwrap();
+        let state = reopened.snapshot().unwrap();
+        assert_eq!(state.official_accounts.len(), 1);
+        assert_eq!(state.official_accounts[0].id, retained.id);
+        assert!(matches!(state.active.kind, ActiveKind::None));
+        let tombstones = fs::read_to_string(root.join("deletion_tombstones.json")).unwrap();
+        assert!(!tombstones.contains("person@example.test"));
+        assert!(!tombstones.contains("deleted-person"));
+
+        let restored = reopened
+            .save_official_account(&identified_official_account(
+                "shared-workspace",
+                "deleted-person",
+                "person@example.test",
+                "relogin",
+            ))
+            .unwrap();
+        assert_eq!(
+            reopened.official_account(&restored.id).unwrap().account_id,
+            "shared-workspace"
+        );
+        assert!(
+            !reopened
+                .snapshot()
+                .unwrap()
+                .deletion_tombstones
+                .official_account_ids
+                .contains(&canonical_official_account_id(&restored))
+        );
+        drop(reopened);
+
+        let once_reopened = Store::open(root.clone()).unwrap();
+        let once_state = serde_json::to_value(once_reopened.snapshot().unwrap()).unwrap();
+        drop(once_reopened);
+        let twice_reopened = Store::open(root).unwrap();
+        assert_eq!(
+            serde_json::to_value(twice_reopened.snapshot().unwrap()).unwrap(),
+            once_state
+        );
+    }
+
+    #[test]
+    fn old_data_without_tombstones_remains_compatible() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        fs::write(
+            root.join("app.json"),
+            r#"{"codex":{},"active":{"kind":"none"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("connections.json"),
+            serde_json::to_vec(&ConnectionsFile {
+                providers: vec![provider("legacy-provider")],
+                ..Default::default()
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(root.join("credentials.json"), "{}").unwrap();
+
+        let store = Store::open(root.to_path_buf()).unwrap();
+        assert_eq!(store.snapshot().unwrap().providers[0].id, "legacy-provider");
+        assert!(root.join("deletion_tombstones.json").exists());
+    }
+
+    #[test]
+    fn tombstone_only_overlay_keeps_read_base_content_and_persists_updates() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().join("base");
+        let overlay = temp.path().join("overlay");
+        let source = Store::open(base.clone()).unwrap();
+        source
+            .connections_save_provider(provider("deleted"))
+            .unwrap();
+        source
+            .connections_save_provider(provider("retained"))
+            .unwrap();
+        drop(source);
+
+        fs::create_dir_all(&overlay).unwrap();
+        JsonStore::write_atomic(
+            &overlay.join("deletion_tombstones.json"),
+            &DeletionTombstones {
+                provider_ids: BTreeSet::from(["deleted".to_owned()]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let store = Store::open_with_read_base(overlay.clone(), Some(base)).unwrap();
+        assert!(store.provider("deleted").is_err());
+        assert!(store.provider("retained").is_ok());
+        store.connections_save_provider(provider("new")).unwrap();
+        drop(store);
+
+        let reopened = Store::open(overlay.clone()).unwrap();
+        assert!(reopened.provider("deleted").is_err());
+        assert!(reopened.provider("retained").is_ok());
+        assert!(reopened.provider("new").is_ok());
+        assert!(state_files_complete(
+            &overlay.join("app.json"),
+            &overlay.join("connections.json"),
+            &overlay.join("credentials.json"),
+            &overlay.join("deletion_tombstones.json"),
+        ));
     }
 
     #[test]
@@ -1733,9 +2554,47 @@ mod tests {
         let active_id = "active-duplicate".to_owned();
         store
             .update(|state| {
+                state.official_accounts[0].remark = "主记录备注".into();
+                state.official_accounts[0].quota = ProviderAccountQuota {
+                    status: QuotaStatus::Success,
+                    fetched_at: Some(10),
+                    estimates: vec![QuotaEstimate {
+                        window_seconds: 18_000,
+                        reset_at: 100,
+                        estimated_total_microusd: 100,
+                        estimated_at: 10,
+                    }],
+                    ..Default::default()
+                };
                 let mut duplicate = state.official_accounts[0].clone();
                 duplicate.id = active_id.clone();
+                duplicate.remark = "活动重复项备注".into();
+                duplicate.quota = ProviderAccountQuota {
+                    status: QuotaStatus::Success,
+                    fetched_at: Some(20),
+                    estimates: vec![QuotaEstimate {
+                        window_seconds: 604_800,
+                        reset_at: 200,
+                        estimated_total_microusd: 200,
+                        estimated_at: 20,
+                    }],
+                    ..Default::default()
+                };
                 state.official_accounts.push(duplicate);
+                state.credential_refresh.insert(
+                    original.id.clone(),
+                    CredentialRefreshState {
+                        last_success_at: Some(30),
+                        ..Default::default()
+                    },
+                );
+                state.credential_refresh.insert(
+                    active_id.clone(),
+                    CredentialRefreshState {
+                        last_check_at: Some(40),
+                        ..Default::default()
+                    },
+                );
                 state.active = ActiveState {
                     kind: ActiveKind::Official,
                     provider_id: None,
@@ -1758,6 +2617,25 @@ mod tests {
         assert_eq!(saved.id, active_id);
         assert_eq!(state.active.account_id.as_deref(), Some(active_id.as_str()));
         assert_eq!(state.official_accounts.len(), 1);
+        let merged = &state.official_accounts[0];
+        assert_eq!(merged.remark, "活动重复项备注\n主记录备注");
+        assert_eq!(merged.quota.fetched_at, Some(20));
+        assert_eq!(merged.quota.estimates.len(), 2);
+        assert_eq!(
+            state
+                .credential_refresh
+                .get(&active_id)
+                .and_then(|refresh| refresh.last_success_at),
+            Some(30)
+        );
+        assert_eq!(
+            state
+                .credential_refresh
+                .get(&active_id)
+                .and_then(|refresh| refresh.last_check_at),
+            Some(40)
+        );
+        assert!(!state.credential_refresh.contains_key(&original.id));
         assert!(
             !state
                 .official_accounts
@@ -1930,6 +2808,18 @@ mod tests {
         assert_eq!(estimates.len(), 2);
         assert!(estimates.contains(&updated_five_hours));
         assert!(estimates.contains(&seven_days));
+
+        store
+            .clear_official_account_quota_estimates(
+                &account.id,
+                &[(
+                    updated_five_hours.window_seconds,
+                    updated_five_hours.reset_at,
+                )],
+            )
+            .unwrap();
+        let remaining = store.official_account(&account.id).unwrap().quota.estimates;
+        assert_eq!(remaining, vec![seven_days]);
     }
 
     #[test]
@@ -2357,6 +3247,71 @@ mod tests {
         store.connections_save_provider(with_key).unwrap();
         store.activate("ready").unwrap();
         assert!(store.provider("ready").unwrap().active);
+    }
+
+    #[test]
+    fn restore_active_state_returns_to_the_previous_connection() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path().to_path_buf()).unwrap();
+        let mut first = provider("first");
+        first.api_key = Some("secret".into());
+        store.connections_save_provider(first).unwrap();
+        let mut second = provider("second");
+        second.api_key = Some("secret".into());
+        store.connections_save_provider(second).unwrap();
+        store.activate("first").unwrap();
+        let previous = store.read(|state| state.active.clone()).unwrap();
+        store.activate("second").unwrap();
+
+        store.restore_active_state(&previous).unwrap();
+
+        let active = store.read(|state| state.active.clone()).unwrap();
+        assert!(matches!(active.kind, ActiveKind::Provider));
+        assert_eq!(active.provider_id.as_deref(), Some("first"));
+        assert!(store.provider("first").unwrap().active);
+        assert!(!store.provider("second").unwrap().active);
+    }
+
+    #[test]
+    fn restore_active_state_rejects_a_missing_previous_connection() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path().to_path_buf()).unwrap();
+        store.connections_save_provider(provider("active")).unwrap();
+        store.activate("active").unwrap();
+        let missing = ActiveState {
+            kind: ActiveKind::Provider,
+            provider_id: Some("deleted".into()),
+            account_id: None,
+        };
+
+        assert!(store.restore_active_state(&missing).is_err());
+        assert!(matches!(
+            store.read(|state| state.active.clone()).unwrap().kind,
+            ActiveKind::Provider
+        ));
+    }
+
+    #[test]
+    fn restore_active_state_returns_to_a_previous_official_account() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path().to_path_buf()).unwrap();
+        let saved = store
+            .save_official_account(&official_account("workspace", "one"))
+            .unwrap();
+        store
+            .connections_activate_official_account(&saved.id)
+            .unwrap();
+        let previous = store.read(|state| state.active.clone()).unwrap();
+        let mut next = provider("next");
+        next.api_key = Some("secret".into());
+        store.connections_save_provider(next).unwrap();
+        store.activate("next").unwrap();
+
+        store.restore_active_state(&previous).unwrap();
+
+        let active = store.read(|state| state.active.clone()).unwrap();
+        assert!(matches!(active.kind, ActiveKind::Official));
+        assert_eq!(active.account_id.as_deref(), Some(saved.id.as_str()));
     }
 
     #[test]

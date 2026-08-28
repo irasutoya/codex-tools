@@ -1,11 +1,13 @@
 use crate::{
-    activation::{activate_openai_record, ensure_codex_stopped, sync_active_openai_credential},
+    activation::{
+        activate_openai_record_with_paths, ensure_codex_stopped, sync_active_openai_credential,
+    },
     auth_center::{AuthCenter, DevicePollResult},
     chat_proxy::ChatProxyRegistry,
     codex::{self, ConfigManager},
     local_usage::UsageLedger,
     models::*,
-    official_quota, proxy_import,
+    official_quota, proxy_import, record_current_activation,
     session_index::SessionIndex,
     state::{ActivationLock, ApiClient},
     storage::Store,
@@ -51,6 +53,25 @@ fn estimate_windows(quota: &ProviderAccountQuota) -> Vec<(i64, i64, f64)> {
     })
 }
 
+fn estimate_window_ids(quota: &ProviderAccountQuota) -> Vec<(i64, i64)> {
+    estimate_windows(quota)
+        .into_iter()
+        .map(|(window_seconds, reset_at, _)| (window_seconds, reset_at))
+        .collect()
+}
+
+fn clear_estimates_for_current_quota(
+    store: &Store,
+    account_id: &str,
+    quota: &ProviderAccountQuota,
+) -> Result<(), AppError> {
+    store.clear_official_account_quota_estimates(account_id, &estimate_window_ids(quota))
+}
+
+fn quota_estimation_crossed_reset(results: &[QuotaEstimateWindowResult], now: i64) -> bool {
+    results.iter().any(|result| now >= result.reset_at)
+}
+
 fn ensure_current_activation(activation: &ActivationLock, operation: u64) -> Result<(), AppError> {
     if activation.is_current(operation) {
         Ok(())
@@ -71,6 +92,13 @@ fn apply_successful_quota_snapshot(
     snapshot.fetched_at = Some(now);
     snapshot.error = None;
     snapshot.error_code = None;
+    // 新额度快照的百分比不能与旧快照的金额混用；同周期旧估算也必须重新计算。
+    let current_windows = estimate_window_ids(snapshot);
+    snapshot.estimates.retain(|estimate| {
+        !current_windows.iter().any(|(window_seconds, reset_at)| {
+            estimate.window_seconds == *window_seconds && estimate.reset_at == *reset_at
+        })
+    });
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -274,7 +302,12 @@ async fn refresh_official_quota(
     }
     match quota_result {
         Ok(data) => {
-            apply_successful_quota_snapshot(&mut snapshot, data.data, data.plan_type, now);
+            apply_successful_quota_snapshot(
+                &mut snapshot,
+                data.data,
+                data.plan_type,
+                chrono::Utc::now().timestamp(),
+            );
         }
         Err(error) => {
             snapshot.status = error.status;
@@ -319,39 +352,88 @@ pub(crate) async fn connections_refresh_quota(
 #[tauri::command]
 pub(crate) async fn connections_estimate_quota(
     store: State<'_, Store>,
+    center: State<'_, AuthCenter>,
+    client: State<'_, ApiClient>,
+    activation: State<'_, ActivationLock>,
     ledger: State<'_, UsageLedger>,
     account_id: String,
 ) -> Result<QuotaEstimateResult, AppError> {
-    let account = store.official_account(&account_id)?;
-    if account.quota.status != QuotaStatus::Success {
-        return Err(AppError::InvalidConfig("请先刷新额度。".into()));
+    let previous_quota = store.official_account(&account_id)?.quota;
+    // 本轮开始即撤销当前窗口旧金额：后续的额度、扫描或完整性失败都不能继续展示它。
+    clear_estimates_for_current_quota(&store, &account_id, &previous_quota)?;
+
+    for attempt in 0..2 {
+        let quota =
+            refresh_official_quota(&store, &center, &client, &activation, &account_id).await?;
+        if quota.status != QuotaStatus::Success {
+            return Err(AppError::InvalidConfig(
+                quota
+                    .error
+                    .unwrap_or_else(|| "刷新额度失败，暂无法估算。".into()),
+            ));
+        }
+        let windows = estimate_windows(&quota);
+        if windows.is_empty() {
+            return Err(AppError::InvalidConfig(
+                "当前额度窗口缺少可识别的时长或重置时间，暂无法估算。".into(),
+            ));
+        }
+        // 本次网络快照可能已进入新周期；无论之后扫描或完整性校验是否失败，都不能展示其旧金额。
+        clear_estimates_for_current_quota(&store, &account_id, &quota)?;
+
+        let quota_snapshot_at_ms = quota
+            .fetched_at
+            .ok_or_else(|| AppError::Internal("刷新额度后缺少快照时间，无法安全估算。".into()))?
+            .saturating_mul(1_000);
+        let account = store.official_account(&account_id)?;
+        let canonical_account_id = canonical_official_account_id(&account);
+        // 对账必须发生在增量解析之前，确保本次新增事件可归属到当前官方账号。
+        record_current_activation(&store, &ledger)?;
+        let official_account_identities = store.read(|state| {
+            state
+                .official_accounts
+                .iter()
+                .map(|account| (account.id.clone(), canonical_official_account_id(account)))
+                .collect::<Vec<_>>()
+        })?;
+        ledger.sync_official_account_identities(&official_account_identities)?;
+        let codex_home = codex::home(&store.codex_home_setting()?);
+        let refresh_started_at_ms = chrono::Utc::now().timestamp_millis();
+        let ledger = ledger.inner().clone();
+        let results = tokio::task::spawn_blocking(move || {
+            ledger.refresh_and_estimate_account_quota(
+                &codex_home,
+                refresh_started_at_ms,
+                &canonical_account_id,
+                &windows,
+                quota_snapshot_at_ms,
+            )
+        })
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))??;
+
+        let crossed_reset =
+            quota_estimation_crossed_reset(&results, chrono::Utc::now().timestamp());
+        if crossed_reset {
+            if attempt == 0 {
+                continue;
+            }
+            return Err(AppError::InvalidConfig(
+                "估算过程中额度周期再次重置，请稍后重新估算。".into(),
+            ));
+        }
+
+        let successful = results
+            .iter()
+            .filter_map(|result| result.success.then_some(result.estimate.clone()).flatten())
+            .collect::<Vec<_>>();
+        if !successful.is_empty() {
+            store.save_official_account_quota_estimates(&account_id, &successful)?;
+        }
+        return Ok(QuotaEstimateResult { windows: results });
     }
-    let windows = estimate_windows(&account.quota);
-    if windows.is_empty() {
-        return Err(AppError::InvalidConfig(
-            "当前额度窗口缺少可识别的时长或重置时间，暂无法估算。".into(),
-        ));
-    }
-    let canonical_account_id = canonical_official_account_id(&account);
-    // 与常规用量刷新使用同一套别名映射，避免不同本地账号互相混入。
-    ledger
-        .sync_official_account_identities(&[(account.id.clone(), canonical_account_id.clone())])?;
-    let now_utc_ms = chrono::Utc::now().timestamp_millis();
-    let ledger = ledger.inner().clone();
-    let results = tokio::task::spawn_blocking(move || {
-        ledger.estimate_account_quota(&canonical_account_id, &windows, now_utc_ms)
-    })
-    .await
-    .map_err(|error| AppError::Internal(error.to_string()))??;
-    let successful = results
-        .iter()
-        .filter_map(|result| result.success.then_some(result.estimate.clone()).flatten())
-        .collect::<Vec<_>>();
-    // 任何失败窗口都不触碰旧成功记录；仅成功窗口覆盖同一窗口身份的旧值。
-    if !successful.is_empty() {
-        store.save_official_account_quota_estimates(&account_id, &successful)?;
-    }
-    Ok(QuotaEstimateResult { windows: results })
+
+    Err(AppError::Internal("额度估算重试状态异常。".into()))
 }
 
 #[tauri::command]
@@ -446,7 +528,7 @@ async fn activate_resolved_official_account(
     sync_active_openai_credential(store, home)?;
     let saved = center.refresh_account(store, id).await?;
     ensure_current_activation(activation, activation_operation)?;
-    let repair = activate_openai_record(
+    let (repair, affected_paths) = activate_openai_record_with_paths(
         store,
         manager,
         ledger,
@@ -456,7 +538,10 @@ async fn activate_resolved_official_account(
         &saved,
     )
     .await?;
-    index.invalidate();
+    if let Err(error) = index.refresh_paths(home, &affected_paths) {
+        index.invalidate();
+        eprintln!("账号切换后定向刷新会话索引失败，已回退全量重建：{error}");
+    }
     Ok(repair)
 }
 
@@ -689,7 +774,81 @@ mod tests {
     }
 
     #[test]
-    fn successful_quota_refresh_keeps_existing_estimates() {
+    fn quota_estimation_retries_when_any_window_crosses_a_reset() {
+        let results = vec![
+            QuotaEstimateWindowResult {
+                window_seconds: FIVE_HOURS_SECONDS,
+                reset_at: 100,
+                success: true,
+                estimate: None,
+                reason: None,
+            },
+            QuotaEstimateWindowResult {
+                window_seconds: SEVEN_DAYS_SECONDS,
+                reset_at: 200,
+                success: true,
+                estimate: None,
+                reason: None,
+            },
+        ];
+        assert!(quota_estimation_crossed_reset(&results, 100));
+        assert!(!quota_estimation_crossed_reset(&results, 99));
+    }
+
+    #[test]
+    fn each_refreshed_quota_window_clears_its_own_old_estimate_including_retry_window() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path().join("data")).unwrap();
+        let account = store
+            .save_official_account(&account("workspace", ""))
+            .unwrap();
+        let old = QuotaEstimate {
+            window_seconds: FIVE_HOURS_SECONDS,
+            reset_at: 100,
+            estimated_total_microusd: 100,
+            estimated_at: 1,
+        };
+        let first_current = QuotaEstimate {
+            reset_at: 200,
+            ..old.clone()
+        };
+        let retry_current = QuotaEstimate {
+            reset_at: 300,
+            ..old.clone()
+        };
+        store
+            .save_official_account_quota_estimates(
+                &account.id,
+                &[old.clone(), first_current.clone(), retry_current.clone()],
+            )
+            .unwrap();
+
+        let quota_for = |reset_at| ProviderAccountQuota {
+            status: QuotaStatus::Success,
+            data: Some(QuotaData::Windowed {
+                primary: Some(QuotaWindow {
+                    used_percent: 25.0,
+                    remaining_percent: 75.0,
+                    window_seconds: Some(FIVE_HOURS_SECONDS),
+                    reset_at: Some(reset_at),
+                }),
+                secondary: None,
+            }),
+            ..Default::default()
+        };
+        clear_estimates_for_current_quota(&store, &account.id, &quota_for(200)).unwrap();
+        let after_first = store.official_account(&account.id).unwrap().quota.estimates;
+        assert!(after_first.contains(&old));
+        assert!(!after_first.contains(&first_current));
+        assert!(after_first.contains(&retry_current));
+
+        clear_estimates_for_current_quota(&store, &account.id, &quota_for(300)).unwrap();
+        let after_retry = store.official_account(&account.id).unwrap().quota.estimates;
+        assert_eq!(after_retry, vec![old]);
+    }
+
+    #[test]
+    fn successful_quota_refresh_clears_estimates_for_the_refreshed_windows() {
         let estimate = QuotaEstimate {
             window_seconds: FIVE_HOURS_SECONDS,
             reset_at: 100,
@@ -716,7 +875,7 @@ mod tests {
             42,
         );
         assert_eq!(snapshot.status, QuotaStatus::Success);
-        assert_eq!(snapshot.estimates, vec![estimate]);
+        assert!(snapshot.estimates.is_empty());
         assert_eq!(snapshot.fetched_at, Some(42));
         assert!(snapshot.error.is_none());
     }

@@ -1,7 +1,7 @@
 use crate::{
     chat_proxy::ChatProxyRegistry,
     codex::{self, ConfigManager},
-    commands::sessions::repair_home_after_activation,
+    commands::sessions::{repair_home_after_activation, repair_home_after_activation_with_paths},
     models::{ActiveKind, AppError, RepairResult, StoredOfficialAccount},
     provider_sync,
     state::ActivationLock,
@@ -156,6 +156,7 @@ pub(crate) async fn sync_active_codex_configuration(
                 || ensure_codex_stopped(store),
             )?;
             store.save_last_managed_model(None)?;
+            let _ = repair_home_after_activation(store, home, "openai".into()).await;
             return Ok(());
         }
         ActiveKind::None => return Ok(()),
@@ -192,9 +193,11 @@ pub(crate) async fn sync_active_codex_configuration(
             ))),
         };
     }
+    let _ = repair_home_after_activation(store, home, codex::MANAGED_PROVIDER_ID.into()).await;
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) async fn activate_openai_record(
     store: &Store,
     manager: &ConfigManager,
@@ -204,6 +207,30 @@ pub(crate) async fn activate_openai_record(
     activation_operation: u64,
     account: &StoredOfficialAccount,
 ) -> Result<RepairResult, AppError> {
+    Ok(activate_openai_record_with_paths(
+        store,
+        manager,
+        ledger,
+        proxy,
+        activation,
+        activation_operation,
+        account,
+    )
+    .await?
+    .0)
+}
+
+/// 与 [`activate_openai_record`] 相同，但额外返回本次实际修改过的会话文件路径，
+/// 供上层只刷新受影响来源的会话索引。
+pub(crate) async fn activate_openai_record_with_paths(
+    store: &Store,
+    manager: &ConfigManager,
+    ledger: &crate::local_usage::UsageLedger,
+    proxy: &ChatProxyRegistry,
+    activation: &ActivationLock,
+    activation_operation: u64,
+    account: &StoredOfficialAccount,
+) -> Result<(RepairResult, Vec<std::path::PathBuf>), AppError> {
     crate::official_quota::ensure_account_usable(account)?;
     ensure_codex_stopped(store)?;
     let home = codex::home(&store.codex_home_setting()?);
@@ -230,24 +257,47 @@ pub(crate) async fn activate_openai_record(
         ) {
             return Err(compensate_activation_failure(store, manager, proxy, error).await);
         }
+        let previous_active = store.read(|state| state.active.clone())?;
         if let Err(error) = store.connections_activate_official_account(&account.id) {
             return Err(compensate_activation_failure(store, manager, proxy, error).await);
         }
-        let repair = if repair_sessions {
-            repair_home_after_activation(store, home, "openai".into()).await
+        let (repair, affected_paths) = if repair_sessions {
+            repair_home_after_activation_with_paths(store, home, "openai".into()).await
         } else {
-            RepairResult {
-                target_provider: "openai".into(),
-                ..RepairResult::default()
-            }
+            (
+                RepairResult {
+                    target_provider: "openai".into(),
+                    repair_complete: true,
+                    verification_passed: true,
+                    ..RepairResult::default()
+                },
+                Vec::new(),
+            )
         };
-        Ok::<_, AppError>(repair)
+        // 会话归属修复必须整体完成才算切换成功：任一会话未修复都回滚激活状态与
+        // Codex 配置，绝不返回部分成功。修复失败时会话文件已由修复路径整体回滚，
+        // 因此恢复原激活状态后重新同步即可回到切换前的连接。
+        if !repair.repair_complete {
+            let rollback_error =
+                AppError::Internal(repair_incomplete_message(&repair, "账号切换已回滚"));
+            if let Err(restore) = store.restore_active_state(&previous_active) {
+                return Err(compensate_activation_failure(
+                    store,
+                    manager,
+                    proxy,
+                    AppError::Internal(format!("{rollback_error}；恢复原账号状态失败：{restore}")),
+                )
+                .await);
+            }
+            return Err(compensate_activation_failure(store, manager, proxy, rollback_error).await);
+        }
+        Ok::<_, AppError>((repair, affected_paths))
     }
     .await;
     match result {
-        Ok(mut repair) => {
+        Ok((mut repair, affected_paths)) => {
             crate::confirm_pending(ledger, &pending_id, &mut repair);
-            Ok(repair)
+            Ok((repair, affected_paths))
         }
         Err(error) => {
             crate::cancel_pending(ledger, &pending_id);
@@ -268,6 +318,16 @@ pub(crate) async fn compensate_activation_failure(
             "{error}；原来的 Codex 连接也未能恢复，请重新选择账号或服务：{rollback}"
         )),
     }
+}
+
+/// 会话归属修复未完成时的回滚错误文案，优先带出后端给出的具体原因。
+pub(crate) fn repair_incomplete_message(repair: &RepairResult, action: &str) -> String {
+    let reason = repair
+        .warnings
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "任一会话未能确认修复。".into());
+    format!("{action}：会话归属修复未完成，{reason}")
 }
 
 #[cfg(test)]
@@ -718,5 +778,106 @@ base_url = "http://127.0.0.1:1/codex-tools-installation-id/stale"
         let auth: serde_json::Value =
             serde_json::from_slice(&fs::read(home.join("auth.json")).unwrap()).unwrap();
         assert_eq!(auth["personal_access_token"], "at-proxy-secret");
+    }
+
+    #[tokio::test]
+    async fn official_activation_rolls_back_when_session_repair_does_not_complete() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex-home");
+        fs::create_dir_all(&home).unwrap();
+        let store = Store::open(temp.path().join("data")).unwrap();
+        store
+            .update(|state| {
+                state.codex.home = home.display().to_string();
+                Ok(())
+            })
+            .unwrap();
+        let provider = store
+            .connections_save_provider(ProviderProfile {
+                id: "provider".into(),
+                name: "Provider".into(),
+                base_url: "http://127.0.0.1:9/v1".into(),
+                headers: Default::default(),
+                timeout_secs: 30,
+                enabled: true,
+                active: false,
+                model: String::new(),
+                model_context_windows: Default::default(),
+                available_models: vec!["api-model".into()],
+                selected_models: None,
+                custom_models: Default::default(),
+                models_dev_meta: Default::default(),
+                api_type: ProviderApiType::Responses,
+                api_key: Some("secret".into()),
+                has_api_key: false,
+                created_at: 0,
+                updated_at: 0,
+            })
+            .unwrap();
+        store.activate(&provider.id).unwrap();
+        let credential = CodexAuthCredential {
+            auth_mode: "chatgpt".into(),
+            openai_api_key: None,
+            tokens: CodexAuthTokens {
+                id_token: "id-secret".into(),
+                access_token: "access-secret".into(),
+                refresh_token: "refresh-secret".into(),
+                account_id: "workspace".into(),
+            },
+            last_refresh: "2026-07-15T00:00:00Z".into(),
+        };
+        let saved = store
+            .save_official_account(&StoredOfficialAccount {
+                id: String::new(),
+                name: "OpenAI".into(),
+                remark: String::new(),
+                account_id: "workspace".into(),
+                email: "person@example.test".into(),
+                credential: credential.clone(),
+                source: OfficialAccountSource::OpenAiOauth,
+                expires_at: None,
+                quota: ProviderAccountQuota::default(),
+                created_at: 0,
+                updated_at: 0,
+            })
+            .unwrap();
+        fs::write(
+            home.join("config.toml"),
+            "model_provider = \"custom\"\n[model_providers.custom]\nbase_url = \"http://127.0.0.1:9/v1\"\nwire_api = \"responses\"\n",
+        )
+        .unwrap();
+        // 未知 Codex 会话数据库结构会让切换后的自动修复整体失败。
+        let database = home.join("state_5.sqlite");
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        connection
+            .execute_batch("CREATE TABLE unknown_table(id TEXT);")
+            .unwrap();
+        drop(connection);
+
+        let ledger = crate::local_usage::UsageLedger::open(&temp.path().join("usage")).unwrap();
+        let activation = ActivationLock::default();
+        let activation_operation = activation.begin_operation();
+        let result = activate_openai_record(
+            &store,
+            &ConfigManager::default(),
+            &ledger,
+            &ChatProxyRegistry::default(),
+            &activation,
+            activation_operation,
+            &saved,
+        )
+        .await;
+
+        let error = result.unwrap_err();
+        assert!(error.to_string().contains("会话归属修复未完成"));
+        let active = store.read(|state| state.active.clone()).unwrap();
+        assert!(matches!(active.kind, ActiveKind::Provider));
+        assert_eq!(active.provider_id.as_deref(), Some("provider"));
+        let config = fs::read_to_string(home.join("config.toml")).unwrap();
+        let document = config.parse::<toml_edit::DocumentMut>().unwrap();
+        assert_eq!(
+            document["model_provider"].as_str(),
+            Some(codex::MANAGED_PROVIDER_ID)
+        );
     }
 }

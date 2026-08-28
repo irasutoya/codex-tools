@@ -7,7 +7,20 @@
     <title>Codex Tools</title>
   </head>
   <body>
-    <div id="root"></div>
-    <script type="module" src="/src/main.tsx"></script>
+    <div id="root" data-startup-pending="true">
+      <main
+        role="alert"
+        style="display: grid; min-height: 100vh; place-items: center; padding: 24px; font-family: system-ui, sans-serif; text-align: center"
+      >
+        <div>
+          <h1 style="margin: 0 0 8px; font-size: 20px">正在启动 Codex Tools</h1>
+          <p style="margin: 0; opacity: 0.7">
+            如果此提示持续显示，请按 Ctrl+R 重新加载，并检查开发终端中的错误信息。
+          </p>
+        </div>
+      </main>
+    </div>
+    <script src="/startup.js"></script>
+    <script type="module" data-app-entry src="/src/main.tsx"></script>
   </body>
 </html>

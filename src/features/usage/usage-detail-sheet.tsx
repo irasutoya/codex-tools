@@ -4,7 +4,6 @@ import {
   Sheet,
   SheetBody,
   SheetContent,
-  SheetDescription,
   SheetHeader,
   SheetTitle,
 } from "@/components/ui/sheet"
@@ -47,9 +46,6 @@ export function UsageDetail({
           <SheetTitle>
             {groupBy === "model" ? display.model : display.sourceName}
           </SheetTitle>
-          <SheetDescription>
-            {groupBy === "model" ? "模型" : "账号"}汇总的 Token 构成
-          </SheetDescription>
         </SheetHeader>
         <SheetBody className="grid content-start gap-2">
           <Progress

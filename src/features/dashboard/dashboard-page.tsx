@@ -99,7 +99,6 @@ export function DashboardPage({
       <Card size="sm" className="min-h-60 flex-1">
         <CardHeader className="grid grid-cols-[1fr_auto] items-center">
           <CardTitle>Token 趋势（最近 7 天）</CardTitle>
-          <span className="text-xs text-muted-foreground">按本地日期</span>
         </CardHeader>
         <CardContent className="flex min-h-0 flex-1">
           <ChartContainer
@@ -167,15 +166,10 @@ export function DashboardPage({
             value={formatTokens(usage.totals.tokens.totalTokens)}
             detail={`输入 ${formatTokens(tokenInput(usage.totals.tokens))} · 输出 ${formatTokens(usage.totals.tokens.outputTokens)}`}
           />
-          <Metric
-            label="请求"
-            value={formatInteger(usage.totals.requests)}
-            detail="已统计请求"
-          />
+          <Metric label="请求" value={formatInteger(usage.totals.requests)} />
           <Metric
             label="估算费用"
             value={formatUsd(usage.totals.estimatedCostMicrousd)}
-            detail="按当前价格规则"
           />
         </CardContent>
       </Card>
@@ -236,7 +230,7 @@ function Metric({
 }: {
   label: string
   value: string
-  detail: string
+  detail?: string
 }) {
   return (
     <div className="flex min-w-0 flex-col gap-1 px-3 first:pl-0 last:pr-0">
@@ -244,7 +238,9 @@ function Metric({
       <span className="text-xl font-medium tracking-tight tabular-nums">
         {value}
       </span>
-      <span className="truncate text-xs text-muted-foreground">{detail}</span>
+      {detail && (
+        <span className="truncate text-xs text-muted-foreground">{detail}</span>
+      )}
     </div>
   )
 }

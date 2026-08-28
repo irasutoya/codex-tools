@@ -260,6 +260,7 @@ const mockUsage: UsageOverview = {
       pricingRuleName: "团队价格",
     },
   ],
+  models: ["gpt-5.6-sol", "gpt-5.6-luna"],
   trendPoints: mockTrend,
   warnings: [],
   lastRefreshedAtMs: now,
@@ -290,12 +291,19 @@ const mockSessions: Session[] = Array.from({ length: 16 }, (_, index) => ({
 const mockRepair: RepairResult = {
   targetProvider: "openai",
   filesScanned: 8,
+  filesCached: 0,
+  filesOpened: 8,
   filesModified: 3,
   filesSkipped: 5,
   filesFailed: 0,
   sessionMetaUpdated: 3,
   rowsUpdated: 3,
+  databasesScanned: 2,
+  databasesUpdated: 2,
   warnings: [],
+  repairComplete: true,
+  verificationPassed: true,
+  elapsedMs: 12,
 }
 
 export async function mockCall(
@@ -355,10 +363,14 @@ export async function mockCall(
         query?: string
         page?: number
         pageSize?: number
+        status?: "active" | "archived"
       }
       const query = input.query?.toLowerCase() ?? ""
-      const filtered = mockSessions.filter((session) =>
-        `${session.title} ${session.cwd}`.toLowerCase().includes(query)
+      const status = input.status ?? "active"
+      const filtered = mockSessions.filter(
+        (session) =>
+          session.archived === (status === "archived") &&
+          `${session.title} ${session.cwd}`.toLowerCase().includes(query)
       )
       const requestedPage = input.page ?? 1
       const pageSize = input.pageSize ?? 8
@@ -580,8 +592,12 @@ export async function mockCall(
       const account = mockAccounts.find(
         (candidate) => candidate.id === accountId
       )
-      if (!account || account.quota.status !== "success") {
-        throw new Error("请先刷新额度。")
+      if (!account) throw new Error(`账号不存在：${accountId}`)
+      // 与真实命令一致：估算操作自行取得当前额度快照，不依赖用户先点“刷新额度”。
+      account.quota = {
+        ...mockQuota,
+        fetchedAt: Math.floor(Date.now() / 1000),
+        estimates: [],
       }
       const windows: import("@/types").QuotaEstimateWindowResult[] = []
       for (const [slot, window] of Object.entries({

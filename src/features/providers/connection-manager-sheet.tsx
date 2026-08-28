@@ -17,28 +17,11 @@ import {
 } from "@/components/ui/alert-dialog"
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
-import {
-  Dialog,
-  DialogBody,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog"
-import {
-  Field,
-  FieldDescription,
-  FieldGroup,
-  FieldLabel,
-} from "@/components/ui/field"
-import { Input } from "@/components/ui/input"
 import { ItemGroup } from "@/components/ui/item"
 import {
   Sheet,
   SheetBody,
   SheetContent,
-  SheetDescription,
   SheetHeader,
   SheetTitle,
 } from "@/components/ui/sheet"
@@ -57,6 +40,7 @@ import type {
 } from "@/types"
 
 import { AccountManagerDialog } from "./account-manager-dialog"
+import { AccountRemarkDialog } from "./account-remark-dialog"
 import {
   accountDescription,
   accountPlanText,
@@ -82,7 +66,10 @@ import {
   syncProviderModels,
   testProviderConnection,
 } from "./connection-actions"
-import { ProviderEditorDialog } from "./provider-editor-dialog"
+import {
+  cloneProviderForEditing,
+  ProviderEditorDialog,
+} from "./provider-editor-dialog"
 import { displayQuotaWindows } from "./quota-estimate"
 
 type ConnectionPage = "dashboard" | "providers"
@@ -198,7 +185,6 @@ export function ConnectionManagerSheet({
 }) {
   const { busy: pending, begin, end } = useAsyncAction<PendingAction>()
   const [remarkAccount, setRemarkAccount] = useState<OfficialAccountView>()
-  const [remarkDraft, setRemarkDraft] = useState("")
   const [providerDraft, setProviderDraft] = useState<Provider>(emptyProvider())
   const [providerEditorOpen, setProviderEditorOpen] = useState(false)
   const latestSavedProviders = useRef(new Map<string, Provider>())
@@ -264,22 +250,6 @@ export function ConnectionManagerSheet({
   const editAccount = (account: OfficialAccountView) => {
     if (pending) return
     setRemarkAccount(account)
-    setRemarkDraft(account.remark)
-  }
-
-  const saveRemark = async () => {
-    if (!remarkAccount) return
-    const saved = await runAction(
-      "remark",
-      remarkAccount.id,
-      () =>
-        call("connections_update_account_remark", {
-          id: remarkAccount.id,
-          remark: remarkDraft,
-        }),
-      "账号备注已保存"
-    )
-    if (saved) setRemarkAccount(undefined)
   }
 
   const editProvider = (provider: Provider) => {
@@ -287,15 +257,7 @@ export function ConnectionManagerSheet({
     const cached = latestSavedProviders.current.get(provider.id)
     const latest =
       cached && cached.updatedAt >= provider.updatedAt ? cached : provider
-    setProviderDraft({
-      ...latest,
-      headers: { ...latest.headers },
-      availableModels: [...(latest.availableModels ?? [])],
-      customModels: [...(latest.customModels ?? [])],
-      selectedModels: latest.selectedModels
-        ? [...latest.selectedModels]
-        : undefined,
-    })
+    setProviderDraft(cloneProviderForEditing(latest))
     setProviderEditorOpen(true)
   }
 
@@ -440,9 +402,6 @@ export function ConnectionManagerSheet({
         >
           <SheetHeader>
             <SheetTitle>账号与服务</SheetTitle>
-            <SheetDescription>
-              查看、切换并管理 Codex 保存的全部连接。
-            </SheetDescription>
           </SheetHeader>
 
           <SheetBody className="gap-4">
@@ -632,61 +591,15 @@ export function ConnectionManagerSheet({
         </SheetContent>
       </Sheet>
 
-      <Dialog
+      <AccountRemarkDialog
+        key={remarkAccount?.id ?? "closed"}
+        account={remarkAccount}
         open={Boolean(remarkAccount)}
         onOpenChange={(nextOpen) => {
-          if (!nextOpen && pending) return
           if (!nextOpen) setRemarkAccount(undefined)
         }}
-      >
-        <DialogContent showCloseButton={!frozen} aria-busy={frozen}>
-          <DialogHeader>
-            <DialogTitle>编辑账号备注</DialogTitle>
-            <DialogDescription>
-              备注仅保存在本机，用于区分相近的账号。
-            </DialogDescription>
-          </DialogHeader>
-          <DialogBody>
-            <FieldGroup>
-              <Field data-disabled={frozen}>
-                <FieldLabel htmlFor="sheet-account-remark">账号备注</FieldLabel>
-                <Input
-                  id="sheet-account-remark"
-                  autoFocus
-                  disabled={frozen}
-                  maxLength={200}
-                  placeholder={remarkAccount?.name || "例如：工作账号"}
-                  value={remarkDraft}
-                  onChange={(event) => setRemarkDraft(event.target.value)}
-                />
-                <FieldDescription>留空可恢复显示账号原名称。</FieldDescription>
-              </Field>
-            </FieldGroup>
-          </DialogBody>
-          <DialogFooter>
-            <Button
-              type="button"
-              variant="outline"
-              disabled={frozen}
-              onClick={() => setRemarkAccount(undefined)}
-            >
-              取消
-            </Button>
-            <Button
-              type="button"
-              disabled={
-                frozen || remarkDraft.trim() === (remarkAccount?.remark ?? "")
-              }
-              onClick={() => void saveRemark()}
-            >
-              {pending?.action === "remark" && (
-                <Spinner data-icon="inline-start" />
-              )}
-              保存
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+        onSaved={onChanged}
+      />
 
       <ProviderEditorDialog
         open={providerEditorOpen}

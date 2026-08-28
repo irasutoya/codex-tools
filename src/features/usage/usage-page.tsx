@@ -3,6 +3,7 @@ import {
   Add01Icon,
   Database02Icon,
   Delete02Icon,
+  Edit02Icon,
   InformationCircleIcon,
   Refresh01Icon,
 } from "@hugeicons/core-free-icons"
@@ -60,13 +61,15 @@ import { call } from "@/lib/ipc"
 import { createRequestGate } from "@/lib/request-gate"
 import type {
   OfficialPricingCatalog,
+  Provider,
+  PricingRule,
   UsageGroupBy,
   UsageQuery,
   UsageRow,
 } from "@/types"
 
 import { PricingEditor } from "./pricing-editor-dialog"
-import { billingModeLabel, pricingSummary } from "./pricing"
+import { billingModeLabel, pricingSourceLabel, pricingSummary } from "./pricing"
 import { UsageDetail } from "./usage-detail-sheet"
 
 let automaticOfficialPricingSync: Promise<OfficialPricingCatalog> | undefined
@@ -95,11 +98,13 @@ export function UsagePage({
   days,
   groupBy,
   onRefresh,
+  providers,
 }: {
   refreshRevision: number
   onRefresh: () => void
   days: number
   groupBy: UsageGroupBy
+  providers: Provider[]
 }) {
   const [tab, setTab] = useState("details")
   const [selection, setSelection] = useState<{
@@ -108,6 +113,7 @@ export function UsagePage({
     refreshRevision: number
   }>()
   const [ruleOpen, setRuleOpen] = useState(false)
+  const [editingRule, setEditingRule] = useState<PricingRule>()
   const [busy, setBusy] = useState(false)
   const [officialCatalog, setOfficialCatalog] =
     useState<OfficialPricingCatalog>()
@@ -331,6 +337,16 @@ export function UsagePage({
     }
   }
 
+  const openNewRule = () => {
+    setEditingRule(undefined)
+    setRuleOpen(true)
+  }
+
+  const openEditRule = (rule: PricingRule) => {
+    setEditingRule(rule)
+    setRuleOpen(true)
+  }
+
   const points = useMemo(
     () => trendPointsToSeries(overview?.trendPoints ?? [], days === 1),
     [days, overview]
@@ -346,8 +362,8 @@ export function UsagePage({
   )
   const modelOptions = useMemo(
     () =>
-      [...new Set((overview?.rows ?? []).map((row) => row.model))]
-        .filter((model) => model !== "多个模型")
+      [...new Set(overview?.models ?? [])]
+        .filter(Boolean)
         .sort((left, right) => left.localeCompare(right)),
     [overview]
   )
@@ -509,7 +525,7 @@ export function UsagePage({
               <TabsTrigger value="pricing">价格规则</TabsTrigger>
             </TabsList>
             {tab === "pricing" && (
-              <Button size="sm" onClick={() => setRuleOpen(true)}>
+              <Button size="sm" onClick={openNewRule}>
                 <HugeiconsIcon icon={Add01Icon} data-icon="inline-start" />
                 添加规则
               </Button>
@@ -627,10 +643,19 @@ export function UsagePage({
                           </Badge>
                         </ItemTitle>
                         <ItemDescription>
+                          {pricingSourceLabel(rule, providers)} ·{" "}
                           {pricingSummary(rule)}
                         </ItemDescription>
                       </ItemContent>
                       <ItemActions>
+                        <Button
+                          size="icon-sm"
+                          variant="ghost"
+                          aria-label="编辑规则"
+                          onClick={() => openEditRule(rule)}
+                        >
+                          <HugeiconsIcon icon={Edit02Icon} />
+                        </Button>
                         <Button
                           size="icon-sm"
                           variant="ghost"
@@ -714,14 +739,20 @@ export function UsagePage({
         onOpenChange={(open) => !open && setSelection(undefined)}
       />
       <PricingEditor
-        key={ruleOpen ? "open" : "closed"}
+        key={`${ruleOpen ? "open" : "closed"}-${editingRule?.id ?? "new"}`}
         open={ruleOpen}
         range={query.range}
         modelOptions={modelOptions}
+        providers={providers}
         rules={rules ?? []}
-        onOpenChange={setRuleOpen}
+        editingRule={editingRule}
+        onOpenChange={(open) => {
+          setRuleOpen(open)
+          if (!open) setEditingRule(undefined)
+        }}
         onSaved={() => {
           setRuleOpen(false)
+          setEditingRule(undefined)
           onRefresh()
         }}
       />

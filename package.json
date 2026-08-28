@@ -1,7 +1,7 @@
 {
   "name": "codex-tools",
   "private": true,
-  "version": "0.7.10",
+  "version": "0.7.11",
   "description": "管理 Codex 的 OpenAI 账号和第三方 Responses API 服务。",
   "author": "Codex Tools contributors",
   "license": "MIT",
@@ -43,6 +43,7 @@
     "@hugeicons/core-free-icons": "^4.2.3",
     "@hugeicons/react": "^1.1.9",
     "@tauri-apps/api": "^2.8.0",
+    "@tauri-apps/plugin-clipboard-manager": "^2.3.2",
     "@tauri-apps/plugin-dialog": "^2.7.2",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",

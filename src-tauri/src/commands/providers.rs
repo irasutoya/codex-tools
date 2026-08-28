@@ -5,7 +5,7 @@ use crate::{
     },
     chat_proxy::ChatProxyRegistry,
     codex::{self, AppliedConfigPatch, ConfigManager},
-    commands::sessions::repair_home_after_activation,
+    commands::sessions::repair_home_after_activation_with_paths,
     local_usage::UsageLedger,
     models::*,
     models_dev, provider_http, provider_sync,
@@ -508,7 +508,12 @@ async fn sync_provider_models(
     expected_revision: Option<&ProviderSnapshotRevision>,
 ) -> Result<SyncedProviderModels, AppError> {
     let expected_source = ProviderSourceFingerprint::from_provider(provider);
-    let details = provider_http::fetch_model_details(client, provider).await?;
+    // /models 和 models.dev 并行请求，减少网络延迟叠加。
+    let (details_result, dev_meta_result) = tokio::join!(
+        provider_http::fetch_model_details(client, provider),
+        models_dev::fetch_provider_meta(client, &provider.base_url, &provider.name),
+    );
+    let details = details_result?;
     let mut models: Vec<String> = details.iter().map(|detail| detail.id.clone()).collect();
     models.sort();
     models.dedup();
@@ -536,9 +541,7 @@ async fn sync_provider_models(
             })
         })
         .collect::<BTreeMap<_, _>>();
-    if let Ok(dev_meta) =
-        models_dev::fetch_provider_meta(client, &provider.base_url, &provider.name).await
-    {
+    if let Ok(dev_meta) = dev_meta_result {
         // 按 /models 返回的原始 id 解析 models.dev 元数据（兼容纯 id / 厂商前缀 / 大小写）。
         for id in &models {
             let Some(info) = models_dev::lookup_model(&dev_meta, id) else {
@@ -700,12 +703,11 @@ pub(crate) async fn connections_activate(
         }
         let home = codex::home(&store.codex_home_setting()?);
         sync_active_openai_credential(&store, &home)?;
-        let active_connection_changed = store.read(|state| {
-            !matches!(state.active.kind, ActiveKind::Provider)
-                || state.active.provider_id.as_deref() != Some(id.as_str())
-        })?;
-        let repair_sessions = active_connection_changed
-            || provider_sync::configured_provider(&home) != codex::MANAGED_PROVIDER_ID;
+        // 第三方之间切换时会话归属字段已经是 "custom"，无需遍历修复；
+        // 仅当当前配置不是 MANAGED_PROVIDER_ID（如从官方账号切换过来）
+        // 时才需要修复。
+        let current_configured_provider = provider_sync::configured_provider(&home);
+        let repair_sessions = current_configured_provider != codex::MANAGED_PROVIDER_ID;
         let preview = manager.preview_custom(&home, &provider, &target)?;
         let pending_id = crate::begin_activation(
             &ledger,
@@ -720,6 +722,7 @@ pub(crate) async fn connections_activate(
                 &preview.operation_id,
             )
             .await?;
+            let previous_active = store.read(|state| state.active.clone())?;
             if let Err(error) = store.activate(&id) {
                 return Err(rollback_provider_activation(
                     &store, &manager, &proxy, rollback, error,
@@ -728,20 +731,62 @@ pub(crate) async fn connections_activate(
             }
             // 转换代理保持运行：Codex 会缓存配置里的地址，端口必须在本机会话内
             // 保持稳定，切回其他服务再切回来时才能继续使用同一端口。
-            let repair = if repair_sessions {
-                repair_home_after_activation(&store, home, codex::MANAGED_PROVIDER_ID.into()).await
+            let (repair, affected_paths) = if repair_sessions {
+                repair_home_after_activation_with_paths(
+                    &store,
+                    home.clone(),
+                    codex::MANAGED_PROVIDER_ID.into(),
+                )
+                .await
             } else {
-                RepairResult {
-                    target_provider: codex::MANAGED_PROVIDER_ID.into(),
-                    ..RepairResult::default()
-                }
+                (
+                    RepairResult {
+                        target_provider: codex::MANAGED_PROVIDER_ID.into(),
+                        repair_complete: true,
+                        verification_passed: true,
+                        ..RepairResult::default()
+                    },
+                    Vec::new(),
+                )
             };
-            Ok::<_, AppError>(repair)
+            // 会话归属修复必须整体完成才算切换成功：任一会话未修复都回滚激活
+            // 状态与 Codex 配置，绝不返回部分成功。修复失败时会话文件已由修复
+            // 路径整体回滚，因此恢复原激活状态后回滚配置即可回到切换前的连接。
+            if !repair.repair_complete {
+                let rollback_error = AppError::Internal(
+                    crate::activation::repair_incomplete_message(&repair, "连接未切换"),
+                );
+                if let Err(restore) = store.restore_active_state(&previous_active) {
+                    return Err(rollback_provider_activation(
+                        &store,
+                        &manager,
+                        &proxy,
+                        rollback,
+                        AppError::Internal(format!(
+                            "{rollback_error}；恢复原连接状态失败：{restore}"
+                        )),
+                    )
+                    .await);
+                }
+                return Err(rollback_provider_activation(
+                    &store,
+                    &manager,
+                    &proxy,
+                    rollback,
+                    rollback_error,
+                )
+                .await);
+            }
+            Ok::<_, AppError>((repair, affected_paths))
         }
         .await;
         match result {
-            Ok(mut repair) => {
+            Ok((mut repair, affected_paths)) => {
                 crate::confirm_pending(&ledger, &pending_id, &mut repair);
+                if let Err(error) = index.refresh_paths(&home, &affected_paths) {
+                    index.invalidate();
+                    eprintln!("连接切换后定向刷新会话索引失败，已回退全量重建：{error}");
+                }
                 Ok(repair)
             }
             Err(error) => {
@@ -750,7 +795,6 @@ pub(crate) async fn connections_activate(
             }
         }
     }?;
-    index.invalidate();
     Ok(repair)
 }
 

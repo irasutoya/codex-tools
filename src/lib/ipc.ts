@@ -92,7 +92,13 @@ type CommandMap = {
   sessions_scan: CommandSpec<undefined, RepairScan>
   sessions_repair: CommandSpec<{ targetProvider: string }, RepairResult>
   sessions_list: CommandSpec<
-    { query?: string; page?: number; pageSize?: number; refresh?: boolean },
+    {
+      query?: string
+      page?: number
+      pageSize?: number
+      refresh?: boolean
+      status?: "active" | "archived"
+    },
     PageResult<Session>
   >
   dashboard_launch: CommandSpec<undefined, ModelUnlockResult>

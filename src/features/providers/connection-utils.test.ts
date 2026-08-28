@@ -1,6 +1,8 @@
-import { describe, expect, it } from "vitest"
+import { afterEach, describe, expect, it, vi } from "vitest"
 
 import type { OfficialAccountView, Provider, RepairResult } from "@/types"
+
+vi.mock("@/lib/ipc", () => ({ call: vi.fn() }))
 
 import {
   addCustomModelTo,
@@ -17,8 +19,10 @@ import {
   removeCustomModelFrom,
   repairWarning,
   quotaStatusText,
+  switchActiveConnection,
   toggleModelSelected,
 } from "./connection-utils"
+import { call } from "@/lib/ipc"
 
 const makeAccount = (
   overrides: Partial<OfficialAccountView> = {}
@@ -74,12 +78,19 @@ const makeProvider = (overrides: Partial<Provider> = {}): Provider => ({
 const repair = (overrides: Partial<RepairResult> = {}): RepairResult => ({
   targetProvider: "openai",
   filesScanned: 0,
+  filesCached: 0,
+  filesOpened: 0,
   filesModified: 0,
   filesSkipped: 0,
   filesFailed: 0,
   sessionMetaUpdated: 0,
   rowsUpdated: 0,
+  databasesScanned: 0,
+  databasesUpdated: 0,
   warnings: [],
+  repairComplete: true,
+  verificationPassed: true,
+  elapsedMs: 0,
   ...overrides,
 })
 
@@ -112,12 +123,64 @@ describe("repairWarning", () => {
     expect(repairWarning(repair())).toBeUndefined()
   })
 
+  it("reports a rolled-back switch when repair did not complete", () => {
+    expect(repairWarning(repair({ repairComplete: false }))).toContain(
+      "切换已回滚：会话归属修复未完成，切换已回滚"
+    )
+  })
+
   it("surfaces partial repair failures and backend warnings", () => {
     expect(
       repairWarning(
         repair({ filesFailed: 2, warnings: ["数据库被占用", "索引刷新失败"] })
       )
     ).toContain("2 个会话文件修复失败；数据库被占用；索引刷新失败")
+  })
+})
+
+describe("switchActiveConnection", () => {
+  afterEach(() => {
+    vi.mocked(call).mockReset()
+  })
+
+  it("switches to the first candidate whose repair completes", async () => {
+    vi.mocked(call)
+      .mockResolvedValueOnce(repair({ repairComplete: true }))
+      .mockResolvedValueOnce(repair({ repairComplete: true }))
+    const result = await switchActiveConnection([
+      { kind: "provider", id: "p1" },
+      { kind: "account", id: "a1" },
+    ])
+    expect(result.switchedId).toBe("p1")
+    expect(result.repair?.repairComplete).toBe(true)
+    expect(call).toHaveBeenCalledTimes(1)
+  })
+
+  it("treats an incomplete repair as a failed candidate and tries the next", async () => {
+    vi.mocked(call)
+      .mockResolvedValueOnce(
+        repair({ repairComplete: false, warnings: ["数据库被占用"] })
+      )
+      .mockResolvedValueOnce(repair({ repairComplete: true }))
+    const result = await switchActiveConnection([
+      { kind: "account", id: "a1" },
+      { kind: "provider", id: "p2" },
+    ])
+    expect(result.switchedId).toBe("p2")
+    expect(call).toHaveBeenCalledTimes(2)
+  })
+
+  it("returns the last error when every candidate fails to repair", async () => {
+    vi.mocked(call).mockResolvedValue(
+      repair({ repairComplete: false, warnings: ["会话文件被占用"] })
+    )
+    const result = await switchActiveConnection([
+      { kind: "account", id: "a1" },
+      { kind: "provider", id: "p2" },
+    ])
+    expect(result.switchedId).toBeUndefined()
+    expect(result.repair).toBeUndefined()
+    expect(String(result.error)).toContain("切换已回滚")
   })
 })
 

@@ -50,6 +50,7 @@ import { Spinner } from "@/components/ui/spinner"
 import { toast } from "@/components/ui/toast"
 import { repairWarning } from "@/features/providers/connection-utils"
 import { errorMessage } from "@/lib/format"
+import { writeClipboardText } from "@/lib/clipboard"
 import { useAsyncAction } from "@/hooks/use-async-action"
 import { call } from "@/lib/ipc"
 import type {
@@ -374,7 +375,7 @@ function DiagnosticsSection({
   ].join("\n")
   const copyReport = async () => {
     try {
-      await navigator.clipboard.writeText(report)
+      await writeClipboardText(report)
       toast.add({ title: "支持报告已复制", type: "success" })
     } catch (reason) {
       toast.add({

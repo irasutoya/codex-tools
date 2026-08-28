@@ -123,6 +123,7 @@ export type UsageOverview = {
     unattributedTokens: number
   }
   rows: UsageRow[]
+  models: string[]
   lastRefreshedAtMs?: number
   collectionStartedAtMs?: number
   collectionStartedVersion?: string
@@ -340,12 +341,19 @@ export type RepairScan = {
 export type RepairResult = {
   targetProvider: string
   filesScanned: number
+  filesCached: number
+  filesOpened: number
   filesModified: number
   filesSkipped: number
   filesFailed: number
   sessionMetaUpdated: number
   rowsUpdated: number
+  databasesScanned: number
+  databasesUpdated: number
   warnings: string[]
+  repairComplete: boolean
+  verificationPassed: boolean
+  elapsedMs: number
 }
 
 export type OfficialAccountView = {

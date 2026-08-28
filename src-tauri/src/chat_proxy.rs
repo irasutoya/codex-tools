@@ -858,7 +858,7 @@ impl ResponseMetadata {
             ("max_output_tokens", Value::Null),
             ("reasoning", json!({"effort": null, "summary": null})),
             ("text", json!({"format": {"type": "text"}})),
-            ("store", Value::Bool(false)),
+            ("store", Value::Bool(true)),
             ("truncation", Value::String("disabled".into())),
             ("user", Value::Null),
         ] {
@@ -2363,7 +2363,7 @@ fn chat_to_responses_body_with_schema(
         "temperature": null,
         "top_p": null,
         "truncation": "disabled",
-        "store": false,
+        "store": true,
         "metadata": {},
         "user": null,
     }))

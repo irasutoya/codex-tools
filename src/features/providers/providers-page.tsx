@@ -20,7 +20,6 @@ import {
 } from "@/components/ui/card"
 import {
   Empty,
-  EmptyDescription,
   EmptyHeader,
   EmptyMedia,
   EmptyTitle,
@@ -59,12 +58,12 @@ import {
   effectiveModelCount,
   quotaStatusText,
 } from "./connection-utils"
-import { ProviderEditorDialog } from "./provider-editor-dialog"
+import { AccountRemarkDialog } from "./account-remark-dialog"
 import {
-  displayQuotaWindows,
-  hasCurrentQuotaEstimate,
-  quotaWindowEstimate,
-} from "./quota-estimate"
+  cloneProviderForEditing,
+  ProviderEditorDialog,
+} from "./provider-editor-dialog"
+import { displayQuotaWindows, quotaWindowEstimate } from "./quota-estimate"
 
 export function ProvidersPage({
   connections,
@@ -83,6 +82,7 @@ export function ProvidersPage({
   const [loginMode, setLoginMode] = useState<AccountLoginMode>("browser")
   const [loginError, setLoginError] = useState<string>()
   const [editor, setEditor] = useState<Provider>(emptyProvider())
+  const [remarkAccount, setRemarkAccount] = useState<OfficialAccountView>()
   const [authorization, setAuthorization] = useState<DeviceAuthorization>()
   const [estimating, setEstimating] = useState(false)
   const { busy, begin, end, run } = useAsyncAction<string>()
@@ -276,6 +276,15 @@ export function ProvidersPage({
           onRefresh()
         }}
       />
+      <AccountRemarkDialog
+        key={remarkAccount?.id ?? "closed"}
+        account={remarkAccount}
+        open={Boolean(remarkAccount)}
+        onOpenChange={(open) => {
+          if (!open) setRemarkAccount(undefined)
+        }}
+        onSaved={onRefresh}
+      />
       <AccountLoginDialog
         key={loginOpen ? "login-open" : "login-closed"}
         open={loginOpen}
@@ -326,9 +335,6 @@ export function ProvidersPage({
                 <HugeiconsIcon icon={Key01Icon} />
               </EmptyMedia>
               <EmptyTitle>还没有连接</EmptyTitle>
-              <EmptyDescription>
-                登录 OpenAI 账号，或连接兼容 Responses API 的服务。
-              </EmptyDescription>
             </EmptyHeader>
             <div className="grid w-full grid-cols-3 gap-2">
               <Button
@@ -378,9 +384,7 @@ export function ProvidersPage({
   const provider = !isAccount ? (item as Provider) : undefined
   const displayName = account?.remark || item.name
   const actionBusy = Boolean(busy) || estimating
-  const canEstimate = Boolean(
-    account && displayQuotaWindows(account.quota).length
-  )
+  const canEstimate = Boolean(account)
 
   const estimateQuota = async () => {
     if (!account || estimating) return
@@ -397,7 +401,6 @@ export function ProvidersPage({
             .join("；") || undefined,
         type: failed.length ? "error" : "success",
       })
-      onRefresh()
     } catch (reason) {
       toast.add({
         title: "额度估算失败",
@@ -406,6 +409,7 @@ export function ProvidersPage({
       })
     } finally {
       setEstimating(false)
+      onRefresh()
     }
   }
 
@@ -413,12 +417,7 @@ export function ProvidersPage({
     <div className="flex min-h-full flex-col gap-3 px-3 pt-1 pb-3">
       <Card size="sm" className="shrink-0">
         <CardContent className="flex flex-col gap-2">
-          <div className="flex flex-col gap-0.5">
-            <div className="text-sm font-medium">添加连接</div>
-            <div className="text-xs text-muted-foreground">
-              使用官方授权或 Cookie 登录 OpenAI，也可以连接兼容 API 服务。
-            </div>
-          </div>
+          <div className="text-sm font-medium">添加连接</div>
           <div className="grid w-full grid-cols-3 gap-2">
             <Button
               type="button"
@@ -529,16 +528,10 @@ export function ProvidersPage({
                 variant="outline"
                 disabled={actionBusy || !canEstimate}
                 aria-busy={estimating}
-                title={canEstimate ? undefined : "请先刷新额度"}
                 onClick={() => void estimateQuota()}
               >
                 {estimating ? <Spinner data-icon="inline-start" /> : null}
-                {hasCurrentQuotaEstimate(
-                  account?.quota,
-                  account?.quota.estimates
-                )
-                  ? "重新估算"
-                  : "额度估算"}
+                {estimating ? "刷新并估算中" : "额度估算"}
               </Button>
               <Button
                 size="sm"
@@ -561,6 +554,14 @@ export function ProvidersPage({
                   <Spinner data-icon="inline-start" />
                 ) : null}
                 立即刷新登录
+              </Button>
+              <Button
+                size="sm"
+                variant="outline"
+                disabled={actionBusy}
+                onClick={() => setRemarkAccount(account)}
+              >
+                编辑备注
               </Button>
             </>
           ) : (
@@ -605,6 +606,17 @@ export function ProvidersPage({
                   />
                 )}
                 同步模型
+              </Button>
+              <Button
+                variant="outline"
+                disabled={actionBusy}
+                onClick={() => {
+                  if (!provider) return
+                  setEditor(cloneProviderForEditing(provider))
+                  setEditorOpen(true)
+                }}
+              >
+                编辑 API 服务
               </Button>
             </>
           )}

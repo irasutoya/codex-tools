@@ -10,6 +10,7 @@ const integerFormatter = new Intl.NumberFormat("zh-CN")
 const usdFormatterPrecise = new Intl.NumberFormat("zh-CN", {
   style: "currency",
   currency: "USD",
+  currencyDisplay: "narrowSymbol",
   minimumFractionDigits: 4,
   maximumFractionDigits: 4,
 })
@@ -17,6 +18,7 @@ const usdFormatterPrecise = new Intl.NumberFormat("zh-CN", {
 const usdFormatterCompact = new Intl.NumberFormat("zh-CN", {
   style: "currency",
   currency: "USD",
+  currencyDisplay: "narrowSymbol",
   minimumFractionDigits: 2,
   maximumFractionDigits: 4,
 })
