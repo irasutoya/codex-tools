@@ -163,7 +163,7 @@ fn show_main_window(app: &tauri::AppHandle) {
         let _ = window.set_focus();
         return;
     }
-    if let Ok(window) =
+    if let Ok(_window) =
         tauri::WebviewWindowBuilder::new(app, "main", tauri::WebviewUrl::App("index.html".into()))
             .title("Codex Tools")
             .inner_size(DEFAULT_WINDOW_WIDTH, DEFAULT_WINDOW_HEIGHT)
@@ -172,7 +172,7 @@ fn show_main_window(app: &tauri::AppHandle) {
             .build()
     {
         #[cfg(windows)]
-        let _ = webview_privacy::configure(&window);
+        let _ = webview_privacy::configure(&_window);
     }
 }
 

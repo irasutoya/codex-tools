@@ -1630,6 +1630,7 @@ pub fn data_root() -> PathBuf {
     }
 }
 
+#[cfg(not(target_os = "macos"))]
 fn executable_data_root(executable: Option<&Path>) -> PathBuf {
     executable
         .and_then(Path::parent)
