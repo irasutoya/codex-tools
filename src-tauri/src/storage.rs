@@ -4,7 +4,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     io::Write,
-    path::{Component, Path, PathBuf},
+    path::{Path, PathBuf},
     sync::{Mutex, RwLock, RwLockReadGuard},
 };
 
@@ -45,7 +45,6 @@ struct CredentialsFile {
 
 pub struct Store {
     root: PathBuf,
-    read_root: Option<PathBuf>,
     path: PathBuf,
     connections_path: PathBuf,
     credentials_path: PathBuf,
@@ -96,49 +95,17 @@ impl ProviderSnapshotRevision {
 
 impl Store {
     pub fn new() -> anyhow::Result<Self> {
-        Self::open_with_read_base(data_root(), read_data_root())
+        Self::open(data_root())
     }
 
-    #[cfg(test)]
     pub fn open(root: PathBuf) -> anyhow::Result<Self> {
-        Self::open_with_read_base(root, None)
-    }
-
-    pub(crate) fn open_with_read_base(
-        root: PathBuf,
-        read_root: Option<PathBuf>,
-    ) -> anyhow::Result<Self> {
-        let read_root = read_root.filter(|path| !path.as_os_str().is_empty());
-        if read_root
-            .as_ref()
-            .is_some_and(|read_root| same_data_root(&root, read_root))
-        {
-            anyhow::bail!(
-                "CODEX_TOOLS_READ_DATA_DIR 必须与 CODEX_TOOLS_DATA_DIR 使用不同的数据目录。"
-            );
-        }
         fs::create_dir_all(&root)?;
         secure_directory(&root)?;
         let path = root.join("app.json");
         let connections_path = root.join("connections.json");
         let credentials_path = root.join("credentials.json");
         let tombstones_path = root.join("deletion_tombstones.json");
-        // 内容状态和墓碑标记必须分别判定：仅有墓碑的覆盖目录仍要从 read_root
-        // 读取未删除内容，再以本地墓碑过滤，不能把它误当成完整本地状态。
-        let local_content_present =
-            state_files_present(&path, &connections_path, &credentials_path);
-        let local_tombstones_present = tombstones_path.exists();
-        let source_root = if local_content_present {
-            &root
-        } else {
-            read_root.as_deref().unwrap_or(&root)
-        };
-        let mut state = load_state_files(source_root)?;
-        // 本地墓碑文件一旦存在（即使为空）就是权威删除事实：空集合代表用户已
-        // 显式恢复，不能再与 read_root 中的过期墓碑做并集。
-        if local_tombstones_present && source_root != root.as_path() {
-            state.deletion_tombstones = load_deletion_tombstones(&tombstones_path)?;
-        }
+        let mut state = load_state_files(&root)?;
         let mut requires_persist = false;
         // 当前目录可能被旧版重写过 connections.json；先清理已被墓碑覆盖的连接，
         // 并修正因此产生的悬空 active 选择。
@@ -154,7 +121,7 @@ impl Store {
             &credentials_path,
             &tombstones_path,
         );
-        if read_root.is_none() && (requires_persist || files_incomplete) {
+        if requires_persist || files_incomplete {
             persist_files(
                 &path,
                 &connections_path,
@@ -163,7 +130,7 @@ impl Store {
                 &state,
             )?;
         }
-        if read_root.is_none() && files_incomplete {
+        if files_incomplete {
             for name in [
                 "credentials.json",
                 "pricing.json",
@@ -176,7 +143,6 @@ impl Store {
         }
         Ok(Self {
             root,
-            read_root,
             path,
             connections_path,
             credentials_path,
@@ -190,68 +156,17 @@ impl Store {
         &self.root
     }
 
-    pub(crate) fn read_data_root(&self) -> Option<&Path> {
-        self.read_root.as_deref()
-    }
-
     pub fn path(&self) -> &Path {
         &self.path
     }
 
     fn read_state(&self) -> Result<RwLockReadGuard<'_, AppConfig>, AppError> {
-        self.refresh_state_from_read_base()?;
         self.state
             .read()
             .map_err(|_| AppError::Internal("暂时无法读取应用数据，请重启应用后再试。".into()))
     }
 
-    fn refresh_state_from_read_base(&self) -> Result<(), AppError> {
-        let Some(read_root) = self.read_root.as_deref() else {
-            return Ok(());
-        };
-        if self.local_content_present() {
-            return Ok(());
-        }
-
-        let _transaction = self
-            .persist_mutex
-            .lock()
-            .map_err(|_| AppError::Internal("暂时无法读取应用数据，请重启应用后再试。".into()))?;
-        if self.local_content_present() {
-            return Ok(());
-        }
-        let mut state =
-            load_state_files(read_root).map_err(|error| AppError::Internal(error.to_string()))?;
-        if self.tombstones_path.exists() {
-            state.deletion_tombstones = load_deletion_tombstones(&self.tombstones_path)
-                .map_err(|error| AppError::Internal(error.to_string()))?;
-        }
-        remove_tombstoned_connections(&mut state);
-        let mut guard = self
-            .state
-            .write()
-            .map_err(|_| AppError::Internal("暂时无法读取应用数据，请重启应用后再试。".into()))?;
-        *guard = state;
-        Ok(())
-    }
-
-    fn local_content_present(&self) -> bool {
-        state_files_present(&self.path, &self.connections_path, &self.credentials_path)
-    }
-
     fn current_state_for_update(&self) -> Result<AppConfig, AppError> {
-        if let Some(read_root) = self.read_root.as_deref()
-            && !self.local_content_present()
-        {
-            let mut state = load_state_files(read_root)
-                .map_err(|error| AppError::Internal(error.to_string()))?;
-            if self.tombstones_path.exists() {
-                state.deletion_tombstones = load_deletion_tombstones(&self.tombstones_path)
-                    .map_err(|error| AppError::Internal(error.to_string()))?;
-            }
-            remove_tombstoned_connections(&mut state);
-            return Ok(state);
-        }
         self.state
             .read()
             .map(|state| state.clone())
@@ -1368,10 +1283,6 @@ fn persist_files(
     Ok(())
 }
 
-fn state_files_present(app_path: &Path, connections_path: &Path, credentials_path: &Path) -> bool {
-    app_path.exists() || connections_path.exists() || credentials_path.exists()
-}
-
 fn state_files_complete(
     app_path: &Path,
     connections_path: &Path,
@@ -1464,48 +1375,6 @@ fn remove_tombstoned_connections(state: &mut AppConfig) -> bool {
         changed = true;
     }
     changed
-}
-
-fn read_data_root() -> Option<PathBuf> {
-    std::env::var_os("CODEX_TOOLS_READ_DATA_DIR")
-        .map(PathBuf::from)
-        .filter(|path| !path.as_os_str().is_empty())
-}
-
-fn same_data_root(first: &Path, second: &Path) -> bool {
-    let first = normalized_data_path(first);
-    let second = normalized_data_path(second);
-    #[cfg(windows)]
-    {
-        first
-            .to_string_lossy()
-            .eq_ignore_ascii_case(&second.to_string_lossy())
-    }
-    #[cfg(not(windows))]
-    {
-        first == second
-    }
-}
-
-fn normalized_data_path(path: &Path) -> PathBuf {
-    let path = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join(path)
-    };
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                normalized.pop();
-            }
-            _ => normalized.push(component.as_os_str()),
-        }
-    }
-    normalized
 }
 
 fn merge_current_duplicate_official_accounts(state: &mut AppConfig) -> bool {
@@ -2297,48 +2166,6 @@ mod tests {
     }
 
     #[test]
-    fn tombstone_only_overlay_keeps_read_base_content_and_persists_updates() {
-        let temp = tempfile::tempdir().unwrap();
-        let base = temp.path().join("base");
-        let overlay = temp.path().join("overlay");
-        let source = Store::open(base.clone()).unwrap();
-        source
-            .connections_save_provider(provider("deleted"))
-            .unwrap();
-        source
-            .connections_save_provider(provider("retained"))
-            .unwrap();
-        drop(source);
-
-        fs::create_dir_all(&overlay).unwrap();
-        JsonStore::write_atomic(
-            &overlay.join("deletion_tombstones.json"),
-            &DeletionTombstones {
-                provider_ids: BTreeSet::from(["deleted".to_owned()]),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-
-        let store = Store::open_with_read_base(overlay.clone(), Some(base)).unwrap();
-        assert!(store.provider("deleted").is_err());
-        assert!(store.provider("retained").is_ok());
-        store.connections_save_provider(provider("new")).unwrap();
-        drop(store);
-
-        let reopened = Store::open(overlay.clone()).unwrap();
-        assert!(reopened.provider("deleted").is_err());
-        assert!(reopened.provider("retained").is_ok());
-        assert!(reopened.provider("new").is_ok());
-        assert!(state_files_complete(
-            &overlay.join("app.json"),
-            &overlay.join("connections.json"),
-            &overlay.join("credentials.json"),
-            &overlay.join("deletion_tombstones.json"),
-        ));
-    }
-
-    #[test]
     fn creates_app_json_without_touching_unrelated_files() {
         let temp = tempfile::tempdir().unwrap();
         fs::write(temp.path().join("unrelated.yaml"), "invalid: [").unwrap();
@@ -2349,54 +2176,6 @@ mod tests {
             fs::read_to_string(temp.path().join("unrelated.txt")).unwrap(),
             "user data"
         );
-    }
-
-    #[test]
-    fn read_base_updates_are_visible_until_overlay_state_forks() {
-        let temp = tempfile::tempdir().unwrap();
-        let base = temp.path().join("base");
-        let overlay = temp.path().join("overlay");
-        fs::create_dir_all(&base).unwrap();
-
-        let write_base = |home: &str| {
-            fs::write(
-                base.join("app.json"),
-                serde_json::json!({
-                    "codex": { "home": home },
-                    "active": { "kind": "none" }
-                })
-                .to_string(),
-            )
-            .unwrap();
-            fs::write(base.join("connections.json"), "{}").unwrap();
-            fs::write(base.join("credentials.json"), "{}").unwrap();
-        };
-
-        write_base("base-a");
-        let store = Store::open_with_read_base(overlay.clone(), Some(base.clone())).unwrap();
-        assert_eq!(store.codex_home_setting().unwrap(), "base-a");
-
-        write_base("base-b");
-        assert_eq!(store.codex_home_setting().unwrap(), "base-b");
-        let base_before_overlay_write = fs::read(base.join("app.json")).unwrap();
-
-        store
-            .update(|state| {
-                state.codex.home = "overlay".into();
-                Ok(())
-            })
-            .unwrap();
-        assert_eq!(
-            fs::read(base.join("app.json")).unwrap(),
-            base_before_overlay_write
-        );
-
-        write_base("base-c");
-        assert_eq!(store.codex_home_setting().unwrap(), "overlay");
-        drop(store);
-
-        let reopened = Store::open_with_read_base(overlay, Some(base)).unwrap();
-        assert_eq!(reopened.codex_home_setting().unwrap(), "overlay");
     }
 
     #[test]

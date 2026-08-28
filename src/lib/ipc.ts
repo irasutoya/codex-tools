@@ -1,4 +1,4 @@
-import { invoke, isTauri } from "@tauri-apps/api/core"
+import { invoke } from "@tauri-apps/api/core"
 
 import type {
   AccountQuota,
@@ -121,23 +121,10 @@ type CallArguments<K extends Command> =
     ? [args?: Exclude<CommandArgs<K>, undefined>]
     : [args: CommandArgs<K>]
 
-export function shouldUseMock({
-  dev,
-  tauri,
-  search,
-}: {
-  dev: boolean
-  tauri: boolean
-  search: string
-}) {
-  return dev && (!tauri || new URLSearchParams(search).has("mock"))
-}
-
-const mockMode = shouldUseMock({
-  dev: import.meta.env.DEV,
-  tauri: isTauri(),
-  search: typeof window === "undefined" ? "" : window.location.search,
-})
+const mockMode =
+  import.meta.env.DEV &&
+  typeof window !== "undefined" &&
+  new URLSearchParams(window.location.search).has("mock")
 let mockModulePromise: Promise<typeof import("@/lib/ipc-mock")> | undefined
 
 export async function call<K extends Command>(

@@ -4,7 +4,6 @@ mod chat_proxy;
 mod codex;
 mod commands;
 mod credential_maintenance;
-mod dev_demo;
 mod json_store;
 mod local_usage;
 mod model_unlock;
@@ -179,9 +178,7 @@ fn show_main_window(app: &tauri::AppHandle) {
 
 pub fn run() {
     let store = Store::new().expect("无法初始化应用数据");
-    dev_demo::seed_if_enabled(&store).expect("无法初始化演示数据");
-    let usage_ledger = UsageLedger::open_with_read_base(store.root(), store.read_data_root())
-        .expect("无法初始化本机用量数据库");
+    let usage_ledger = UsageLedger::open(store.root()).expect("无法初始化本机用量数据库");
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_clipboard_manager::init());

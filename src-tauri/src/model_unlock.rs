@@ -406,9 +406,9 @@ pub(crate) async fn launch_with_debug(
             } else {
                 "Codex 未能正常启动。请检查 Codex 路径是否正确（设置页 → Codex 应用），或手动启动 Codex 后再试。"
             };
-            return Err(AppError::InvalidConfig(
-                format!("等待 Codex 调试端口超时（30 秒）。{hint}"),
-            ));
+            return Err(AppError::InvalidConfig(format!(
+                "等待 Codex 调试端口超时（30 秒）。{hint}"
+            )));
         }
         tokio::time::sleep(Duration::from_millis(300)).await;
     };

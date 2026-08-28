@@ -19,7 +19,7 @@ use crate::{
     },
 };
 use chrono::{Local, TimeZone, Timelike, Utc};
-use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 use std::time::Instant;
 use std::{
@@ -118,8 +118,6 @@ fn read_bounded_line<R: BufRead>(
 #[derive(Clone)]
 pub(crate) struct UsageLedger {
     database_path: Arc<PathBuf>,
-    read_database_path: Option<Arc<PathBuf>>,
-    overlay_lock: Arc<Mutex<()>>,
     refresh_lock: Arc<Mutex<()>>,
 }
 
@@ -195,40 +193,6 @@ struct QuotaEstimateAccumulator {
     reason: Option<String>,
 }
 
-enum ReadConnection {
-    Direct(Connection),
-    Snapshot {
-        connection: Option<Connection>,
-        snapshot_root: PathBuf,
-    },
-}
-
-impl std::ops::Deref for ReadConnection {
-    type Target = Connection;
-
-    fn deref(&self) -> &Self::Target {
-        match self {
-            Self::Direct(connection) => connection,
-            Self::Snapshot { connection, .. } => {
-                connection.as_ref().expect("读取快照连接在释放前必须可用")
-            }
-        }
-    }
-}
-
-impl Drop for ReadConnection {
-    fn drop(&mut self) {
-        if let Self::Snapshot {
-            connection,
-            snapshot_root,
-        } = self
-        {
-            drop(connection.take());
-            let _ = fs::remove_dir_all(snapshot_root);
-        }
-    }
-}
-
 fn scaled_quota_estimate(cost_microusd: u64, used_percent: f64) -> Option<u64> {
     let value = (cost_microusd as f64) * 100.0 / used_percent;
     (value.is_finite() && value <= u64::MAX as f64).then(|| value.round() as u64)
@@ -262,29 +226,17 @@ enum AttributionOutcome {
 }
 
 impl UsageLedger {
-    #[cfg(test)]
     pub(crate) fn open(app_data_root: &Path) -> anyhow::Result<Self> {
-        Self::open_with_read_base(app_data_root, None)
-    }
-
-    pub(crate) fn open_with_read_base(
-        app_data_root: &Path,
-        read_data_root: Option<&Path>,
-    ) -> anyhow::Result<Self> {
         fs::create_dir_all(app_data_root)?;
         secure_directory(app_data_root)?;
         let database_path = app_data_root.join("usage.sqlite3");
         let ledger = Self {
             database_path: Arc::new(database_path),
-            read_database_path: read_data_root.map(|root| Arc::new(root.join("usage.sqlite3"))),
-            overlay_lock: Arc::new(Mutex::new(())),
             refresh_lock: Arc::new(Mutex::new(())),
         };
-        if ledger.read_database_path.is_none() || ledger.database_path.exists() {
-            let connection = ledger.open_connection()?;
-            initialize_schema(&connection)?;
-            secure_file(&ledger.database_path)?;
-        }
+        let connection = ledger.open_connection()?;
+        initialize_schema(&connection)?;
+        secure_file(&ledger.database_path)?;
         Ok(ledger)
     }
 
@@ -1237,7 +1189,6 @@ impl UsageLedger {
     }
 
     fn open_connection(&self) -> anyhow::Result<Connection> {
-        self.ensure_overlay_database()?;
         let connection = Connection::open(self.database_path.as_ref())?;
         connection.execute_batch(
             "PRAGMA journal_mode = WAL;
@@ -1247,127 +1198,9 @@ impl UsageLedger {
         Ok(connection)
     }
 
-    fn open_read_connection(&self) -> anyhow::Result<ReadConnection> {
-        if self.database_path.exists() || self.read_database_path.is_none() {
-            return self.open_connection().map(ReadConnection::Direct);
-        }
-        let Some(read_database_path) = self.read_database_path.as_deref() else {
-            unreachable!("只读基底路径已在前置条件中确认存在")
-        };
-        if read_database_path.is_file() {
-            let connection = open_read_only_connection(read_database_path)?;
-            validate_read_schema(&connection)?;
-            return Ok(connection);
-        }
-
-        // 未提供 usage.sqlite3 时仍保持纯读取：内存数据库只为返回空查询结果，
-        // 不会在覆盖层或只读基底创建任何文件。
-        let connection = Connection::open_in_memory()?;
-        initialize_schema(&connection)?;
-        Ok(ReadConnection::Direct(connection))
+    fn open_read_connection(&self) -> anyhow::Result<Connection> {
+        self.open_connection()
     }
-
-    fn ensure_overlay_database(&self) -> anyhow::Result<()> {
-        let _guard = self
-            .overlay_lock
-            .lock()
-            .map_err(|_| anyhow::anyhow!("本机用量覆盖层锁已损坏，请重启应用。"))?;
-        if self.database_path.exists() {
-            return Ok(());
-        }
-
-        let parent = self
-            .database_path
-            .parent()
-            .ok_or_else(|| anyhow::anyhow!("本机用量覆盖层路径无效。"))?;
-        fs::create_dir_all(parent)?;
-        secure_directory(parent)?;
-
-        if let Some(read_database_path) = self
-            .read_database_path
-            .as_deref()
-            .filter(|path| path.is_file())
-        {
-            copy_read_database(read_database_path, self.database_path.as_ref())?;
-        } else {
-            drop(Connection::open(self.database_path.as_ref())?);
-        }
-        secure_file(&self.database_path)?;
-        Ok(())
-    }
-}
-
-fn open_read_only_connection(path: &Path) -> anyhow::Result<ReadConnection> {
-    let wal_path = sqlite_sidecar_path(path, "-wal");
-    let shm_path = sqlite_sidecar_path(path, "-shm");
-    if wal_path.exists() && (!wal_path.is_file() || !shm_path.is_file()) {
-        anyhow::bail!(
-            "只读基底的本机用量数据库存在 WAL 但缺少可用的 -shm；为避免 SQLite 为读取创建或修改基底文件，测试版不会读取或分叉该数据库。"
-        )
-    }
-
-    // SQLite 即使使用 READ_ONLY 打开活跃 WAL，也可能更新源 -shm；先复制到
-    // 临时快照再读取，既保留未 checkpoint 的 WAL 数据，也不触碰用户基底。
-    let snapshot_root =
-        std::env::temp_dir().join(format!("codex-tools-usage-read-{}", Uuid::new_v4()));
-    fs::create_dir(&snapshot_root)?;
-    secure_directory(&snapshot_root)?;
-    let result = (|| -> anyhow::Result<ReadConnection> {
-        let snapshot_database = snapshot_root.join("usage.sqlite3");
-        fs::copy(path, &snapshot_database)?;
-        if wal_path.exists() {
-            fs::copy(&wal_path, sqlite_sidecar_path(&snapshot_database, "-wal"))?;
-            fs::copy(&shm_path, sqlite_sidecar_path(&snapshot_database, "-shm"))?;
-        }
-        let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
-        let connection = Connection::open_with_flags(&snapshot_database, flags)?;
-        Ok(ReadConnection::Snapshot {
-            connection: Some(connection),
-            snapshot_root: snapshot_root.clone(),
-        })
-    })();
-    if result.is_err() {
-        let _ = fs::remove_dir_all(&snapshot_root);
-    }
-    result
-}
-
-fn sqlite_sidecar_path(path: &Path, suffix: &str) -> PathBuf {
-    let mut sidecar = path.as_os_str().to_os_string();
-    sidecar.push(suffix);
-    PathBuf::from(sidecar)
-}
-
-fn validate_read_schema(connection: &Connection) -> anyhow::Result<()> {
-    let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    if version > SCHEMA_VERSION {
-        anyhow::bail!("本机用量数据库版本较新，当前版本无法读取。")
-    }
-    if version < SCHEMA_VERSION {
-        anyhow::bail!("只读基底的本机用量数据库需要先分叉到覆盖层后才能安全迁移。")
-    }
-    Ok(())
-}
-
-fn copy_read_database(source_path: &Path, target_path: &Path) -> anyhow::Result<()> {
-    let source = open_read_only_connection(source_path)?;
-    let version: i64 = source.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    if version > SCHEMA_VERSION {
-        anyhow::bail!("本机用量数据库版本较新，当前版本无法分叉。")
-    }
-
-    let temporary = target_path.with_extension(format!("sqlite3.overlay-{}", Uuid::new_v4()));
-    let temporary_text = temporary.to_string_lossy().into_owned();
-    if let Err(error) = source.execute("VACUUM INTO ?1", params![temporary_text]) {
-        let _ = fs::remove_file(&temporary);
-        return Err(error.into());
-    }
-    drop(source);
-    if let Err(error) = fs::rename(&temporary, target_path) {
-        let _ = fs::remove_file(&temporary);
-        return Err(error.into());
-    }
-    Ok(())
 }
 
 fn initialize_schema(connection: &Connection) -> anyhow::Result<()> {
@@ -3478,8 +3311,7 @@ fn u64_db(value: u64) -> Result<i64, String> {
 mod tests {
     use super::{
         ActivationSnapshot, COLLECTION_EPOCH_METADATA_KEY, UsageLedger, file_modified_at_ms,
-        open_read_only_connection, read_bounded_line, read_metadata, scaled_quota_estimate,
-        sqlite_sidecar_path,
+        read_bounded_line, scaled_quota_estimate,
     };
     use crate::models::{
         ActivationRecord, AppError, BillingMode, CostStatus, PricingMatchKind, PricingScopeKind,
@@ -3489,54 +3321,7 @@ mod tests {
     use crate::usage_log::{ParsedUsageEvent, TokenUsage, UsageQuality};
     use chrono::DateTime;
     use rusqlite::params;
-    use std::{
-        collections::{BTreeMap, BTreeSet},
-        ffi::OsString,
-        fs,
-        io::Cursor,
-        path::Path,
-        sync::mpsc,
-        thread,
-        time::Duration,
-    };
-
-    struct SqliteBaseSnapshot {
-        files: BTreeMap<&'static str, Vec<u8>>,
-        directory_entries: BTreeSet<OsString>,
-    }
-
-    fn capture_sqlite_base_snapshot(root: &Path, database: &Path) -> SqliteBaseSnapshot {
-        let files = ["", "-wal", "-shm"]
-            .into_iter()
-            .map(|suffix| {
-                let path = if suffix.is_empty() {
-                    database.to_path_buf()
-                } else {
-                    sqlite_sidecar_path(database, suffix)
-                };
-                (suffix, fs::read(path).unwrap())
-            })
-            .collect();
-        let directory_entries = fs::read_dir(root)
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name())
-            .collect();
-        SqliteBaseSnapshot {
-            files,
-            directory_entries,
-        }
-    }
-
-    fn assert_sqlite_base_unchanged(before: &SqliteBaseSnapshot, after: &SqliteBaseSnapshot) {
-        assert!(
-            before.files == after.files,
-            "合成只读基底的 SQLite 文件内容发生变化"
-        );
-        assert!(
-            before.directory_entries == after.directory_entries,
-            "合成只读基底的目录文件集合发生变化"
-        );
-    }
+    use std::{fs, io::Cursor, path::Path, sync::mpsc, thread, time::Duration};
 
     #[test]
     fn bounded_line_drains_oversized_records_without_retaining_them() {
@@ -5080,124 +4865,6 @@ mod tests {
                 & 0o777,
             0o600
         );
-    }
-
-    #[test]
-    fn read_base_usage_database_stays_read_only_until_overlay_write() {
-        let temp = tempfile::tempdir().unwrap();
-        let base_root = temp.path().join("base");
-        let overlay_root = temp.path().join("overlay");
-        let base_ledger = UsageLedger::open(&base_root).unwrap();
-        let base_database = base_root.join("usage.sqlite3");
-        let base_wal = base_root.join("usage.sqlite3-wal");
-        base_ledger
-            .open_connection()
-            .unwrap()
-            .execute(
-                "INSERT INTO usage_metadata(key, value) VALUES ('base_marker', 'base-value')",
-                [],
-            )
-            .unwrap();
-        let base_before = fs::read(&base_database).unwrap();
-        let base_wal_before = fs::read(&base_wal).ok();
-
-        let ledger = UsageLedger::open_with_read_base(&overlay_root, Some(&base_root)).unwrap();
-        let connection = ledger.open_read_connection().unwrap();
-        assert_eq!(
-            read_metadata(&connection, "base_marker").unwrap(),
-            Some("base-value".into())
-        );
-        drop(connection);
-        assert!(!overlay_root.join("usage.sqlite3").exists());
-        assert_eq!(fs::read(&base_database).unwrap(), base_before);
-        assert_eq!(fs::read(&base_wal).ok(), base_wal_before);
-
-        // 首次写操作才会把只读基底分叉到覆盖层。
-        ledger.cancel_activation("test-overlay-fork").unwrap();
-        let overlay_database = overlay_root.join("usage.sqlite3");
-        assert!(overlay_database.exists());
-        let overlay_connection = ledger.open_connection().unwrap();
-        assert_eq!(
-            read_metadata(&overlay_connection, "base_marker").unwrap(),
-            Some("base-value".into())
-        );
-        overlay_connection
-            .execute(
-                "INSERT INTO usage_metadata(key, value) VALUES ('overlay_marker', 'overlay-value')",
-                [],
-            )
-            .unwrap();
-        drop(overlay_connection);
-
-        let base_connection = open_read_only_connection(&base_database).unwrap();
-        assert_eq!(
-            read_metadata(&base_connection, "overlay_marker").unwrap(),
-            None
-        );
-        assert_eq!(
-            read_metadata(&base_connection, "base_marker").unwrap(),
-            Some("base-value".into())
-        );
-        assert_eq!(fs::read(&base_database).unwrap(), base_before);
-        assert_eq!(fs::read(&base_wal).ok(), base_wal_before);
-    }
-
-    #[test]
-    fn active_read_base_wal_is_read_and_forked_without_source_changes() {
-        let temp = tempfile::tempdir().unwrap();
-        let base_root = temp.path().join("base");
-        let overlay_root = temp.path().join("overlay");
-        let base_ledger = UsageLedger::open(&base_root).unwrap();
-        let base_database = base_root.join("usage.sqlite3");
-        let base_wal = sqlite_sidecar_path(&base_database, "-wal");
-        let base_shm = sqlite_sidecar_path(&base_database, "-shm");
-        let connection = base_ledger.open_connection().unwrap();
-        connection
-            .pragma_update(None, "wal_autocheckpoint", 0)
-            .unwrap();
-        connection
-            .execute(
-                "INSERT INTO usage_metadata(key, value) VALUES ('wal_only_marker', 'wal-only-marker')",
-                [],
-            )
-            .unwrap();
-        assert!(base_wal.is_file());
-        assert!(base_shm.is_file());
-        assert!(
-            !fs::read(&base_database)
-                .unwrap()
-                .windows(b"wal-only-marker".len())
-                .any(|bytes| bytes == b"wal-only-marker"),
-            "合成 marker 不应已写回基底主数据库"
-        );
-        assert!(
-            fs::read(&base_wal)
-                .unwrap()
-                .windows(b"wal-only-marker".len())
-                .any(|bytes| bytes == b"wal-only-marker"),
-            "合成 marker 应只存在于 WAL"
-        );
-        let base_before = capture_sqlite_base_snapshot(&base_root, &base_database);
-
-        let ledger = UsageLedger::open_with_read_base(&overlay_root, Some(&base_root)).unwrap();
-        let read_connection = ledger.open_read_connection().unwrap();
-        assert_eq!(
-            read_metadata(&read_connection, "wal_only_marker").unwrap(),
-            Some("wal-only-marker".into())
-        );
-        drop(read_connection);
-        assert!(!overlay_root.join("usage.sqlite3").exists());
-
-        let overlay_connection = ledger.open_connection().unwrap();
-        assert_eq!(
-            read_metadata(&overlay_connection, "wal_only_marker").unwrap(),
-            Some("wal-only-marker".into())
-        );
-        drop(overlay_connection);
-
-        let base_after = capture_sqlite_base_snapshot(&base_root, &base_database);
-        assert_sqlite_base_unchanged(&base_before, &base_after);
-        drop(connection);
     }
 
     #[test]
