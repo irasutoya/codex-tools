@@ -393,16 +393,34 @@ fn process_named_running(name: &str) -> bool {
 #[cfg(target_os = "macos")]
 fn path_running(path: &Path) -> bool {
     // .app 目录按可执行文件路径匹配；可执行文件按自身路径匹配。
-    let needle = if path.is_dir() {
+    let path = if path.is_dir() {
         path.join("Contents/MacOS").to_string_lossy().to_string()
     } else {
         path.display().to_string()
     };
+    let needle = escape_extended_regex(&path);
     Command::new("/usr/bin/pgrep")
         .args(["-f", &needle])
         .output()
         .ok()
         .is_some_and(|output| output.status.success())
+}
+
+#[cfg(target_os = "macos")]
+fn escape_extended_regex(value: &str) -> String {
+    value.chars().fold(
+        String::with_capacity(value.len()),
+        |mut escaped, character| {
+            if matches!(
+                character,
+                '.' | '[' | ']' | '(' | ')' | '*' | '+' | '?' | '{' | '}' | '|' | '^' | '$' | '\\'
+            ) {
+                escaped.push('\\');
+            }
+            escaped.push(character);
+            escaped
+        },
+    )
 }
 
 #[cfg(windows)]
@@ -656,6 +674,15 @@ mod tests {
         assert_eq!(
             validate_codex_app_path(&bundle.display().to_string()).unwrap(),
             bundle
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn escapes_macos_paths_before_process_matching() {
+        assert_eq!(
+            escape_extended_regex(r"/Applications/Codex.app/Contents/MacOS/Codex (Beta)+[1]\\test"),
+            r"/Applications/Codex\.app/Contents/MacOS/Codex \(Beta\)\+\[1\]\\\\test"
         );
     }
 }
