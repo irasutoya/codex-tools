@@ -21,6 +21,7 @@ import type {
   ProviderSaveInput,
   ProviderTestResult,
   QuotaRefreshResult,
+  QuotaEstimateResult,
   RepairResult,
   RepairScan,
   RepriceResult,
@@ -76,6 +77,10 @@ type CommandMap = {
   connections_list_models: CommandSpec<{ id: string }, string[]>
   connections_refresh_models: CommandSpec<undefined, string[]>
   connections_refresh_quota: CommandSpec<{ accountId: string }, AccountQuota>
+  connections_estimate_quota: CommandSpec<
+    { accountId: string },
+    QuotaEstimateResult
+  >
   connections_refresh_all_quota: CommandSpec<undefined, QuotaRefreshResult[]>
   connections_activate: CommandSpec<{ id: string }, RepairResult>
   connections_activate_official: CommandSpec<undefined, RepairResult>
@@ -87,7 +92,13 @@ type CommandMap = {
   sessions_scan: CommandSpec<undefined, RepairScan>
   sessions_repair: CommandSpec<{ targetProvider: string }, RepairResult>
   sessions_list: CommandSpec<
-    { query?: string; page?: number; pageSize?: number; refresh?: boolean },
+    {
+      query?: string
+      page?: number
+      pageSize?: number
+      refresh?: boolean
+      status?: "active" | "archived"
+    },
     PageResult<Session>
   >
   dashboard_launch: CommandSpec<undefined, ModelUnlockResult>

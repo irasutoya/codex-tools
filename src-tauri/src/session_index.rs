@@ -102,6 +102,112 @@ impl SessionIndex {
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
     }
+
+    /// 只刷新本次修复实际改动过的来源（rollout / 数据库），其余会话保持不变。
+    /// 用于切换账号或服务后替代全量重建：缓存未初始化、home 不匹配或没有
+    /// 受影响路径时直接返回；所有来源的 stamp 均未变化时只更新检查时间。
+    pub fn refresh_paths(&self, codex_home: &Path, affected: &[PathBuf]) -> anyhow::Result<()> {
+        if affected.is_empty() {
+            return Ok(());
+        }
+        let (database_paths, rollout_paths, sources) = session_sources(codex_home);
+        let checked_at = Instant::now();
+        let mut cache = self
+            .cache
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(cached) = cache.as_mut() else {
+            return Ok(());
+        };
+        if cached.home != codex_home {
+            return Ok(());
+        }
+        if cached.sources == sources {
+            cached.checked_at = checked_at;
+            return Ok(());
+        }
+        let mut affected_dbs: Vec<PathBuf> = Vec::new();
+        let mut affected_rollouts: Vec<PathBuf> = Vec::new();
+        for path in affected {
+            if is_sqlite_source(path) {
+                affected_dbs.push(path.clone());
+            } else if is_rollout_source(path) {
+                affected_rollouts.push(path.clone());
+            }
+        }
+        affected_dbs.sort();
+        affected_rollouts.sort();
+        let sessions = merge_refreshed_sessions(
+            &cached.sessions,
+            &affected_dbs,
+            &affected_rollouts,
+            &database_paths,
+            &rollout_paths,
+        )?;
+        cached.sessions = Arc::new(sessions);
+        cached.sources = sources;
+        cached.database_count = database_paths.len();
+        cached.checked_at = checked_at;
+        Ok(())
+    }
+}
+
+fn is_rollout_source(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|extension| extension == "jsonl")
+}
+
+fn is_sqlite_source(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|extension| extension == "sqlite" || extension == "db")
+}
+
+/// 把受影响来源重建出的会话合并进现有索引：只有当某条会话的权威来源（最后
+/// 写入 provider 的来源，rollout 优先于数据库）确实属于受影响路径时才整体替换，
+/// 否则保留现有值，避免未受影响来源覆盖的 provider 被回退。
+fn merge_refreshed_sessions(
+    existing: &[SessionSummary],
+    affected_dbs: &[PathBuf],
+    affected_rollouts: &[PathBuf],
+    all_databases: &[PathBuf],
+    all_rollouts: &[PathBuf],
+) -> anyhow::Result<Vec<SessionSummary>> {
+    let scope = provider_sync::session_scope(all_databases, all_rollouts)?;
+    let affected = rebuild_from_paths_with_scope(affected_dbs, affected_rollouts, &scope)?;
+    let mut by_id: HashMap<String, SessionSummary> = existing
+        .iter()
+        .map(|session| (session.id.clone(), session.clone()))
+        .collect();
+    for session in affected {
+        match by_id.get_mut(&session.id) {
+            Some(current) => {
+                if authoritative_source_affected(current, affected_dbs, affected_rollouts) {
+                    *current = session;
+                }
+            }
+            None => {
+                by_id.insert(session.id.clone(), session);
+            }
+        }
+    }
+    let mut output: Vec<SessionSummary> = by_id.into_values().collect();
+    output.sort_by_key(|session| std::cmp::Reverse(session.updated_at));
+    Ok(output)
+}
+
+fn authoritative_source_affected(
+    session: &SessionSummary,
+    affected_dbs: &[PathBuf],
+    affected_rollouts: &[PathBuf],
+) -> bool {
+    match session.source_rollout.as_deref() {
+        Some(path) => affected_rollouts
+            .iter()
+            .any(|item| item.as_path() == Path::new(path)),
+        None => affected_dbs
+            .iter()
+            .any(|item| item.as_path() == Path::new(&session.source_db)),
+    }
 }
 
 fn session_sources(codex_home: &Path) -> (Vec<PathBuf>, Vec<PathBuf>, Vec<SourceStamp>) {
@@ -134,8 +240,17 @@ fn rebuild_from_paths(
     database_paths: &[PathBuf],
     rollout_paths: &[PathBuf],
 ) -> anyhow::Result<Vec<SessionSummary>> {
+    let scope = provider_sync::session_scope(database_paths, rollout_paths)?;
+    rebuild_from_paths_with_scope(database_paths, rollout_paths, &scope)
+}
+
+fn rebuild_from_paths_with_scope(
+    database_paths: &[PathBuf],
+    rollout_paths: &[PathBuf],
+    scope: &provider_sync::SessionScope,
+) -> anyhow::Result<Vec<SessionSummary>> {
     let mut sessions = HashMap::<String, SessionSummary>::new();
-    for mut session in provider_sync::list_database_sessions_from_paths(database_paths)? {
+    for mut session in provider_sync::list_database_sessions_from_paths(database_paths, scope)? {
         session.id = truncate_text(&session.id, MAX_SESSION_ID_CHARS);
         session.title = truncate_text(&session.title, 512);
         session.provider = provider_sync::normalize_provider(&session.provider);
@@ -188,13 +303,13 @@ fn rebuild_from_paths(
             }
         }
         let Some(metadata) = metadata else { continue };
-        if metadata.pointer("/source/subagent").is_some() {
-            continue;
-        }
         let Some(raw_id) = metadata.get("id").and_then(Value::as_str) else {
             continue;
         };
         let id = truncate_text(raw_id, MAX_SESSION_ID_CHARS);
+        let Some(archived) = scope.root_archived(&id) else {
+            continue;
+        };
         let provider = provider_sync::normalize_provider(
             metadata
                 .get("model_provider")
@@ -234,9 +349,7 @@ fn rebuild_from_paths(
                         .replace('\\', "/"),
                     MAX_SESSION_PATH_CHARS,
                 ),
-                archived: path
-                    .components()
-                    .any(|part| part.as_os_str() == "archived_sessions"),
+                archived,
                 updated_at,
                 source_db: String::new(),
                 source_rollout: Some(rollout),
@@ -255,6 +368,7 @@ pub fn session_page(
     query: &str,
     page: usize,
     page_size: usize,
+    archived: bool,
 ) -> Result<PageResult<SessionSummary>, AppError> {
     let sessions = index.load_recent(home)?;
     let query = query.trim();
@@ -266,6 +380,7 @@ pub fn session_page(
     let query = normalized_query.as_ref();
     let matches = sessions
         .iter()
+        .filter(|session| session.archived == archived)
         .filter(|session| query.is_empty() || session_matches_query(session, query))
         .collect::<Vec<_>>();
     let total = matches.len();
@@ -429,6 +544,141 @@ mod tests {
     }
 
     #[test]
+    fn refresh_paths_updates_only_affected_rollout() {
+        let temp = tempfile::tempdir().unwrap();
+        let sessions = temp.path().join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let a = sessions.join("a.jsonl");
+        let b = sessions.join("b.jsonl");
+        let write_rollout = |path: &Path, id: &str, provider: &str| {
+            fs::write(
+                path,
+                format!(
+                    "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\",\"model_provider\":\"{provider}\"}}}}\n\
+                     {{\"type\":\"event_msg\",\"payload\":{{\"type\":\"user_message\",\"message\":\"{id} title\"}}}}\n"
+                ),
+            )
+            .unwrap();
+        };
+        write_rollout(&a, "one", "openai");
+        write_rollout(&b, "two", "openai");
+        let index = SessionIndex::default();
+        let first = index.load(temp.path()).unwrap();
+        assert_eq!(
+            first.iter().find(|s| s.id == "one").unwrap().provider,
+            "openai"
+        );
+        assert_eq!(
+            first.iter().find(|s| s.id == "two").unwrap().provider,
+            "openai"
+        );
+
+        write_rollout(&a, "one", "custom");
+        index
+            .refresh_paths(temp.path(), std::slice::from_ref(&a))
+            .unwrap();
+
+        let refreshed = index.load(temp.path()).unwrap();
+        assert_eq!(
+            refreshed.iter().find(|s| s.id == "one").unwrap().provider,
+            "custom"
+        );
+        assert_eq!(
+            refreshed.iter().find(|s| s.id == "two").unwrap().provider,
+            "openai"
+        );
+    }
+
+    #[test]
+    fn refresh_paths_keeps_rollout_provider_when_only_database_changed() {
+        let temp = tempfile::tempdir().unwrap();
+        let sessions = temp.path().join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let rollout = sessions.join("one.jsonl");
+        fs::write(
+            &rollout,
+            concat!(
+                "{\"type\":\"session_meta\",\"payload\":{\"id\":\"one\",\"model_provider\":\"custom\"}}\n",
+                "{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"one title\"}}\n"
+            ),
+        )
+        .unwrap();
+        let database = temp.path().join("state_5.sqlite");
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE threads(
+                    id TEXT PRIMARY KEY, model_provider TEXT, title TEXT, cwd TEXT,
+                    archived INTEGER, updated_at INTEGER
+                );
+                INSERT INTO threads VALUES('one','openai','db title','C:/one',0,1);",
+            )
+            .unwrap();
+        drop(connection);
+
+        let index = SessionIndex::default();
+        let first = index.load(temp.path()).unwrap();
+        assert_eq!(
+            first.iter().find(|s| s.id == "one").unwrap().provider,
+            "custom"
+        );
+
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute(
+                "UPDATE threads SET model_provider='custom' WHERE id='one'",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+        index
+            .refresh_paths(temp.path(), std::slice::from_ref(&database))
+            .unwrap();
+
+        let refreshed = index.load(temp.path()).unwrap();
+        let session = refreshed.iter().find(|s| s.id == "one").unwrap();
+        assert_eq!(session.provider, "custom");
+        assert_eq!(
+            session.source_rollout.as_deref(),
+            Some(rollout.to_str().unwrap())
+        );
+    }
+
+    #[test]
+    fn refresh_paths_applies_repair_affected_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let sessions = home.join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let rollout = sessions.join("one.jsonl");
+        fs::write(
+            &rollout,
+            concat!(
+                "{\"type\":\"session_meta\",\"payload\":{\"id\":\"one\",\"model_provider\":\"openai\"}}\n",
+                "{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"one title\"}}\n"
+            ),
+        )
+        .unwrap();
+
+        let index = SessionIndex::default();
+        let first = index.load(&home).unwrap();
+        assert_eq!(first[0].provider, "openai");
+
+        let (_, paths) = provider_sync::repair_after_connection_switch_preserving_history_with_guard_at_with_paths(
+            &home,
+            "custom",
+            None,
+            || Ok(true),
+        )
+        .unwrap();
+        assert_eq!(paths, vec![rollout.clone()]);
+
+        index.refresh_paths(&home, &paths).unwrap();
+        let refreshed = index.load(&home).unwrap();
+        assert_eq!(refreshed[0].provider, "custom");
+    }
+
+    #[test]
     fn oversized_rollout_lines_do_not_block_later_metadata() {
         let temp = tempfile::tempdir().unwrap();
         let sessions = temp.path().join("sessions");
@@ -477,8 +727,8 @@ mod tests {
         }
         let index = SessionIndex::default();
 
-        let first = session_page(&index, temp.path(), "", 1, 2).unwrap();
-        let second = session_page(&index, temp.path(), "", 2, 2).unwrap();
+        let first = session_page(&index, temp.path(), "", 1, 2, false).unwrap();
+        let second = session_page(&index, temp.path(), "", 2, 2, false).unwrap();
         assert_eq!(first.total, 3);
         assert_eq!(first.items.len(), 2);
         assert_eq!(second.total, 3);
@@ -492,14 +742,14 @@ mod tests {
         ids.sort();
         assert_eq!(ids, ["one", "three", "two"]);
 
-        let ascii = session_page(&index, temp.path(), "ALPHA", 1, 10).unwrap();
+        let ascii = session_page(&index, temp.path(), "ALPHA", 1, 10, false).unwrap();
         assert_eq!(ascii.total, 1);
         assert_eq!(ascii.items[0].id, "one");
-        let unicode = session_page(&index, temp.path(), "中文", 1, 10).unwrap();
+        let unicode = session_page(&index, temp.path(), "中文", 1, 10, false).unwrap();
         assert_eq!(unicode.total, 1);
         assert_eq!(unicode.items[0].id, "two");
 
-        let overflow = session_page(&index, temp.path(), "ALPHA", 8, 2).unwrap();
+        let overflow = session_page(&index, temp.path(), "ALPHA", 8, 2, false).unwrap();
         assert_eq!(overflow.page, 1);
         assert_eq!(overflow.total, 1);
         assert_eq!(overflow.items[0].id, "one");

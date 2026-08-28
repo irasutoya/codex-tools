@@ -57,7 +57,7 @@ const PROBE_PORTS: &[u16] = &[9229, 9222, 9334, 9335];
 const PROBE_TIMEOUT: Duration = Duration::from_millis(400);
 const MAX_CDP_PROBE_BYTES: usize = 256 * 1024;
 const EVALUATE_TIMEOUT: Duration = Duration::from_secs(5);
-const WAIT_LAUNCH_TIMEOUT: Duration = Duration::from_secs(20);
+const WAIT_LAUNCH_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// 构造调试端口候选列表：上次启动用的随机端口优先，再补上常见调试端口。
 /// 端口不再固定，本机其他进程无法预测本应用的调试端口。
@@ -384,7 +384,7 @@ pub(crate) async fn launch_with_debug(
     // 用户现有的实例，直接要求用户手动退出后再启动。
     if platform::codex_app_running(configured.as_deref()) {
         return Err(AppError::InvalidConfig(
-            "Codex 已在运行但没有开启调试端口。为避免影响现有会话，请手动退出 Codex 后再点击“以调试模式启动 Codex 并解锁”。".into(),
+            "Codex 已在运行但没有开启调试端口。请先完全退出 Codex（任务管理器中结束进程），再从概览页点击「打开 Codex（自动解锁）」。".into(),
         ));
     }
     let home = crate::codex::home(&store.codex_home_setting()?);
@@ -401,9 +401,14 @@ pub(crate) async fn launch_with_debug(
             break port;
         }
         if Instant::now() >= deadline {
-            return Err(AppError::InvalidConfig(
-                "等待 Codex 调试端口超时，请检查 Codex 是否正常启动。".into(),
-            ));
+            let hint = if platform::codex_app_running(configured.as_deref()) {
+                "Codex 似乎已启动但未开启调试端口。请确认 Codex 是通过本工具启动的（而非手动双击），或手动退出后重试。"
+            } else {
+                "Codex 未能正常启动。请检查 Codex 路径是否正确（设置页 → Codex 应用），或手动启动 Codex 后再试。"
+            };
+            return Err(AppError::InvalidConfig(format!(
+                "等待 Codex 调试端口超时（30 秒）。{hint}"
+            )));
         }
         tokio::time::sleep(Duration::from_millis(300)).await;
     };
@@ -521,17 +526,25 @@ fn pick_codex_page_ws(targets: Vec<CdpTarget>) -> Option<String> {
 /// 对单个端口发起 `GET /json` 探测，返回 Codex 页面目标的 WebSocket 地址。
 async fn probe_port(port: u16) -> Option<String> {
     let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
-    let mut stream = tokio::time::timeout(PROBE_TIMEOUT, TcpStream::connect(address))
+    let deadline = Instant::now() + PROBE_TIMEOUT;
+    let mut stream = tokio::time::timeout_at(deadline.into(), TcpStream::connect(address))
         .await
         .ok()?
         .ok()?;
     let request =
         format!("GET /json HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
-    stream.write_all(request.as_bytes()).await.ok()?;
+    tokio::time::timeout_at(deadline.into(), stream.write_all(request.as_bytes()))
+        .await
+        .ok()?
+        .ok()?;
     let mut body = Vec::new();
     let mut chunk = [0_u8; 8192];
     loop {
-        match tokio::time::timeout(PROBE_TIMEOUT, stream.read(&mut chunk)).await {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, stream.read(&mut chunk)).await {
             Ok(Ok(0)) => break,
             Ok(Ok(read)) => {
                 body.extend_from_slice(&chunk[..read]);
@@ -554,9 +567,11 @@ async fn probe_port(port: u16) -> Option<String> {
 /// 通过 CDP WebSocket 在 Codex 渲染进程执行表达式，返回求值结果
 /// （`returnByValue` + `awaitPromise`）。
 async fn evaluate(ws_url: &str, expression: &str) -> Result<Value, AppError> {
-    let (mut socket, _response) = tokio_tungstenite::connect_async(ws_url)
-        .await
-        .map_err(|error| AppError::Internal(format!("无法连接 Codex 调试端口：{error}")))?;
+    let (mut socket, _response) =
+        tokio::time::timeout(EVALUATE_TIMEOUT, tokio_tungstenite::connect_async(ws_url))
+            .await
+            .map_err(|_| AppError::Internal("连接 Codex 调试端口超时。".into()))?
+            .map_err(|error| AppError::Internal(format!("无法连接 Codex 调试端口：{error}")))?;
     let request = json!({
         "id": 1,
         "method": "Runtime.evaluate",
@@ -566,38 +581,45 @@ async fn evaluate(ws_url: &str, expression: &str) -> Result<Value, AppError> {
             "awaitPromise": true,
         }
     });
-    socket
-        .send(Message::Text(request.to_string()))
-        .await
-        .map_err(|error| AppError::Internal(format!("无法向 Codex 发送调试指令：{error}")))?;
-    loop {
-        let message = tokio::time::timeout(EVALUATE_TIMEOUT, socket.next())
-            .await
-            .map_err(|_| AppError::Internal("等待 Codex 响应超时。".into()))?
-            .ok_or_else(|| AppError::Internal("Codex 调试端口连接中断。".into()))?
-            .map_err(|error| AppError::Internal(format!("Codex 调试端口连接错误：{error}")))?;
-        let Message::Text(text) = message else {
-            continue;
-        };
-        let value: Value = serde_json::from_str(&text)
-            .map_err(|error| AppError::Internal(format!("Codex 调试响应格式无效：{error}")))?;
-        if value.get("id").and_then(Value::as_u64) != Some(1) {
-            continue;
+    tokio::time::timeout(
+        EVALUATE_TIMEOUT,
+        socket.send(Message::Text(request.to_string())),
+    )
+    .await
+    .map_err(|_| AppError::Internal("向 Codex 发送调试指令超时。".into()))?
+    .map_err(|error| AppError::Internal(format!("无法向 Codex 发送调试指令：{error}")))?;
+    tokio::time::timeout(EVALUATE_TIMEOUT, async {
+        loop {
+            let message = socket
+                .next()
+                .await
+                .ok_or_else(|| AppError::Internal("Codex 调试端口连接中断。".into()))?
+                .map_err(|error| AppError::Internal(format!("Codex 调试端口连接错误：{error}")))?;
+            let Message::Text(text) = message else {
+                continue;
+            };
+            let value: Value = serde_json::from_str(&text)
+                .map_err(|error| AppError::Internal(format!("Codex 调试响应格式无效：{error}")))?;
+            if value.get("id").and_then(Value::as_u64) != Some(1) {
+                continue;
+            }
+            if let Some(details) = value.pointer("/result/exceptionDetails") {
+                let text = details
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .unwrap_or("未知错误");
+                return Err(AppError::Internal(format!(
+                    "Codex 渲染进程执行脚本失败：{text}"
+                )));
+            }
+            return Ok(value
+                .pointer("/result/result/value")
+                .cloned()
+                .unwrap_or(Value::Null));
         }
-        if let Some(details) = value.pointer("/result/exceptionDetails") {
-            let text = details
-                .get("text")
-                .and_then(Value::as_str)
-                .unwrap_or("未知错误");
-            return Err(AppError::Internal(format!(
-                "Codex 渲染进程执行脚本失败：{text}"
-            )));
-        }
-        return Ok(value
-            .pointer("/result/result/value")
-            .cloned()
-            .unwrap_or(Value::Null));
-    }
+    })
+    .await
+    .map_err(|_| AppError::Internal("等待 Codex 响应超时。".into()))?
 }
 
 /// 注入到 Codex 渲染进程的解锁脚本。

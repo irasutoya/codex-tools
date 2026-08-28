@@ -8,15 +8,45 @@ pub fn codex_cli_command() -> Command {
     Command::new(codex_cli_executable())
 }
 
+/// 根据已配置的 Codex Desktop 路径定位其内置 CLI。
+///
+/// `CODEX_BIN` 始终优先，便于显式指定独立 CLI。配置了桌面程序时不能静默回退
+/// 到 PATH：否则自定义安装缺失 `resources/codex.exe` 会退化为难以定位的
+/// `program not found`，甚至可能调用另一套 Codex。
+pub fn codex_cli_command_for_app(configured_app: Option<&str>) -> Result<Command, String> {
+    let configured_app = configured_app.ok_or_else(|| {
+        "无法定位 Codex 内置 CLI：未配置 Codex Desktop 路径，历史迁移已停止。".to_owned()
+    })?;
+    let app_path = validate_codex_app_path(configured_app)
+        .map_err(|error| format!("无法定位 Codex 内置 CLI：{error}"))?;
+    let executable = codex_cli_from_app_path(&app_path)
+        .map(PathBuf::into_os_string)
+        .ok_or_else(|| {
+            format!(
+                "无法定位 Codex 内置 CLI：已配置桌面程序 {}，未找到其 resources 目录中的 CLI。",
+                app_path.display()
+            )
+        })?;
+    Ok(Command::new(executable))
+}
+
+fn codex_bin_override() -> Option<OsString> {
+    match std::env::var_os("CODEX_BIN") {
+        Some(configured) if !configured.is_empty() => Some(configured),
+        _ => None,
+    }
+}
+
 fn codex_cli_executable() -> OsString {
-    if let Some(configured) = std::env::var_os("CODEX_BIN")
-        && !configured.is_empty()
-    {
+    if let Some(configured) = codex_bin_override() {
         return configured;
     }
-
     let program = if cfg!(windows) { "codex.exe" } else { "codex" };
     if let Some(path) = executable_on_path(program) {
+        return path.into_os_string();
+    }
+
+    if let Some(path) = codex_app_path(None).and_then(|path| codex_cli_from_app_path(&path)) {
         return path.into_os_string();
     }
 
@@ -29,6 +59,61 @@ fn codex_cli_executable() -> OsString {
     }
 
     program.into()
+}
+
+fn codex_cli_from_app_path(app_path: &Path) -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        let parent = app_path.parent()?;
+        let bundled = parent.join("resources/codex.exe");
+        if is_executable(&bundled) {
+            return Some(bundled);
+        }
+        if parent
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.eq_ignore_ascii_case("resources"))
+            && app_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.eq_ignore_ascii_case("codex.exe"))
+            && is_executable(app_path)
+        {
+            return Some(app_path.to_path_buf());
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if app_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name == "codex")
+            && app_path
+                .parent()
+                .and_then(Path::file_name)
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name == "Resources")
+            && is_executable(app_path)
+        {
+            return Some(app_path.to_path_buf());
+        }
+        if app_path.is_dir() {
+            let bundled = app_path.join("Contents/Resources/codex");
+            if is_executable(&bundled) {
+                return Some(bundled);
+            }
+        } else if let Some(contents) = app_path.parent().and_then(Path::parent) {
+            let bundled = contents.join("Resources/codex");
+            if is_executable(&bundled) {
+                return Some(bundled);
+            }
+        }
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    if is_executable(app_path) {
+        return Some(app_path.to_path_buf());
+    }
+    None
 }
 
 fn executable_on_path(program: &str) -> Option<PathBuf> {
@@ -213,21 +298,23 @@ pub fn codex_app_running(configured: Option<&str>) -> bool {
     {
         let app_path = codex_app_path(configured);
         let cli_path = codex_cli_executable();
-        let configured_running = app_path
+        let mut names: Vec<&str> = Vec::with_capacity(5);
+        if let Some(name) = app_path
             .as_deref()
             .and_then(Path::file_name)
             .and_then(|name| name.to_str())
-            .is_some_and(process_named_running);
-        let cli_running = Path::new(&cli_path)
+        {
+            names.push(name);
+        }
+        if let Some(name) = Path::new(&cli_path)
             .file_name()
             .and_then(|name| name.to_str())
-            .is_some_and(process_named_running);
-        if configured_running || cli_running {
-            return true;
+        {
+            names.push(name);
         }
-        ["Codex.exe", "codex.exe", "ChatGPT.exe"]
-            .into_iter()
-            .any(process_named_running)
+        names.extend(["Codex.exe", "codex.exe", "ChatGPT.exe"]);
+        names.dedup();
+        any_process_named_running(names)
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
@@ -322,28 +409,91 @@ fn path_running(path: &Path) -> bool {
 fn windows_codex_exe() -> Option<PathBuf> {
     let local = std::env::var_os("LOCALAPPDATA")?;
     let local = Path::new(&local);
-    [
+    let standard = [
         local.join("Programs/OpenAI/Codex/Codex.exe"),
         local.join("Programs/Codex/Codex.exe"),
         local.join("Programs/ChatGPT/ChatGPT.exe"),
         local.join("OpenAI/Codex/bin/codex.exe"),
     ]
     .into_iter()
-    .find(|path| path.is_file())
+    .find(|path| path.is_file());
+    if standard.is_some() {
+        return standard;
+    }
+    // 从注册表卸载信息中查找自定义安装路径
+    windows_codex_exe_from_registry()
 }
 
 #[cfg(windows)]
-fn process_named_running(name: &str) -> bool {
-    use std::os::windows::process::CommandExt;
-    // tasklist 是控制台程序：GUI 应用直接拉起会闪现一个控制台窗口，
-    // 用 CREATE_NO_WINDOW 让它在后台静默运行（与 codex --version 检测一致）。
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    Command::new("tasklist")
-        .args(["/FI", &format!("IMAGENAME eq {name}"), "/NH"])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
-        .ok()
-        .is_some_and(|output| String::from_utf8_lossy(&output.stdout).contains(name))
+fn windows_codex_exe_from_registry() -> Option<PathBuf> {
+    use winreg::RegKey;
+    use winreg::enums::HKEY_CURRENT_USER;
+    let hklm = RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey("Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall")
+        .ok()?;
+    for entry in hklm.enum_keys() {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => continue,
+        };
+        let key = match hklm.open_subkey(&entry) {
+            Ok(key) => key,
+            Err(_) => continue,
+        };
+        let name: String = key.get_value("DisplayName").unwrap_or_default();
+        if !name.eq_ignore_ascii_case("Codex") && !name.eq_ignore_ascii_case("ChatGPT") {
+            continue;
+        }
+        let install_location: String = key.get_value("InstallLocation").unwrap_or_default();
+        if install_location.is_empty() {
+            continue;
+        }
+        let dir = Path::new(&install_location);
+        for candidate in [dir.join("ChatGPT.exe"), dir.join("Codex.exe")] {
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+#[cfg(windows)]
+fn any_process_named_running<'a>(names: impl IntoIterator<Item = &'a str>) -> bool {
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+        TH32CS_SNAPPROCESS,
+    };
+
+    let names: Vec<String> = names.into_iter().map(|n| n.to_uppercase()).collect();
+    if names.is_empty() {
+        return false;
+    }
+    let Ok(snapshot) = (unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }) else {
+        return false;
+    };
+    let mut entry = PROCESSENTRY32W {
+        dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+        ..unsafe { std::mem::zeroed() }
+    };
+    let mut found = false;
+    if unsafe { Process32FirstW(snapshot, &mut entry) }.is_ok() {
+        loop {
+            let exe = {
+                let len = entry.szExeFile.iter().position(|&c| c == 0).unwrap_or(0);
+                String::from_utf16_lossy(&entry.szExeFile[..len]).to_uppercase()
+            };
+            if names.contains(&exe) {
+                found = true;
+                break;
+            }
+            if unsafe { Process32NextW(snapshot, &mut entry) }.is_err() {
+                break;
+            }
+        }
+    }
+    let _ = unsafe { windows::Win32::Foundation::CloseHandle(snapshot) };
+    found
 }
 
 pub fn os_name() -> &'static str {
@@ -435,6 +585,47 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let missing = temp.path().join("Codex");
         assert!(validate_codex_app_path(&missing.display().to_string()).is_err());
+    }
+
+    #[test]
+    fn migration_cli_requires_a_configured_desktop_path() {
+        let error = codex_cli_command_for_app(None).unwrap_err();
+        assert!(error.contains("未配置 Codex Desktop 路径"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn derives_cli_from_custom_windows_desktop_executable() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("Custom/Codex.exe");
+        let cli = temp.path().join("Custom/resources/codex.exe");
+        std::fs::create_dir_all(cli.parent().unwrap()).unwrap();
+        std::fs::write(&app, b"desktop").unwrap();
+        std::fs::write(&cli, b"cli").unwrap();
+
+        assert_eq!(codex_cli_from_app_path(&app), Some(cli));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn accepts_configured_windows_resources_cli_directly() {
+        let temp = tempfile::tempdir().unwrap();
+        let cli = temp.path().join("Custom/resources/codex.exe");
+        std::fs::create_dir_all(cli.parent().unwrap()).unwrap();
+        std::fs::write(&cli, b"cli").unwrap();
+
+        assert_eq!(codex_cli_from_app_path(&cli), Some(cli));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn does_not_treat_windows_desktop_executable_as_cli_when_bundle_is_missing() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("Custom/Codex.exe");
+        std::fs::create_dir_all(app.parent().unwrap()).unwrap();
+        std::fs::write(&app, b"desktop").unwrap();
+
+        assert_eq!(codex_cli_from_app_path(&app), None);
     }
 
     #[cfg(unix)]

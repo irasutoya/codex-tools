@@ -1,4 +1,4 @@
-import { formatDate, quotaWindow } from "@/lib/format"
+import { formatDate } from "@/lib/format"
 import { call } from "@/lib/ipc"
 import type {
   CredentialMaintenanceResult,
@@ -7,6 +7,8 @@ import type {
   ProviderSaveInput,
   RepairResult,
 } from "@/types"
+
+import { displayQuotaWindows } from "./quota-estimate"
 
 export type ConnectionKind = "account" | "provider"
 
@@ -175,12 +177,20 @@ export function quotaStatusText(
 }
 
 export function accountDescription(account: OfficialAccountView) {
-  const quota = quotaWindow(account.quota)
-  const quotaText = quotaStatusText(account, quota?.remainingPercent)
-  const resetText = quota?.resetAt
-    ? ` · 重置 ${formatDate(quota.resetAt, true)}`
-    : ""
-  return `${accountPlanText(account)} · ${quotaText}${resetText} · ${account.email || account.name || "OpenAI 账号"}`
+  const quotaWindows = displayQuotaWindows(account.quota).sort(
+    (left, right) => left.windowSeconds - right.windowSeconds
+  )
+  const quotaText = quotaWindows.length
+    ? quotaWindows
+        .map(
+          (quota) =>
+            `${quota.label} 剩余 ${quota.remainingPercent.toFixed(1)}% · 重置 ${quota.resetAt ? formatDate(quota.resetAt, true) : "—"}`
+        )
+        .join("；")
+    : quotaStatusText(account)
+  const identityText =
+    account.email.trim() || account.name.trim() || "OpenAI 账号"
+  return `${accountPlanText(account)} · ${quotaText} · ${identityText}`
 }
 
 export function accountPlanText(account: OfficialAccountView) {
@@ -213,13 +223,19 @@ export type FallbackCandidate = {
 
 export function repairWarning(result: RepairResult) {
   const details: string[] = []
+  if (!result.repairComplete) {
+    details.push("会话归属修复未完成，切换已回滚")
+  }
   if (result.filesFailed > 0) {
     details.push(`${result.filesFailed} 个会话文件修复失败`)
   }
   if (result.warnings.length > 0) {
     details.push(result.warnings.slice(0, 2).join("；"))
   }
-  return details.length > 0 ? `连接已切换，但${details.join("；")}` : undefined
+  if (details.length === 0) return undefined
+  return result.repairComplete === false
+    ? `切换已回滚：${details.join("；")}`
+    : `连接已切换，但${details.join("；")}`
 }
 
 export function buildFallbackCandidates(
@@ -273,6 +289,11 @@ export async function switchActiveConnection(
       const repair = await (candidate.kind === "account"
         ? call("connections_activate_account", { id: candidate.id })
         : call("connections_activate", { id: candidate.id }))
+      if (repair?.repairComplete === false) {
+        throw new Error(
+          repairWarning(repair) ?? "会话归属修复未完成，连接已回滚，请稍后重试"
+        )
+      }
       return { switchedId: candidate.id, repair }
     } catch (reason) {
       lastError = reason

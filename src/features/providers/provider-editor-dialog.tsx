@@ -39,6 +39,35 @@ import {
   toggleModelSelected,
 } from "./connection-utils"
 
+// 纯数据复制函数由多个入口共享，不参与组件的 Fast Refresh 状态。
+// eslint-disable-next-line react-refresh/only-export-components
+export function cloneProviderForEditing(provider: Provider): Provider {
+  return {
+    ...provider,
+    headers: { ...provider.headers },
+    modelContextWindows: provider.modelContextWindows
+      ? { ...provider.modelContextWindows }
+      : undefined,
+    availableModels: provider.availableModels
+      ? [...provider.availableModels]
+      : undefined,
+    customModels: provider.customModels
+      ? [...provider.customModels]
+      : undefined,
+    selectedModels: provider.selectedModels
+      ? [...provider.selectedModels]
+      : undefined,
+    modelsDevMeta: provider.modelsDevMeta
+      ? Object.fromEntries(
+          Object.entries(provider.modelsDevMeta).map(([model, metadata]) => [
+            model,
+            { ...metadata },
+          ])
+        )
+      : undefined,
+  }
+}
+
 export function ProviderEditorDialog({
   open,
   onOpenChange,
@@ -151,7 +180,13 @@ export function ProviderEditorDialog({
               <FieldLabel htmlFor="provider-key">API Key</FieldLabel>
               <Input
                 id="provider-key"
+                autoComplete="off"
+                autoCapitalize="none"
+                autoCorrect="off"
+                data-1p-ignore
+                data-lpignore="true"
                 disabled={saving}
+                spellCheck={false}
                 type="password"
                 value={provider.apiKey ?? ""}
                 placeholder={

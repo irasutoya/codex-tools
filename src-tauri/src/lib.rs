@@ -21,8 +21,9 @@ mod session_index;
 mod state;
 mod storage;
 mod usage_log;
+#[cfg(windows)]
+mod webview_privacy;
 
-use activation::sync_active_codex_configuration;
 use auth_center::AuthCenter;
 use chat_proxy::ChatProxyRegistry;
 use codex::ConfigManager;
@@ -42,23 +43,6 @@ const DEFAULT_WINDOW_WIDTH: f64 = 1180.0;
 const DEFAULT_WINDOW_HEIGHT: f64 = 760.0;
 const MIN_WINDOW_WIDTH: f64 = 360.0;
 const MIN_WINDOW_HEIGHT: f64 = 520.0;
-
-async fn sync_configured_provider(app: tauri::AppHandle) {
-    let store = app.state::<Store>();
-    let manager = app.state::<ConfigManager>();
-    let ledger = app.state::<UsageLedger>();
-    let activation = app.state::<ActivationLock>();
-    let proxy = app.state::<ChatProxyRegistry>();
-    let _guard = activation.0.lock().await;
-    if sync_active_codex_configuration(&store, &manager, &proxy)
-        .await
-        .is_ok()
-    {
-        let _ = reconcile_current_activation(&store, &ledger);
-    } else {
-        let _ = ledger.cancel_pending_activations();
-    }
-}
 
 /// 启动即执行一次，之后每分钟检查。实际刷新仍由维护器依据账号状态决定，
 /// 因而不会因为轮询而重复消耗轮换型 Refresh Token。
@@ -102,16 +86,14 @@ fn current_activation(
     })
 }
 
-fn record_current_activation(store: &Store, ledger: &UsageLedger) -> Result<(), AppError> {
+pub(crate) fn record_current_activation(
+    store: &Store,
+    ledger: &UsageLedger,
+) -> Result<(), AppError> {
     if let Some(activation) = current_activation(store, chrono::Utc::now().timestamp_millis())? {
         ledger.record_activation(activation)?;
     }
     Ok(())
-}
-
-fn reconcile_current_activation(store: &Store, ledger: &UsageLedger) -> Result<(), AppError> {
-    ledger.cancel_pending_activations()?;
-    record_current_activation(store, ledger)
 }
 
 fn activation_for_official(
@@ -181,22 +163,32 @@ fn show_main_window(app: &tauri::AppHandle) {
         let _ = window.set_focus();
         return;
     }
-    let _ =
+    if let Ok(_window) =
         tauri::WebviewWindowBuilder::new(app, "main", tauri::WebviewUrl::App("index.html".into()))
             .title("Codex Tools")
             .inner_size(DEFAULT_WINDOW_WIDTH, DEFAULT_WINDOW_HEIGHT)
             .min_inner_size(MIN_WINDOW_WIDTH, MIN_WINDOW_HEIGHT)
-            .build();
+            .general_autofill_enabled(false)
+            .build()
+    {
+        #[cfg(windows)]
+        let _ = webview_privacy::configure(&_window);
+    }
 }
 
 pub fn run() {
     let store = Store::new().expect("无法初始化应用数据");
     let usage_ledger = UsageLedger::open(store.root()).expect("无法初始化本机用量数据库");
-    let app = tauri::Builder::default()
+    let builder = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_single_instance::init(|app, _, _| {
-            show_main_window(app)
-        }))
+        .plugin(tauri_plugin_clipboard_manager::init());
+    // 开发版需要能与已安装版本并存，否则 `tauri dev` 会被发布版的
+    // 单实例进程接管并立即退出，看起来像是启动后没有窗口。
+    #[cfg(not(debug_assertions))]
+    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _, _| {
+        show_main_window(app)
+    }));
+    let app = builder
         .manage(store)
         .manage(usage_ledger)
         .manage(AuthCenter::default())
@@ -206,6 +198,10 @@ pub fn run() {
         .manage(ChatProxyRegistry::default())
         .manage(SessionIndex::default())
         .setup(|app| {
+            #[cfg(windows)]
+            if let Some(window) = app.get_webview_window("main") {
+                webview_privacy::configure(&window)?;
+            }
             let show =
                 MenuItem::with_id(app, TRAY_SHOW_ID, "显示 Codex Tools", true, None::<&str>)?;
             let exit = MenuItem::with_id(app, TRAY_EXIT_ID, "退出", true, None::<&str>)?;
@@ -235,8 +231,6 @@ pub fn run() {
                     }
                 })
                 .build(app)?;
-            let handle = app.handle().clone();
-            tauri::async_runtime::spawn(sync_configured_provider(handle));
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(run_credential_maintenance(handle));
             Ok(())
@@ -268,6 +262,7 @@ pub fn run() {
             commands::providers::connections_list_models,
             commands::providers::connections_refresh_models,
             commands::official_accounts::connections_refresh_quota,
+            commands::official_accounts::connections_estimate_quota,
             commands::official_accounts::connections_refresh_all_quota,
             commands::providers::settings_preview_activation,
             commands::providers::settings_apply_activation,

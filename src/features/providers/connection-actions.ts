@@ -1,5 +1,9 @@
 import { call } from "@/lib/ipc"
-import type { AccountQuota, ProviderTestResult } from "@/types"
+import type {
+  AccountQuota,
+  ProviderTestResult,
+  QuotaEstimateResult,
+} from "@/types"
 
 const quotaFailureMessage: Record<
   Exclude<AccountQuota["status"], "success">,
@@ -18,6 +22,20 @@ export async function refreshAccountQuota(accountId: string) {
     throw new Error(result.error || quotaFailureMessage[result.status])
   }
   return result
+}
+
+export function estimateAccountQuota(
+  accountId: string
+): Promise<QuotaEstimateResult> {
+  return call("connections_estimate_quota", { accountId })
+}
+
+export function refreshAccountLogin(id: string) {
+  return call("connections_refresh_login", { id })
+}
+
+export function syncProviderModels(id: string) {
+  return call("connections_list_models", { id })
 }
 
 export async function testProviderConnection(id: string) {

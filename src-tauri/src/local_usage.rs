@@ -1,9 +1,10 @@
 use crate::{
     models::{
         ActivationRecord, AppError, BillingMode, CostStatus, PricingMatchKind, PricingRule,
-        PricingScope, PricingScopeKind, RepriceResult, SavePricingRule, TokenBreakdown,
-        UsageGroupBy, UsageOverview, UsageQuery, UsageRange, UsageRefreshResult, UsageRow,
-        UsageSourceKind, UsageTotals, UsageTrend, UsageTrendPoint, UsageWarning,
+        PricingScope, PricingScopeKind, QuotaEstimate, QuotaEstimateWindowResult, RepriceResult,
+        SavePricingRule, TokenBreakdown, UsageGroupBy, UsageOverview, UsageQuery, UsageRange,
+        UsageRefreshResult, UsageRow, UsageSourceKind, UsageTotals, UsageTrend, UsageTrendPoint,
+        UsageWarning,
     },
     official_pricing::OfficialPricingCatalog,
     pricing::{
@@ -18,10 +19,11 @@ use crate::{
     },
 };
 use chrono::{Local, TimeZone, Timelike, Utc};
-use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
+use std::time::Instant;
 use std::{
-    collections::{BTreeMap, btree_map::Entry},
+    collections::{BTreeMap, BTreeSet, btree_map::Entry},
     fs::{self, File},
     io::{BufRead, BufReader, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
@@ -40,6 +42,31 @@ const PARSER_VERSION_METADATA_KEY: &str = "usage_parser_version";
 const COLLECTION_MODE: &str = "after_update";
 const COLLECTION_VERSION: &str = env!("CARGO_PKG_VERSION");
 const PARSER_VERSION: &str = "5";
+const USAGE_RETENTION_DAYS: i64 = 90;
+const USAGE_RETENTION_MS: i64 = USAGE_RETENTION_DAYS * 24 * 60 * 60 * 1000;
+const FREELIST_VACUUM_THRESHOLD: i64 = 1024;
+const INCREMENTAL_VACUUM_LIMIT: i64 = 256;
+const UPSERT_USAGE_CURSOR_SQL: &str = r#"
+    INSERT INTO usage_cursors(
+        rollout_id, last_path, byte_offset, next_event_ordinal,
+        last_model, last_model_provider, usage_boundary_passed,
+        usage_boundary_state, subagent_boundary_mode,
+        file_length, file_modified_at_ms, prefix_sha256, updated_at_ms
+    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+    ON CONFLICT(rollout_id) DO UPDATE SET
+      last_path = excluded.last_path,
+      byte_offset = excluded.byte_offset,
+      next_event_ordinal = excluded.next_event_ordinal,
+      last_model = excluded.last_model,
+      last_model_provider = excluded.last_model_provider,
+      usage_boundary_passed = excluded.usage_boundary_passed,
+      usage_boundary_state = excluded.usage_boundary_state,
+      subagent_boundary_mode = excluded.subagent_boundary_mode,
+      file_length = excluded.file_length,
+      file_modified_at_ms = excluded.file_modified_at_ms,
+      prefix_sha256 = excluded.prefix_sha256,
+      updated_at_ms = excluded.updated_at_ms
+"#;
 
 struct BoundedLine {
     bytes: Vec<u8>,
@@ -98,6 +125,7 @@ struct FileRefreshResult {
     events_added: usize,
     events_skipped: usize,
     partial_lines: usize,
+    file_skipped: bool,
     warnings: Vec<UsageWarning>,
 }
 
@@ -155,6 +183,21 @@ struct UsageAggregate {
     pricing_rule_version: Option<u64>,
 }
 
+struct QuotaEstimateAccumulator {
+    window_seconds: i64,
+    reset_at: i64,
+    used_percent: f64,
+    valid: bool,
+    events: u64,
+    cost_microusd: u64,
+    reason: Option<String>,
+}
+
+fn scaled_quota_estimate(cost_microusd: u64, used_percent: f64) -> Option<u64> {
+    let value = (cost_microusd as f64) * 100.0 / used_percent;
+    (value.is_finite() && value <= u64::MAX as f64).then(|| value.round() as u64)
+}
+
 #[derive(Debug, Clone)]
 struct ActivationSnapshot {
     effective_at_ms: i64,
@@ -206,15 +249,68 @@ impl UsageLedger {
             .refresh_lock
             .lock()
             .map_err(|_| AppError::Internal("本机用量刷新锁已损坏，请重启应用。".into()))?;
+        self.refresh_unlocked(codex_home, now_utc_ms)
+    }
+
+    /// 额度估算需要把本次增量扫描和紧随其后的读取固定在同一刷新锁内，
+    /// 不能让其它刷新在两者之间插入新的用量事件。
+    pub(crate) fn refresh_and_estimate_account_quota(
+        &self,
+        codex_home: &Path,
+        refresh_now_utc_ms: i64,
+        canonical_account_id: &str,
+        windows: &[(i64, i64, f64)],
+        quota_snapshot_at_ms: i64,
+    ) -> Result<Vec<QuotaEstimateWindowResult>, AppError> {
+        self.refresh_and_estimate_account_quota_with_after_refresh(
+            codex_home,
+            refresh_now_utc_ms,
+            canonical_account_id,
+            windows,
+            quota_snapshot_at_ms,
+            || {},
+        )
+    }
+
+    fn refresh_and_estimate_account_quota_with_after_refresh(
+        &self,
+        codex_home: &Path,
+        refresh_now_utc_ms: i64,
+        canonical_account_id: &str,
+        windows: &[(i64, i64, f64)],
+        quota_snapshot_at_ms: i64,
+        after_refresh: impl FnOnce(),
+    ) -> Result<Vec<QuotaEstimateWindowResult>, AppError> {
+        let _guard = self
+            .refresh_lock
+            .lock()
+            .map_err(|_| AppError::Internal("本机用量刷新锁已损坏，请重启应用。".into()))?;
+        self.refresh_unlocked(codex_home, refresh_now_utc_ms)?;
+        after_refresh();
+        self.estimate_account_quota(canonical_account_id, windows, quota_snapshot_at_ms)
+    }
+
+    fn refresh_unlocked(
+        &self,
+        codex_home: &Path,
+        now_utc_ms: i64,
+    ) -> Result<UsageRefreshResult, AppError> {
+        let started = Instant::now();
         let mut connection = self.open_connection().map_err(AppError::from)?;
         initialize_schema(&connection).map_err(AppError::from)?;
         let mut result = UsageRefreshResult {
             files_scanned: 0,
+            files_skipped: 0,
+            files_opened: 0,
             events_added: 0,
             events_skipped: 0,
+            events_pruned: 0,
             partial_lines: 0,
             warnings: vec![],
             last_refreshed_at_ms: now_utc_ms,
+            elapsed_ms: 0,
+            retention_days: 0,
+            database_compacted: false,
         };
         let mut paths = provider_sync::rollout_files(codex_home);
         paths.sort();
@@ -233,10 +329,16 @@ impl UsageLedger {
         let official_catalog = load_official_catalog(&connection).map_err(AppError::from)?;
         let pricing_rules = load_pricing_rule_records(&connection).map_err(AppError::from)?;
 
+        // 整个扫描共用一个外层事务：成功文件的数据在最后一次性提交，
+        // 避免每个文件都做一次 fsync；单个文件失败时只回滚该文件的
+        // savepoint，不影响其余文件，也不让失败文件留下半截写入。
+        let mut transaction = connection
+            .transaction()
+            .map_err(|error| AppError::Internal(format!("开始保存本机用量事务失败：{error}")))?;
         for path in paths {
             result.files_scanned += 1;
             match refresh_file(
-                &mut connection,
+                &mut transaction,
                 &path,
                 now_utc_ms,
                 collection_epoch,
@@ -248,6 +350,7 @@ impl UsageLedger {
                     result.events_added += file_result.events_added;
                     result.events_skipped += file_result.events_skipped;
                     result.partial_lines += file_result.partial_lines;
+                    result.files_skipped += usize::from(file_result.file_skipped);
                     result.warnings.extend(file_result.warnings);
                 }
                 Err(error) => result.warnings.push(UsageWarning {
@@ -255,6 +358,42 @@ impl UsageLedger {
                     message: error,
                 }),
             }
+        }
+        transaction
+            .commit()
+            .map_err(|error| AppError::Internal(format!("提交本机用量事务失败：{error}")))?;
+
+        result.files_opened = result.files_scanned.saturating_sub(result.files_skipped);
+        result.elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+
+        // 成功扫描后清理超过保留期的明细。保留游标，旧日志不会被重新导入；
+        // 即使清理 90 天前的数据，也不会删除任何 Codex 原始会话。
+        result.retention_days = USAGE_RETENTION_DAYS;
+        let cutoff_ms = now_utc_ms.saturating_sub(USAGE_RETENTION_MS);
+        result.events_pruned = connection
+            .execute(
+                "DELETE FROM usage_events WHERE occurred_at_ms < ?1",
+                params![cutoff_ms],
+            )
+            .map_err(|error| AppError::Internal(format!("清理过期本机用量失败：{error}")))?;
+
+        // 空闲页达到阈值时执行限量增量压缩，避免一次性大 VACUUM 阻塞刷新。
+        connection
+            .execute_batch("PRAGMA auto_vacuum = INCREMENTAL;")
+            .map_err(|error| AppError::Internal(format!("启用本机用量增量压缩失败：{error}")))?;
+        let freelist_before: i64 = connection
+            .query_row("PRAGMA freelist_count", [], |row| row.get(0))
+            .map_err(|error| AppError::Internal(format!("读取本机用量空闲页失败：{error}")))?;
+        if freelist_before > FREELIST_VACUUM_THRESHOLD {
+            connection
+                .execute_batch(&format!(
+                    "PRAGMA incremental_vacuum({INCREMENTAL_VACUUM_LIMIT});"
+                ))
+                .map_err(|error| AppError::Internal(format!("本机用量增量压缩失败：{error}")))?;
+            let freelist_after: i64 = connection
+                .query_row("PRAGMA freelist_count", [], |row| row.get(0))
+                .map_err(|error| AppError::Internal(format!("读取本机用量空闲页失败：{error}")))?;
+            result.database_compacted = freelist_after < freelist_before;
         }
 
         connection
@@ -264,161 +403,47 @@ impl UsageLedger {
                 params![now_utc_ms.to_string()],
             )
             .map_err(|error| AppError::Internal(format!("保存本机用量刷新时间失败：{error}")))?;
+        connection
+            .execute(
+                "INSERT INTO usage_metadata(key, value) VALUES ('last_refresh_warning_count', ?1)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![
+                    result
+                        .warnings
+                        .len()
+                        .saturating_add(result.partial_lines)
+                        .to_string()
+                ],
+            )
+            .map_err(|error| AppError::Internal(format!("保存本机用量刷新告警失败：{error}")))?;
 
         Ok(result)
     }
 
     pub(crate) fn query(&self, query: UsageQuery) -> Result<UsageOverview, AppError> {
         query.range.validate()?;
-        let connection = self.open_connection().map_err(AppError::from)?;
-        initialize_schema(&connection).map_err(AppError::from)?;
+        let connection = self.open_read_connection().map_err(AppError::from)?;
 
         let collection_epoch = read_collection_epoch(&connection)?;
         let effective_start = collection_epoch
             .map(|epoch| query.range.start_at_ms.max(epoch))
             .unwrap_or(query.range.end_at_ms);
-        let mut statement = connection
-            .prepare(
-                "SELECT occurred_at_ms, model, usage_events.source_kind, usage_events.provider_id,
-                        COALESCE(account_identity_aliases.canonical_account_id, usage_events.account_id),
-                        usage_events.source_name,
-                        input_tokens, cached_input_tokens, cache_write_input_tokens,
-                        output_tokens, reasoning_output_tokens, total_tokens,
-                        cost_status, estimated_cost_microusd, pricing_rule_name,
-                        pricing_rule_version
-                 FROM usage_events
-                 LEFT JOIN account_identity_aliases
-                   ON account_identity_aliases.source_kind = usage_events.source_kind
-                  AND account_identity_aliases.provider_id IS usage_events.provider_id
-                  AND account_identity_aliases.local_account_id = usage_events.account_id
-                WHERE occurred_at_ms >= ?1 AND occurred_at_ms < ?2
-                 ORDER BY occurred_at_ms, event_ordinal",
-            )
-            .map_err(|error| AppError::Internal(format!("读取本机用量失败：{error}")))?;
-
-        let rows = statement
-            .query_map(params![effective_start, query.range.end_at_ms], |row| {
-                read_usage_row(row, query.group_by)
-            })
-            .map_err(|error| AppError::Internal(format!("读取本机用量失败：{error}")))?;
-
-        let mut aggregates = BTreeMap::<String, UsageAggregate>::new();
-        let mut totals = UsageTotals {
-            tokens: TokenBreakdown::default(),
-            requests: 0,
-            estimated_cost_microusd: 0,
-            subscription_tokens: 0,
-            unpriced_tokens: 0,
-            partial_tokens: 0,
-            unattributed_tokens: 0,
-        };
-        // 与 totals 同一趟查询产出趋势，避免对同一范围做第二趟全量扫描。
+        let (aggregates, totals) = query_aggregates(
+            &connection,
+            effective_start,
+            query.range.end_at_ms,
+            query.group_by,
+        )?;
+        let models = query_models(&connection, effective_start, query.range.end_at_ms)?;
+        // 趋势与 totals 共用同一套口径；SQL 按本机自然日/小时分桶聚合，
+        // 不再把范围内全部事件载入 Rust。
         let hourly_trend = range_is_single_local_day(&query.range);
-        let mut trend_points = BTreeMap::<i64, UsageTrendPoint>::new();
-
-        for row in rows {
-            let row =
-                row.map_err(|error| AppError::Internal(format!("读取本机用量失败：{error}")))?;
-            let key = aggregate_key(&row, query.group_by);
-            // 只在新建分组时克隆 key，命中已有分组时通过 entry 直接取到可变引用，
-            // 避免每行都克隆一次聚合键字符串。
-            let aggregate = match aggregates.entry(key) {
-                Entry::Occupied(entry) => entry.into_mut(),
-                Entry::Vacant(entry) => {
-                    let key = entry.key().clone();
-                    entry.insert(UsageAggregate {
-                        key,
-                        model: if query.group_by == UsageGroupBy::Model {
-                            row.model.clone()
-                        } else {
-                            "多个模型".into()
-                        },
-                        source_kind: row.source_kind,
-                        provider_id: row.provider_id.clone(),
-                        account_id: row.account_id.clone(),
-                        source_name: row.source_name.clone(),
-                        tokens: TokenBreakdown::default(),
-                        requests: 0,
-                        estimated_cost_microusd: 0,
-                        has_estimated: false,
-                        has_subscription: false,
-                        has_unpriced: false,
-                        has_partial: false,
-                        has_unattributed: false,
-                        pricing_rule_name: row.pricing_rule_name.clone(),
-                        pricing_rule_version: row.pricing_rule_version,
-                    })
-                }
-            };
-            if query.group_by == UsageGroupBy::Model
-                && (aggregate.source_kind != row.source_kind
-                    || aggregate.provider_id != row.provider_id
-                    || aggregate.account_id != row.account_id)
-            {
-                // “按模型”必须保证一个模型 ID 只出现一次。来源元数据不一致时，
-                // 清除单一来源标识，避免把合并后的用量错误归到第一条事件的账号上。
-                aggregate.source_kind = UsageSourceKind::Unattributed;
-                aggregate.provider_id = None;
-                aggregate.account_id = None;
-                aggregate.source_name = "多个账号/来源".into();
-            }
-            add_tokens(&mut aggregate.tokens, &row.tokens);
-            aggregate.requests = aggregate.requests.saturating_add(1);
-            aggregate.estimated_cost_microusd = aggregate
-                .estimated_cost_microusd
-                .saturating_add(row.estimated_cost_microusd.unwrap_or(0));
-            aggregate.has_estimated |= row.cost_status == CostStatus::Estimated;
-            aggregate.has_subscription |= row.cost_status == CostStatus::Subscription;
-            aggregate.has_unpriced |= row.cost_status == CostStatus::Unpriced;
-            aggregate.has_partial |= row.cost_status == CostStatus::Partial;
-            aggregate.has_unattributed |= row.cost_status == CostStatus::Unattributed
-                || row.source_kind == UsageSourceKind::Unattributed;
-            if aggregate.pricing_rule_version != row.pricing_rule_version {
-                aggregate.pricing_rule_version = None;
-            }
-
-            add_tokens(&mut totals.tokens, &row.tokens);
-            totals.requests = totals.requests.saturating_add(1);
-            if row.cost_status == CostStatus::Estimated
-                || (row.cost_status == CostStatus::Partial && row.estimated_cost_microusd.is_some())
-            {
-                totals.estimated_cost_microusd = totals
-                    .estimated_cost_microusd
-                    .saturating_add(row.estimated_cost_microusd.unwrap_or(0));
-            }
-            if row.cost_status == CostStatus::Unpriced {
-                totals.unpriced_tokens = totals
-                    .unpriced_tokens
-                    .saturating_add(row.tokens.total_tokens);
-            }
-            if row.cost_status == CostStatus::Subscription {
-                totals.subscription_tokens = totals
-                    .subscription_tokens
-                    .saturating_add(row.tokens.total_tokens);
-            }
-            if row.cost_status == CostStatus::Partial {
-                totals.partial_tokens = totals
-                    .partial_tokens
-                    .saturating_add(row.tokens.total_tokens);
-            }
-            if row.cost_status == CostStatus::Unattributed
-                || row.source_kind == UsageSourceKind::Unattributed
-            {
-                totals.unattributed_tokens = totals
-                    .unattributed_tokens
-                    .saturating_add(row.tokens.total_tokens);
-            }
-
-            accumulate_trend_point(
-                &mut trend_points,
-                row.occurred_at_ms,
-                &row.tokens,
-                row.cost_status,
-                row.estimated_cost_microusd,
-                row.source_kind,
-                hourly_trend,
-            );
-        }
+        let mut trend_points = query_trend_points(
+            &connection,
+            effective_start,
+            query.range.end_at_ms,
+            hourly_trend,
+        )?;
         if hourly_trend {
             ensure_hourly_points(&mut trend_points, &query.range);
         }
@@ -462,6 +487,7 @@ impl UsageLedger {
             range: query.range,
             totals,
             rows,
+            models,
             last_refreshed_at_ms,
             collection_started_at_ms: collection_epoch,
             collection_started_version,
@@ -470,11 +496,180 @@ impl UsageLedger {
         })
     }
 
+    /// 单次读取目标账号最早额度窗口到额度快照时刻的已归属事件，再对每个窗口聚合。
+    /// 此处绝不触发日志刷新、额度请求或价格网络刷新。
+    pub(crate) fn estimate_account_quota(
+        &self,
+        canonical_account_id: &str,
+        windows: &[(i64, i64, f64)],
+        quota_snapshot_at_ms: i64,
+    ) -> Result<Vec<QuotaEstimateWindowResult>, AppError> {
+        if windows.is_empty() {
+            return Ok(vec![]);
+        }
+        let connection = self.open_read_connection().map_err(AppError::from)?;
+        let collection_epoch = read_collection_epoch(&connection)?;
+        let warning_count = read_metadata(&connection, "last_refresh_warning_count")?
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(0);
+        let earliest_start = windows
+            .iter()
+            .map(|(seconds, reset_at, _)| {
+                reset_at
+                    .saturating_mul(1_000)
+                    .saturating_sub(seconds.saturating_mul(1_000))
+            })
+            .min()
+            .unwrap_or(quota_snapshot_at_ms);
+        let latest_end = windows
+            .iter()
+            .map(|(_, reset_at, _)| reset_at.saturating_mul(1_000).min(quota_snapshot_at_ms))
+            .max()
+            .unwrap_or(quota_snapshot_at_ms);
+        let mut states = windows
+            .iter()
+            .map(
+                |(window_seconds, reset_at, used_percent)| QuotaEstimateAccumulator {
+                    window_seconds: *window_seconds,
+                    reset_at: *reset_at,
+                    used_percent: *used_percent,
+                    valid: true,
+                    events: 0,
+                    cost_microusd: 0,
+                    reason: None,
+                },
+            )
+            .collect::<Vec<_>>();
+
+        let mut statement = connection
+            .prepare(
+                "SELECT usage_events.occurred_at_ms, usage_events.cost_status,
+                        usage_events.estimated_cost_microusd,
+                        account_identity_aliases.canonical_account_id
+                   FROM usage_events
+              LEFT JOIN account_identity_aliases
+                     ON account_identity_aliases.source_kind = usage_events.source_kind
+                    AND account_identity_aliases.provider_id IS usage_events.provider_id
+                    AND account_identity_aliases.local_account_id = usage_events.account_id
+                  WHERE usage_events.occurred_at_ms >= ?1
+                    AND usage_events.occurred_at_ms < ?2
+                     AND usage_events.source_kind = 'official'
+               ORDER BY usage_events.occurred_at_ms, usage_events.event_ordinal",
+            )
+            .map_err(|error| AppError::Internal(format!("读取额度估算用量失败：{error}")))?;
+        let rows = statement
+            .query_map(params![earliest_start, latest_end], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            })
+            .map_err(|error| AppError::Internal(format!("读取额度估算用量失败：{error}")))?;
+        for row in rows {
+            let (occurred_at_ms, cost_status, cost_microusd, event_canonical_account_id) =
+                row.map_err(|error| AppError::Internal(format!("读取额度估算用量失败：{error}")))?;
+            for state in &mut states {
+                let start = state
+                    .reset_at
+                    .saturating_mul(1_000)
+                    .saturating_sub(state.window_seconds.saturating_mul(1_000));
+                let end = state
+                    .reset_at
+                    .saturating_mul(1_000)
+                    .min(quota_snapshot_at_ms);
+                if occurred_at_ms < start || occurred_at_ms >= end {
+                    continue;
+                }
+                match event_canonical_account_id.as_deref() {
+                    Some(account_id) if account_id == canonical_account_id => {}
+                    Some(_) => continue,
+                    None => {
+                        state.valid = false;
+                        state.reason =
+                            Some("窗口内存在无法确认账号归属的官方本机用量，无法安全估算。".into());
+                        continue;
+                    }
+                }
+                state.events = state.events.saturating_add(1);
+                if cost_status != "estimated" || cost_microusd.is_none() {
+                    state.valid = false;
+                    state.reason =
+                        Some("窗口内存在未完整定价、订阅、部分或未归属的本机用量。".into());
+                    continue;
+                }
+                state.cost_microusd = state
+                    .cost_microusd
+                    .saturating_add(cost_microusd.unwrap_or_default().max(0) as u64);
+            }
+        }
+
+        Ok(states
+            .into_iter()
+            .map(|state| {
+                let start = state
+                    .reset_at
+                    .saturating_mul(1_000)
+                    .saturating_sub(state.window_seconds.saturating_mul(1_000));
+                let reason = if state.used_percent < 10.0 {
+                    Some("额度已用比例低于 10%，样本不足，暂不估算。".into())
+                } else if warning_count > 0 {
+                    Some("最近一次本机用量刷新或解析有告警，请刷新并确认用量完整后再估算。".into())
+                } else if collection_epoch.is_none_or(|epoch| epoch > start) {
+                    Some("本机用量采集起点晚于该额度窗口起点，无法完整估算。".into())
+                } else if !state.valid {
+                    state.reason
+                } else if state.events == 0 {
+                    Some("该额度窗口内没有可用于估算的本机用量。".into())
+                } else {
+                    None
+                };
+                let estimated_total_microusd = if reason.is_none() {
+                    let Some(value) =
+                        scaled_quota_estimate(state.cost_microusd, state.used_percent)
+                    else {
+                        return QuotaEstimateWindowResult {
+                            window_seconds: state.window_seconds,
+                            reset_at: state.reset_at,
+                            success: false,
+                            estimate: None,
+                            reason: Some("估算金额超出可安全表示的范围。".into()),
+                        };
+                    };
+                    value
+                } else {
+                    0
+                };
+                match reason {
+                    Some(reason) => QuotaEstimateWindowResult {
+                        window_seconds: state.window_seconds,
+                        reset_at: state.reset_at,
+                        success: false,
+                        estimate: None,
+                        reason: Some(reason),
+                    },
+                    None => QuotaEstimateWindowResult {
+                        window_seconds: state.window_seconds,
+                        reset_at: state.reset_at,
+                        success: true,
+                        estimate: Some(QuotaEstimate {
+                            window_seconds: state.window_seconds,
+                            reset_at: state.reset_at,
+                            estimated_total_microusd,
+                            estimated_at: quota_snapshot_at_ms / 1_000,
+                        }),
+                        reason: None,
+                    },
+                }
+            })
+            .collect())
+    }
+
     /// 按本机自然日或小时聚合用量事件，返回趋势序列（受统计周期起点约束）。
     pub(crate) fn trend(&self, range: UsageRange) -> Result<UsageTrend, AppError> {
         range.validate()?;
-        let connection = self.open_connection().map_err(AppError::from)?;
-        initialize_schema(&connection).map_err(AppError::from)?;
+        let connection = self.open_read_connection().map_err(AppError::from)?;
 
         let collection_epoch = read_collection_epoch(&connection)?;
         let effective_start = collection_epoch
@@ -555,10 +750,16 @@ impl UsageLedger {
         let connection = self.open_connection().map_err(AppError::from)?;
         initialize_schema(&connection).map_err(AppError::from)?;
         let now = Utc::now().timestamp_millis();
+        let mut aliases = BTreeSet::new();
         for (local_account_id, canonical_account_id) in accounts {
             if local_account_id.trim().is_empty() || canonical_account_id.trim().is_empty() {
                 continue;
             }
+            aliases.insert((local_account_id.trim(), canonical_account_id.trim()));
+            // 使用规范身份写入的激活记录同样是已确认归属，不能因没有内部 UUID 别名而被误判。
+            aliases.insert((canonical_account_id.trim(), canonical_account_id.trim()));
+        }
+        for (local_account_id, canonical_account_id) in aliases {
             connection
                 .execute(
                     "INSERT INTO account_identity_aliases(
@@ -568,7 +769,7 @@ impl UsageLedger {
                      ON CONFLICT(source_kind, provider_id, local_account_id) DO UPDATE SET
                         canonical_account_id = excluded.canonical_account_id,
                         identity_source = excluded.identity_source",
-                    params![local_account_id.trim(), canonical_account_id.trim(), now],
+                    params![local_account_id, canonical_account_id, now],
                 )
                 .map_err(|error| AppError::Internal(format!("保存账号归一化映射失败：{error}")))?;
         }
@@ -585,19 +786,6 @@ impl UsageLedger {
         let connection = self.open_connection().map_err(AppError::from)?;
         initialize_schema(&connection).map_err(AppError::from)?;
         update_activation_status(&connection, id, "cancelled")
-    }
-
-    pub(crate) fn cancel_pending_activations(&self) -> Result<(), AppError> {
-        let connection = self.open_connection().map_err(AppError::from)?;
-        initialize_schema(&connection).map_err(AppError::from)?;
-        connection
-            .execute(
-                "UPDATE activation_history SET status = 'cancelled'
-                 WHERE status = 'pending'",
-                [],
-            )
-            .map_err(|error| AppError::Internal(format!("清理未完成账号切换记录失败：{error}")))?;
-        Ok(())
     }
 
     pub(crate) fn record_activation(&self, activation: ActivationRecord) -> Result<(), AppError> {
@@ -645,8 +833,7 @@ impl UsageLedger {
         &self,
         scope: Option<PricingScope>,
     ) -> Result<Vec<PricingRule>, AppError> {
-        let connection = self.open_connection().map_err(AppError::from)?;
-        initialize_schema(&connection).map_err(AppError::from)?;
+        let connection = self.open_read_connection().map_err(AppError::from)?;
         let rules = load_pricing_rule_dtos(&connection)?;
         Ok(rules
             .into_iter()
@@ -664,8 +851,7 @@ impl UsageLedger {
     pub(crate) fn official_pricing_catalog(
         &self,
     ) -> Result<Option<OfficialPricingCatalog>, AppError> {
-        let connection = self.open_connection().map_err(AppError::from)?;
-        initialize_schema(&connection).map_err(AppError::from)?;
+        let connection = self.open_read_connection().map_err(AppError::from)?;
         load_official_catalog(&connection).map_err(AppError::from)
     }
 
@@ -1011,6 +1197,10 @@ impl UsageLedger {
         )?;
         Ok(connection)
     }
+
+    fn open_read_connection(&self) -> anyhow::Result<Connection> {
+        self.open_connection()
+    }
 }
 
 fn initialize_schema(connection: &Connection) -> anyhow::Result<()> {
@@ -1060,15 +1250,17 @@ fn initialize_schema(connection: &Connection) -> anyhow::Result<()> {
                created_at_ms INTEGER NOT NULL,
                UNIQUE (rollout_id, event_ordinal)
              );
-             CREATE INDEX IF NOT EXISTS usage_events_time_idx
-               ON usage_events(occurred_at_ms);
+              CREATE INDEX IF NOT EXISTS usage_events_time_idx
+                ON usage_events(occurred_at_ms);
+              CREATE INDEX IF NOT EXISTS usage_events_time_ordinal_idx
+                ON usage_events(occurred_at_ms, event_ordinal);
              CREATE INDEX IF NOT EXISTS usage_events_account_idx
                ON usage_events(account_id, occurred_at_ms);
              CREATE INDEX IF NOT EXISTS usage_events_provider_idx
                ON usage_events(provider_id, occurred_at_ms);
              CREATE INDEX IF NOT EXISTS usage_events_model_idx
                ON usage_events(model, occurred_at_ms);
-             CREATE TABLE IF NOT EXISTS usage_cursors (
+              CREATE TABLE IF NOT EXISTS usage_cursors (
                rollout_id TEXT PRIMARY KEY,
                last_path TEXT NOT NULL,
                byte_offset INTEGER NOT NULL,
@@ -1084,8 +1276,10 @@ fn initialize_schema(connection: &Connection) -> anyhow::Result<()> {
                 file_length INTEGER NOT NULL,
                 file_modified_at_ms INTEGER,
                 prefix_sha256 TEXT,
-                updated_at_ms INTEGER NOT NULL
-             );
+                 updated_at_ms INTEGER NOT NULL
+              );
+              CREATE INDEX IF NOT EXISTS usage_cursors_path_idx
+                ON usage_cursors(last_path, file_length, file_modified_at_ms);
              CREATE TABLE IF NOT EXISTS activation_history (
                id TEXT PRIMARY KEY,
                effective_at_ms INTEGER NOT NULL,
@@ -1275,6 +1469,32 @@ fn initialize_schema(connection: &Connection) -> anyhow::Result<()> {
              COMMIT;",
         )?;
     }
+    // 只有目标表与列已存在时才补建索引。CREATE INDEX IF NOT EXISTS 在表或列
+    // 不存在时仍会报错，极简旧版夹具/降级库可能缺表或缺列。
+    let usage_events_exists: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master
+                       WHERE type = 'table' AND name = 'usage_events')",
+        [],
+        |row| row.get(0),
+    )?;
+    if usage_events_exists {
+        connection.execute_batch(
+            "CREATE INDEX IF NOT EXISTS usage_events_time_ordinal_idx
+               ON usage_events(occurred_at_ms, event_ordinal);",
+        )?;
+    }
+    let cursor_path_columns: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('usage_cursors')
+         WHERE name IN ('last_path', 'file_length', 'file_modified_at_ms')",
+        [],
+        |row| row.get(0),
+    )?;
+    if cursor_path_columns == 3 {
+        connection.execute_batch(
+            "CREATE INDEX IF NOT EXISTS usage_cursors_path_idx
+               ON usage_cursors(last_path, file_length, file_modified_at_ms);",
+        )?;
+    }
     Ok(())
 }
 
@@ -1408,25 +1628,7 @@ fn initialize_collection_epoch(
             .map_err(|error| AppError::Internal(format!("读取本机用量文件状态失败：{error}")))?;
         transaction
             .execute(
-                "INSERT INTO usage_cursors(
-                    rollout_id, last_path, byte_offset, next_event_ordinal,
-                    last_model, last_model_provider, usage_boundary_passed,
-                    usage_boundary_state, subagent_boundary_mode,
-                    file_length, file_modified_at_ms, prefix_sha256, updated_at_ms
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
-                 ON CONFLICT(rollout_id) DO UPDATE SET
-                   last_path = excluded.last_path,
-                   byte_offset = excluded.byte_offset,
-                   next_event_ordinal = excluded.next_event_ordinal,
-                   last_model = excluded.last_model,
-                   last_model_provider = excluded.last_model_provider,
-                   usage_boundary_passed = excluded.usage_boundary_passed,
-                   usage_boundary_state = excluded.usage_boundary_state,
-                   subagent_boundary_mode = excluded.subagent_boundary_mode,
-                   file_length = excluded.file_length,
-                   file_modified_at_ms = excluded.file_modified_at_ms,
-                   prefix_sha256 = excluded.prefix_sha256,
-                   updated_at_ms = excluded.updated_at_ms",
+                UPSERT_USAGE_CURSOR_SQL,
                 params![
                     rollout_id,
                     path.display().to_string(),
@@ -1523,7 +1725,7 @@ fn update_activation_status(
 }
 
 fn refresh_file(
-    connection: &mut Connection,
+    transaction: &mut rusqlite::Transaction<'_>,
     path: &Path,
     now_utc_ms: i64,
     collection_epoch: i64,
@@ -1535,11 +1737,24 @@ fn refresh_file(
     if metadata.len() > MAX_ROLLOUT_BYTES {
         return Err("会话文件超过 256 MB，已跳过以避免占用过多内存。".into());
     }
+    let file_modified_at_ms = file_modified_at_ms(&metadata);
+    // 先按路径和文件戳命中游标，避免每次刷新都读取 JSONL 头部来发现 rollout_id。
+    // 只有新增、追加、截断或替换的文件才进入 discover_rollout/增量解析。
+    if unchanged_cursor_matches(transaction, path, metadata.len(), file_modified_at_ms)? {
+        return Ok(FileRefreshResult {
+            events_added: 0,
+            events_skipped: 0,
+            partial_lines: 0,
+            file_skipped: true,
+            warnings: vec![],
+        });
+    }
     let Some(discovered) = discover_rollout(path)? else {
         return Ok(FileRefreshResult {
             events_added: 0,
             events_skipped: 0,
             partial_lines: 0,
+            file_skipped: false,
             warnings: vec![UsageWarning {
                 path: Some(path.display().to_string()),
                 message: "会话文件缺少有效 session_meta.id，未统计 Token。".into(),
@@ -1548,8 +1763,7 @@ fn refresh_file(
     };
     let rollout_id = discovered.rollout_id.clone();
 
-    let cursor = load_cursor(connection, &rollout_id)?;
-    let file_modified_at_ms = file_modified_at_ms(&metadata);
+    let cursor = load_cursor(transaction, &rollout_id)?;
     let mut rebuild_rollout = discovered.is_subagent
         && discovered.boundary_marker_required
         && cursor
@@ -1563,7 +1777,7 @@ fn refresh_file(
                 match cursor.prefix_sha256.as_deref() {
                     Some(expected) => prefix_hasher.clone().finalize_hex() != expected,
                     None => !committed_prefix_matches(
-                        connection,
+                        transaction,
                         path,
                         &discovered,
                         cursor,
@@ -1588,6 +1802,7 @@ fn refresh_file(
             events_added: 0,
             events_skipped: 0,
             partial_lines: 0,
+            file_skipped: true,
             warnings: vec![],
         });
     }
@@ -1679,11 +1894,11 @@ fn refresh_file(
         }
     }
 
-    let transaction = connection
-        .transaction()
+    let savepoint = transaction
+        .savepoint()
         .map_err(|error| format!("开始保存本机用量事务失败：{error}"))?;
     if rebuild_rollout {
-        transaction
+        savepoint
             .execute(
                 "DELETE FROM usage_events WHERE rollout_id = ?1",
                 params![rollout_id],
@@ -1697,7 +1912,7 @@ fn refresh_file(
             continue;
         }
         if insert_event(
-            &transaction,
+            &savepoint,
             &rollout_id,
             &event,
             now_utc_ms,
@@ -1708,27 +1923,9 @@ fn refresh_file(
             events_added += 1;
         }
     }
-    transaction
+    savepoint
         .execute(
-            "INSERT INTO usage_cursors(
-                rollout_id, last_path, byte_offset, next_event_ordinal,
-                last_model, last_model_provider, usage_boundary_passed,
-                usage_boundary_state, subagent_boundary_mode,
-                file_length, file_modified_at_ms, prefix_sha256, updated_at_ms
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
-             ON CONFLICT(rollout_id) DO UPDATE SET
-               last_path = excluded.last_path,
-               byte_offset = excluded.byte_offset,
-               next_event_ordinal = excluded.next_event_ordinal,
-               last_model = excluded.last_model,
-               last_model_provider = excluded.last_model_provider,
-               usage_boundary_passed = excluded.usage_boundary_passed,
-               usage_boundary_state = excluded.usage_boundary_state,
-               subagent_boundary_mode = excluded.subagent_boundary_mode,
-               file_length = excluded.file_length,
-               file_modified_at_ms = excluded.file_modified_at_ms,
-               prefix_sha256 = excluded.prefix_sha256,
-               updated_at_ms = excluded.updated_at_ms",
+            UPSERT_USAGE_CURSOR_SQL,
             params![
                 rollout_id,
                 path.display().to_string(),
@@ -1747,7 +1944,7 @@ fn refresh_file(
             ],
         )
         .map_err(|error| format!("保存本机用量游标失败：{error}"))?;
-    transaction
+    savepoint
         .commit()
         .map_err(|error| format!("提交本机用量事务失败：{error}"))?;
 
@@ -1770,6 +1967,7 @@ fn refresh_file(
         events_added,
         events_skipped,
         partial_lines,
+        file_skipped: false,
         warnings,
     })
 }
@@ -2016,6 +2214,29 @@ fn load_cursor(connection: &Connection, rollout_id: &str) -> Result<Option<Store
         )
         .optional()
         .map_err(|error| format!("读取本机用量游标失败：{error}"))
+}
+
+fn unchanged_cursor_matches(
+    connection: &Connection,
+    path: &Path,
+    file_length: u64,
+    modified_at_ms: Option<i64>,
+) -> Result<bool, String> {
+    let file_length = i64::try_from(file_length).map_err(|_| "会话文件大小超过数据库范围。")?;
+    connection
+        .query_row(
+            "SELECT 1 FROM usage_cursors
+             WHERE last_path = ?1
+               AND file_length = ?2
+               AND file_modified_at_ms IS ?3
+               AND prefix_sha256 IS NOT NULL
+             LIMIT 1",
+            params![path.display().to_string(), file_length, modified_at_ms],
+            |_| Ok(true),
+        )
+        .optional()
+        .map(|value| value.unwrap_or(false))
+        .map_err(|error| format!("读取本机用量文件游标失败：{error}"))
 }
 
 fn load_activations(connection: &Connection) -> anyhow::Result<Vec<ActivationSnapshot>> {
@@ -2344,7 +2565,7 @@ fn billing_mode_text(value: BillingMode) -> &'static str {
 }
 
 fn insert_event(
-    transaction: &rusqlite::Transaction<'_>,
+    connection: &rusqlite::Connection,
     rollout_id: &str,
     event: &ParsedUsageEvent,
     created_at_ms: i64,
@@ -2458,7 +2679,7 @@ fn insert_event(
     } else if !matches!(event.quality, crate::usage_log::UsageQuality::Complete) {
         cost_status = "partial";
     }
-    let affected = transaction
+    let affected = connection
         .execute(
             "INSERT OR IGNORE INTO usage_events(
                 event_id, rollout_id, event_ordinal, occurred_at_ms, model,
@@ -2530,62 +2751,12 @@ fn pricing_rule_label(id: Option<&str>, rules: &[PricingRuleRecord]) -> Option<S
 }
 
 #[derive(Debug)]
-struct DbUsageRow {
-    occurred_at_ms: i64,
-    model: String,
-    source_kind: UsageSourceKind,
-    provider_id: Option<String>,
-    account_id: Option<String>,
-    source_name: String,
-    tokens: TokenBreakdown,
-    cost_status: CostStatus,
-    estimated_cost_microusd: Option<u64>,
-    pricing_rule_name: Option<String>,
-    pricing_rule_version: Option<u64>,
-}
-
-#[derive(Debug)]
 struct DbTrendRow {
     occurred_at_ms: i64,
     source_kind: UsageSourceKind,
     tokens: TokenBreakdown,
     cost_status: CostStatus,
     estimated_cost_microusd: Option<u64>,
-}
-
-fn read_usage_row(row: &Row<'_>, _group_by: UsageGroupBy) -> rusqlite::Result<DbUsageRow> {
-    Ok(DbUsageRow {
-        occurred_at_ms: row.get(0)?,
-        model: row.get(1)?,
-        source_kind: parse_source_kind(&row.get::<_, String>(2)?),
-        provider_id: row.get(3)?,
-        account_id: row.get(4)?,
-        source_name: row.get(5)?,
-        tokens: TokenBreakdown {
-            input_tokens: i64_to_u64(row.get(6)?)?,
-            cached_input_tokens: i64_to_u64(row.get(7)?)?,
-            cache_write_input_tokens: i64_to_u64(row.get(8)?)?,
-            output_tokens: i64_to_u64(row.get(9)?)?,
-            reasoning_output_tokens: i64_to_u64(row.get(10)?)?,
-            total_tokens: i64_to_u64(row.get(11)?)?,
-        },
-        cost_status: parse_cost_status(&row.get::<_, String>(12)?),
-        estimated_cost_microusd: row.get::<_, Option<i64>>(13)?.map(i64_to_u64).transpose()?,
-        pricing_rule_name: row.get(14)?,
-        pricing_rule_version: row.get::<_, Option<i64>>(15)?.map(i64_to_u64).transpose()?,
-    })
-}
-
-fn aggregate_key(row: &DbUsageRow, group_by: UsageGroupBy) -> String {
-    match group_by {
-        UsageGroupBy::Model => format!("model:{}", row.model),
-        UsageGroupBy::Account => format!(
-            "account:{}:{}:{}",
-            source_kind_text(row.source_kind),
-            row.provider_id.as_deref().unwrap_or_default(),
-            row.account_id.as_deref().unwrap_or("unattributed")
-        ),
-    }
 }
 
 fn add_tokens(target: &mut TokenBreakdown, source: &TokenBreakdown) {
@@ -2740,6 +2911,361 @@ fn aggregate_cost_status(aggregate: &UsageAggregate) -> CostStatus {
     }
 }
 
+struct UsageAggregateRow {
+    key: String,
+    requests: u64,
+    tokens: TokenBreakdown,
+    aggregate_cost_microusd: u64,
+    status_cost_microusd: u64,
+    unpriced_tokens: u64,
+    subscription_tokens: u64,
+    partial_tokens: u64,
+    unattributed_tokens: u64,
+    first_model: String,
+    first_source_kind: String,
+    first_provider_id: Option<String>,
+    first_account_id: Option<String>,
+    first_source_name: String,
+    first_pricing_rule_name: Option<String>,
+    has_estimated: bool,
+    has_subscription: bool,
+    has_unpriced: bool,
+    has_partial: bool,
+    has_unattributed: bool,
+    has_source_delta: bool,
+    resolved_pricing_rule_version: Option<u64>,
+}
+
+/// 用 SQL 按 key 聚合范围内全部用量事件（SUM/GROUP BY + 窗口函数取每组首行
+/// 元数据），只把“分组数”行载入 Rust，避免把范围内全部事件逐行读入后聚合。
+fn query_aggregates(
+    connection: &Connection,
+    start_ms: i64,
+    end_ms: i64,
+    group_by: UsageGroupBy,
+) -> Result<(BTreeMap<String, UsageAggregate>, UsageTotals), AppError> {
+    let canonical_account_expr =
+        "COALESCE(account_identity_aliases.canonical_account_id, usage_events.account_id)";
+    let key_expr = match group_by {
+        UsageGroupBy::Model => "('model:' || usage_events.model)".to_string(),
+        UsageGroupBy::Account => format!(
+            "('account:' || usage_events.source_kind || ':' ||
+             COALESCE(usage_events.provider_id, '') || ':' ||
+             COALESCE({canonical_account_expr}, 'unattributed'))"
+        ),
+    };
+    let sql = format!(
+        r#"
+WITH ranked AS (
+  SELECT
+    usage_events.*,
+    {canonical_account_expr} AS canonical_account_id,
+    {key_expr} AS grp_key,
+    ROW_NUMBER() OVER (
+      PARTITION BY {key_expr}
+      ORDER BY usage_events.occurred_at_ms, usage_events.event_ordinal
+    ) AS first_rn
+  FROM usage_events
+  LEFT JOIN account_identity_aliases
+    ON account_identity_aliases.source_kind = usage_events.source_kind
+   AND account_identity_aliases.provider_id IS usage_events.provider_id
+   AND account_identity_aliases.local_account_id = usage_events.account_id
+  WHERE usage_events.occurred_at_ms >= ?1
+    AND usage_events.occurred_at_ms < ?2
+)
+SELECT
+  grp_key,
+  COUNT(*) AS requests,
+  COALESCE(SUM(input_tokens), 0) AS input_tokens,
+  COALESCE(SUM(cached_input_tokens), 0) AS cached_input_tokens,
+  COALESCE(SUM(cache_write_input_tokens), 0) AS cache_write_input_tokens,
+  COALESCE(SUM(output_tokens), 0) AS output_tokens,
+  COALESCE(SUM(reasoning_output_tokens), 0) AS reasoning_output_tokens,
+  COALESCE(SUM(total_tokens), 0) AS total_tokens,
+  COALESCE(SUM(estimated_cost_microusd), 0) AS aggregate_cost_microusd,
+  COALESCE(SUM(CASE WHEN cost_status = 'estimated'
+                     OR (cost_status = 'partial' AND estimated_cost_microusd IS NOT NULL)
+                    THEN estimated_cost_microusd ELSE 0 END), 0) AS status_cost_microusd,
+  COALESCE(SUM(CASE WHEN cost_status = 'unpriced' THEN total_tokens ELSE 0 END), 0) AS unpriced_tokens,
+  COALESCE(SUM(CASE WHEN cost_status = 'subscription' THEN total_tokens ELSE 0 END), 0) AS subscription_tokens,
+  COALESCE(SUM(CASE WHEN cost_status = 'partial' THEN total_tokens ELSE 0 END), 0) AS partial_tokens,
+  COALESCE(SUM(CASE WHEN cost_status = 'unattributed' OR source_kind = 'unattributed'
+                    THEN total_tokens ELSE 0 END), 0) AS unattributed_tokens,
+  MAX(CASE WHEN first_rn = 1 THEN model END) AS first_model,
+  MAX(CASE WHEN first_rn = 1 THEN source_kind END) AS first_source_kind,
+  MAX(CASE WHEN first_rn = 1 THEN provider_id END) AS first_provider_id,
+  MAX(CASE WHEN first_rn = 1 THEN canonical_account_id END) AS first_account_id,
+  MAX(CASE WHEN first_rn = 1 THEN source_name END) AS first_source_name,
+  MAX(CASE WHEN first_rn = 1 THEN pricing_rule_name END) AS first_pricing_rule_name,
+  MAX(CASE WHEN cost_status = 'estimated' THEN 1 ELSE 0 END) AS has_estimated,
+  MAX(CASE WHEN cost_status = 'subscription' THEN 1 ELSE 0 END) AS has_subscription,
+  MAX(CASE WHEN cost_status = 'unpriced' THEN 1 ELSE 0 END) AS has_unpriced,
+  MAX(CASE WHEN cost_status = 'partial' THEN 1 ELSE 0 END) AS has_partial,
+  MAX(CASE WHEN cost_status = 'unattributed' OR source_kind = 'unattributed' THEN 1 ELSE 0 END) AS has_unattributed,
+  CASE WHEN ?3 = 1 THEN
+    (COUNT(DISTINCT source_kind) > 1
+     OR (COUNT(DISTINCT provider_id) + CASE WHEN COUNT(*) > COUNT(provider_id) THEN 1 ELSE 0 END) > 1
+     OR (COUNT(DISTINCT canonical_account_id) + CASE WHEN COUNT(*) > COUNT(canonical_account_id) THEN 1 ELSE 0 END) > 1)
+  ELSE 0 END AS has_source_delta,
+  CASE WHEN COUNT(DISTINCT COALESCE(pricing_rule_version, -1)) = 1
+       THEN MAX(pricing_rule_version) ELSE NULL END AS resolved_pricing_rule_version
+FROM ranked
+GROUP BY grp_key"#,
+        canonical_account_expr = canonical_account_expr,
+        key_expr = key_expr,
+    );
+    let is_model_group = group_by == UsageGroupBy::Model;
+    let mut statement = connection
+        .prepare(&sql)
+        .map_err(|error| AppError::Internal(format!("读取本机用量失败：{error}")))?;
+    let rows = statement
+        .query_map(params![start_ms, end_ms, is_model_group], |row| {
+            Ok(UsageAggregateRow {
+                key: row.get(0)?,
+                requests: i64_to_u64(row.get(1)?)?,
+                tokens: TokenBreakdown {
+                    input_tokens: i64_to_u64(row.get(2)?)?,
+                    cached_input_tokens: i64_to_u64(row.get(3)?)?,
+                    cache_write_input_tokens: i64_to_u64(row.get(4)?)?,
+                    output_tokens: i64_to_u64(row.get(5)?)?,
+                    reasoning_output_tokens: i64_to_u64(row.get(6)?)?,
+                    total_tokens: i64_to_u64(row.get(7)?)?,
+                },
+                aggregate_cost_microusd: i64_to_u64(row.get(8)?)?,
+                status_cost_microusd: i64_to_u64(row.get(9)?)?,
+                unpriced_tokens: i64_to_u64(row.get(10)?)?,
+                subscription_tokens: i64_to_u64(row.get(11)?)?,
+                partial_tokens: i64_to_u64(row.get(12)?)?,
+                unattributed_tokens: i64_to_u64(row.get(13)?)?,
+                first_model: row.get(14)?,
+                first_source_kind: row.get(15)?,
+                first_provider_id: row.get(16)?,
+                first_account_id: row.get(17)?,
+                first_source_name: row.get(18)?,
+                first_pricing_rule_name: row.get(19)?,
+                has_estimated: row.get(20)?,
+                has_subscription: row.get(21)?,
+                has_unpriced: row.get(22)?,
+                has_partial: row.get(23)?,
+                has_unattributed: row.get(24)?,
+                has_source_delta: row.get(25)?,
+                resolved_pricing_rule_version: row
+                    .get::<_, Option<i64>>(26)?
+                    .map(i64_to_u64)
+                    .transpose()?,
+            })
+        })
+        .map_err(|error| AppError::Internal(format!("读取本机用量失败：{error}")))?;
+
+    let mut aggregates = BTreeMap::<String, UsageAggregate>::new();
+    let mut totals = UsageTotals {
+        tokens: TokenBreakdown::default(),
+        requests: 0,
+        estimated_cost_microusd: 0,
+        subscription_tokens: 0,
+        unpriced_tokens: 0,
+        partial_tokens: 0,
+        unattributed_tokens: 0,
+    };
+    for row in rows {
+        let row = row.map_err(|error| AppError::Internal(format!("读取本机用量失败：{error}")))?;
+        let multi_source = row.has_source_delta;
+        let aggregate = UsageAggregate {
+            key: row.key.clone(),
+            model: if group_by == UsageGroupBy::Model {
+                row.first_model.clone()
+            } else {
+                "多个模型".into()
+            },
+            source_kind: if multi_source {
+                UsageSourceKind::Unattributed
+            } else {
+                parse_source_kind(&row.first_source_kind)
+            },
+            provider_id: if multi_source {
+                None
+            } else {
+                row.first_provider_id.clone()
+            },
+            account_id: if multi_source {
+                None
+            } else {
+                row.first_account_id.clone()
+            },
+            source_name: if multi_source {
+                "多个账号/来源".into()
+            } else {
+                row.first_source_name.clone()
+            },
+            tokens: row.tokens.clone(),
+            requests: row.requests,
+            estimated_cost_microusd: row.aggregate_cost_microusd,
+            has_estimated: row.has_estimated,
+            has_subscription: row.has_subscription,
+            has_unpriced: row.has_unpriced,
+            has_partial: row.has_partial,
+            has_unattributed: row.has_unattributed,
+            pricing_rule_name: row.first_pricing_rule_name.clone(),
+            pricing_rule_version: row.resolved_pricing_rule_version,
+        };
+        // 各分组互斥且覆盖全范围，按分组累加即得到与逐事件累加一致的总量。
+        add_tokens(&mut totals.tokens, &row.tokens);
+        totals.requests = totals.requests.saturating_add(row.requests);
+        totals.estimated_cost_microusd = totals
+            .estimated_cost_microusd
+            .saturating_add(row.status_cost_microusd);
+        totals.unpriced_tokens = totals.unpriced_tokens.saturating_add(row.unpriced_tokens);
+        totals.subscription_tokens = totals
+            .subscription_tokens
+            .saturating_add(row.subscription_tokens);
+        totals.partial_tokens = totals.partial_tokens.saturating_add(row.partial_tokens);
+        totals.unattributed_tokens = totals
+            .unattributed_tokens
+            .saturating_add(row.unattributed_tokens);
+        aggregates.insert(aggregate.key.clone(), aggregate);
+    }
+    Ok((aggregates, totals))
+}
+
+fn query_models(
+    connection: &Connection,
+    start_ms: i64,
+    end_ms: i64,
+) -> Result<Vec<String>, AppError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT DISTINCT model
+             FROM usage_events
+             WHERE occurred_at_ms >= ?1
+               AND occurred_at_ms < ?2
+             ORDER BY model",
+        )
+        .map_err(|error| AppError::Internal(format!("读取用量模型列表失败：{error}")))?;
+    let models = statement
+        .query_map(params![start_ms, end_ms], |row| row.get::<_, String>(0))
+        .map_err(|error| AppError::Internal(format!("读取用量模型列表失败：{error}")))?;
+    models
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|error| AppError::Internal(format!("读取用量模型列表失败：{error}")))
+}
+
+/// 先把范围内的本机自然日/小时桶边界在 Rust 里枚举出来（桶数量远小于事件数），
+/// 再让 SQLite 按桶聚合，避免把范围内全部事件载入 Rust；口径与逐事件累加一致。
+fn query_trend_points(
+    connection: &Connection,
+    start_ms: i64,
+    end_ms: i64,
+    hourly: bool,
+) -> Result<BTreeMap<i64, UsageTrendPoint>, AppError> {
+    let step_ms = if hourly {
+        60 * 60 * 1000
+    } else {
+        24 * 60 * 60 * 1000
+    };
+    let Some(mut current) = (if hourly {
+        local_hour_start_ms(start_ms)
+    } else {
+        local_day_start_ms(start_ms)
+    }) else {
+        return Ok(BTreeMap::new());
+    };
+    let mut bucket_starts = BTreeSet::<i64>::new();
+    while current < end_ms {
+        bucket_starts.insert(current);
+        let next_instant = current.saturating_add(step_ms);
+        if next_instant <= current {
+            break;
+        }
+        let next = if hourly {
+            local_hour_start_ms(next_instant)
+        } else {
+            local_day_start_ms(next_instant)
+        };
+        let Some(next) = next else { break };
+        if next <= current {
+            break;
+        }
+        current = next;
+    }
+    if bucket_starts.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+
+    let mut sql = String::from(
+        "SELECT CASE
+",
+    );
+    let mut values = Vec::<rusqlite::types::Value>::new();
+    let buckets: Vec<i64> = bucket_starts.into_iter().collect();
+    for (index, bucket) in buckets.iter().enumerate() {
+        let bucket_end = buckets.get(index + 1).copied().unwrap_or(end_ms);
+        let start_param = index * 2 + 1;
+        let end_param = start_param + 1;
+        sql.push_str(&format!(
+            " WHEN usage_events.occurred_at_ms >= ?{start_param} AND usage_events.occurred_at_ms < ?{end_param} THEN ?{start_param}
+"
+        ));
+        values.push(rusqlite::types::Value::Integer(*bucket));
+        values.push(rusqlite::types::Value::Integer(bucket_end));
+    }
+    let range_start_param = buckets.len() * 2 + 1;
+    let range_end_param = range_start_param + 1;
+    sql.push_str(
+        " ELSE NULL END AS bucket_start_ms,
+",
+    );
+    sql.push_str(&format!(
+        "  COUNT(*) AS requests,
+           COALESCE(SUM(input_tokens), 0) AS input_tokens,
+           COALESCE(SUM(cached_input_tokens), 0) AS cached_input_tokens,
+           COALESCE(SUM(cache_write_input_tokens), 0) AS cache_write_input_tokens,
+           COALESCE(SUM(output_tokens), 0) AS output_tokens,
+           COALESCE(SUM(reasoning_output_tokens), 0) AS reasoning_output_tokens,
+           COALESCE(SUM(total_tokens), 0) AS total_tokens,
+           COALESCE(SUM(CASE WHEN cost_status = 'estimated' OR (cost_status = 'partial' AND estimated_cost_microusd IS NOT NULL) THEN estimated_cost_microusd ELSE 0 END), 0) AS estimated_cost_microusd,
+           COALESCE(SUM(CASE WHEN cost_status = 'unpriced' THEN total_tokens ELSE 0 END), 0) AS unpriced_tokens,
+           COALESCE(SUM(CASE WHEN cost_status = 'partial' THEN total_tokens ELSE 0 END), 0) AS partial_tokens,
+           COALESCE(SUM(CASE WHEN cost_status = 'unattributed' OR source_kind = 'unattributed' THEN total_tokens ELSE 0 END), 0) AS unattributed_tokens
+     FROM usage_events
+    WHERE usage_events.occurred_at_ms >= ?{range_start_param}
+      AND usage_events.occurred_at_ms < ?{range_end_param}
+    GROUP BY bucket_start_ms",
+    ));
+    values.push(rusqlite::types::Value::Integer(start_ms));
+    values.push(rusqlite::types::Value::Integer(end_ms));
+
+    let mut statement = connection
+        .prepare(&sql)
+        .map_err(|error| AppError::Internal(format!("读取本机用量趋势失败：{error}")))?;
+    let rows = statement
+        .query_map(rusqlite::params_from_iter(values.iter()), |row| {
+            Ok(UsageTrendPoint {
+                day_start_ms: row.get::<_, i64>(0)?,
+                requests: i64_to_u64(row.get(1)?)?,
+                tokens: TokenBreakdown {
+                    input_tokens: i64_to_u64(row.get(2)?)?,
+                    cached_input_tokens: i64_to_u64(row.get(3)?)?,
+                    cache_write_input_tokens: i64_to_u64(row.get(4)?)?,
+                    output_tokens: i64_to_u64(row.get(5)?)?,
+                    reasoning_output_tokens: i64_to_u64(row.get(6)?)?,
+                    total_tokens: i64_to_u64(row.get(7)?)?,
+                },
+                estimated_cost_microusd: i64_to_u64(row.get(8)?)?,
+                unpriced_tokens: i64_to_u64(row.get(9)?)?,
+                partial_tokens: i64_to_u64(row.get(10)?)?,
+                unattributed_tokens: i64_to_u64(row.get(11)?)?,
+            })
+        })
+        .map_err(|error| AppError::Internal(format!("读取本机用量趋势失败：{error}")))?;
+    let mut points = BTreeMap::<i64, UsageTrendPoint>::new();
+    for row in rows {
+        let row =
+            row.map_err(|error| AppError::Internal(format!("读取本机用量趋势失败：{error}")))?;
+        points.insert(row.day_start_ms, row);
+    }
+    Ok(points)
+}
+
 fn parse_source_kind(value: &str) -> UsageSourceKind {
     match value {
         "official" => UsageSourceKind::Official,
@@ -2783,7 +3309,10 @@ fn u64_db(value: u64) -> Result<i64, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ActivationSnapshot, UsageLedger, file_modified_at_ms, read_bounded_line};
+    use super::{
+        ActivationSnapshot, COLLECTION_EPOCH_METADATA_KEY, UsageLedger, file_modified_at_ms,
+        read_bounded_line, scaled_quota_estimate,
+    };
     use crate::models::{
         ActivationRecord, AppError, BillingMode, CostStatus, PricingMatchKind, PricingScopeKind,
         SavePricingRule, UsageGroupBy, UsageQuery, UsageRange, UsageSourceKind,
@@ -2791,7 +3320,8 @@ mod tests {
     use crate::official_pricing::build_catalog;
     use crate::usage_log::{ParsedUsageEvent, TokenUsage, UsageQuality};
     use chrono::DateTime;
-    use std::{fs, io::Cursor, path::Path};
+    use rusqlite::params;
+    use std::{fs, io::Cursor, path::Path, sync::mpsc, thread, time::Duration};
 
     #[test]
     fn bounded_line_drains_oversized_records_without_retaining_them() {
@@ -2901,6 +3431,300 @@ mod tests {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, text).unwrap();
         path
+    }
+
+    #[test]
+    fn quota_estimate_scales_safely_and_rounds_to_nearest_microusd() {
+        assert_eq!(scaled_quota_estimate(250_000, 25.0), Some(1_000_000));
+        assert_eq!(scaled_quota_estimate(1, 30.0), Some(3));
+        assert_eq!(scaled_quota_estimate(u64::MAX, 0.000_000_1), None);
+    }
+
+    fn estimate_test_ledger() -> (tempfile::TempDir, UsageLedger) {
+        let temp = tempfile::tempdir().unwrap();
+        let ledger = UsageLedger::open(&temp.path().join("app")).unwrap();
+        (temp, ledger)
+    }
+
+    #[test]
+    fn combined_quota_refresh_keeps_the_refresh_lock_until_estimation_reads() {
+        let (temp, ledger) = estimate_test_ledger();
+        let home = temp.path().join("codex");
+        let (estimate_entered_tx, estimate_entered_rx) = mpsc::channel();
+        let (allow_estimate_tx, allow_estimate_rx) = mpsc::channel();
+        let (second_refresh_done_tx, second_refresh_done_rx) = mpsc::channel();
+
+        let estimate_ledger = ledger.clone();
+        let estimate_home = home.clone();
+        let estimate = thread::spawn(move || {
+            estimate_ledger.refresh_and_estimate_account_quota_with_after_refresh(
+                &estimate_home,
+                1_000,
+                "canonical-account",
+                &[(18_000, 2_000, 25.0)],
+                1_000,
+                || {
+                    estimate_entered_tx.send(()).unwrap();
+                    allow_estimate_rx.recv().unwrap();
+                },
+            )
+        });
+        estimate_entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+
+        let refresh_ledger = ledger.clone();
+        let refresh_home = home.clone();
+        let second_refresh = thread::spawn(move || {
+            let result = refresh_ledger.refresh(&refresh_home, 1_001);
+            second_refresh_done_tx.send(result).unwrap();
+        });
+        assert!(
+            second_refresh_done_rx
+                .recv_timeout(Duration::from_millis(100))
+                .is_err()
+        );
+
+        allow_estimate_tx.send(()).unwrap();
+        assert!(estimate.join().unwrap().is_ok());
+        assert!(
+            second_refresh_done_rx
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .is_ok()
+        );
+        second_refresh.join().unwrap();
+    }
+
+    fn set_estimate_metadata(ledger: &UsageLedger, collection_epoch: i64, warning_count: usize) {
+        let connection = ledger.open_connection().unwrap();
+        connection
+            .execute(
+                "INSERT INTO usage_metadata(key, value) VALUES (?1, ?2)",
+                params![COLLECTION_EPOCH_METADATA_KEY, collection_epoch.to_string()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO usage_metadata(key, value) VALUES ('last_refresh_warning_count', ?1)",
+                params![warning_count.to_string()],
+            )
+            .unwrap();
+    }
+
+    fn insert_estimate_event(
+        ledger: &UsageLedger,
+        ordinal: i64,
+        occurred_at_ms: i64,
+        account_id: &str,
+        cost_status: &str,
+        cost_microusd: Option<i64>,
+    ) {
+        ledger
+            .open_connection()
+            .unwrap()
+            .execute(
+                "INSERT INTO usage_events(
+                    event_id, rollout_id, event_ordinal, occurred_at_ms, model, model_provider,
+                    source_kind, provider_id, account_id, source_name,
+                    input_tokens, cached_input_tokens, cache_write_input_tokens, output_tokens,
+                    reasoning_output_tokens, total_tokens, usage_quality, pricing_rule_id,
+                    pricing_rule_version, pricing_rule_name, estimated_cost_microusd, cost_status,
+                    created_at_ms
+                 ) VALUES (?1, 'estimate-rollout', ?2, ?3, 'gpt-5.6', NULL,
+                    'official', NULL, ?4, '测试账号', 1, 0, 0, 1, 0, 2, 'complete', NULL,
+                    NULL, NULL, ?5, ?6, ?3)",
+                params![
+                    format!("estimate-{ordinal}"),
+                    ordinal,
+                    occurred_at_ms,
+                    account_id,
+                    cost_microusd,
+                    cost_status
+                ],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn estimate_account_quota_isolates_accounts_and_aggregates_windows_in_one_scan() {
+        let (_temp, ledger) = estimate_test_ledger();
+        let now = 10_000_000_000_i64;
+        let reset_at = now / 1_000 + 3_600;
+        let seven_day_start = reset_at * 1_000 - 604_800_000;
+        set_estimate_metadata(&ledger, seven_day_start - 1, 0);
+        ledger
+            .sync_official_account_identities(&[
+                ("local-a".into(), "canonical-a".into()),
+                ("local-b".into(), "canonical-b".into()),
+            ])
+            .unwrap();
+        insert_estimate_event(&ledger, 1, now - 60_000, "local-a", "estimated", Some(250));
+        insert_estimate_event(
+            &ledger,
+            2,
+            now - 500_000_000,
+            "local-a",
+            "estimated",
+            Some(700),
+        );
+        insert_estimate_event(
+            &ledger,
+            3,
+            now - 60_000,
+            "local-b",
+            "estimated",
+            Some(9_999),
+        );
+
+        let result = ledger
+            .estimate_account_quota(
+                "canonical-a",
+                &[(18_000, reset_at, 25.0), (604_800, reset_at, 50.0)],
+                now,
+            )
+            .unwrap();
+
+        assert_eq!(result.len(), 2);
+        assert_eq!(
+            result[0]
+                .estimate
+                .as_ref()
+                .unwrap()
+                .estimated_total_microusd,
+            1_000
+        );
+        assert_eq!(
+            result[1]
+                .estimate
+                .as_ref()
+                .unwrap()
+                .estimated_total_microusd,
+            1_900
+        );
+    }
+
+    #[test]
+    fn quota_estimate_rejects_unknown_official_usage_and_respects_cycle_snapshot_boundaries() {
+        let (_temp, ledger) = estimate_test_ledger();
+        let quota_snapshot_at = 10_000_000_000_i64;
+        let reset_at = quota_snapshot_at / 1_000 + 3_600;
+        let cycle_start = reset_at * 1_000 - 18_000_000;
+        set_estimate_metadata(&ledger, cycle_start - 1, 0);
+        ledger
+            .sync_official_account_identities(&[
+                ("local-target".into(), "canonical-target".into()),
+                ("local-other".into(), "canonical-other".into()),
+            ])
+            .unwrap();
+
+        // 周期起点包含，另一账号不得混入；快照之后的事件也不能作为本次额度快照的样本。
+        insert_estimate_event(
+            &ledger,
+            1,
+            cycle_start,
+            "local-target",
+            "estimated",
+            Some(250),
+        );
+        insert_estimate_event(
+            &ledger,
+            2,
+            quota_snapshot_at - 1,
+            "local-other",
+            "estimated",
+            Some(9_999),
+        );
+        insert_estimate_event(
+            &ledger,
+            3,
+            quota_snapshot_at,
+            "local-target",
+            "estimated",
+            Some(9_999),
+        );
+        // 无法确认归属的官方用量可能属于目标账号，必须让相应窗口失败，而不是忽略它。
+        insert_estimate_event(
+            &ledger,
+            4,
+            quota_snapshot_at - 2,
+            "local-unknown",
+            "estimated",
+            Some(100),
+        );
+
+        let result = ledger
+            .estimate_account_quota(
+                "canonical-target",
+                &[(18_000, reset_at, 25.0)],
+                quota_snapshot_at,
+            )
+            .unwrap();
+
+        assert!(!result[0].success);
+        assert!(
+            result[0]
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("无法确认账号归属"))
+        );
+
+        ledger
+            .open_connection()
+            .unwrap()
+            .execute(
+                "DELETE FROM usage_events WHERE account_id = 'local-unknown'",
+                [],
+            )
+            .unwrap();
+        let isolated = ledger
+            .estimate_account_quota(
+                "canonical-target",
+                &[(18_000, reset_at, 25.0)],
+                quota_snapshot_at,
+            )
+            .unwrap();
+        assert!(isolated[0].success);
+        // 只留下周期起点的目标账号事件：另一账号与快照截止后的目标事件都不能混入。
+        assert_eq!(
+            isolated[0]
+                .estimate
+                .as_ref()
+                .unwrap()
+                .estimated_total_microusd,
+            1_000
+        );
+    }
+
+    #[test]
+    fn estimate_account_quota_rejects_each_accuracy_gate() {
+        let now = 10_000_000_000_i64;
+        let reset_at = now / 1_000 + 3_600;
+        let start = reset_at * 1_000 - 18_000_000;
+        for (name, used_percent, collection_epoch, warning_count, cost_status, insert_event) in [
+            ("低比例", 9.9, start - 1, 0, "estimated", true),
+            ("采集过晚", 20.0, start + 1, 0, "estimated", true),
+            ("刷新告警", 20.0, start - 1, 1, "estimated", true),
+            ("未定价", 20.0, start - 1, 0, "unpriced", true),
+            ("部分", 20.0, start - 1, 0, "partial", true),
+            ("订阅", 20.0, start - 1, 0, "subscription", true),
+            ("未归属", 20.0, start - 1, 0, "unattributed", true),
+            ("无事件", 20.0, start - 1, 0, "estimated", false),
+        ] {
+            let (_temp, ledger) = estimate_test_ledger();
+            set_estimate_metadata(&ledger, collection_epoch, warning_count);
+            ledger
+                .sync_official_account_identities(&[("local-a".into(), "canonical-a".into())])
+                .unwrap();
+            if insert_event {
+                insert_estimate_event(&ledger, 1, now - 60_000, "local-a", cost_status, Some(100));
+            }
+            let result = ledger
+                .estimate_account_quota("canonical-a", &[(18_000, reset_at, used_percent)], now)
+                .unwrap();
+            assert!(!result[0].success, "{name} 应拒绝估算");
+            assert!(result[0].reason.is_some(), "{name} 应说明原因");
+        }
     }
 
     fn save_test_catalog(ledger: &UsageLedger) {
@@ -3401,14 +4225,43 @@ mod tests {
             "warnings: {:?}",
             refreshed.warnings
         );
+        let unchanged = ledger.refresh(&home, 1_754_121_001_000).unwrap();
+        assert_eq!(unchanged.events_added, 0);
         assert_eq!(
-            ledger
-                .refresh(&home, 1_754_121_001_000)
-                .unwrap()
-                .events_added,
-            0
+            unchanged.files_opened, 0,
+            "无变化扫描不应读取任何 JSONL 正文"
         );
+        assert_eq!(unchanged.files_skipped, unchanged.files_scanned);
         assert_eq!(query(&ledger).totals.requests, 1);
+    }
+
+    #[test]
+    fn retention_prunes_events_older_than_90_days_without_reimporting() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex");
+        write_rollout(&home, rollout_prefix());
+        let ledger = UsageLedger::open(&temp.path().join("app")).unwrap();
+
+        // 首次刷新建立收集起点；随后追加的事件在保留期内被计入。
+        let first_now = 1_785_500_000_000;
+        assert_eq!(ledger.refresh(&home, first_now).unwrap().events_added, 0);
+        append_new_usage(&home);
+        let event_ms = 1_785_578_401_000;
+        let appended = ledger.refresh(&home, event_ms).unwrap();
+        assert_eq!(appended.events_added, 1);
+        assert_eq!(query(&ledger).totals.requests, 1);
+
+        // 推进到事件时间之后 91 天，事件超过 90 天保留期被清理。
+        let later_now = event_ms + 91 * 24 * 60 * 60 * 1000;
+        let pruned = ledger.refresh(&home, later_now).unwrap();
+        assert_eq!(pruned.events_pruned, 1);
+        assert_eq!(query(&ledger).totals.requests, 0);
+
+        // 文件未变化，游标仍位于文件末尾，旧事件不会被重新导入。
+        let again = ledger.refresh(&home, later_now).unwrap();
+        assert_eq!(again.events_added, 0);
+        assert_eq!(again.events_pruned, 0);
+        assert_eq!(query(&ledger).totals.requests, 0);
     }
 
     #[test]
@@ -3472,6 +4325,7 @@ mod tests {
             })
             .unwrap();
         assert_eq!(before.rows.len(), 2);
+        assert_eq!(before.models, vec!["gpt-5.6-sol"]);
 
         ledger
             .sync_official_account_identities(&[
@@ -3556,6 +4410,7 @@ mod tests {
 
         assert_eq!(overview.rows.len(), 1);
         assert_eq!(overview.rows[0].model, "gpt-5.6-sol");
+        assert_eq!(overview.models, vec!["gpt-5.6-sol"]);
         assert_eq!(overview.rows[0].source_name, "多个账号/来源");
         assert_eq!(overview.rows[0].requests, 2);
         assert_eq!(overview.rows[0].tokens.total_tokens, 216);
@@ -3862,7 +4717,7 @@ mod tests {
     }
 
     #[test]
-    fn same_length_same_mtime_replacement_rebuilds_after_restart() {
+    fn same_length_same_mtime_replacement_is_skipped_after_restart() {
         let temp = tempfile::tempdir().unwrap();
         let home = temp.path().join("codex");
         let path = write_rollout(&home, rollout_prefix());
@@ -3894,14 +4749,18 @@ mod tests {
         let reopened = UsageLedger::open(&app).unwrap();
         let refreshed = reopened.refresh(&home, 1_785_624_002_000).unwrap();
 
+        // 契约：路径+长度+mtime 命中游标时无变化扫描不读取 JSONL 正文，因此
+        // 同长度且手工还原 mtime 的内容替换在重启后无法被检测（信息论上不读
+        // 正文就无法区分），该边界按计划接受：files_skipped=1、events_added=0。
         assert_eq!(
-            refreshed.events_added, 1,
+            refreshed.events_added, 0,
             "warnings: {:?}",
             refreshed.warnings
         );
+        assert_eq!(refreshed.files_skipped, 1);
         let overview = query(&reopened);
         assert_eq!(overview.totals.requests, 1);
-        assert_eq!(overview.totals.tokens.total_tokens, 109);
+        assert_eq!(overview.totals.tokens.total_tokens, 108);
     }
 
     #[test]

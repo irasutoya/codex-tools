@@ -607,4 +607,67 @@ mod tests {
             }
         );
     }
+
+    #[test]
+    fn provider_specific_model_rule_beats_global_for_its_provider_only() {
+        let mut global =
+            PricingRuleRecord::token("global", PricingScopeKind::GlobalModel, None, 1, 0, 0, 0);
+        global.model_pattern = "shared-model".into();
+        let mut provider = PricingRuleRecord::token(
+            "provider-b",
+            PricingScopeKind::ProviderModel,
+            Some("relay-b"),
+            2,
+            0,
+            0,
+            0,
+        );
+        provider.model_pattern = "shared-model".into();
+        let usage = TokenUsage {
+            input_tokens: 1_000_000,
+            cached_input_tokens: 0,
+            cache_write_input_tokens: 0,
+            output_tokens: 0,
+            reasoning_output_tokens: 0,
+            total_tokens: 1_000_000,
+        };
+
+        let for_provider_b = super::price_with_rules(
+            &[global.clone(), provider.clone()],
+            &usage,
+            &PricingContext {
+                model: "shared-model",
+                provider_id: Some("relay-b"),
+                account_id: None,
+                effective_at_ms: 1,
+            },
+        );
+        let for_other_provider = super::price_with_rules(
+            &[global, provider],
+            &usage,
+            &PricingContext {
+                model: "shared-model",
+                provider_id: Some("relay-a"),
+                account_id: None,
+                effective_at_ms: 1,
+            },
+        );
+
+        assert_eq!(
+            for_provider_b,
+            PricingOutcome::Estimated {
+                cost_microusd: 2,
+                rule_id: "provider-b".into(),
+                version: 1,
+            }
+        );
+        assert_eq!(
+            for_other_provider,
+            PricingOutcome::Estimated {
+                cost_microusd: 1,
+                rule_id: "global".into(),
+                version: 1,
+            }
+        );
+    }
 }

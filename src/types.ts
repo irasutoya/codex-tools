@@ -123,6 +123,7 @@ export type UsageOverview = {
     unattributedTokens: number
   }
   rows: UsageRow[]
+  models: string[]
   lastRefreshedAtMs?: number
   collectionStartedAtMs?: number
   collectionStartedVersion?: string
@@ -241,6 +242,26 @@ export type AccountQuota = {
   lastAttemptAt?: number
   error?: string
   errorCode?: string
+  estimates?: QuotaEstimate[]
+}
+
+export type QuotaEstimate = {
+  windowSeconds: number
+  resetAt: number
+  estimatedTotalMicrousd: number
+  estimatedAt: number
+}
+
+export type QuotaEstimateWindowResult = {
+  windowSeconds: number
+  resetAt: number
+  success: boolean
+  estimate?: QuotaEstimate
+  reason?: string
+}
+
+export type QuotaEstimateResult = {
+  windows: QuotaEstimateWindowResult[]
 }
 
 export type CredentialRefreshStatus =
@@ -320,12 +341,19 @@ export type RepairScan = {
 export type RepairResult = {
   targetProvider: string
   filesScanned: number
+  filesCached: number
+  filesOpened: number
   filesModified: number
   filesSkipped: number
   filesFailed: number
   sessionMetaUpdated: number
   rowsUpdated: number
+  databasesScanned: number
+  databasesUpdated: number
   warnings: string[]
+  repairComplete: boolean
+  verificationPassed: boolean
+  elapsedMs: number
 }
 
 export type OfficialAccountView = {

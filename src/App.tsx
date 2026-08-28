@@ -9,23 +9,37 @@ import {
   useState,
 } from "react"
 import {
+  ArrowDown01Icon,
   ChartHistogramIcon,
   Clock01Icon,
+  ComputerIcon,
   FilterIcon,
   Home01Icon,
   InformationCircleIcon,
   Link01Icon,
+  Moon01Icon,
   Refresh01Icon,
   Rocket01Icon,
   Search01Icon,
   Settings01Icon,
+  Sun01Icon,
 } from "@hugeicons/core-free-icons"
 import { HugeiconsIcon, type IconSvgElement } from "@hugeicons/react"
+import { useTheme } from "next-themes"
 
 import { Badge } from "@/components/ui/badge"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
 import { ErrorBoundary } from "@/components/error-boundary"
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuGroup,
+  DropdownMenuLabel,
+  DropdownMenuRadioGroup,
+  DropdownMenuRadioItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu"
 import { Field, FieldGroup, FieldLabel } from "@/components/ui/field"
 import {
   InputGroup,
@@ -36,7 +50,6 @@ import {
   Sheet,
   SheetBody,
   SheetContent,
-  SheetDescription,
   SheetHeader,
   SheetTitle,
 } from "@/components/ui/sheet"
@@ -114,6 +127,15 @@ const navigation: Array<{
   { id: "settings", label: "设置", icon: Settings01Icon },
 ]
 
+const contextMetadata: Record<Page, { icon: IconSvgElement; action: string }> =
+  {
+    dashboard: { icon: Link01Icon, action: "切换或管理连接" },
+    providers: { icon: Link01Icon, action: "切换或管理连接" },
+    usage: { icon: FilterIcon, action: "调整用量筛选" },
+    sessions: { icon: Search01Icon, action: "搜索会话" },
+    settings: { icon: Settings01Icon, action: "选择设置章节" },
+  }
+
 const settingsSectionLabels: Record<SettingsSection, string> = {
   config: "当前配置",
   diagnostics: "诊断信息",
@@ -121,8 +143,24 @@ const settingsSectionLabels: Record<SettingsSection, string> = {
   unlock: "模型解锁",
 }
 
-function usesSharedConnectionState(page: Page) {
+const themeOptions = [
+  { id: "system", label: "跟随系统", icon: ComputerIcon },
+  { id: "light", label: "浅色", icon: Sun01Icon },
+  { id: "dark", label: "深色", icon: Moon01Icon },
+] as const
+
+type ThemeOptionId = (typeof themeOptions)[number]["id"]
+
+function isThemeOptionId(value: unknown): value is ThemeOptionId {
+  return value === "system" || value === "light" || value === "dark"
+}
+
+function usesConnectionManager(page: Page): page is "dashboard" | "providers" {
   return page === "dashboard" || page === "providers"
+}
+
+function usesSharedConnectionState(page: Page) {
+  return usesConnectionManager(page) || page === "usage"
 }
 
 export default function App() {
@@ -190,7 +228,7 @@ export default function App() {
     return () => {
       cancelled = true
     }
-  }, [page, refreshRevision, sharedStateActive])
+  }, [refreshRevision, sharedStateActive])
 
   const refresh = useCallback(() => {
     if (usesSharedConnectionState(pageRef.current)) {
@@ -261,12 +299,7 @@ export default function App() {
     usageGroupBy,
   ])
 
-  const contextIcon =
-    page === "usage"
-      ? FilterIcon
-      : page === "sessions"
-        ? Search01Icon
-        : undefined
+  const context = contextMetadata[page]
 
   const sharedProps = useMemo(
     () => ({ refreshRevision, onRefresh: refresh }),
@@ -309,27 +342,41 @@ export default function App() {
 
         <div className="flex min-w-0 flex-col overflow-hidden">
           <header className="flex h-13 shrink-0 items-center gap-2 px-3">
-            <Button
-              variant="outline"
-              size="sm"
-              className="max-w-48"
-              onClick={() => {
-                setContextMounted(true)
-                if (page === "sessions") setSessionQueryDraft(sessionQuery)
-                setContextOpen(true)
-              }}
-            >
-              {contextIcon && (
-                <HugeiconsIcon icon={contextIcon} data-icon="inline-start" />
-              )}
-              <span className="truncate">{contextLabel}</span>
-            </Button>
+            <Tooltip>
+              <TooltipTrigger
+                render={
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="max-w-64 min-w-0"
+                    aria-label={`${context.action}：${contextLabel}`}
+                    aria-expanded={contextOpen}
+                    onClick={() => {
+                      setContextMounted(true)
+                      if (page === "sessions")
+                        setSessionQueryDraft(sessionQuery)
+                      setContextOpen(true)
+                    }}
+                  />
+                }
+              >
+                <HugeiconsIcon icon={context.icon} data-icon="inline-start" />
+                <span className="min-w-0 truncate">{contextLabel}</span>
+                <HugeiconsIcon
+                  icon={ArrowDown01Icon}
+                  data-icon="inline-end"
+                  className="shrink-0"
+                />
+              </TooltipTrigger>
+              <TooltipContent side="bottom">{context.action}</TooltipContent>
+            </Tooltip>
             {sharedStateActive && (
               <Badge variant={stateError ? "destructive" : "secondary"}>
                 {stateError ? "异常" : dashboard ? "正常" : "读取中"}
               </Badge>
             )}
             <div className="ml-auto flex items-center gap-2">
+              <ThemeMenu />
               <Tooltip>
                 <TooltipTrigger
                   render={
@@ -371,7 +418,8 @@ export default function App() {
           >
             {stateError &&
               ((page === "dashboard" && !dashboard) ||
-                (page === "providers" && !connections)) && (
+                ((page === "providers" || page === "usage") &&
+                  !connections)) && (
                 <div className="px-3 pt-1">
                   <Alert variant="destructive">
                     <HugeiconsIcon icon={InformationCircleIcon} />
@@ -399,13 +447,17 @@ export default function App() {
                     onSelectedIdChange={setSelectedConnection}
                   />
                 )}
-                {page === "usage" && (
-                  <UsagePage
-                    {...sharedProps}
-                    days={usageDays}
-                    groupBy={usageGroupBy}
-                  />
-                )}
+                {page === "usage" &&
+                  (connections ? (
+                    <UsagePage
+                      {...sharedProps}
+                      days={usageDays}
+                      groupBy={usageGroupBy}
+                      providers={connections.providers}
+                    />
+                  ) : stateError ? null : (
+                    <PageLoading />
+                  ))}
                 {page === "sessions" && (
                   <SessionsPage
                     key={sessionQuery}
@@ -497,6 +549,64 @@ function NavButton({
   )
 }
 
+function ThemeMenu() {
+  const { theme, setTheme } = useTheme()
+  const mounted = typeof window !== "undefined"
+
+  const selectedTheme: ThemeOptionId =
+    mounted && isThemeOptionId(theme) ? theme : "system"
+  const currentTheme =
+    themeOptions.find((option) => option.id === selectedTheme) ??
+    themeOptions[0]
+  const currentLabel = mounted ? currentTheme.label : "跟随系统"
+  const currentIcon = mounted ? currentTheme.icon : ComputerIcon
+
+  return (
+    <DropdownMenu>
+      <Tooltip>
+        <TooltipTrigger
+          render={
+            <DropdownMenuTrigger
+              render={
+                <Button
+                  variant="outline"
+                  size="icon-sm"
+                  aria-label={`界面主题：${currentLabel}`}
+                />
+              }
+            />
+          }
+        >
+          <HugeiconsIcon icon={currentIcon} />
+        </TooltipTrigger>
+        <TooltipContent side="bottom">界面主题：{currentLabel}</TooltipContent>
+      </Tooltip>
+      <DropdownMenuContent align="end" className="w-40">
+        <DropdownMenuGroup>
+          <DropdownMenuLabel>界面主题 · 当前：{currentLabel}</DropdownMenuLabel>
+        </DropdownMenuGroup>
+        <DropdownMenuRadioGroup
+          value={selectedTheme}
+          onValueChange={(value) => {
+            if (isThemeOptionId(value)) setTheme(value)
+          }}
+        >
+          {themeOptions.map((option) => (
+            <DropdownMenuRadioItem
+              key={option.id}
+              value={option.id}
+              closeOnClick
+            >
+              <HugeiconsIcon icon={option.icon} />
+              <span>{option.label}</span>
+            </DropdownMenuRadioItem>
+          ))}
+        </DropdownMenuRadioGroup>
+      </DropdownMenuContent>
+    </DropdownMenu>
+  )
+}
+
 function ContextSheet({
   open,
   onOpenChange,
@@ -537,7 +647,7 @@ function ContextSheet({
     onOpenChange(false)
   }
 
-  if (usesSharedConnectionState(page)) {
+  if (usesConnectionManager(page)) {
     return (
       <ConnectionManagerSheet
         open={open}
@@ -562,13 +672,6 @@ function ContextSheet({
                 ? "搜索会话"
                 : "设置章节"}
           </SheetTitle>
-          <SheetDescription>
-            {page === "usage"
-              ? "调整统计范围与汇总方式。"
-              : page === "sessions"
-                ? "按标题或项目路径搜索。"
-                : "选择要查看的设置。"}
-          </SheetDescription>
         </SheetHeader>
 
         <SheetBody className="gap-3">

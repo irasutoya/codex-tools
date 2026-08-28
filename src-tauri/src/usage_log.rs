@@ -243,6 +243,22 @@ pub(crate) fn parse_line(line: &[u8], state: &mut ParserState) -> Result<LineRes
                 return Ok(LineResult::SkippedInheritedUsage);
             }
 
+            let Some(info) = value
+                .get("payload")
+                .and_then(Value::as_object)
+                .and_then(|payload| payload.get("info"))
+            else {
+                return Ok(LineResult::Ignored);
+            };
+            if info.is_null() {
+                return Ok(LineResult::Ignored);
+            }
+            let usage = info
+                .as_object()
+                .and_then(|info| info.get("last_token_usage"))
+                .filter(|usage| !usage.is_null())
+                .ok_or_else(|| "Token 事件缺少 last_token_usage。".to_owned())?;
+
             let timestamp = value
                 .get("timestamp")
                 .or_else(|| {
@@ -256,12 +272,6 @@ pub(crate) fn parse_line(line: &[u8], state: &mut ParserState) -> Result<LineRes
                 Ok(timestamp) => timestamp,
                 Err(error) => return Ok(LineResult::Warning(error)),
             };
-
-            let usage = value
-                .get("payload")
-                .and_then(|payload| payload.get("info"))
-                .and_then(|info| info.get("last_token_usage"))
-                .ok_or_else(|| "Token 事件缺少 last_token_usage。".to_owned())?;
 
             let (usage, quality) = parse_usage(usage)?;
             Ok(LineResult::Event(ParsedUsageEvent {
@@ -406,6 +416,63 @@ mod tests {
         assert_eq!(parsed.events.len(), 1);
         assert_eq!(parsed.events[0].model, "gpt-5.6-luna");
         assert_eq!(parsed.events[0].usage.total_tokens, 15);
+    }
+
+    #[test]
+    fn ignores_token_count_without_info_snapshot() {
+        let text = concat!(
+            r#"{"timestamp":"2026-08-23T10:52:53Z","type":"event_msg","payload":{"type":"token_count","info":null,"rate_limits":{"limit_id":"codex"}}}"#,
+            "\n",
+            r#"{"type":"token_count","timestamp":"2026-08-01T10:00:02Z","payload":{}}"#,
+            "\n",
+        );
+
+        let parsed = parse_rollout_text(text);
+
+        assert!(parsed.events.is_empty());
+        assert!(parsed.warnings.is_empty());
+        assert_eq!(parsed.state.next_event_ordinal, 2);
+    }
+
+    #[test]
+    fn warns_for_malformed_info_object_without_last_token_usage() {
+        let text = concat!(
+            r#"{"type":"token_count","timestamp":"2026-08-01T10:00:01Z","payload":{"info":{}}}"#,
+            "\n",
+            r#"{"type":"token_count","timestamp":"2026-08-01T10:00:02Z","payload":{"info":{"last_token_usage":null}}}"#,
+            "\n",
+        );
+
+        let parsed = parse_rollout_text(text);
+
+        assert!(parsed.events.is_empty());
+        assert_eq!(parsed.warnings.len(), 2);
+        assert!(
+            parsed
+                .warnings
+                .iter()
+                .all(|warning| warning == "Token 事件缺少 last_token_usage。")
+        );
+    }
+
+    #[test]
+    fn continues_after_empty_token_count_snapshot() {
+        let text = concat!(
+            r#"{"type":"token_count","timestamp":"2026-08-01T10:00:01Z","payload":{"info":{"last_token_usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}}"#,
+            "\n",
+            r#"{"type":"token_count","timestamp":"2026-08-01T10:00:02Z","payload":{"info":null}}"#,
+            "\n",
+            r#"{"type":"token_count","timestamp":"2026-08-01T10:00:03Z","payload":{"info":{"last_token_usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}}"#,
+            "\n",
+        );
+
+        let parsed = parse_rollout_text(text);
+
+        assert_eq!(parsed.events.len(), 2);
+        assert!(parsed.warnings.is_empty());
+        assert_eq!(parsed.events[0].ordinal, 0);
+        assert_eq!(parsed.events[1].ordinal, 2);
+        assert_eq!(parsed.events[1].usage.total_tokens, 5);
     }
 
     #[test]

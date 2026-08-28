@@ -2,7 +2,7 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 pub(crate) const MAX_DISPLAY_NAME_CHARS: usize = 100;
@@ -534,6 +534,35 @@ pub struct ProviderAccountQuota {
     pub error: Option<String>,
     #[serde(default)]
     pub error_code: Option<String>,
+    #[serde(default)]
+    pub estimates: Vec<QuotaEstimate>,
+}
+
+/// 本机依据已记录用量推算出的额度金额。它不是 OpenAI 返回的账单数据，
+/// 因此必须同时保存对应额度窗口的身份，避免跨窗口复用旧结论。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct QuotaEstimate {
+    pub window_seconds: i64,
+    pub reset_at: i64,
+    pub estimated_total_microusd: u64,
+    pub estimated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuotaEstimateWindowResult {
+    pub window_seconds: i64,
+    pub reset_at: i64,
+    pub success: bool,
+    pub estimate: Option<QuotaEstimate>,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuotaEstimateResult {
+    pub windows: Vec<QuotaEstimateWindowResult>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -770,6 +799,19 @@ pub struct AppConfig {
     /// 独立保存维护元数据，避免把脱敏状态写入任一敏感凭据对象。
     #[serde(default)]
     pub credential_refresh: BTreeMap<String, CredentialRefreshState>,
+    /// 已删除连接的非敏感稳定标识；由独立 tombstone 文件持久化，避免旧版
+    /// connections.json 覆盖后把用户主动删除的连接重新导入。
+    #[serde(default)]
+    pub(crate) deletion_tombstones: DeletionTombstones,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct DeletionTombstones {
+    #[serde(default)]
+    pub(crate) provider_ids: BTreeSet<String>,
+    #[serde(default)]
+    pub(crate) official_account_ids: BTreeSet<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -962,6 +1004,7 @@ pub struct UsageOverview {
     pub range: UsageRange,
     pub totals: UsageTotals,
     pub rows: Vec<UsageRow>,
+    pub models: Vec<String>,
     pub last_refreshed_at_ms: Option<i64>,
     pub collection_started_at_ms: Option<i64>,
     pub collection_started_version: Option<String>,
@@ -1026,11 +1069,17 @@ pub struct TokenRatesView {
 #[serde(rename_all = "camelCase")]
 pub struct UsageRefreshResult {
     pub files_scanned: usize,
+    pub files_skipped: usize,
+    pub files_opened: usize,
     pub events_added: usize,
     pub events_skipped: usize,
+    pub events_pruned: usize,
     pub partial_lines: usize,
     pub warnings: Vec<UsageWarning>,
     pub last_refreshed_at_ms: i64,
+    pub elapsed_ms: u64,
+    pub retention_days: i64,
+    pub database_compacted: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1144,12 +1193,19 @@ pub struct RepairScan {
 pub struct RepairResult {
     pub target_provider: String,
     pub files_scanned: usize,
+    pub files_cached: usize,
+    pub files_opened: usize,
     pub files_modified: usize,
     pub files_skipped: usize,
     pub files_failed: usize,
     pub session_meta_updated: usize,
     pub rows_updated: usize,
+    pub databases_scanned: usize,
+    pub databases_updated: usize,
     pub warnings: Vec<String>,
+    pub repair_complete: bool,
+    pub verification_passed: bool,
+    pub elapsed_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

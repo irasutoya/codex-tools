@@ -1,10 +1,13 @@
-import { describe, expect, it } from "vitest"
+import { afterEach, describe, expect, it, vi } from "vitest"
 
 import type { OfficialAccountView, Provider, RepairResult } from "@/types"
+
+vi.mock("@/lib/ipc", () => ({ call: vi.fn() }))
 
 import {
   addCustomModelTo,
   allModelsSelected,
+  accountDescription,
   accountWorkspaceIsDeactivated,
   buildFallbackCandidates,
   credentialMaintenanceMessage,
@@ -16,8 +19,10 @@ import {
   removeCustomModelFrom,
   repairWarning,
   quotaStatusText,
+  switchActiveConnection,
   toggleModelSelected,
 } from "./connection-utils"
+import { call } from "@/lib/ipc"
 
 const makeAccount = (
   overrides: Partial<OfficialAccountView> = {}
@@ -37,6 +42,25 @@ const makeAccount = (
   ...overrides,
 })
 
+const makeQuotaWindow = (
+  windowSeconds: number,
+  remainingPercent: number,
+  resetAt?: number
+) => ({
+  usedPercent: 100 - remainingPercent,
+  remainingPercent,
+  windowSeconds,
+  ...(resetAt === undefined ? {} : { resetAt }),
+})
+
+const makeWindowedQuota = (
+  primary?: ReturnType<typeof makeQuotaWindow>,
+  secondary?: ReturnType<typeof makeQuotaWindow>
+): OfficialAccountView["quota"] => ({
+  status: "success",
+  data: { kind: "windowed", primary, secondary },
+})
+
 const makeProvider = (overrides: Partial<Provider> = {}): Provider => ({
   id: "p1",
   name: "服务",
@@ -54,12 +78,19 @@ const makeProvider = (overrides: Partial<Provider> = {}): Provider => ({
 const repair = (overrides: Partial<RepairResult> = {}): RepairResult => ({
   targetProvider: "openai",
   filesScanned: 0,
+  filesCached: 0,
+  filesOpened: 0,
   filesModified: 0,
   filesSkipped: 0,
   filesFailed: 0,
   sessionMetaUpdated: 0,
   rowsUpdated: 0,
+  databasesScanned: 0,
+  databasesUpdated: 0,
   warnings: [],
+  repairComplete: true,
+  verificationPassed: true,
+  elapsedMs: 0,
   ...overrides,
 })
 
@@ -92,12 +123,64 @@ describe("repairWarning", () => {
     expect(repairWarning(repair())).toBeUndefined()
   })
 
+  it("reports a rolled-back switch when repair did not complete", () => {
+    expect(repairWarning(repair({ repairComplete: false }))).toContain(
+      "切换已回滚：会话归属修复未完成，切换已回滚"
+    )
+  })
+
   it("surfaces partial repair failures and backend warnings", () => {
     expect(
       repairWarning(
         repair({ filesFailed: 2, warnings: ["数据库被占用", "索引刷新失败"] })
       )
     ).toContain("2 个会话文件修复失败；数据库被占用；索引刷新失败")
+  })
+})
+
+describe("switchActiveConnection", () => {
+  afterEach(() => {
+    vi.mocked(call).mockReset()
+  })
+
+  it("switches to the first candidate whose repair completes", async () => {
+    vi.mocked(call)
+      .mockResolvedValueOnce(repair({ repairComplete: true }))
+      .mockResolvedValueOnce(repair({ repairComplete: true }))
+    const result = await switchActiveConnection([
+      { kind: "provider", id: "p1" },
+      { kind: "account", id: "a1" },
+    ])
+    expect(result.switchedId).toBe("p1")
+    expect(result.repair?.repairComplete).toBe(true)
+    expect(call).toHaveBeenCalledTimes(1)
+  })
+
+  it("treats an incomplete repair as a failed candidate and tries the next", async () => {
+    vi.mocked(call)
+      .mockResolvedValueOnce(
+        repair({ repairComplete: false, warnings: ["数据库被占用"] })
+      )
+      .mockResolvedValueOnce(repair({ repairComplete: true }))
+    const result = await switchActiveConnection([
+      { kind: "account", id: "a1" },
+      { kind: "provider", id: "p2" },
+    ])
+    expect(result.switchedId).toBe("p2")
+    expect(call).toHaveBeenCalledTimes(2)
+  })
+
+  it("returns the last error when every candidate fails to repair", async () => {
+    vi.mocked(call).mockResolvedValue(
+      repair({ repairComplete: false, warnings: ["会话文件被占用"] })
+    )
+    const result = await switchActiveConnection([
+      { kind: "account", id: "a1" },
+      { kind: "provider", id: "p2" },
+    ])
+    expect(result.switchedId).toBeUndefined()
+    expect(result.repair).toBeUndefined()
+    expect(String(result.error)).toContain("切换已回滚")
   })
 })
 
@@ -129,6 +212,68 @@ describe("账号额度错误", () => {
         (candidate) => candidate.id
       )
     ).toEqual(["usable"])
+  })
+})
+
+describe("账号额度摘要", () => {
+  it.each([
+    {
+      name: "双窗口按 5H 后 7D 排序",
+      quota: makeWindowedQuota(
+        makeQuotaWindow(604_800, 20, 1_800_604_800),
+        makeQuotaWindow(18_000, 80, 1_800_018_000)
+      ),
+      expected: ["5H 剩余 80.0% · 重置", "7D 剩余 20.0% · 重置"],
+    },
+    {
+      name: "仅 5H",
+      quota: makeWindowedQuota(makeQuotaWindow(18_000, 75, 1_800_018_000)),
+      expected: ["5H 剩余 75.0% · 重置"],
+      absent: ["7D"],
+    },
+    {
+      name: "仅 7D",
+      quota: makeWindowedQuota(
+        undefined,
+        makeQuotaWindow(604_800, 65, 1_800_604_800)
+      ),
+      expected: ["7D 剩余 65.0% · 重置"],
+      absent: ["5H"],
+    },
+    {
+      name: "保留 0.0%",
+      quota: makeWindowedQuota(makeQuotaWindow(18_000, 0, 1_800_018_000)),
+      expected: ["5H 剩余 0.0% · 重置"],
+    },
+    {
+      name: "缺少 resetAt",
+      quota: makeWindowedQuota(makeQuotaWindow(18_000, 50)),
+      expected: ["5H 剩余 50.0% · 重置 —"],
+    },
+    {
+      name: "无窗口 never 状态",
+      quota: { status: "never" },
+      expected: ["尚未刷新"],
+    },
+    {
+      name: "错误状态保留后端错误",
+      quota: {
+        status: "error",
+        error: "额度接口暂时不可用（HTTP 500）",
+      },
+      expected: ["额度接口暂时不可用（HTTP 500）"],
+    },
+  ] as const)("$name", ({ quota, expected, absent = [] }) => {
+    const summary = accountDescription(makeAccount({ quota }))
+    const indexes = expected.map((fragment) => summary.indexOf(fragment))
+
+    expect(indexes.every((index) => index >= 0)).toBe(true)
+    for (let index = 1; index < indexes.length; index += 1) {
+      expect(indexes[index - 1]!).toBeLessThan(indexes[index]!)
+    }
+    for (const fragment of absent) {
+      expect(summary).not.toContain(fragment)
+    }
   })
 })
 

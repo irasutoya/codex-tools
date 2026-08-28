@@ -14,7 +14,6 @@ import {
   Dialog,
   DialogBody,
   DialogContent,
-  DialogDescription,
   DialogFooter,
   DialogHeader,
   DialogTitle,
@@ -30,6 +29,7 @@ import { Spinner } from "@/components/ui/spinner"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Textarea } from "@/components/ui/textarea"
 import { toast } from "@/components/ui/toast"
+import { writeClipboardText } from "@/lib/clipboard"
 import { errorMessage } from "@/lib/format"
 import type { DeviceAuthorization } from "@/types"
 
@@ -81,7 +81,7 @@ export function AccountLoginDialog({
   const copyAuthorizationCode = async () => {
     if (!authorization) return
     try {
-      await navigator.clipboard.writeText(authorization.userCode)
+      await writeClipboardText(authorization.userCode)
     } catch (reason) {
       toast.add({
         title: "复制失败",
@@ -96,9 +96,6 @@ export function AccountLoginDialog({
       <DialogContent showCloseButton={!busy} aria-busy={busy}>
         <DialogHeader>
           <DialogTitle>登录 OpenAI 账号</DialogTitle>
-          <DialogDescription>
-            通过 OpenAI 官方授权登录，或导入已有的 Cookie 登录数据。
-          </DialogDescription>
         </DialogHeader>
 
         <DialogBody>
@@ -247,8 +244,12 @@ export function AccountLoginDialog({
                   <Textarea
                     ref={contentRef}
                     id="cookie-account-content"
+                    autoCapitalize="none"
                     className="field-sizing-fixed h-28 max-h-28 min-h-28 max-w-full resize-none overflow-y-auto font-mono text-xs break-all"
                     autoComplete="off"
+                    autoCorrect="off"
+                    data-1p-ignore
+                    data-lpignore="true"
                     disabled={busy}
                     spellCheck={false}
                     wrap="soft"

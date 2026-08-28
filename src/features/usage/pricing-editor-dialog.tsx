@@ -5,7 +5,6 @@ import {
   Dialog,
   DialogBody,
   DialogContent,
-  DialogDescription,
   DialogFooter,
   DialogHeader,
   DialogTitle,
@@ -31,51 +30,75 @@ import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group"
 import { toast } from "@/components/ui/toast"
 import { errorMessage } from "@/lib/format"
 import { call } from "@/lib/ipc"
-import type { BillingMode, PricingRule, UsageRange } from "@/types"
+import type { BillingMode, PricingRule, Provider, UsageRange } from "@/types"
+
+import {
+  findEquivalentPricingRule,
+  pricingScopeForSource,
+  pricingSourceFromValue,
+  pricingSourceOptions,
+  pricingSourceValueForRule,
+} from "./pricing"
 
 export function PricingEditor({
   open,
   range,
   modelOptions,
+  providers,
   rules,
+  editingRule,
   onOpenChange,
   onSaved,
 }: {
   open: boolean
   range: UsageRange
   modelOptions: string[]
+  providers: Provider[]
   rules: PricingRule[]
+  editingRule?: PricingRule
   onOpenChange: (open: boolean) => void
   onSaved: () => void
 }) {
-  const [pattern, setPattern] = useState("")
-  const [billingMode, setBillingMode] =
-    useState<Extract<BillingMode, "token" | "unpriced">>("token")
-  const [input, setInput] = useState("2.50")
-  const [cachedRead, setCachedRead] = useState("0.25")
-  const [cacheWrite, setCacheWrite] = useState("3.00")
-  const [output, setOutput] = useState("10.00")
-  const [cacheWriteIncluded, setCacheWriteIncluded] = useState(true)
+  const [pattern, setPattern] = useState(editingRule?.modelPattern ?? "")
+  const [billingMode, setBillingMode] = useState<
+    Extract<BillingMode, "token" | "unpriced">
+  >(editingRule?.billingMode === "token" ? "token" : "unpriced")
+  const [input, setInput] = useState(editingRule?.inputUsdPerMillion ?? "2.50")
+  const [cachedRead, setCachedRead] = useState(
+    editingRule?.cachedReadUsdPerMillion ?? "0.25"
+  )
+  const [cacheWrite, setCacheWrite] = useState(
+    editingRule?.cacheWriteUsdPerMillion ?? "3.00"
+  )
+  const [output, setOutput] = useState(
+    editingRule?.outputUsdPerMillion ?? "10.00"
+  )
+  const [cacheWriteIncluded, setCacheWriteIncluded] = useState(
+    editingRule?.cacheWriteIncludedInInput ?? true
+  )
+  const [sourceValue, setSourceValue] = useState(
+    editingRule ? pricingSourceValueForRule(editingRule) : ""
+  )
   const [busy, setBusy] = useState(false)
 
   const normalizedPattern = pattern.trim()
+  const scope = pricingScopeForSource(pricingSourceFromValue(sourceValue))
+  const sourceOptions = pricingSourceOptions(providers)
 
   const save = async () => {
+    if (!scope || !normalizedPattern) return
     setBusy(true)
     const now = Date.now()
-    const existing = rules.find(
-      (candidate) =>
-        candidate.scopeKind === "global_model" &&
-        candidate.providerId === undefined &&
-        candidate.accountId === undefined &&
-        candidate.modelPattern === normalizedPattern &&
-        candidate.matchKind === "exact"
-    )
+    const existing = findEquivalentPricingRule(rules, {
+      ...scope,
+      modelPattern: normalizedPattern,
+      matchKind: "exact",
+    })
     const rule: PricingRule = {
-      id: existing?.id ?? "",
-      version: existing?.version ?? 1,
+      id: editingRule?.id ?? existing?.id ?? "",
+      version: editingRule?.version ?? existing?.version ?? 1,
       active: true,
-      scopeKind: "global_model",
+      ...scope,
       modelPattern: normalizedPattern,
       matchKind: "exact",
       billingMode,
@@ -122,13 +145,31 @@ export function PricingEditor({
     >
       <DialogContent showCloseButton={!busy} aria-busy={busy}>
         <DialogHeader>
-          <DialogTitle>添加价格规则</DialogTitle>
-          <DialogDescription>
-            选择不计价，或按每百万 Token 的美元金额计价。
-          </DialogDescription>
+          <DialogTitle>
+            {editingRule ? "编辑价格规则" : "添加价格规则"}
+          </DialogTitle>
         </DialogHeader>
         <DialogBody>
           <FieldGroup>
+            <Field>
+              <FieldLabel htmlFor="price-source">来源</FieldLabel>
+              <Select
+                items={sourceOptions}
+                value={sourceValue}
+                onValueChange={(value) => setSourceValue(value ?? "")}
+              >
+                <SelectTrigger id="price-source" className="w-full">
+                  <SelectValue placeholder="选择适用的第三方 API" />
+                </SelectTrigger>
+                <SelectContent>
+                  {sourceOptions.map((option) => (
+                    <SelectItem key={option.value} value={option.value}>
+                      {option.label}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </Field>
             <Field>
               <FieldLabel htmlFor="price-model">模型</FieldLabel>
               {modelOptions.length > 0 && (
@@ -177,9 +218,6 @@ export function PricingEditor({
                   不计价
                 </ToggleGroupItem>
               </ToggleGroup>
-              <FieldDescription>
-                不计价规则会保留 Token 用量，但不估算费用。
-              </FieldDescription>
             </Field>
             {billingMode === "token" && (
               <FieldGroup className="grid grid-cols-2 gap-3">
@@ -249,7 +287,7 @@ export function PricingEditor({
             取消
           </Button>
           <Button
-            disabled={busy || !normalizedPattern}
+            disabled={busy || !normalizedPattern || !scope}
             onClick={() => void save()}
           >
             {busy && <Spinner data-icon="inline-start" />}保存

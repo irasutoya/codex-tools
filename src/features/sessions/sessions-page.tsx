@@ -70,6 +70,7 @@ export function SessionsPage({
   query: string
 }) {
   const [page, setPage] = useState(1)
+  const [status, setStatus] = useState<"active" | "archived">("active")
   const [repairTarget, setRepairTarget] = useState<RepairTarget>()
   const [busy, setBusy] = useState(false)
   const loadedRefreshRevision = useRef(refreshRevision)
@@ -82,8 +83,9 @@ export function SessionsPage({
       page,
       pageSize,
       refresh: forceRefresh,
+      status,
     })
-  }, [page, query, refreshRevision])
+  }, [page, query, refreshRevision, status])
   const { data: result, error: listError } = useAsync(fetchList, {
     onError: (message) =>
       toast.add({
@@ -117,7 +119,10 @@ export function SessionsPage({
       const response = await call("sessions_repair", {
         targetProvider: scan.currentProvider,
       })
-      const partial = response.filesFailed > 0 || response.warnings.length > 0
+      const partial =
+        response.repairComplete === false ||
+        response.filesFailed > 0 ||
+        response.warnings.length > 0
       toast.add({
         title: partial ? "会话修复已完成，但有部分警告" : "会话归属已修复",
         description:
@@ -237,9 +242,35 @@ export function SessionsPage({
       <Card size="sm" className="min-h-64 shrink-0">
         <CardHeader className="grid grid-cols-[1fr_auto] items-center">
           <div>
-            <CardTitle>会话</CardTitle>
+            <div className="flex items-center gap-2">
+              <CardTitle>会话</CardTitle>
+              <div className="flex rounded-lg bg-muted p-0.5">
+                <Button
+                  size="sm"
+                  variant={status === "active" ? "secondary" : "ghost"}
+                  onClick={() => {
+                    setStatus("active")
+                    setPage(1)
+                  }}
+                >
+                  活跃
+                </Button>
+                <Button
+                  size="sm"
+                  variant={status === "archived" ? "secondary" : "ghost"}
+                  onClick={() => {
+                    setStatus("archived")
+                    setPage(1)
+                  }}
+                >
+                  已归档
+                </Button>
+              </div>
+            </div>
             <div className="mt-1 text-xs text-muted-foreground">
-              {query ? `“${query}” 的结果` : "全部本地会话"}
+              {query
+                ? `“${query}” 的${status === "archived" ? "已归档" : "活跃"}结果`
+                : `全部${status === "archived" ? "已归档" : "活跃"}本地会话`}
             </div>
           </div>
           <Badge variant="outline">{result.total} 条</Badge>

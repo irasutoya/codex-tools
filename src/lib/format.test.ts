@@ -5,6 +5,7 @@ import {
   formatDate,
   formatPercent,
   formatTokens,
+  formatUsd,
   quotaWindow,
   tokenInput,
 } from "@/lib/format"
@@ -39,6 +40,22 @@ describe("format helpers", () => {
 
   it("uses a compact token label", () => {
     expect(formatTokens(12_400)).toContain("万")
+  })
+
+  it("formats precise USD amounts with a narrow dollar symbol", () => {
+    const value = formatUsd(123_456)
+
+    expect(value).toBe("$0.1235")
+    expect(value[0]).toBe("$")
+    expect(value).not.toContain("US$")
+  })
+
+  it("keeps compact USD amount precision with a narrow dollar symbol", () => {
+    const value = formatUsd(100_000)
+
+    expect(value).toBe("$0.10")
+    expect(value[0]).toBe("$")
+    expect(value).not.toContain("US$")
   })
 
   it("selects the primary quota window", () => {

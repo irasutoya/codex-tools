@@ -19,7 +19,6 @@ import {
   Dialog,
   DialogBody,
   DialogContent,
-  DialogDescription,
   DialogFooter,
   DialogHeader,
   DialogTitle,
@@ -285,9 +284,6 @@ export function AccountManagerDialog({
         >
           <DialogHeader>
             <DialogTitle>批量管理账号</DialogTitle>
-            <DialogDescription>
-              批量修改本机备注，或选择多个 OpenAI 账号一起删除。
-            </DialogDescription>
           </DialogHeader>
 
           <DialogBody>

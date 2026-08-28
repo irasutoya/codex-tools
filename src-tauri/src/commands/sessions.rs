@@ -1,8 +1,10 @@
+#[cfg(not(test))]
+use crate::platform;
 use crate::{
     activation::ensure_codex_stopped,
     codex,
     models::{AppError, PageResult, RepairResult, RepairScan, SessionSummary},
-    platform, provider_sync,
+    provider_sync,
     session_index::{self, SessionIndex},
     storage::Store,
 };
@@ -11,43 +13,119 @@ use tauri::State;
 
 const MAX_SESSION_QUERY_CHARS: usize = 256;
 
+/// 不能缓存此判断：Codex 可能在 rollout 与 SQLite 两次写入之间重新启动，或
+/// 激活操作已切换到其他连接。修复引擎会在每一次实际写入之前调用它。
+fn may_write_now(
+    configured_app: &Option<String>,
+    home: &std::path::Path,
+    expected: &str,
+) -> Result<bool, AppError> {
+    if codex_app_is_running(configured_app.as_deref()) {
+        return Ok(false);
+    }
+    Ok(provider_sync::configured_provider(home) == expected)
+}
+
+fn codex_app_is_running(configured: Option<&str>) -> bool {
+    #[cfg(test)]
+    {
+        let _ = configured;
+        false
+    }
+    #[cfg(not(test))]
+    {
+        platform::codex_app_running(configured)
+    }
+}
+
 pub(crate) async fn scan_home(home: PathBuf) -> Result<RepairScan, AppError> {
     tokio::task::spawn_blocking(move || provider_sync::scan(&home))
         .await
         .map_err(|error| AppError::Internal(error.to_string()))
 }
 
-pub(crate) async fn repair_home(
+pub(crate) async fn repair_home_with_paths(
     store: &Store,
     home: PathBuf,
     target_provider: String,
-) -> Result<RepairResult, AppError> {
-    ensure_codex_stopped(store)?;
+) -> Result<(RepairResult, Vec<PathBuf>), AppError> {
     let configured_app = store.codex_app_setting()?;
+    ensure_codex_stopped(store)?;
     let expected_configured_provider = provider_sync::configured_provider(&home);
     tokio::task::spawn_blocking(move || {
-        provider_sync::repair_with_guard(&home, &target_provider, || {
-            if platform::codex_app_running(configured_app.as_deref()) {
-                return Ok(false);
-            }
-            Ok(provider_sync::configured_provider(&home) == expected_configured_provider)
-        })
+        provider_sync::repair_with_guard_with_paths_for_app(
+            &home,
+            &target_provider,
+            configured_app.as_deref(),
+            || may_write_now(&configured_app, &home, &expected_configured_provider),
+        )
     })
     .await
     .map_err(|error| AppError::Internal(error.to_string()))?
 }
 
 pub(crate) async fn repair_home_after_activation(
-    _store: &Store,
-    _home: PathBuf,
+    store: &Store,
+    home: PathBuf,
     target_provider: String,
 ) -> RepairResult {
-    // Codex 近期以 JSONL 字节偏移和 ordinal 映射关联 thread_history_1.sqlite；
-    // 自动重序列化 rollout 会破坏该映射。账号/服务切换不得扫描或修复历史，
-    // 显式的 sessions_repair 仍保留为用户主动维护入口。
-    RepairResult {
-        target_provider,
-        ..RepairResult::default()
+    repair_home_after_activation_with_paths(store, home, target_provider)
+        .await
+        .0
+}
+
+pub(crate) async fn repair_home_after_activation_with_paths(
+    store: &Store,
+    home: PathBuf,
+    target_provider: String,
+) -> (RepairResult, Vec<PathBuf>) {
+    let configured_app = match store.codex_app_setting() {
+        Ok(configured_app) => configured_app,
+        Err(error) => {
+            return (
+                RepairResult {
+                    target_provider,
+                    warnings: vec![format!("会话归属未自动修复：{error}")],
+                    ..RepairResult::default()
+                },
+                Vec::new(),
+            );
+        }
+    };
+    if let Err(error) = ensure_codex_stopped(store) {
+        return (
+            RepairResult {
+                target_provider,
+                warnings: vec![format!("会话归属未自动修复：{error}")],
+                ..RepairResult::default()
+            },
+            Vec::new(),
+        );
+    }
+    let expected_configured_provider = provider_sync::configured_provider(&home);
+    let repair_target = target_provider.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        provider_sync::repair_after_connection_switch_preserving_history_with_guard_at_with_paths_for_app(
+            &home,
+            &repair_target,
+            None,
+            configured_app.as_deref(),
+            || may_write_now(&configured_app, &home, &expected_configured_provider),
+        )
+    })
+    .await
+    .map_err(|error| AppError::Internal(error.to_string()))
+    .and_then(|result| result);
+    match result {
+        Ok((result, affected_paths)) => (result, affected_paths),
+        Err(error) => (
+            RepairResult {
+                target_provider,
+                warnings: vec![format!("会话归属未自动修复：{error}")],
+                ..RepairResult::default()
+            },
+            Vec::new(),
+        ),
     }
 }
 
@@ -64,9 +142,17 @@ pub(crate) async fn sessions_repair(
 ) -> Result<RepairResult, AppError> {
     let home = codex::home(&store.codex_home_setting()?);
     let index = index.inner().clone();
-    let result = repair_home(&store, home, target_provider).await;
-    index.invalidate();
-    result
+    let result = repair_home_with_paths(&store, home.clone(), target_provider).await;
+    match result {
+        Ok((repair, affected_paths)) => {
+            if let Err(error) = index.refresh_paths(&home, &affected_paths) {
+                index.invalidate();
+                eprintln!("会话修复后定向刷新索引失败，已回退全量重建：{error}");
+            }
+            Ok(repair)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 #[tauri::command]
@@ -77,6 +163,7 @@ pub(crate) async fn sessions_list(
     page: Option<usize>,
     page_size: Option<usize>,
     refresh: Option<bool>,
+    status: Option<String>,
 ) -> Result<PageResult<SessionSummary>, AppError> {
     let home = codex::home(&store.codex_home_setting()?);
     let index = index.inner().clone();
@@ -91,8 +178,17 @@ pub(crate) async fn sessions_list(
     }
     let page = page.unwrap_or(1).max(1);
     let page_size = page_size.unwrap_or(25).clamp(1, 100);
+    let archived = match status.as_deref().unwrap_or("active") {
+        "active" => false,
+        "archived" => true,
+        _ => {
+            return Err(AppError::InvalidConfig(
+                "会话状态只能是 active 或 archived。".into(),
+            ));
+        }
+    };
     tokio::task::spawn_blocking(move || {
-        session_index::session_page(&index, &home, &query, page, page_size)
+        session_index::session_page(&index, &home, &query, page, page_size, archived)
     })
     .await
     .map_err(|error| AppError::Internal(error.to_string()))?
@@ -101,21 +197,18 @@ pub(crate) async fn sessions_list(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sha2::{Digest, Sha256};
+    use rusqlite::Connection;
     use std::fs;
 
-    fn sha256(bytes: &[u8]) -> String {
-        format!("{:x}", Sha256::digest(bytes))
-    }
-
     #[tokio::test]
-    async fn post_activation_switch_preserves_rollout_bytes_and_thread_history_sentinel() {
+    async fn post_activation_switch_preserves_rollout_and_thread_history_projection() {
         let temp = tempfile::tempdir().unwrap();
         let home = temp.path().join("codex-home");
         let sessions = home.join("sessions/2026/08/24");
         let archived = home.join("archived_sessions/2026/08/24");
         fs::create_dir_all(&sessions).unwrap();
         fs::create_dir_all(&archived).unwrap();
+        fs::write(home.join("config.toml"), "model_provider = \"custom\"\n").unwrap();
 
         let active_rollout = sessions.join("rollout.jsonl");
         let archived_rollout = archived.join("rollout.jsonl");
@@ -128,35 +221,58 @@ mod tests {
 {"type":"event_msg","payload":{"type":"user_message","message":"keep archived ordinal"}}
 "#;
         let thread_history = home.join("thread_history_1.sqlite");
-        let thread_history_bytes = b"thread-history-v1-byte-cursor-sentinel";
         fs::write(&active_rollout, active_bytes).unwrap();
         fs::write(&archived_rollout, archived_bytes).unwrap();
-        fs::write(&thread_history, thread_history_bytes).unwrap();
+        let history = Connection::open(&thread_history).unwrap();
+        history
+            .execute_batch(
+                "CREATE TABLE thread_history_projection_state(
+                     thread_id TEXT, next_rollout_byte_offset INTEGER, next_rollout_ordinal INTEGER
+                 );
+                 CREATE TABLE thread_items(
+                     thread_id TEXT, turn_id TEXT, item_id TEXT, rollout_ordinal INTEGER, item_json TEXT
+                 );
+                 CREATE TABLE thread_turns(
+                     thread_id TEXT, turn_id TEXT, rollout_ordinal INTEGER, rollout_byte_offset INTEGER,
+                     rollout_end_ordinal INTEGER, rollout_end_byte_offset INTEGER
+                 );
+                 INSERT INTO thread_history_projection_state VALUES('active',1,1),('archived',1,1);
+                 INSERT INTO thread_items VALUES('active','turn','item',1,'{}'),('archived','turn','item',1,'{}');
+                 INSERT INTO thread_turns VALUES('active','turn',1,1,2,2),('archived','turn',1,1,2,2);",
+            )
+            .unwrap();
+        drop(history);
+        let history_before = fs::read(&thread_history).unwrap();
 
         let store = Store::open(temp.path().join("data")).unwrap();
+        store
+            .settings_save_codex_app_path(Some(
+                temp.path().join("missing-codex.exe").display().to_string(),
+            ))
+            .unwrap();
         let repair = repair_home_after_activation(&store, home.clone(), "custom".into()).await;
 
-        assert_eq!(repair.files_scanned, 0);
-        assert_eq!(repair.files_modified, 0);
-        assert_eq!(fs::read(&active_rollout).unwrap(), active_bytes);
-        assert_eq!(
-            sha256(&fs::read(&active_rollout).unwrap()),
-            sha256(active_bytes)
-        );
-        assert_eq!(fs::read(&archived_rollout).unwrap(), archived_bytes);
-        assert_eq!(
-            sha256(&fs::read(&archived_rollout).unwrap()),
-            sha256(archived_bytes)
-        );
-        assert_eq!(fs::read(&thread_history).unwrap(), thread_history_bytes);
-        assert_eq!(
-            sha256(&fs::read(&thread_history).unwrap()),
-            sha256(thread_history_bytes)
-        );
+        assert_eq!(repair.files_scanned, 2);
+        assert_eq!(repair.files_modified, 2);
+        assert_eq!(repair.session_meta_updated, 2);
+        let active_after = fs::read(&active_rollout).unwrap();
+        let archived_after = fs::read(&archived_rollout).unwrap();
+        // provider 切换只改等长元数据，完整 transcript 与所有 response_item 保留。
+        assert_eq!(active_after.len(), active_bytes.len());
+        assert_eq!(archived_after.len(), archived_bytes.len());
+        assert!(String::from_utf8_lossy(&active_after).contains("model_provider"));
+        assert!(String::from_utf8_lossy(&active_after).contains("custom"));
+        assert!(String::from_utf8_lossy(&archived_after).contains("model_provider"));
+        assert!(String::from_utf8_lossy(&archived_after).contains("custom"));
+        assert!(String::from_utf8_lossy(&active_after).contains("keep active ordinal"));
+        assert!(String::from_utf8_lossy(&archived_after).contains("keep archived ordinal"));
+        assert_ne!(active_after.as_slice(), active_bytes);
+        assert_ne!(archived_after.as_slice(), archived_bytes);
+        assert_eq!(fs::read(thread_history).unwrap(), history_before);
     }
 
     #[tokio::test]
-    async fn post_activation_repair_is_a_noop() {
+    async fn post_activation_repair_rejects_invalid_target() {
         let temp = tempfile::tempdir().unwrap();
         let store = Store::open(temp.path().join("data")).unwrap();
 
@@ -169,6 +285,92 @@ mod tests {
 
         assert_eq!(result.target_provider, "unsupported");
         assert_eq!(result.files_scanned, 0);
-        assert!(result.warnings.is_empty());
+        assert_eq!(result.warnings.len(), 1);
+        assert!(result.warnings[0].contains("只能在 OpenAI"));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn automatic_repair_reports_missing_configured_cli_and_rolls_back() {
+        if std::env::var_os("CODEX_BIN").is_some() {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex-home");
+        let sessions = home.join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        fs::write(home.join("config.toml"), "model_provider = \"custom\"\n").unwrap();
+        let rollout = sessions.join("one.jsonl");
+        let rollout_before = concat!(
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"one\",\"model_provider\":\"openai\",\"history_mode\":\"paginated\"}}\n",
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"turn-one\"}}\n",
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"keep\"}}\n"
+        );
+        fs::write(&rollout, rollout_before).unwrap();
+
+        let state = home.join("state_5.sqlite");
+        let database = Connection::open(&state).unwrap();
+        database
+            .execute_batch(
+                "CREATE TABLE threads(
+                     id TEXT PRIMARY KEY,
+                     model_provider TEXT,
+                     history_mode TEXT,
+                     archived INTEGER,
+                     source TEXT
+                 );
+                 INSERT INTO threads VALUES('one','openai','paginated',0,NULL);",
+            )
+            .unwrap();
+        drop(database);
+        let state_before = fs::read(&state).unwrap();
+
+        let history = home.join("thread_history_1.sqlite");
+        let database = Connection::open(&history).unwrap();
+        database
+            .execute_batch(
+                "CREATE TABLE thread_history_projection_state(
+                     thread_id TEXT PRIMARY KEY,
+                     next_rollout_byte_offset INTEGER,
+                     next_rollout_ordinal INTEGER
+                 );
+                 CREATE TABLE thread_items(
+                     thread_id TEXT,
+                     rollout_ordinal INTEGER,
+                     item_json TEXT
+                 );
+                 CREATE TABLE thread_turns(
+                     thread_id TEXT,
+                     rollout_ordinal INTEGER,
+                     rollout_byte_offset INTEGER,
+                     rollout_end_ordinal INTEGER,
+                     rollout_end_byte_offset INTEGER
+                 );",
+            )
+            .unwrap();
+        drop(database);
+        let history_before = fs::read(&history).unwrap();
+
+        let app = temp.path().join("Custom/Codex.exe");
+        fs::create_dir_all(app.parent().unwrap()).unwrap();
+        fs::write(&app, b"desktop").unwrap();
+        let store = Store::open(temp.path().join("data")).unwrap();
+        store
+            .settings_save_codex_app_path(Some(app.display().to_string()))
+            .unwrap();
+
+        let repair = repair_home_after_activation(&store, home, "custom".into()).await;
+
+        assert!(
+            repair
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("无法定位 Codex 内置 CLI")),
+            "warnings: {:?}",
+            repair.warnings
+        );
+        assert_eq!(fs::read_to_string(&rollout).unwrap(), rollout_before);
+        assert_eq!(fs::read(&state).unwrap(), state_before);
+        assert_eq!(fs::read(&history).unwrap(), history_before);
     }
 }
