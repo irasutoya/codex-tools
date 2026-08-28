@@ -1,4 +1,4 @@
-import type { AccountQuota, TokenBreakdown, UsageRange } from "@/types"
+import type { TokenBreakdown, UsageRange } from "@/types"
 
 const compactNumber = new Intl.NumberFormat("zh-CN", {
   notation: "compact",
@@ -88,11 +88,6 @@ export function cacheHitRate(tokens?: TokenBreakdown) {
 
 export function formatPercent(value?: number) {
   return value === undefined ? "—" : percentFormatter.format(value / 100)
-}
-
-export function quotaWindow(quota?: AccountQuota) {
-  if (quota?.status !== "success") return undefined
-  return quota?.data?.primary ?? quota?.data?.secondary
 }
 
 export function errorMessage(reason: unknown) {

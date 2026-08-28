@@ -6,7 +6,6 @@ import {
   formatPercent,
   formatTokens,
   formatUsd,
-  quotaWindow,
   tokenInput,
 } from "@/lib/format"
 
@@ -56,31 +55,6 @@ describe("format helpers", () => {
     expect(value).toBe("$0.10")
     expect(value[0]).toBe("$")
     expect(value).not.toContain("US$")
-  })
-
-  it("selects the primary quota window", () => {
-    expect(
-      quotaWindow({
-        status: "success",
-        data: {
-          kind: "windowed",
-          primary: { usedPercent: 25, remainingPercent: 75 },
-          secondary: { usedPercent: 50, remainingPercent: 50 },
-        },
-      })?.usedPercent
-    ).toBe(25)
-  })
-
-  it("does not expose stale quota data after a failed refresh", () => {
-    expect(
-      quotaWindow({
-        status: "unauthorized",
-        data: {
-          kind: "windowed",
-          primary: { usedPercent: 25, remainingPercent: 75 },
-        },
-      })
-    ).toBeUndefined()
   })
 
   it("formats invalid timestamps as unavailable", () => {

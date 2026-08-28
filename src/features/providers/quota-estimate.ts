@@ -53,12 +53,3 @@ export function quotaWindowEstimate(
       estimate.resetAt === window.resetAt
   )
 }
-
-export function hasCurrentQuotaEstimate(
-  quota: AccountQuota | undefined,
-  estimates: QuotaEstimate[] | undefined
-) {
-  return displayQuotaWindows(quota).some((window) =>
-    quotaWindowEstimate(estimates ?? [], window)
-  )
-}
