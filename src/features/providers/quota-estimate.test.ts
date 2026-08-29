@@ -3,8 +3,8 @@ import { describe, expect, it } from "vitest"
 import type { AccountQuota } from "@/types"
 
 import {
+  CURRENT_QUOTA_ESTIMATE_CALCULATION_VERSION,
   displayQuotaWindows,
-  hasCurrentQuotaEstimate,
   quotaWindowEstimate,
 } from "./quota-estimate"
 
@@ -64,6 +64,7 @@ describe("displayQuotaWindows", () => {
             resetAt: 21,
             estimatedAt: 1,
             estimatedTotalMicrousd: 100,
+            calculationVersion: CURRENT_QUOTA_ESTIMATE_CALCULATION_VERSION,
           },
         ],
         window!
@@ -71,33 +72,27 @@ describe("displayQuotaWindows", () => {
     ).toBeUndefined()
   })
 
-  it("仅当前额度窗口命中的结果才显示重新估算", () => {
-    const quota: AccountQuota = {
+  it("旧 calculationVersion 的金额不显示，当前版本保留显示", () => {
+    const [window] = displayQuotaWindows({
       status: "success",
       data: {
         kind: "windowed",
         primary: { usedPercent: 20, remainingPercent: 80, resetAt: 20 },
       },
+    })
+    expect(window).toBeDefined()
+    const old = {
+      windowSeconds: 18_000,
+      resetAt: 20,
+      estimatedAt: 1,
+      estimatedTotalMicrousd: 100,
+      calculationVersion: 0,
     }
-    expect(
-      hasCurrentQuotaEstimate(quota, [
-        {
-          windowSeconds: 18_000,
-          resetAt: 19,
-          estimatedAt: 1,
-          estimatedTotalMicrousd: 100,
-        },
-      ])
-    ).toBe(false)
-    expect(
-      hasCurrentQuotaEstimate(quota, [
-        {
-          windowSeconds: 18_000,
-          resetAt: 20,
-          estimatedAt: 1,
-          estimatedTotalMicrousd: 100,
-        },
-      ])
-    ).toBe(true)
+    const current = {
+      ...old,
+      calculationVersion: CURRENT_QUOTA_ESTIMATE_CALCULATION_VERSION,
+    }
+    expect(quotaWindowEstimate([old], window!)).toBeUndefined()
+    expect(quotaWindowEstimate([current], window!)).toEqual(current)
   })
 })

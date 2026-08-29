@@ -114,6 +114,9 @@ impl Store {
         // 每次加载后都归并当前根目录中已经写入的同身份重复记录；无重复状态
         // 不会触发持久化。
         requires_persist |= merge_current_duplicate_official_accounts(&mut state);
+        // 旧算法的估算金额会放大事件，缺失版本字段按 0 处理；加载时必须从持久化
+        // 状态撤销，避免页面在下一次重新估算前继续显示错误金额。
+        requires_persist |= discard_outdated_quota_estimates(&mut state);
 
         let files_incomplete = !state_files_complete(
             &path,
@@ -1542,6 +1545,18 @@ fn merge_account_quota(
     merged
 }
 
+fn discard_outdated_quota_estimates(state: &mut AppConfig) -> bool {
+    let mut changed = false;
+    for account in &mut state.official_accounts {
+        let estimate_count = account.quota.estimates.len();
+        account.quota.estimates.retain(|estimate| {
+            estimate.calculation_version == CURRENT_QUOTA_ESTIMATE_CALCULATION_VERSION
+        });
+        changed |= account.quota.estimates.len() != estimate_count;
+    }
+    changed
+}
+
 fn quota_updated_at(quota: &ProviderAccountQuota) -> i64 {
     quota
         .fetched_at
@@ -1879,6 +1894,7 @@ mod tests {
                         reset_at: 100,
                         estimated_total_microusd: 100,
                         estimated_at: 10,
+                        calculation_version: CURRENT_QUOTA_ESTIMATE_CALCULATION_VERSION,
                     }],
                     ..Default::default()
                 };
@@ -1895,6 +1911,7 @@ mod tests {
                         reset_at: 200,
                         estimated_total_microusd: 200,
                         estimated_at: 20,
+                        calculation_version: CURRENT_QUOTA_ESTIMATE_CALCULATION_VERSION,
                     }],
                     ..Default::default()
                 };
@@ -2343,6 +2360,7 @@ mod tests {
                         reset_at: 100,
                         estimated_total_microusd: 100,
                         estimated_at: 10,
+                        calculation_version: CURRENT_QUOTA_ESTIMATE_CALCULATION_VERSION,
                     }],
                     ..Default::default()
                 };
@@ -2357,6 +2375,7 @@ mod tests {
                         reset_at: 200,
                         estimated_total_microusd: 200,
                         estimated_at: 20,
+                        calculation_version: CURRENT_QUOTA_ESTIMATE_CALCULATION_VERSION,
                     }],
                     ..Default::default()
                 };
@@ -2558,12 +2577,14 @@ mod tests {
             reset_at: 100,
             estimated_total_microusd: 100,
             estimated_at: 1,
+            calculation_version: CURRENT_QUOTA_ESTIMATE_CALCULATION_VERSION,
         };
         let seven_days = QuotaEstimate {
             window_seconds: 604_800,
             reset_at: 200,
             estimated_total_microusd: 200,
             estimated_at: 1,
+            calculation_version: CURRENT_QUOTA_ESTIMATE_CALCULATION_VERSION,
         };
         store
             .save_official_account_quota_estimates(
@@ -2600,6 +2621,52 @@ mod tests {
             .unwrap();
         let remaining = store.official_account(&account.id).unwrap().quota.estimates;
         assert_eq!(remaining, vec![seven_days]);
+    }
+
+    #[test]
+    fn reopening_discards_old_quota_estimates_but_keeps_current_calculation_version() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        let store = Store::open(root.clone()).unwrap();
+        let account = store
+            .save_official_account(&official_account("workspace-current", "calculation"))
+            .unwrap();
+        store
+            .save_official_account_quota_estimates(
+                &account.id,
+                &[
+                    QuotaEstimate {
+                        window_seconds: 18_000,
+                        reset_at: 100,
+                        estimated_total_microusd: 100,
+                        estimated_at: 1,
+                        calculation_version: 0,
+                    },
+                    QuotaEstimate {
+                        window_seconds: 604_800,
+                        reset_at: 200,
+                        estimated_total_microusd: 200,
+                        estimated_at: 1,
+                        calculation_version: CURRENT_QUOTA_ESTIMATE_CALCULATION_VERSION,
+                    },
+                ],
+            )
+            .unwrap();
+        drop(store);
+
+        let reopened = Store::open(root.clone()).unwrap();
+        let estimates = reopened
+            .official_account(&account.id)
+            .unwrap()
+            .quota
+            .estimates;
+        assert_eq!(estimates.len(), 1);
+        assert_eq!(
+            estimates[0].calculation_version,
+            CURRENT_QUOTA_ESTIMATE_CALCULATION_VERSION
+        );
+        let persisted = fs::read_to_string(root.join("connections.json")).unwrap();
+        assert!(!persisted.contains("\"calculationVersion\":0"));
     }
 
     #[test]

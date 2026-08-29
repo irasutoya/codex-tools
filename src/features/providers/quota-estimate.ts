@@ -5,6 +5,8 @@ export type DisplayQuotaWindow = QuotaWindow & {
   label: "5H" | "7D" | string
 }
 
+export const CURRENT_QUOTA_ESTIMATE_CALCULATION_VERSION = 1
+
 /** 先按明确时长识别；老响应缺时长时才使用 primary/secondary 的兼容位置。 */
 export function displayQuotaWindows(
   quota?: AccountQuota
@@ -50,15 +52,7 @@ export function quotaWindowEstimate(
   return estimates.find(
     (estimate) =>
       estimate.windowSeconds === window.windowSeconds &&
-      estimate.resetAt === window.resetAt
-  )
-}
-
-export function hasCurrentQuotaEstimate(
-  quota: AccountQuota | undefined,
-  estimates: QuotaEstimate[] | undefined
-) {
-  return displayQuotaWindows(quota).some((window) =>
-    quotaWindowEstimate(estimates ?? [], window)
+      estimate.resetAt === window.resetAt &&
+      estimate.calculationVersion === CURRENT_QUOTA_ESTIMATE_CALCULATION_VERSION
   )
 }

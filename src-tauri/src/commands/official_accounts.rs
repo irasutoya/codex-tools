@@ -807,6 +807,7 @@ mod tests {
             reset_at: 100,
             estimated_total_microusd: 100,
             estimated_at: 1,
+            calculation_version: CURRENT_QUOTA_ESTIMATE_CALCULATION_VERSION,
         };
         let first_current = QuotaEstimate {
             reset_at: 200,
@@ -854,6 +855,7 @@ mod tests {
             reset_at: 100,
             estimated_total_microusd: 123,
             estimated_at: 1,
+            calculation_version: CURRENT_QUOTA_ESTIMATE_CALCULATION_VERSION,
         };
         let mut snapshot = ProviderAccountQuota {
             estimates: vec![estimate.clone()],

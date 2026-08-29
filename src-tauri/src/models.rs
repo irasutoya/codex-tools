@@ -540,6 +540,8 @@ pub struct ProviderAccountQuota {
 
 /// 本机依据已记录用量推算出的额度金额。它不是 OpenAI 返回的账单数据，
 /// 因此必须同时保存对应额度窗口的身份，避免跨窗口复用旧结论。
+pub const CURRENT_QUOTA_ESTIMATE_CALCULATION_VERSION: u32 = 1;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct QuotaEstimate {
@@ -547,6 +549,9 @@ pub struct QuotaEstimate {
     pub reset_at: i64,
     pub estimated_total_microusd: u64,
     pub estimated_at: i64,
+    /// 缺少该字段的历史持久化结果按 0 处理，加载时会被自动撤销。
+    #[serde(default)]
+    pub calculation_version: u32,
 }
 
 #[derive(Debug, Clone, Serialize)]

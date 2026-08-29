@@ -31,7 +31,9 @@ use std::{
 };
 use uuid::Uuid;
 
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 8;
+const OFFICIAL_IDENTITY_PROVIDER_ID: &str = "__official__";
+const MISSING_IDENTITY_PROVIDER_ID: &str = "__missing_provider__";
 const MAX_ROLLOUT_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_METADATA_SCAN_BYTES: usize = 4 * 1024 * 1024;
 const MAX_RECORD_LINE_BYTES: usize = 8 * 1024 * 1024;
@@ -543,14 +545,30 @@ impl UsageLedger {
 
         let mut statement = connection
             .prepare(
-                "SELECT usage_events.occurred_at_ms, usage_events.cost_status,
+                "WITH identity_map AS (
+                   SELECT source_kind, provider_id, local_account_id, canonical_account_id
+                   FROM (
+                     SELECT source_kind, provider_id, local_account_id, canonical_account_id,
+                            ROW_NUMBER() OVER (
+                              PARTITION BY source_kind, provider_id, local_account_id
+                              ORDER BY created_at_ms DESC, rowid DESC
+                            ) AS identity_rank
+                     FROM account_identity_aliases
+                   )
+                   WHERE identity_rank = 1
+                 )
+                 SELECT usage_events.occurred_at_ms, usage_events.cost_status,
                         usage_events.estimated_cost_microusd,
-                        account_identity_aliases.canonical_account_id
+                        identity_map.canonical_account_id
                    FROM usage_events
-              LEFT JOIN account_identity_aliases
-                     ON account_identity_aliases.source_kind = usage_events.source_kind
-                    AND account_identity_aliases.provider_id IS usage_events.provider_id
-                    AND account_identity_aliases.local_account_id = usage_events.account_id
+              LEFT JOIN identity_map
+                     ON identity_map.source_kind = usage_events.source_kind
+                    AND identity_map.provider_id = CASE
+                      WHEN usage_events.source_kind = 'official' THEN '__official__'
+                      WHEN TRIM(COALESCE(usage_events.provider_id, '')) = '' THEN '__missing_provider__'
+                      ELSE TRIM(usage_events.provider_id)
+                    END
+                    AND identity_map.local_account_id = usage_events.account_id
                   WHERE usage_events.occurred_at_ms >= ?1
                     AND usage_events.occurred_at_ms < ?2
                      AND usage_events.source_kind = 'official'
@@ -658,6 +676,8 @@ impl UsageLedger {
                             reset_at: state.reset_at,
                             estimated_total_microusd,
                             estimated_at: quota_snapshot_at_ms / 1_000,
+                            calculation_version:
+                                crate::models::CURRENT_QUOTA_ESTIMATE_CALCULATION_VERSION,
                         }),
                         reason: None,
                     },
@@ -765,11 +785,19 @@ impl UsageLedger {
                     "INSERT INTO account_identity_aliases(
                         source_kind, provider_id, local_account_id,
                         canonical_account_id, identity_source, created_at_ms
-                     ) VALUES ('official', NULL, ?1, ?2, 'official_external_id', ?3)
+                     ) VALUES ('official', ?1, ?2, ?3, 'official_external_id', ?4)
                      ON CONFLICT(source_kind, provider_id, local_account_id) DO UPDATE SET
                         canonical_account_id = excluded.canonical_account_id,
-                        identity_source = excluded.identity_source",
-                    params![local_account_id, canonical_account_id, now],
+                        identity_source = excluded.identity_source,
+                        created_at_ms = excluded.created_at_ms
+                     WHERE account_identity_aliases.canonical_account_id IS NOT excluded.canonical_account_id
+                        OR account_identity_aliases.identity_source IS NOT excluded.identity_source",
+                    params![
+                        OFFICIAL_IDENTITY_PROVIDER_ID,
+                        local_account_id,
+                        canonical_account_id,
+                        now
+                    ],
                 )
                 .map_err(|error| AppError::Internal(format!("保存账号归一化映射失败：{error}")))?;
         }
@@ -1217,7 +1245,7 @@ fn initialize_schema(connection: &Connection) -> anyhow::Result<()> {
              );
              CREATE TABLE IF NOT EXISTS account_identity_aliases (
                source_kind TEXT NOT NULL,
-               provider_id TEXT,
+               provider_id TEXT NOT NULL CHECK (length(provider_id) > 0),
                local_account_id TEXT NOT NULL,
                canonical_account_id TEXT NOT NULL,
                identity_source TEXT NOT NULL,
@@ -1326,7 +1354,7 @@ fn initialize_schema(connection: &Connection) -> anyhow::Result<()> {
              );
              CREATE INDEX IF NOT EXISTS official_pricing_catalog_active_idx
                ON official_pricing_catalogs(active, fetched_at_ms DESC);
-              PRAGMA user_version = 7;
+              PRAGMA user_version = 8;
              COMMIT;",
         )?;
         return Ok(());
@@ -1468,6 +1496,76 @@ fn initialize_schema(connection: &Connection) -> anyhow::Result<()> {
              PRAGMA user_version = 7;
              COMMIT;",
         )?;
+    }
+    if version > 0 && version < 8 {
+        let aliases_exist: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master
+                           WHERE type = 'table' AND name = 'account_identity_aliases')",
+            [],
+            |row| row.get(0),
+        )?;
+        if aliases_exist {
+            let migration = format!(
+                "BEGIN;
+             ALTER TABLE account_identity_aliases RENAME TO account_identity_aliases_v7;
+             CREATE TABLE account_identity_aliases (
+               source_kind TEXT NOT NULL,
+               provider_id TEXT NOT NULL CHECK (length(provider_id) > 0),
+               local_account_id TEXT NOT NULL,
+               canonical_account_id TEXT NOT NULL,
+               identity_source TEXT NOT NULL,
+               created_at_ms INTEGER NOT NULL,
+               PRIMARY KEY (source_kind, provider_id, local_account_id)
+             );
+             INSERT INTO account_identity_aliases(
+               source_kind, provider_id, local_account_id,
+               canonical_account_id, identity_source, created_at_ms
+             )
+             SELECT source_kind, normalized_provider_id, local_account_id,
+                    canonical_account_id, identity_source, created_at_ms
+             FROM (
+               SELECT account_identity_aliases_v7.*,
+                      CASE
+                        WHEN source_kind = 'official' THEN '{official_provider_id}'
+                        WHEN TRIM(COALESCE(provider_id, '')) = '' THEN '{missing_provider_id}'
+                        ELSE TRIM(provider_id)
+                      END AS normalized_provider_id,
+                      ROW_NUMBER() OVER (
+                        PARTITION BY source_kind,
+                                     CASE
+                                       WHEN source_kind = 'official' THEN '{official_provider_id}'
+                                       WHEN TRIM(COALESCE(provider_id, '')) = '' THEN '{missing_provider_id}'
+                                       ELSE TRIM(provider_id)
+                                     END,
+                                     local_account_id
+                        ORDER BY created_at_ms DESC, rowid DESC
+                      ) AS identity_rank
+               FROM account_identity_aliases_v7
+             )
+             WHERE identity_rank = 1;
+             DROP TABLE account_identity_aliases_v7;
+             PRAGMA user_version = 8;
+             COMMIT;",
+            official_provider_id = OFFICIAL_IDENTITY_PROVIDER_ID,
+            missing_provider_id = MISSING_IDENTITY_PROVIDER_ID,
+            );
+            connection.execute_batch(&migration)?;
+        } else {
+            connection.execute_batch(
+                "BEGIN;
+                 CREATE TABLE account_identity_aliases (
+                   source_kind TEXT NOT NULL,
+                   provider_id TEXT NOT NULL CHECK (length(provider_id) > 0),
+                   local_account_id TEXT NOT NULL,
+                   canonical_account_id TEXT NOT NULL,
+                   identity_source TEXT NOT NULL,
+                   created_at_ms INTEGER NOT NULL,
+                   PRIMARY KEY (source_kind, provider_id, local_account_id)
+                 );
+                 PRAGMA user_version = 8;
+                 COMMIT;",
+            )?;
+        }
     }
     // 只有目标表与列已存在时才补建索引。CREATE INDEX IF NOT EXISTS 在表或列
     // 不存在时仍会报错，极简旧版夹具/降级库可能缺表或缺列。
@@ -2945,7 +3043,7 @@ fn query_aggregates(
     group_by: UsageGroupBy,
 ) -> Result<(BTreeMap<String, UsageAggregate>, UsageTotals), AppError> {
     let canonical_account_expr =
-        "COALESCE(account_identity_aliases.canonical_account_id, usage_events.account_id)";
+        "COALESCE(identity_map.canonical_account_id, usage_events.account_id)";
     let key_expr = match group_by {
         UsageGroupBy::Model => "('model:' || usage_events.model)".to_string(),
         UsageGroupBy::Account => format!(
@@ -2956,7 +3054,19 @@ fn query_aggregates(
     };
     let sql = format!(
         r#"
-WITH ranked AS (
+WITH identity_map AS (
+  SELECT source_kind, provider_id, local_account_id, canonical_account_id
+  FROM (
+    SELECT source_kind, provider_id, local_account_id, canonical_account_id,
+           ROW_NUMBER() OVER (
+             PARTITION BY source_kind, provider_id, local_account_id
+             ORDER BY created_at_ms DESC, rowid DESC
+           ) AS identity_rank
+    FROM account_identity_aliases
+  )
+  WHERE identity_rank = 1
+),
+ranked AS (
   SELECT
     usage_events.*,
     {canonical_account_expr} AS canonical_account_id,
@@ -2966,10 +3076,14 @@ WITH ranked AS (
       ORDER BY usage_events.occurred_at_ms, usage_events.event_ordinal
     ) AS first_rn
   FROM usage_events
-  LEFT JOIN account_identity_aliases
-    ON account_identity_aliases.source_kind = usage_events.source_kind
-   AND account_identity_aliases.provider_id IS usage_events.provider_id
-   AND account_identity_aliases.local_account_id = usage_events.account_id
+  LEFT JOIN identity_map
+    ON identity_map.source_kind = usage_events.source_kind
+   AND identity_map.provider_id = CASE
+     WHEN usage_events.source_kind = 'official' THEN '__official__'
+     WHEN TRIM(COALESCE(usage_events.provider_id, '')) = '' THEN '__missing_provider__'
+     ELSE TRIM(usage_events.provider_id)
+   END
+   AND identity_map.local_account_id = usage_events.account_id
   WHERE usage_events.occurred_at_ms >= ?1
     AND usage_events.occurred_at_ms < ?2
 )
@@ -3547,6 +3661,76 @@ mod tests {
     }
 
     #[test]
+    fn official_identity_sync_is_idempotent_and_never_duplicates_estimates_or_aggregates() {
+        let (_temp, ledger) = estimate_test_ledger();
+        let now = 10_000_000_000_i64;
+        let reset_at = now / 1_000 + 3_600;
+        let window_start = reset_at * 1_000 - 18_000_000;
+        set_estimate_metadata(&ledger, window_start - 1, 0);
+
+        ledger
+            .sync_official_account_identities(&[("local-a".into(), "canonical-old".into())])
+            .unwrap();
+        ledger
+            .sync_official_account_identities(&[("local-a".into(), "canonical-old".into())])
+            .unwrap();
+        let connection = ledger.open_connection().unwrap();
+        let stable_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM account_identity_aliases
+                  WHERE source_kind = 'official'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stable_count, 2);
+
+        ledger
+            .sync_official_account_identities(&[("local-a".into(), "canonical-new".into())])
+            .unwrap();
+        let mapped_account: String = connection
+            .query_row(
+                "SELECT canonical_account_id FROM account_identity_aliases
+                  WHERE source_kind = 'official' AND provider_id = ?1
+                    AND local_account_id = 'local-a'",
+                params![super::OFFICIAL_IDENTITY_PROVIDER_ID],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(mapped_account, "canonical-new");
+
+        insert_estimate_event(&ledger, 1, now - 60_000, "local-a", "estimated", Some(100));
+        let estimates = ledger
+            .estimate_account_quota("canonical-new", &[(18_000, reset_at, 10.0)], now)
+            .unwrap();
+        assert_eq!(
+            estimates[0]
+                .estimate
+                .as_ref()
+                .unwrap()
+                .estimated_total_microusd,
+            1_000
+        );
+        let repeated_estimates = ledger
+            .estimate_account_quota("canonical-new", &[(18_000, reset_at, 10.0)], now)
+            .unwrap();
+        assert_eq!(repeated_estimates[0].success, estimates[0].success);
+        assert_eq!(repeated_estimates[0].estimate, estimates[0].estimate);
+        assert_eq!(repeated_estimates[0].reason, estimates[0].reason);
+        let overview = ledger
+            .query(UsageQuery {
+                range: UsageRange {
+                    start_at_ms: window_start,
+                    end_at_ms: now,
+                },
+                group_by: UsageGroupBy::Account,
+            })
+            .unwrap();
+        assert_eq!(overview.totals.requests, 1);
+        assert_eq!(overview.totals.estimated_cost_microusd, 100);
+    }
+
+    #[test]
     fn estimate_account_quota_isolates_accounts_and_aggregates_windows_in_one_scan() {
         let (_temp, ledger) = estimate_test_ledger();
         let now = 10_000_000_000_i64;
@@ -3775,6 +3959,54 @@ mod tests {
     }
 
     #[test]
+    fn migrates_v7_null_official_alias_duplicates_to_the_latest_single_mapping() {
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE account_identity_aliases (
+                   source_kind TEXT NOT NULL,
+                   provider_id TEXT,
+                   local_account_id TEXT NOT NULL,
+                   canonical_account_id TEXT NOT NULL,
+                   identity_source TEXT NOT NULL,
+                   created_at_ms INTEGER NOT NULL,
+                   PRIMARY KEY (source_kind, provider_id, local_account_id)
+                 );
+                 INSERT INTO account_identity_aliases VALUES
+                   ('official', NULL, 'local-a', 'canonical-old', 'official_external_id', 10),
+                   ('official', NULL, 'local-a', 'canonical-newer', 'official_external_id', 20),
+                   ('official', NULL, 'local-a', 'canonical-latest-rowid', 'official_external_id', 20);
+                 PRAGMA user_version = 7;",
+            )
+            .unwrap();
+
+        super::initialize_schema(&connection).unwrap();
+
+        let version: i64 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 8);
+        let aliases: Vec<(String, String)> = connection
+            .prepare(
+                "SELECT provider_id, canonical_account_id
+                   FROM account_identity_aliases
+                  WHERE source_kind = 'official' AND local_account_id = 'local-a'",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            aliases,
+            vec![(
+                (super::OFFICIAL_IDENTITY_PROVIDER_ID).into(),
+                "canonical-latest-rowid".into()
+            )]
+        );
+    }
+
+    #[test]
     fn migrates_v5_subscription_rules_to_unpriced_without_readding_cursor_column() {
         let connection = rusqlite::Connection::open_in_memory().unwrap();
         connection
@@ -3823,7 +4055,7 @@ mod tests {
         let version: i64 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 7);
+        assert_eq!(version, 8);
         let migrated_mode: String = connection
             .query_row(
                 "SELECT billing_mode FROM pricing_rules WHERE id = 'legacy-subscription'",
@@ -3909,7 +4141,7 @@ mod tests {
         let version: i64 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 7);
+        assert_eq!(version, 8);
     }
 
     #[test]
