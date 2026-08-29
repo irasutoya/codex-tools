@@ -1,4 +1,4 @@
-import { useState } from "react"
+import { useMemo, useState } from "react"
 
 import { Button } from "@/components/ui/button"
 import {
@@ -83,7 +83,10 @@ export function PricingEditor({
 
   const normalizedPattern = pattern.trim()
   const scope = pricingScopeForSource(pricingSourceFromValue(sourceValue))
-  const sourceOptions = pricingSourceOptions(providers)
+  const sourceOptions = useMemo(
+    () => pricingSourceOptions(providers),
+    [providers]
+  )
 
   const save = async () => {
     if (!scope || !normalizedPattern) return
