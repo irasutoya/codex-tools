@@ -1,4 +1,4 @@
-import { useLayoutEffect, useRef } from "react"
+import { useState } from "react"
 import { Progress, ProgressLabel } from "@/components/ui/progress"
 import {
   Sheet,
@@ -20,11 +20,9 @@ export function UsageDetail({
   groupBy: UsageGroupBy
   onOpenChange: (open: boolean) => void
 }) {
-  const lastRow = useRef<UsageRow>(undefined)
-  useLayoutEffect(() => {
-    if (row) lastRow.current = row
-  }, [row])
-  const display = row ?? lastRow.current
+  const [lastRow, setLastRow] = useState<UsageRow>()
+  if (row && row !== lastRow) setLastRow(row)
+  const display = row ?? lastRow
 
   if (!display) return null
   const hitRate = cacheHitRate(display.tokens)
