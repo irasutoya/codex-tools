@@ -2560,7 +2560,10 @@ fn resolve_activation(
 ) -> ActivationResolution {
     let index = activations
         .partition_point(|activation| activation.effective_at_ms <= event.occurred_at_ms);
-    let Some(activation) = index.checked_sub(1).and_then(|index| activations.get(index)) else {
+    let Some(activation) = index
+        .checked_sub(1)
+        .and_then(|index| activations.get(index))
+    else {
         return ActivationResolution::Missing;
     };
     // The confirmed activation timeline is the authoritative account source.

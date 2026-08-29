@@ -557,9 +557,10 @@ pub(crate) fn repair_after_connection_switch_preserving_history_with_guard_at_wi
                         .get(path_key.as_ref())
                         .map(Vec::as_slice)
                         .unwrap_or_default();
-                    let result = plan_rollout(&path, target_provider, entries).map_err(|error| {
-                        AppError::Internal(format!("会话文件 {}：{error}", path.display()))
-                    })?;
+                    let result =
+                        plan_rollout(&path, target_provider, entries).map_err(|error| {
+                            AppError::Internal(format!("会话文件 {}：{error}", path.display()))
+                        })?;
                     Ok::<_, AppError>((path, result))
                 })
             })
