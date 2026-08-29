@@ -46,13 +46,23 @@ export function providerSaveInputOf(provider: Provider): ProviderSaveInput {
 /** 有效模型 = /models 同步模型 ∪ 自定义模型（保序去重）。 */
 export function effectiveModelsOf(provider: Provider): string[] {
   const available = provider.availableModels ?? []
-  const custom = provider.customModels ?? []
-  return [...available, ...custom.filter((model) => !available.includes(model))]
+  const availableSet = new Set(available)
+  const models = [...available]
+  for (const model of provider.customModels ?? []) {
+    if (!availableSet.has(model)) models.push(model)
+  }
+  return models
 }
 
 /** 有效模型数 = /models 同步模型 ∪ 自定义模型（去重）。 */
 export function effectiveModelCount(provider: Provider) {
-  return effectiveModelsOf(provider).length
+  const available = provider.availableModels ?? []
+  const availableSet = new Set(available)
+  let count = available.length
+  for (const model of provider.customModels ?? []) {
+    if (!availableSet.has(model)) count += 1
+  }
+  return count
 }
 
 /** 将后端序列化的 null 统一转为 undefined，保持"未设置=全选"语义。 */
@@ -64,13 +74,14 @@ function selectedModelsOf(provider: Provider): string[] | undefined {
 export function allModelsSelected(provider: Provider): boolean {
   const selected = selectedModelsOf(provider)
   if (selected === undefined) return true
-  return effectiveModelsOf(provider).every((model) => selected.includes(model))
+  const selectedSet = new Set(selected)
+  return effectiveModelsOf(provider).every((model) => selectedSet.has(model))
 }
 
 /** 无选中 = 存在有效模型但 selectedModels 为空数组（此时禁止保存）。 */
 export function noModelsSelected(provider: Provider): boolean {
   const selected = selectedModelsOf(provider)
-  return effectiveModelsOf(provider).length > 0 && selected?.length === 0
+  return effectiveModelCount(provider) > 0 && selected?.length === 0
 }
 
 export function accountIsExpired(account: OfficialAccountView) {
@@ -244,19 +255,21 @@ export function buildFallbackCandidates(
   excludedAccountIds: ReadonlySet<string> = new Set(),
   excludedProviderId?: string
 ): FallbackCandidate[] {
-  const remainingAccounts = accounts.filter(
-    (account) =>
-      !excludedAccountIds.has(account.id) &&
-      !accountWorkspaceIsDeactivated(account)
-  )
-  const healthyAccounts = remainingAccounts.filter(
-    (account) =>
+  const healthyAccounts: OfficialAccountView[] = []
+  const otherAccounts: OfficialAccountView[] = []
+  for (const account of accounts) {
+    if (
+      excludedAccountIds.has(account.id) ||
+      accountWorkspaceIsDeactivated(account)
+    ) {
+      continue
+    }
+    const group =
       account.quota.status !== "unauthorized" && !accountIsExpired(account)
-  )
-  const healthyIds = new Set(healthyAccounts.map((account) => account.id))
-  const otherAccounts = remainingAccounts.filter(
-    (account) => !healthyIds.has(account.id)
-  )
+        ? healthyAccounts
+        : otherAccounts
+    group.push(account)
+  }
   const enabledProviders = providers.filter(
     (provider) =>
       provider.id !== excludedProviderId &&

@@ -172,6 +172,12 @@ export function EditableContextMenu() {
       })
       setMenu({ ...position, snapshot })
     }
+    document.addEventListener("contextmenu", openMenu)
+    return () => document.removeEventListener("contextmenu", openMenu)
+  }, [])
+
+  useEffect(() => {
+    if (!menu) return
     const closeMenu = (event: Event) => {
       if (
         event.type === "pointerdown" &&
@@ -186,21 +192,19 @@ export function EditableContextMenu() {
       if (event.key === "Escape") setMenu(null)
     }
 
-    document.addEventListener("contextmenu", openMenu)
     document.addEventListener("pointerdown", closeMenu, true)
     document.addEventListener("keydown", closeOnEscape)
     window.addEventListener("blur", closeMenu)
     window.addEventListener("resize", closeMenu)
     window.addEventListener("scroll", closeMenu, true)
     return () => {
-      document.removeEventListener("contextmenu", openMenu)
       document.removeEventListener("pointerdown", closeMenu, true)
       document.removeEventListener("keydown", closeOnEscape)
       window.removeEventListener("blur", closeMenu)
       window.removeEventListener("resize", closeMenu)
       window.removeEventListener("scroll", closeMenu, true)
     }
-  }, [])
+  }, [menu])
 
   useEffect(() => {
     if (!menu) return

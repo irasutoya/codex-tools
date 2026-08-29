@@ -538,17 +538,28 @@ pub(crate) fn repair_after_connection_switch_preserving_history_with_guard_at_wi
 
     // ---- 只读预检：任一 rollout / 数据库无法确认可修复即整体终止 ----
     // 并行读取+解析各 rollout 文件，减少 I/O 等待时间。
+    let mut manifest_entries: HashMap<&str, Vec<&SessionRepairManifestEntry>> = HashMap::new();
+    for entry in &manifest.entries {
+        manifest_entries
+            .entry(entry.path.as_str())
+            .or_default()
+            .push(entry);
+    }
     let planned: Vec<(PathBuf, PlannedRollout)> = std::thread::scope(|s| {
         let handles: Vec<_> = rollouts
             .iter()
             .map(|path| {
                 let path = path.clone();
-                let manifest = manifest.clone();
+                let manifest_entries = &manifest_entries;
                 s.spawn(move || {
-                    let result =
-                        plan_rollout(&path, target_provider, &manifest).map_err(|error| {
-                            AppError::Internal(format!("会话文件 {}：{error}", path.display()))
-                        })?;
+                    let path_key = path.to_string_lossy();
+                    let entries = manifest_entries
+                        .get(path_key.as_ref())
+                        .map(Vec::as_slice)
+                        .unwrap_or_default();
+                    let result = plan_rollout(&path, target_provider, entries).map_err(|error| {
+                        AppError::Internal(format!("会话文件 {}：{error}", path.display()))
+                    })?;
                     Ok::<_, AppError>((path, result))
                 })
             })
@@ -792,7 +803,7 @@ struct SessionRepairManifestEntry {
     session_meta_count: usize,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 struct SessionRepairManifest {
     version: u32,
@@ -1345,11 +1356,11 @@ struct PlannedRollout {
 fn plan_rollout(
     path: &Path,
     target: &str,
-    manifest: &SessionRepairManifest,
+    manifest_entries: &[&SessionRepairManifestEntry],
 ) -> anyhow::Result<PlannedRollout> {
-    if let Some(entry) = manifest
-        .entries
+    if let Some(entry) = manifest_entries
         .iter()
+        .copied()
         .find(|entry| entry_matches_file(entry, path, target))
     {
         return Ok(PlannedRollout {
@@ -1592,6 +1603,11 @@ fn eligible_database_changes(
     scope: &SessionScope,
 ) -> anyhow::Result<Vec<String>> {
     let mut output = Vec::new();
+    let model_change = if table_columns(db, table)?.contains("model") {
+        " OR model IS NOT NULL"
+    } else {
+        ""
+    };
     for ids in scope.eligible_ids().chunks(900) {
         if ids.is_empty() {
             continue;
@@ -1599,11 +1615,6 @@ fn eligible_database_changes(
         let placeholders = std::iter::repeat_n("?", ids.len())
             .collect::<Vec<_>>()
             .join(",");
-        let model_change = if table_columns(db, table)?.contains("model") {
-            " OR model IS NOT NULL"
-        } else {
-            ""
-        };
         let sql = format!(
             "SELECT {id_column} FROM {table} WHERE (COALESCE(model_provider,'')<>?1{model_change}) AND {id_column} IN ({placeholders})"
         );

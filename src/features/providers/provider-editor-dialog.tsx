@@ -33,7 +33,6 @@ import {
   addCustomModelTo,
   allModelsSelected,
   effectiveModelsOf,
-  noModelsSelected,
   providerSaveInputOf,
   removeCustomModelFrom,
   toggleModelSelected,
@@ -113,8 +112,13 @@ export function ProviderEditorDialog({
   const customModels = provider.customModels ?? []
   // 有效模型 = /models 同步的模型 ∪ 用户手动添加的自定义模型（保序去重）。
   const effectiveModels = effectiveModelsOf(provider)
-  const allSelected = allModelsSelected(provider)
-  const noneSelected = noModelsSelected(provider)
+  const selectedSet = provider.selectedModels
+    ? new Set(provider.selectedModels)
+    : undefined
+  const customSet = new Set(customModels)
+  const allSelected =
+    !selectedSet || effectiveModels.every((model) => selectedSet.has(model))
+  const noneSelected = effectiveModels.length > 0 && selectedSet?.size === 0
   const normalizedSearch = modelSearch.trim().toLowerCase()
   const filteredModels = normalizedSearch
     ? effectiveModels.filter((model) =>
@@ -286,9 +290,8 @@ export function ProviderEditorDialog({
                   </div>
                 ) : (
                   filteredModels.map((model) => {
-                    const selected =
-                      provider.selectedModels?.includes(model) ?? true
-                    const isCustom = customModels.includes(model)
+                    const selected = selectedSet?.has(model) ?? true
+                    const isCustom = customSet.has(model)
                     return (
                       <div
                         key={model}

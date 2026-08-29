@@ -378,17 +378,20 @@ pub fn session_page(
         Cow::Owned(query.to_lowercase())
     };
     let query = normalized_query.as_ref();
-    let matches = sessions
+    let matches = |session: &SessionSummary| {
+        session.archived == archived
+            && (query.is_empty() || session_matches_query(session, query))
+    };
+    let total = sessions
         .iter()
-        .filter(|session| session.archived == archived)
-        .filter(|session| query.is_empty() || session_matches_query(session, query))
-        .collect::<Vec<_>>();
-    let total = matches.len();
+        .filter(|session| matches(session))
+        .count();
     let last_page = total.max(1).div_ceil(page_size);
     let page = page.clamp(1, last_page);
     let start = (page - 1).saturating_mul(page_size);
-    let items = matches
-        .into_iter()
+    let items = sessions
+        .iter()
+        .filter(|session| matches(session))
         .skip(start)
         .take(page_size)
         .cloned()

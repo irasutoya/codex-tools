@@ -516,73 +516,74 @@ export function ConnectionManagerSheet({
                     {providers.length === 0 && (
                       <EmptyConnectionItem label="暂无 API 服务" />
                     )}
-                    {providers.map((provider) => (
-                      <ConnectionItem
-                        key={provider.id}
-                        kind="provider"
-                        id={provider.id}
-                        name={provider.name}
-                        description={`${
-                          effectiveModelCount(provider)
-                            ? `${effectiveModelCount(provider)} 个模型`
-                            : "模型尚未同步"
-                        } · ${provider.baseUrl}`}
-                        active={provider.active}
-                        canView={page === "providers"}
-                        selected={
-                          page === "providers" && selectedId === provider.id
-                        }
-                        unavailable={!provider.enabled || !provider.hasApiKey}
-                        unavailableLabel={
-                          provider.enabled ? "缺少密钥" : "已停用"
-                        }
-                        activateDisabled={
-                          !provider.enabled || !provider.hasApiKey
-                        }
-                        frozen={frozen}
-                        pending={pending}
-                        onView={() => {
-                          onSelectedIdChange(provider.id)
-                          onOpenChange(false)
-                        }}
-                        onActivate={() =>
-                          void activate("provider", provider.id)
-                        }
-                        onEdit={() => editProvider(provider)}
-                        onDelete={() =>
-                          requestDelete({
-                            active: provider.active,
-                            id: provider.id,
-                            kind: "provider",
-                            name: provider.name,
-                          })
-                        }
-                        moreActions={[
-                          {
-                            label: "测试连接",
-                            icon: TestTube01Icon,
-                            onSelect: () =>
-                              void runAction(
-                                "test",
-                                provider.id,
-                                () => testProviderConnection(provider.id),
-                                "连接测试通过"
-                              ),
-                          },
-                          {
-                            label: "同步模型",
-                            icon: Refresh01Icon,
-                            onSelect: () =>
-                              void runAction(
-                                "models",
-                                provider.id,
-                                () => syncProviderModels(provider.id),
-                                "模型已同步"
-                              ),
-                          },
-                        ]}
-                      />
-                    ))}
+                    {providers.map((provider) => {
+                      const modelCount = effectiveModelCount(provider)
+                      return (
+                        <ConnectionItem
+                          key={provider.id}
+                          kind="provider"
+                          id={provider.id}
+                          name={provider.name}
+                          description={`${
+                            modelCount ? `${modelCount} 个模型` : "模型尚未同步"
+                          } · ${provider.baseUrl}`}
+                          active={provider.active}
+                          canView={page === "providers"}
+                          selected={
+                            page === "providers" && selectedId === provider.id
+                          }
+                          unavailable={!provider.enabled || !provider.hasApiKey}
+                          unavailableLabel={
+                            provider.enabled ? "缺少密钥" : "已停用"
+                          }
+                          activateDisabled={
+                            !provider.enabled || !provider.hasApiKey
+                          }
+                          frozen={frozen}
+                          pending={pending}
+                          onView={() => {
+                            onSelectedIdChange(provider.id)
+                            onOpenChange(false)
+                          }}
+                          onActivate={() =>
+                            void activate("provider", provider.id)
+                          }
+                          onEdit={() => editProvider(provider)}
+                          onDelete={() =>
+                            requestDelete({
+                              active: provider.active,
+                              id: provider.id,
+                              kind: "provider",
+                              name: provider.name,
+                            })
+                          }
+                          moreActions={[
+                            {
+                              label: "测试连接",
+                              icon: TestTube01Icon,
+                              onSelect: () =>
+                                void runAction(
+                                  "test",
+                                  provider.id,
+                                  () => testProviderConnection(provider.id),
+                                  "连接测试通过"
+                                ),
+                            },
+                            {
+                              label: "同步模型",
+                              icon: Refresh01Icon,
+                              onSelect: () =>
+                                void runAction(
+                                  "models",
+                                  provider.id,
+                                  () => syncProviderModels(provider.id),
+                                  "模型已同步"
+                                ),
+                            },
+                          ]}
+                        />
+                      )
+                    })}
                   </ItemGroup>
                 </section>
               </>
