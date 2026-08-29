@@ -250,6 +250,8 @@ export type QuotaEstimate = {
   resetAt: number
   estimatedTotalMicrousd: number
   estimatedAt: number
+  /** 缺失字段表示旧计算结果，加载后会由后端清理。 */
+  calculationVersion?: number
 }
 
 export type QuotaEstimateWindowResult = {
