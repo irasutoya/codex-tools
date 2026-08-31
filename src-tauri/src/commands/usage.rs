@@ -6,17 +6,29 @@ use chrono::TimeZone;
 use tauri::State;
 
 #[tauri::command]
+#[tracing::instrument(name = "usage_get_overview", skip_all)]
 pub(crate) async fn usage_get_overview(
     ledger: State<'_, UsageLedger>,
     query: UsageQuery,
 ) -> Result<UsageOverview, AppError> {
     let ledger = ledger.inner().clone();
-    tokio::task::spawn_blocking(move || ledger.query(query))
+    let result = tokio::task::spawn_blocking(move || ledger.query(query))
         .await
-        .map_err(|error| AppError::Internal(error.to_string()))?
+        .map_err(|error| AppError::Internal(error.to_string()))?;
+    match &result {
+        Ok(overview) => tracing::info!(
+            operation = "usage_get_overview",
+            outcome = "ok",
+            row_count = overview.rows.len(),
+            warning_count = overview.warnings.len()
+        ),
+        Err(_) => tracing::warn!(operation = "usage_get_overview", outcome = "error"),
+    }
+    result
 }
 
 #[tauri::command]
+#[tracing::instrument(name = "usage_refresh", skip_all)]
 pub(crate) async fn usage_refresh(
     store: State<'_, Store>,
     ledger: State<'_, UsageLedger>,
@@ -35,7 +47,7 @@ pub(crate) async fn usage_refresh(
     let codex_home = codex::home(&store.codex_home_setting()?);
     let now_utc_ms = chrono::Utc::now().timestamp_millis();
     let ledger = ledger.inner().clone();
-    tokio::task::spawn_blocking(move || {
+    let result = tokio::task::spawn_blocking(move || {
         let refreshed = ledger.refresh(&codex_home, now_utc_ms)?;
         let mut overview = ledger.query(query)?;
         overview.warnings = refreshed.warnings;
@@ -51,7 +63,17 @@ pub(crate) async fn usage_refresh(
         Ok(overview)
     })
     .await
-    .map_err(|error| AppError::Internal(error.to_string()))?
+    .map_err(|error| AppError::Internal(error.to_string()))?;
+    match &result {
+        Ok(overview) => tracing::info!(
+            operation = "usage_refresh",
+            outcome = "ok",
+            row_count = overview.rows.len(),
+            warning_count = overview.warnings.len()
+        ),
+        Err(_) => tracing::warn!(operation = "usage_refresh", outcome = "error"),
+    }
+    result
 }
 
 #[tauri::command]

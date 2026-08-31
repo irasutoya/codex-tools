@@ -225,6 +225,9 @@ export function ProviderEditorDialog({
             </Field>
             <Field data-disabled={saving}>
               <FieldLabel>写入 Codex 的模型</FieldLabel>
+              <label className="sr-only" htmlFor="provider-model-search">
+                搜索模型
+              </label>
               <Input
                 id="provider-model-search"
                 type="search"
@@ -235,6 +238,9 @@ export function ProviderEditorDialog({
                 className="mb-2"
               />
               <div className="mb-2 flex items-center gap-2">
+                <label className="sr-only" htmlFor="provider-custom-model">
+                  自定义模型 ID
+                </label>
                 <Input
                   id="provider-custom-model"
                   placeholder="添加自定义模型 ID…"

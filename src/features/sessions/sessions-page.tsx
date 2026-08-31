@@ -87,6 +87,7 @@ export function SessionsPage({
     })
   }, [page, query, refreshRevision, status])
   const { data: result, error: listError } = useAsync(fetchList, {
+    clearOnLoad: true,
     onError: (message) =>
       toast.add({
         title: "无法读取会话列表",
@@ -164,7 +165,12 @@ export function SessionsPage({
 
   if (!result || !scan)
     return (
-      <div className="grid grid-rows-[72px_256px] gap-3 px-3 pt-1 pb-3">
+      <div
+        className="grid grid-rows-[72px_256px] gap-3 px-3 pt-1 pb-3"
+        role="status"
+        aria-busy="true"
+      >
+        <span className="sr-only">正在读取会话</span>
         <Skeleton className="rounded-2xl" />
         <Skeleton className="rounded-2xl" />
       </div>
@@ -333,13 +339,9 @@ export function SessionsPage({
               <PaginationContent>
                 <PaginationItem>
                   <PaginationPrevious
-                    href="#"
                     text="上一页"
-                    aria-disabled={currentPage === 1}
-                    onClick={(event) => {
-                      event.preventDefault()
-                      if (currentPage > 1) setPage(currentPage - 1)
-                    }}
+                    disabled={currentPage === 1}
+                    onClick={() => setPage(currentPage - 1)}
                   />
                 </PaginationItem>
                 <PaginationItem>
@@ -349,13 +351,9 @@ export function SessionsPage({
                 </PaginationItem>
                 <PaginationItem>
                   <PaginationNext
-                    href="#"
                     text="下一页"
-                    aria-disabled={currentPage === pageCount}
-                    onClick={(event) => {
-                      event.preventDefault()
-                      if (currentPage < pageCount) setPage(currentPage + 1)
-                    }}
+                    disabled={currentPage === pageCount}
+                    onClick={() => setPage(currentPage + 1)}
                   />
                 </PaginationItem>
               </PaginationContent>

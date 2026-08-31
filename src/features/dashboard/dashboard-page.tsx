@@ -66,7 +66,12 @@ export function DashboardPage({
 
   if (!dashboard || (!usage && !error)) {
     return (
-      <div className="grid min-h-full grid-rows-[minmax(240px,1fr)_80px_80px] gap-3 px-3 pt-1 pb-3">
+      <div
+        className="grid min-h-full grid-rows-[minmax(240px,1fr)_80px_80px] gap-3 px-3 pt-1 pb-3"
+        role="status"
+        aria-busy="true"
+      >
+        <span className="sr-only">正在读取概览</span>
         <Skeleton className="rounded-2xl" />
         <Skeleton className="rounded-2xl" />
         <Skeleton className="rounded-2xl" />

@@ -9,8 +9,8 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/irasutoya/codex-tools/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/irasutoya/codex-tools/actions/workflows/ci.yml/badge.svg" /></a>
-  <a href="https://github.com/irasutoya/codex-tools/releases/latest"><img alt="GitHub Release" src="https://img.shields.io/github/v/release/irasutoya/codex-tools?display_name=tag&sort=semver" /></a>
+  <a href="https://github.com/kageumi/codex-tools/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/kageumi/codex-tools/actions/workflows/ci.yml/badge.svg" /></a>
+  <a href="https://github.com/kageumi/codex-tools/releases/latest"><img alt="GitHub Release" src="https://img.shields.io/github/v/release/kageumi/codex-tools?display_name=tag&sort=semver" /></a>
   <a href="LICENSE"><img alt="MIT License" src="https://img.shields.io/badge/license-MIT-blue.svg" /></a>
 </p>
 
@@ -35,7 +35,7 @@ Codex Tools 是一个轻量的 Tauri 2 + Rust 桌面应用，直接管理 Codex 
 
 ## 下载与安装
 
-从 [Releases](https://github.com/irasutoya/codex-tools/releases/latest) 下载对应平台的安装包：
+从 [Releases](https://github.com/kageumi/codex-tools/releases/latest) 下载对应平台的安装包：
 
 | 平台                | 发布产物                | 系统要求                |
 | ------------------- | ----------------------- | ----------------------- |
@@ -97,7 +97,7 @@ X-Custom-Header = "<可选请求头>"
 需要 Node.js 24、Rust 1.85+ 及当前平台的 [Tauri 2 构建依赖](https://v2.tauri.app/start/prerequisites/)（Windows 另需 WebView2、NSIS；macOS 需 Xcode CLT）。
 
 ```shell
-git clone https://github.com/irasutoya/codex-tools.git
+git clone https://github.com/kageumi/codex-tools.git
 cd codex-tools
 npm ci
 npm run dev
@@ -121,7 +121,7 @@ npm run dist:mac:arm64
 
 ## 项目状态
 
-项目仍处于早期预览阶段。请在 [Issues](https://github.com/irasutoya/codex-tools/issues) 中报告问题；提交前请移除 API Key、OAuth token、`auth.json`、`credentials.json` 与会话正文。
+项目仍处于早期预览阶段。请在 [Issues](https://github.com/kageumi/codex-tools/issues) 中报告问题；提交前请移除 API Key、OAuth token、`auth.json`、`credentials.json` 与会话正文。
 
 ## 许可证
 

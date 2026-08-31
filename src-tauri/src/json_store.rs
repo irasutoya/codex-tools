@@ -43,6 +43,7 @@ impl JsonStore {
             fs::metadata(path).is_ok_and(|metadata| metadata.len() == bytes.len() as u64);
         if same_length && fs::read(path).is_ok_and(|current| current == bytes) {
             secure_file(path)?;
+            sync_parent_directory(path)?;
             return Ok(());
         }
         let temporary = temporary_path(path);
@@ -56,8 +57,23 @@ impl JsonStore {
             return Err(error);
         }
         secure_file(path)?;
+        sync_parent_directory(path)?;
         Ok(())
     }
+}
+
+#[cfg(unix)]
+pub(crate) fn sync_parent_directory(path: &Path) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::File::open(parent)?.sync_all()?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub(crate) fn sync_parent_directory(_path: &Path) -> std::io::Result<()> {
+    // Windows replacements use MOVEFILE_WRITE_THROUGH below.
+    Ok(())
 }
 
 pub(crate) fn temporary_path(path: &Path) -> PathBuf {

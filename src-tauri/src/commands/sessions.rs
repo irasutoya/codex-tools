@@ -130,11 +130,23 @@ pub(crate) async fn repair_home_after_activation_with_paths(
 }
 
 #[tauri::command]
+#[tracing::instrument(name = "sessions_scan", skip_all)]
 pub(crate) async fn sessions_scan(store: State<'_, Store>) -> Result<RepairScan, AppError> {
-    scan_home(codex::home(&store.codex_home_setting()?)).await
+    let result = scan_home(codex::home(&store.codex_home_setting()?)).await;
+    match &result {
+        Ok(scan) => tracing::info!(
+            operation = "sessions_scan",
+            outcome = "ok",
+            rollout_files = scan.rollout_files,
+            warning_count = scan.warnings.len()
+        ),
+        Err(_) => tracing::warn!(operation = "sessions_scan", outcome = "error"),
+    }
+    result
 }
 
 #[tauri::command]
+#[tracing::instrument(name = "sessions_repair", skip_all)]
 pub(crate) async fn sessions_repair(
     store: State<'_, Store>,
     index: State<'_, SessionIndex>,
@@ -147,11 +159,25 @@ pub(crate) async fn sessions_repair(
         Ok((repair, affected_paths)) => {
             if let Err(error) = index.refresh_paths(&home, &affected_paths) {
                 index.invalidate();
-                eprintln!("会话修复后定向刷新索引失败，已回退全量重建：{error}");
+                let _ = error;
+                tracing::warn!(
+                    operation = "sessions_repair_index_refresh",
+                    outcome = "fallback"
+                );
             }
+            tracing::info!(
+                operation = "sessions_repair",
+                outcome = "ok",
+                files_modified = repair.files_modified,
+                rows_updated = repair.rows_updated,
+                warning_count = repair.warnings.len()
+            );
             Ok(repair)
         }
-        Err(error) => Err(error),
+        Err(error) => {
+            tracing::warn!(operation = "sessions_repair", outcome = "error");
+            Err(error)
+        }
     }
 }
 

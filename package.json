@@ -7,11 +7,11 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/irasutoya/codex-tools.git"
+    "url": "git+https://github.com/kageumi/codex-tools.git"
   },
-  "homepage": "https://github.com/irasutoya/codex-tools#readme",
+  "homepage": "https://github.com/kageumi/codex-tools#readme",
   "bugs": {
-    "url": "https://github.com/irasutoya/codex-tools/issues"
+    "url": "https://github.com/kageumi/codex-tools/issues"
   },
   "engines": {
     "node": ">=24",
@@ -31,6 +31,9 @@
     "format:check": "prettier --check \"src/**/*.{ts,tsx}\" \"scripts/**/*.mjs\" \"*.{json,md,yml}\" \".github/**/*.yml\"",
     "typecheck": "tsc -b",
     "test": "vitest run",
+    "bench": "npm run bench:frontend && npm run bench:backend",
+    "bench:frontend": "vitest bench --run",
+    "bench:backend": "cargo bench --manifest-path src-tauri/Cargo.toml --bench usage_log",
     "rust:format:check": "cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check",
     "rust:lint": "cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --locked -- -D warnings",
     "rust:test": "cargo test --manifest-path src-tauri/Cargo.toml --locked",
@@ -61,6 +64,7 @@
     "@eslint/js": "^10",
     "@tailwindcss/vite": "^4",
     "@tauri-apps/cli": "^2.8.0",
+    "@testing-library/react": "^16.3.3",
     "@types/node": "^24",
     "@types/react": "^19",
     "@types/react-dom": "^19",
@@ -69,6 +73,7 @@
     "eslint-plugin-react-hooks": "^7.1.1",
     "eslint-plugin-react-refresh": "^0.5.2",
     "globals": "^17",
+    "jsdom": "^29.1.1",
     "prettier": "^3.8.3",
     "prettier-plugin-tailwindcss": "^0.8.0",
     "shadcn": "^4.16.1",

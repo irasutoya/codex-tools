@@ -812,6 +812,11 @@ export async function mockCall(
       return []
     case "usage_save_pricing_rule":
       return (args as { input: PricingRule }).input
+    case "settings_save_codex_app_path":
+    case "settings_apply_activation":
+    case "connections_open_login_page":
+    case "usage_delete_pricing_rule":
+      return undefined
     case "usage_reprice":
       return {
         eventsRepriced: 2,
@@ -829,7 +834,9 @@ export async function mockCall(
         message: "Codex 已启动",
       }
     }
-    default:
-      return undefined
+    default: {
+      command satisfies never
+      throw new Error(`未实现的 mock IPC 命令：${String(command)}`)
+    }
   }
 }

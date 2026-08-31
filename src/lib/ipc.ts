@@ -121,6 +121,58 @@ type CallArguments<K extends Command> =
     ? [args?: Exclude<CommandArgs<K>, undefined>]
     : [args: CommandArgs<K>]
 
+const defineCommandInventory = <const Inventory extends readonly Command[]>(
+  inventory: Inventory &
+    (Exclude<Command, Inventory[number]> extends never ? unknown : never)
+) => Object.freeze(inventory)
+
+export const commandInventory = defineCommandInventory([
+  "dashboard_get",
+  "settings_get_overview",
+  "settings_get_diagnostics",
+  "settings_get_codex_app",
+  "settings_save_codex_app_path",
+  "connections_list",
+  "connections_save_provider",
+  "connections_delete_provider",
+  "connections_import_cookie",
+  "connections_login_start",
+  "connections_login_poll",
+  "connections_activate_account",
+  "connections_refresh_login",
+  "connections_update_account_remark",
+  "connections_update_account_remarks",
+  "connections_delete_account",
+  "connections_delete_accounts",
+  "connections_open_login_page",
+  "connections_test_provider",
+  "connections_list_models",
+  "connections_refresh_models",
+  "connections_refresh_quota",
+  "connections_estimate_quota",
+  "connections_refresh_all_quota",
+  "connections_activate",
+  "connections_activate_official",
+  "settings_preview_activation",
+  "settings_apply_activation",
+  "settings_model_unlock_status",
+  "settings_unlock_models",
+  "settings_launch_codex_debug",
+  "sessions_scan",
+  "sessions_repair",
+  "sessions_list",
+  "dashboard_launch",
+  "usage_get_overview",
+  "usage_refresh",
+  "usage_get_trend",
+  "usage_get_official_pricing",
+  "usage_refresh_official_pricing",
+  "usage_list_pricing_rules",
+  "usage_save_pricing_rule",
+  "usage_delete_pricing_rule",
+  "usage_reprice",
+] as const)
+
 const mockMode =
   import.meta.env.DEV &&
   typeof window !== "undefined" &&

@@ -39,10 +39,22 @@ use tauri::{Manager, WindowEvent};
 
 const TRAY_SHOW_ID: &str = "tray_show";
 const TRAY_EXIT_ID: &str = "tray_exit";
-const DEFAULT_WINDOW_WIDTH: f64 = 1180.0;
-const DEFAULT_WINDOW_HEIGHT: f64 = 760.0;
-const MIN_WINDOW_WIDTH: f64 = 360.0;
+const DEFAULT_WINDOW_WIDTH: f64 = 720.0;
+const DEFAULT_WINDOW_HEIGHT: f64 = 520.0;
+const MIN_WINDOW_WIDTH: f64 = 720.0;
 const MIN_WINDOW_HEIGHT: f64 = 520.0;
+
+fn init_tracing() {
+    use tracing_subscriber::{
+        filter::Targets, fmt::format::FmtSpan, layer::SubscriberExt, util::SubscriberInitExt,
+    };
+
+    let filter = Targets::new().with_target("codex_tools_lib", tracing::Level::INFO);
+    let _ = tracing_subscriber::registry()
+        .with(filter)
+        .with(tracing_subscriber::fmt::layer().with_span_events(FmtSpan::CLOSE))
+        .try_init();
+}
 
 /// 启动即执行一次，之后每分钟检查。实际刷新仍由维护器依据账号状态决定，
 /// 因而不会因为轮询而重复消耗轮换型 Refresh Token。
@@ -168,6 +180,8 @@ fn show_main_window(app: &tauri::AppHandle) {
             .title("Codex Tools")
             .inner_size(DEFAULT_WINDOW_WIDTH, DEFAULT_WINDOW_HEIGHT)
             .min_inner_size(MIN_WINDOW_WIDTH, MIN_WINDOW_HEIGHT)
+            .resizable(false)
+            .maximizable(false)
             .general_autofill_enabled(false)
             .build()
     {
@@ -177,6 +191,8 @@ fn show_main_window(app: &tauri::AppHandle) {
 }
 
 pub fn run() {
+    init_tracing();
+    tracing::info!(operation = "startup", "application starting");
     let store = Store::new().expect("无法初始化应用数据");
     let usage_ledger = UsageLedger::open(store.root()).expect("无法初始化本机用量数据库");
     let builder = tauri::Builder::default()
@@ -303,4 +319,23 @@ pub fn run() {
             let _ = app;
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recreated_window_matches_the_declared_main_window() {
+        let config: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        let window = &config["app"]["windows"][0];
+
+        assert_eq!(window["width"].as_f64(), Some(DEFAULT_WINDOW_WIDTH));
+        assert_eq!(window["height"].as_f64(), Some(DEFAULT_WINDOW_HEIGHT));
+        assert_eq!(window["minWidth"].as_f64(), Some(MIN_WINDOW_WIDTH));
+        assert_eq!(window["minHeight"].as_f64(), Some(MIN_WINDOW_HEIGHT));
+        assert_eq!(window["resizable"].as_bool(), Some(false));
+        assert_eq!(window["maximizable"].as_bool(), Some(false));
+    }
 }

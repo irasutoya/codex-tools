@@ -115,6 +115,8 @@ export function UsagePage({
   const [ruleOpen, setRuleOpen] = useState(false)
   const [editingRule, setEditingRule] = useState<PricingRule>()
   const [busy, setBusy] = useState(false)
+  const [pricingMutation, setPricingMutation] = useState<string>()
+  const pricingMutationActive = useRef(false)
   const [officialCatalog, setOfficialCatalog] =
     useState<OfficialPricingCatalog>()
   const [officialPricingError, setOfficialPricingError] = useState<string>()
@@ -314,6 +316,9 @@ export function UsagePage({
   }
 
   const deleteRule = async (id: string) => {
+    if (pricingMutationActive.current) return
+    pricingMutationActive.current = true
+    setPricingMutation(id)
     try {
       await call("usage_delete_pricing_rule", { id })
       setRules((current) => (current ?? []).filter((rule) => rule.id !== id))
@@ -334,6 +339,9 @@ export function UsagePage({
         description: errorMessage(reason),
         type: "error",
       })
+    } finally {
+      pricingMutationActive.current = false
+      if (mounted.current) setPricingMutation(undefined)
     }
   }
 
@@ -381,7 +389,12 @@ export function UsagePage({
 
   if (!overview)
     return (
-      <div className="grid min-h-full grid-rows-[164px_minmax(208px,1fr)] gap-3 px-3 pt-1 pb-3">
+      <div
+        className="grid min-h-full grid-rows-[164px_minmax(208px,1fr)] gap-3 px-3 pt-1 pb-3"
+        role="status"
+        aria-busy="true"
+      >
+        <span className="sr-only">正在读取用量</span>
         <Skeleton className="rounded-2xl" />
         <Skeleton className="rounded-2xl" />
       </div>
@@ -525,7 +538,11 @@ export function UsagePage({
               <TabsTrigger value="pricing">价格规则</TabsTrigger>
             </TabsList>
             {tab === "pricing" && (
-              <Button size="sm" onClick={openNewRule}>
+              <Button
+                size="sm"
+                disabled={Boolean(pricingMutation)}
+                onClick={openNewRule}
+              >
                 <HugeiconsIcon icon={Add01Icon} data-icon="inline-start" />
                 添加规则
               </Button>
@@ -652,6 +669,7 @@ export function UsagePage({
                           size="icon-sm"
                           variant="ghost"
                           aria-label="编辑规则"
+                          disabled={Boolean(pricingMutation)}
                           onClick={() => openEditRule(rule)}
                         >
                           <HugeiconsIcon icon={Edit02Icon} />
@@ -660,9 +678,14 @@ export function UsagePage({
                           size="icon-sm"
                           variant="ghost"
                           aria-label="删除规则"
+                          disabled={Boolean(pricingMutation)}
                           onClick={() => void deleteRule(rule.id)}
                         >
-                          <HugeiconsIcon icon={Delete02Icon} />
+                          {pricingMutation === rule.id ? (
+                            <Spinner />
+                          ) : (
+                            <HugeiconsIcon icon={Delete02Icon} />
+                          )}
                         </Button>
                       </ItemActions>
                     </Item>

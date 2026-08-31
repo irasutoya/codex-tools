@@ -4,6 +4,7 @@ import { errorMessage } from "@/lib/format"
 import type { RequestGate } from "@/lib/request-gate"
 
 type UseAsyncOptions<T> = {
+  clearOnLoad?: boolean
   onError?: (message: string) => void
   onSuccess?: (data: T) => void
   requestGate?: RequestGate
@@ -17,6 +18,7 @@ export function useAsync<T>(
   const [data, setData] = useState<T>()
   const [error, setError] = useState<string>()
   const requestGate = options?.requestGate
+  const clearOnLoad = options?.clearOnLoad
   const notifySuccess = useEffectEvent((next: T) => {
     options?.onSuccess?.(next)
   })
@@ -27,6 +29,10 @@ export function useAsync<T>(
   useEffect(() => {
     let cancelled = false
     const request = requestGate?.begin()
+    if (clearOnLoad) {
+      setData(undefined)
+      setError(undefined)
+    }
     void fetcher()
       .then((next) => {
         if (
@@ -55,7 +61,7 @@ export function useAsync<T>(
       cancelled = true
       if (request !== undefined) requestGate?.finish(request)
     }
-  }, [fetcher, reloadKey, requestGate])
+  }, [clearOnLoad, fetcher, reloadKey, requestGate])
 
   const mutate = useCallback((next: T | ((current: T | undefined) => T)) => {
     setData((current) => {

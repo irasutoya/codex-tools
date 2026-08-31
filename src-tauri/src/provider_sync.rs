@@ -12,12 +12,16 @@ use std::{
     fs,
     io::{BufRead, Read},
     path::{Path, PathBuf},
+    sync::atomic::{AtomicUsize, Ordering},
     time::Instant,
 };
 use walkdir::WalkDir;
 
 const MAX_ROLLOUT_SCAN_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_REPAIR_ROLLOUT_BYTES: u64 = 256 * 1024 * 1024;
+// Each planner can hold both the original and repaired rollout. Keep the cap
+// stricter than available_parallelism so preflight memory remains predictable.
+const MAX_REPAIR_WORKERS: usize = 4;
 const MAX_REPAIR_WARNINGS: usize = 100;
 const MAX_WARNING_CHARS: usize = 1_000;
 // v3 invalidates entries produced by the former rewrite-and-clear-projection
@@ -26,6 +30,12 @@ const MAX_WARNING_CHARS: usize = 1_000;
 const MANIFEST_VERSION: u32 = 3;
 const MANIFEST_PREFIX_BYTES: usize = 4 * 1024;
 const THREAD_HISTORY_FILE: &str = "thread_history_1.sqlite";
+
+fn repair_worker_count(file_count: usize, available_parallelism: usize) -> usize {
+    file_count
+        .min(available_parallelism.max(1))
+        .min(MAX_REPAIR_WORKERS)
+}
 
 /// 修复引擎唯一接受的路由目标。两个变体都表示清除会话模型覆盖，让 Codex
 /// 继承刚刚激活的连接的当前默认模型；不把任何历史 model 名称带到新上游。
@@ -537,7 +547,7 @@ pub(crate) fn repair_after_connection_switch_preserving_history_with_guard_at_wi
     };
 
     // ---- 只读预检：任一 rollout / 数据库无法确认可修复即整体终止 ----
-    // 并行读取+解析各 rollout 文件，减少 I/O 等待时间。
+    // 有界并行读取+解析各 rollout 文件，避免大量会话耗尽线程或内存。
     let mut manifest_entries: HashMap<&str, Vec<&SessionRepairManifestEntry>> = HashMap::new();
     for entry in &manifest.entries {
         manifest_entries
@@ -545,37 +555,54 @@ pub(crate) fn repair_after_connection_switch_preserving_history_with_guard_at_wi
             .or_default()
             .push(entry);
     }
-    let planned: Vec<(PathBuf, PlannedRollout)> = std::thread::scope(|s| {
-        let handles: Vec<_> = rollouts
-            .iter()
-            .map(|path| {
-                let path = path.clone();
+    let next_rollout = AtomicUsize::new(0);
+    let available_parallelism = std::thread::available_parallelism()
+        .map(|parallelism| parallelism.get())
+        .unwrap_or(1);
+    let worker_count = repair_worker_count(rollouts.len(), available_parallelism);
+    let planned: Vec<(PathBuf, PlannedRollout)> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..worker_count)
+            .map(|_| {
                 let manifest_entries = &manifest_entries;
-                s.spawn(move || {
-                    let path_key = path.to_string_lossy();
-                    let entries = manifest_entries
-                        .get(path_key.as_ref())
-                        .map(Vec::as_slice)
-                        .unwrap_or_default();
-                    let result =
-                        plan_rollout(&path, target_provider, entries).map_err(|error| {
-                            AppError::Internal(format!("会话文件 {}：{error}", path.display()))
-                        })?;
-                    Ok::<_, AppError>((path, result))
+                let rollouts = &rollouts;
+                let next_rollout = &next_rollout;
+                scope.spawn(move || {
+                    let mut results = Vec::new();
+                    loop {
+                        let index = next_rollout.fetch_add(1, Ordering::Relaxed);
+                        let Some(path) = rollouts.get(index) else {
+                            break;
+                        };
+                        let path_key = path.to_string_lossy();
+                        let entries = manifest_entries
+                            .get(path_key.as_ref())
+                            .map(Vec::as_slice)
+                            .unwrap_or_default();
+                        let result = plan_rollout(path, target_provider, entries)
+                            .map(|plan| (path.clone(), plan))
+                            .map_err(|error| {
+                                AppError::Internal(format!("会话文件 {}：{error}", path.display()))
+                            });
+                        results.push((index, result));
+                    }
+                    results
                 })
             })
             .collect();
-        let mut results = Vec::with_capacity(handles.len());
+        let mut indexed = Vec::with_capacity(rollouts.len());
         for handle in handles {
             match handle.join() {
-                Ok(Ok(result)) => results.push(result),
-                Ok(Err(error)) => return Err(error),
+                Ok(results) => indexed.extend(results),
                 Err(error) => {
                     return Err(AppError::Internal(format!("会话修复线程异常：{error:?}")));
                 }
             }
         }
-        Ok(results)
+        indexed.sort_by_key(|(index, _)| *index);
+        indexed
+            .into_iter()
+            .map(|(_, result)| result)
+            .collect::<Result<Vec<_>, _>>()
     })?;
     let mut repair_plans: Vec<RolloutPlan> = Vec::new();
     let mut cached_entries: Vec<SessionRepairManifestEntry> = Vec::new();
@@ -641,9 +668,11 @@ pub(crate) fn repair_after_connection_switch_preserving_history_with_guard_at_wi
         let expected_rollouts = repair_plans
             .iter()
             .filter_map(|plan| match plan {
-                RolloutPlan::Repair { path, repaired, .. } => {
-                    Some((path.clone(), repaired.clone()))
-                }
+                RolloutPlan::Repair {
+                    path,
+                    repaired_sha256,
+                    ..
+                } => Some((path.clone(), repaired_sha256.clone())),
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -657,10 +686,10 @@ pub(crate) fn repair_after_connection_switch_preserving_history_with_guard_at_wi
             for plan in repair_plans.drain(..) {
                 let RolloutPlan::Repair {
                     path,
-                    original,
-                    repaired,
                     original_sha256,
+                    repaired_sha256,
                     meta_count,
+                    session_meta_count,
                     ..
                 } = plan
                 else {
@@ -669,12 +698,20 @@ pub(crate) fn repair_after_connection_switch_preserving_history_with_guard_at_wi
                 if !may_write()? {
                     anyhow::bail!("Codex 已重新运行或修复目标已变化，切换已终止并回滚。");
                 }
-                if file_sha256(&path)? != original_sha256 {
+                let analysis = analyze_rollout_metadata_in_place(&path, target_provider)?;
+                let Some(write) = analysis.write else {
+                    anyhow::bail!("Codex 正在更新会话 {}，切换已终止并回滚。", path.display());
+                };
+                if write.original_sha256 != original_sha256
+                    || file_sha256_bytes(&write.repaired) != repaired_sha256
+                    || write.meta_count != meta_count
+                    || analysis.session_meta_count != session_meta_count
+                {
                     anyhow::bail!("Codex 正在更新会话 {}，切换已终止并回滚。", path.display());
                 }
-                backup.add_bytes(&path, &original)?;
+                backup.add_bytes(&path, &write.original)?;
                 backed_paths.insert(path.clone());
-                if !atomic_write_if_unchanged(&path, &original, &repaired)? {
+                if !atomic_write_if_unchanged(&path, &write.original, &write.repaired)? {
                     anyhow::bail!("Codex 正在更新会话 {}，切换已终止并回滚。", path.display());
                 }
                 result.files_modified += 1;
@@ -716,10 +753,11 @@ pub(crate) fn repair_after_connection_switch_preserving_history_with_guard_at_wi
                         anyhow::bail!("Codex 已重新运行或修复目标已变化，历史恢复已终止并回滚。");
                     }
                     let current = fs::read(&plan.path)?;
-                    if file_sha256_bytes(&current) != plan.original_sha256
-                        && !expected_rollouts
-                            .iter()
-                            .any(|(path, expected)| path == &plan.path && expected == &current)
+                    let current_sha256 = file_sha256_bytes(&current);
+                    if current_sha256 != plan.original_sha256
+                        && !expected_rollouts.iter().any(|(path, expected)| {
+                            path == &plan.path && expected == &current_sha256
+                        })
                     {
                         anyhow::bail!(
                             "Codex 正在更新会话 {}，历史恢复已终止并回滚。",
@@ -1374,9 +1412,8 @@ fn plan_rollout(
         plan: match analysis.write {
             Some(write) => RolloutPlan::Repair {
                 path: path.to_path_buf(),
-                original: write.original,
-                repaired: write.repaired,
                 original_sha256: write.original_sha256,
+                repaired_sha256: file_sha256_bytes(&write.repaired),
                 meta_count: write.meta_count,
                 session_meta_count: analysis.session_meta_count,
             },
@@ -1396,9 +1433,8 @@ enum RolloutPlan {
     },
     Repair {
         path: PathBuf,
-        original: Vec<u8>,
-        repaired: Vec<u8>,
         original_sha256: String,
+        repaired_sha256: String,
         meta_count: usize,
         session_meta_count: usize,
     },
@@ -1506,13 +1542,13 @@ impl RepairBackup {
 }
 
 fn verify_repair_commit(
-    expected_rollouts: &[(PathBuf, Vec<u8>)],
+    expected_rollouts: &[(PathBuf, String)],
     database_plans: &[(PathBuf, usize, String)],
     target: &str,
     scope: &SessionScope,
 ) -> anyhow::Result<()> {
-    for (path, expected) in expected_rollouts {
-        if fs::read(path)? != *expected {
+    for (path, expected_sha256) in expected_rollouts {
+        if file_sha256(path)? != *expected_sha256 {
             anyhow::bail!("会话文件 {} 在写入后发生变化", path.display());
         }
         verify_rollout_route(path, target)?;
@@ -2184,6 +2220,75 @@ fn finish_warnings(warnings: &mut Vec<String>, omitted: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{BufWriter, Seek, Write};
+
+    #[test]
+    fn repair_workers_are_bounded_by_files_parallelism_and_cap() {
+        assert_eq!(repair_worker_count(0, 16), 0);
+        assert_eq!(repair_worker_count(2, 16), 2);
+        assert_eq!(repair_worker_count(100, 2), 2);
+        assert_eq!(repair_worker_count(100, 16), MAX_REPAIR_WORKERS);
+    }
+
+    #[test]
+    #[ignore = "manual provider repair resource measurement"]
+    fn measure_synthetic_provider_repair() {
+        let mode = std::env::var("CODEX_TOOLS_PROVIDER_REPAIR_MODE")
+            .expect("CODEX_TOOLS_PROVIDER_REPAIR_MODE must be setup or run");
+        let scenario = std::env::var("CODEX_TOOLS_PROVIDER_REPAIR_SCENARIO")
+            .expect("CODEX_TOOLS_PROVIDER_REPAIR_SCENARIO must be large or small");
+        let home = PathBuf::from(
+            std::env::var_os("CODEX_TOOLS_PROVIDER_REPAIR_HOME")
+                .expect("CODEX_TOOLS_PROVIDER_REPAIR_HOME must be set"),
+        );
+        let (file_count, file_bytes) = match scenario.as_str() {
+            "large" => (100, 4 * 1024 * 1024),
+            "small" => (10_000, 1024),
+            _ => panic!("unknown provider repair scenario: {scenario}"),
+        };
+
+        if mode == "setup" {
+            assert!(!home.exists(), "fixture home must not already exist");
+            let sessions = home.join("sessions");
+            fs::create_dir_all(&sessions).unwrap();
+            let filler = b"{\"type\":\"event_msg\",\"payload\":{\"type\":\"note\",\"message\":\"synthetic\"}}\n";
+            for index in 0..file_count {
+                let path = sessions.join(format!("rollout-{index:05}.jsonl"));
+                let file = fs::File::create(path).unwrap();
+                let mut writer = BufWriter::new(file);
+                writeln!(
+                    writer,
+                    "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"synthetic-{index:05}\",\"model_provider\":\"openai\"}}}}"
+                )
+                .unwrap();
+                while writer.stream_position().unwrap() < file_bytes {
+                    writer.write_all(filler).unwrap();
+                }
+            }
+            println!(
+                "prepared scenario={scenario} files={file_count} target_bytes_per_file={file_bytes}"
+            );
+            return;
+        }
+        assert_eq!(mode, "run", "unknown provider repair measurement mode");
+
+        let started = Instant::now();
+        let (result, _) =
+            repair_after_connection_switch_preserving_history_with_guard_at_with_paths(
+                &home,
+                "custom",
+                Some(&home.join("measurement-manifest.json")),
+                || Ok(true),
+            )
+            .unwrap();
+        assert_eq!(result.files_scanned, file_count);
+        assert_eq!(result.files_modified, file_count);
+        println!(
+            "measured scenario={scenario} files={file_count} engine_elapsed_ms={} wall_elapsed_ms={}",
+            result.elapsed_ms,
+            started.elapsed().as_millis()
+        );
+    }
 
     #[cfg(windows)]
     #[test]
@@ -2466,6 +2571,44 @@ mod tests {
 
         assert!(error.to_string().contains("切换已终止"));
         assert_eq!(fs::read_to_string(rollout).unwrap(), original);
+    }
+
+    #[test]
+    fn repair_preserves_a_rollout_changed_after_preflight() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex");
+        fs::create_dir_all(home.join("sessions")).unwrap();
+        let rollout = home.join("sessions/rollout.jsonl");
+        fs::write(
+            &rollout,
+            format!(
+                "{}\n",
+                serde_json::json!({"type":"session_meta","payload":{"id":"concurrent","model_provider":"openai"}})
+            ),
+        )
+        .unwrap();
+        let concurrent = format!(
+            "{}\n",
+            serde_json::json!({"type":"session_meta","payload":{"id":"concurrent","model_provider":"openai","external":true}})
+        );
+        let mut guard_calls = 0;
+
+        let error = repair_after_connection_switch_preserving_history_with_guard_at(
+            &home,
+            "custom",
+            Some(&temp.path().join("manifest.json")),
+            || {
+                guard_calls += 1;
+                if guard_calls == 1 {
+                    fs::write(&rollout, &concurrent).unwrap();
+                }
+                Ok(true)
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("正在更新会话"));
+        assert_eq!(fs::read_to_string(rollout).unwrap(), concurrent);
     }
 
     #[test]

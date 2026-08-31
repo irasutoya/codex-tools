@@ -1,4 +1,7 @@
-use crate::{json_store::JsonStore, models::*};
+use crate::{
+    json_store::{JsonStore, sync_parent_directory},
+    models::*,
+};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -11,6 +14,10 @@ use std::{
 const MAX_SAVED_PROVIDERS: usize = 500;
 pub(crate) const MAX_SAVED_OPENAI_ACCOUNTS: usize = 500;
 const MAX_EMAIL_CHARS: usize = 320;
+const STATE_TRANSACTION_FILE: &str = "state-transaction.json";
+const COMPLETED_STATE_TRANSACTION_FILE: &str = ".state-transaction.completed";
+const STATE_TRANSACTION_VERSION: u32 = 1;
+const MAX_STATE_TRANSACTION_BYTES: u64 = 129 * 1024 * 1024;
 #[cfg(test)]
 const MAX_APP_DATA_BYTES: u64 = 32 * 1024 * 1024;
 
@@ -41,6 +48,16 @@ struct CredentialsFile {
     provider_api_keys: BTreeMap<String, String>,
     #[serde(default)]
     provider_headers: BTreeMap<String, BTreeMap<String, String>>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StateTransaction {
+    version: u32,
+    app: AppFile,
+    connections: ConnectionsFile,
+    credentials: CredentialsFile,
+    deletion_tombstones: DeletionTombstones,
 }
 
 pub struct Store {
@@ -101,6 +118,7 @@ impl Store {
     pub fn open(root: PathBuf) -> anyhow::Result<Self> {
         fs::create_dir_all(&root)?;
         secure_directory(&root)?;
+        recover_state_transaction(&root)?;
         let path = root.join("app.json");
         let connections_path = root.join("connections.json");
         let credentials_path = root.join("credentials.json");
@@ -126,6 +144,7 @@ impl Store {
         );
         if requires_persist || files_incomplete {
             persist_files(
+                &root,
                 &path,
                 &connections_path,
                 &credentials_path,
@@ -249,22 +268,13 @@ impl Store {
         let mut draft = current.clone();
         let result = mutate(&mut draft)?;
         if let Err(error) = persist_files(
+            &self.root,
             &self.path,
             &self.connections_path,
             &self.credentials_path,
             &self.tombstones_path,
             &draft,
         ) {
-            // persist_files 依次替换四个 JSON；后续文件失败时，前面的文件
-            // 可能已写入候选状态。在同一持久化锁内尽力恢复当前快照，
-            // 并始终把最初的持久化错误返回给调用方。
-            let _ = persist_files(
-                &self.path,
-                &self.connections_path,
-                &self.credentials_path,
-                &self.tombstones_path,
-                &current,
-            );
             return Err(AppError::Internal(error.to_string()));
         }
 
@@ -1243,12 +1253,56 @@ fn preserve_redacted_headers(
 }
 
 fn persist_files(
+    root: &Path,
     app_path: &Path,
     connections_path: &Path,
     credentials_path: &Path,
     tombstones_path: &Path,
     state: &AppConfig,
 ) -> anyhow::Result<()> {
+    let result = persist_files_with_hook(
+        root,
+        app_path,
+        connections_path,
+        credentials_path,
+        tombstones_path,
+        state,
+        |_| Ok(()),
+    );
+    if let Err(commit_error) = result {
+        if root.join(STATE_TRANSACTION_FILE).exists() {
+            return recover_state_transaction(root).map_err(|recovery_error| {
+                anyhow::anyhow!(
+                    "状态事务提交失败且无法恢复：{commit_error}（恢复错误：{recovery_error}）"
+                )
+            });
+        }
+        return Err(commit_error);
+    }
+    Ok(())
+}
+
+fn persist_files_with_hook(
+    root: &Path,
+    app_path: &Path,
+    connections_path: &Path,
+    credentials_path: &Path,
+    tombstones_path: &Path,
+    state: &AppConfig,
+    mut after_file: impl FnMut(usize) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    ensure_state_paths(
+        root,
+        app_path,
+        connections_path,
+        credentials_path,
+        tombstones_path,
+    )?;
+    let completed = root.join(COMPLETED_STATE_TRANSACTION_FILE);
+    if completed.exists() {
+        fs::remove_file(&completed)?;
+        sync_parent_directory(&completed)?;
+    }
     let app = AppFile {
         codex: state.codex.clone(),
         active: state.active.clone(),
@@ -1279,10 +1333,101 @@ fn persist_files(
         official_accounts: state.official_accounts.clone(),
         credential_refresh: state.credential_refresh.clone(),
     };
-    JsonStore::write_atomic(app_path, &app)?;
-    JsonStore::write_atomic(connections_path, &connections)?;
-    JsonStore::write_atomic(credentials_path, &credentials)?;
-    JsonStore::write_atomic(tombstones_path, &state.deletion_tombstones)?;
+    let transaction = StateTransaction {
+        version: STATE_TRANSACTION_VERSION,
+        app,
+        connections,
+        credentials,
+        deletion_tombstones: state.deletion_tombstones.clone(),
+    };
+    JsonStore::write_atomic(&root.join(STATE_TRANSACTION_FILE), &transaction)?;
+    after_file(0)?;
+    apply_state_transaction(root, &transaction, &mut after_file)?;
+    clear_state_transaction(root, &mut after_file)?;
+    Ok(())
+}
+
+fn ensure_state_paths(
+    root: &Path,
+    app_path: &Path,
+    connections_path: &Path,
+    credentials_path: &Path,
+    tombstones_path: &Path,
+) -> anyhow::Result<()> {
+    for (actual, expected) in [
+        (app_path, root.join("app.json")),
+        (connections_path, root.join("connections.json")),
+        (credentials_path, root.join("credentials.json")),
+        (tombstones_path, root.join("deletion_tombstones.json")),
+    ] {
+        if actual != expected {
+            anyhow::bail!("状态文件路径不在应用数据目录中：{}", actual.display());
+        }
+    }
+    Ok(())
+}
+
+fn apply_state_transaction(
+    root: &Path,
+    transaction: &StateTransaction,
+    after_file: &mut impl FnMut(usize) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    if transaction.version != STATE_TRANSACTION_VERSION {
+        anyhow::bail!("不支持的状态事务版本：{}", transaction.version);
+    }
+    JsonStore::write_atomic(&root.join("app.json"), &transaction.app)?;
+    after_file(1)?;
+    JsonStore::write_atomic(&root.join("connections.json"), &transaction.connections)?;
+    after_file(2)?;
+    JsonStore::write_atomic(&root.join("credentials.json"), &transaction.credentials)?;
+    after_file(3)?;
+    JsonStore::write_atomic(
+        &root.join("deletion_tombstones.json"),
+        &transaction.deletion_tombstones,
+    )?;
+    after_file(4)?;
+    Ok(())
+}
+
+fn recover_state_transaction(root: &Path) -> anyhow::Result<()> {
+    let completed = root.join(COMPLETED_STATE_TRANSACTION_FILE);
+    if completed.exists() && fs::remove_file(&completed).is_ok() {
+        let _ = sync_parent_directory(&completed);
+    }
+    let journal = root.join(STATE_TRANSACTION_FILE);
+    if !journal.exists() {
+        return Ok(());
+    }
+    if fs::metadata(&journal)?.len() > MAX_STATE_TRANSACTION_BYTES {
+        anyhow::bail!("状态事务文件超过 129 MB，拒绝恢复");
+    }
+    let transaction = serde_json::from_slice::<StateTransaction>(&fs::read(&journal)?)
+        .map_err(|error| anyhow::anyhow!("状态事务文件损坏：{error}"))?;
+    apply_state_transaction(root, &transaction, &mut |_| Ok(()))?;
+    clear_state_transaction(root, &mut |_| Ok(()))
+}
+
+fn clear_state_transaction(
+    root: &Path,
+    after_file: &mut impl FnMut(usize) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    let journal = root.join(STATE_TRANSACTION_FILE);
+    if !journal.exists() {
+        return Ok(());
+    }
+    let completed = root.join(COMPLETED_STATE_TRANSACTION_FILE);
+    if completed.exists() {
+        fs::remove_file(&completed)?;
+    }
+    replace_file(&journal, &completed)?;
+    after_file(5)?;
+    // Renaming the journal is the commit point. Cleanup failures after this
+    // leave only an idempotent completion marker and must not stale memory.
+    let _ = sync_parent_directory(&completed);
+    if fs::remove_file(&completed).is_ok() {
+        let _ = sync_parent_directory(&completed);
+    }
+    after_file(6)?;
     Ok(())
 }
 
@@ -1715,6 +1860,7 @@ fn replace_temporary(temporary: &Path, path: &Path) -> anyhow::Result<()> {
         let _ = fs::remove_file(temporary);
         return Err(error);
     }
+    sync_parent_directory(path)?;
     Ok(())
 }
 
@@ -1801,6 +1947,19 @@ mod tests {
         let error = Store::open(temp.path().to_path_buf()).err().unwrap();
 
         assert!(error.to_string().contains("超过 32 MB"));
+    }
+
+    #[test]
+    fn rejects_oversized_state_transaction_before_parsing() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = temp.path().join(STATE_TRANSACTION_FILE);
+        let file = fs::File::create(journal).unwrap();
+        file.set_len(MAX_STATE_TRANSACTION_BYTES + 1).unwrap();
+
+        let error = Store::open(temp.path().to_path_buf()).err().unwrap();
+
+        assert!(error.to_string().contains("状态事务文件超过 129 MB"));
+        assert!(!temp.path().join("app.json").exists());
     }
 
     fn official_account(account_id: &str, suffix: &str) -> StoredOfficialAccount {
@@ -3518,6 +3677,93 @@ mod tests {
     }
 
     #[test]
+    fn interrupted_state_commit_reopens_as_the_complete_new_generation() {
+        for interrupted_after in 0..=6 {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join(format!("fault-{interrupted_after}"));
+            let store = Store::open(root.clone()).unwrap();
+            store
+                .connections_save_provider(provider("transaction"))
+                .unwrap();
+            let mut draft = store.snapshot().unwrap();
+            draft.codex.home = "/synthetic/new-home".into();
+            draft.providers[0].base_url = "https://new.example.test/v1".into();
+            draft.providers[0].api_key = Some("new-secret".into());
+            draft
+                .deletion_tombstones
+                .provider_ids
+                .insert("previously-deleted".into());
+
+            let error = persist_files_with_hook(
+                &root,
+                &root.join("app.json"),
+                &root.join("connections.json"),
+                &root.join("credentials.json"),
+                &root.join("deletion_tombstones.json"),
+                &draft,
+                |completed| {
+                    if completed == interrupted_after {
+                        anyhow::bail!("injected process interruption");
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("injected process interruption"));
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                for path in [
+                    root.join(STATE_TRANSACTION_FILE),
+                    root.join(COMPLETED_STATE_TRANSACTION_FILE),
+                ] {
+                    if path.exists() {
+                        assert_eq!(
+                            fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                            0o600
+                        );
+                    }
+                }
+            }
+
+            let reopened = Store::open(root.clone()).unwrap();
+            let provider = reopened.provider("transaction").unwrap();
+            assert_eq!(provider.base_url, "https://new.example.test/v1");
+            assert_eq!(provider.api_key.as_deref(), Some("new-secret"));
+            assert_eq!(
+                reopened.snapshot().unwrap().codex.home,
+                "/synthetic/new-home"
+            );
+            assert!(
+                reopened
+                    .snapshot()
+                    .unwrap()
+                    .deletion_tombstones
+                    .provider_ids
+                    .contains("previously-deleted")
+            );
+            assert!(!root.join("state-transaction.json").exists());
+            for name in [
+                "app.json",
+                "connections.json",
+                "credentials.json",
+                "deletion_tombstones.json",
+            ] {
+                let path = root.join(name);
+                serde_json::from_slice::<serde_json::Value>(&fs::read(&path).unwrap()).unwrap();
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    assert_eq!(
+                        fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                        0o600
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn failed_persist_leaves_memory_unchanged_and_returns_error() {
         let temp = tempfile::tempdir().unwrap();
         let mut store = Store::open(temp.path().to_path_buf()).unwrap();
@@ -3536,6 +3782,24 @@ mod tests {
             store.read(|state| state.codex.home.clone()).unwrap(),
             original_home
         );
+    }
+
+    #[test]
+    fn stale_completion_marker_cannot_validate_a_later_update() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        let store = Store::open(root.clone()).unwrap();
+        let original_home = store.snapshot().unwrap().codex.home;
+        fs::create_dir(root.join(COMPLETED_STATE_TRANSACTION_FILE)).unwrap();
+
+        let result = store.update(|state| {
+            state.codex.home = "/must-not-commit".into();
+            Ok(())
+        });
+
+        assert!(result.is_err());
+        assert_eq!(store.snapshot().unwrap().codex.home, original_home);
+        assert!(!root.join(STATE_TRANSACTION_FILE).exists());
     }
 
     #[test]

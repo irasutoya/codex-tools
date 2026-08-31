@@ -18,6 +18,7 @@
 //! 上游流停滞过久转成明确的 response.failed 事件；上游忽略 stream=true
 //! 直接返回 JSON 时合成等价的 SSE 流；下游长时间无事件时发送心跳注释行保活。
 
+mod reasoning_store;
 mod sse;
 
 use crate::{
@@ -40,13 +41,16 @@ use futures_util::StreamExt;
 use serde_json::{Map, Value, json};
 use std::{
     borrow::Cow,
-    collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, HashSet},
     sync::Arc,
     time::Duration,
 };
 use tokio::sync::{Mutex, oneshot};
 
-use self::sse::{SseEventParser, utf8_lossy_slice};
+use self::{
+    reasoning_store::ReasoningStore,
+    sse::{SseEventParser, utf8_lossy_slice},
+};
 
 /// 本机转换代理的监听地址（只允许本机访问）。
 pub(crate) const PROXY_HOST: &str = "127.0.0.1";
@@ -274,73 +278,6 @@ struct ProxyState {
     config: Arc<ProxyConfigSlot>,
     client: ProxyClient,
     proxy_authorization: HeaderValue,
-}
-
-/// 有界的 reasoning_content 存储：条目 id → 思考内容。
-/// 只保留最近若干轮，超限时淘汰最早的条目。
-#[derive(Default)]
-struct ReasoningStore {
-    entries: HashMap<String, Arc<str>>,
-    order: VecDeque<String>,
-    ambiguous_call_ids: HashSet<String>,
-}
-
-impl ReasoningStore {
-    const MAX_ENTRIES: usize = 2000;
-    const MAX_CONTENT_BYTES: usize = 1024 * 1024;
-
-    #[cfg(test)]
-    fn insert(&mut self, id: &str, content: &str) {
-        if content.trim().is_empty() {
-            return;
-        }
-        self.insert_shared(id, Self::bounded_content(content));
-    }
-
-    fn bounded_content(content: &str) -> Arc<str> {
-        if content.len() <= Self::MAX_CONTENT_BYTES {
-            Arc::<str>::from(content)
-        } else {
-            let mut end = Self::MAX_CONTENT_BYTES;
-            while !content.is_char_boundary(end) {
-                end -= 1;
-            }
-            Arc::<str>::from(&content[..end])
-        }
-    }
-
-    fn insert_shared(&mut self, id: &str, content: Arc<str>) {
-        if self.entries.contains_key(id) {
-            self.entries.insert(id.to_owned(), content);
-            return;
-        }
-        if self.entries.len() >= Self::MAX_ENTRIES {
-            if let Some(oldest) = self.order.pop_front() {
-                self.entries.remove(&oldest);
-            }
-        }
-        let owned_id = id.to_owned();
-        self.entries.insert(owned_id.clone(), content);
-        self.order.push_back(owned_id);
-    }
-
-    fn insert_call_alias(&mut self, call_id: &str, content: Arc<str>) {
-        if self.ambiguous_call_ids.contains(call_id) {
-            return;
-        }
-        if let Some(existing) = self.entries.get(call_id)
-            && existing.as_ref() != content.as_ref()
-        {
-            self.entries.remove(call_id);
-            self.ambiguous_call_ids.insert(call_id.to_owned());
-            return;
-        }
-        self.insert_shared(call_id, content);
-    }
-
-    fn get(&self, id: &str) -> Option<&str> {
-        self.entries.get(id).map(AsRef::as_ref)
-    }
 }
 
 /// 跟随系统代理变化的独立网络客户端（不设置整体超时，允许长时间流式响应）。
@@ -1688,19 +1625,7 @@ fn reasoning_lookup_for_body(
     let store = store
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let entries = ids
-        .into_iter()
-        .filter_map(|id| {
-            store
-                .entries
-                .get(id)
-                .map(|content| (id.to_owned(), content.clone()))
-        })
-        .collect();
-    ReasoningStore {
-        entries,
-        ..ReasoningStore::default()
-    }
+    store.subset(ids)
 }
 
 /// 把 Chat 请求里的 `response_format`（json_schema）降级为系统提示词指令，

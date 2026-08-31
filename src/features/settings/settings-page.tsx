@@ -53,6 +53,8 @@ import { errorMessage } from "@/lib/format"
 import { writeClipboardText } from "@/lib/clipboard"
 import { useAsyncAction } from "@/hooks/use-async-action"
 import { call } from "@/lib/ipc"
+import { createRequestGate } from "@/lib/request-gate"
+import type { RequestGate } from "@/lib/request-gate"
 import type {
   CodexAppSetting,
   ConfigPatchPreview,
@@ -75,7 +77,11 @@ export function SettingsPage({
   const [app, setApp] = useState<CodexAppSetting>()
   const [unlock, setUnlock] = useState<ModelUnlockStatus>()
   const [diagnostics, setDiagnostics] = useState<SupportDiagnostics>()
-  const [preview, setPreview] = useState<ConfigPatchPreview>()
+  const [preview, setPreview] = useState<{
+    value: ConfigPatchPreview
+    request: ReturnType<RequestGate["begin"]>
+  }>()
+  const [previewRequests] = useState(createRequestGate)
   const { busy, begin, end, run } = useAsyncAction()
   const [loadError, setLoadError] = useState<{
     section: SettingsSection
@@ -83,6 +89,7 @@ export function SettingsPage({
   }>()
 
   useEffect(() => {
+    previewRequests.invalidate()
     let cancelled = false
     const request =
       section === "diagnostics"
@@ -125,19 +132,27 @@ export function SettingsPage({
     return () => {
       cancelled = true
     }
-  }, [refreshRevision, section])
+  }, [previewRequests, refreshRevision, section])
 
   const onPreview = async () => {
     if (!begin("preview")) return
+    const request = previewRequests.begin()
+    let retained = false
     try {
-      setPreview(await call("settings_preview_activation"))
+      const next = await call("settings_preview_activation")
+      if (previewRequests.isCurrent(request)) {
+        setPreview({ value: next, request })
+        retained = true
+      }
     } catch (reason) {
+      if (!previewRequests.isCurrent(request)) return
       toast.add({
         title: "无法生成预览",
         description: errorMessage(reason),
         type: "error",
       })
     } finally {
+      if (!retained) previewRequests.finish(request)
       end("preview")
     }
   }
@@ -149,6 +164,16 @@ export function SettingsPage({
     (section === "unlock" && !unlock)
 
   const sectionError = loadError?.section === section ? loadError.message : null
+  const activePreview =
+    section === "config" &&
+    preview &&
+    previewRequests.isCurrent(preview.request)
+      ? preview.value
+      : undefined
+  const closePreview = () => {
+    if (preview) previewRequests.finish(preview.request)
+    setPreview(undefined)
+  }
 
   if (loading && sectionError)
     return (
@@ -163,7 +188,8 @@ export function SettingsPage({
 
   if (loading)
     return (
-      <div className="min-h-full px-3 pt-1 pb-3">
+      <div className="min-h-full px-3 pt-1 pb-3" role="status" aria-busy="true">
+        <span className="sr-only">正在读取设置</span>
         <Skeleton className="min-h-full rounded-2xl" />
       </div>
     )
@@ -229,10 +255,10 @@ export function SettingsPage({
       )}
 
       <Dialog
-        open={Boolean(preview)}
+        open={Boolean(activePreview)}
         onOpenChange={(open) => {
           if (!open && busy === "apply") return
-          setPreview(undefined)
+          closePreview()
         }}
       >
         <DialogContent
@@ -241,41 +267,41 @@ export function SettingsPage({
         >
           <DialogHeader>
             <DialogTitle>配置变更预览</DialogTitle>
-            <DialogDescription>{preview?.targetPath}</DialogDescription>
+            <DialogDescription>{activePreview?.targetPath}</DialogDescription>
           </DialogHeader>
           <DialogBody className="grid gap-2">
-            {preview?.changes.map((change) => (
+            {activePreview?.changes.map((change) => (
               <div key={change} className="rounded-2xl bg-muted px-3 py-2">
                 {change}
               </div>
             ))}
             <pre className="max-h-56 overflow-auto rounded-2xl bg-muted p-3 text-xs whitespace-pre-wrap">
-              {preview?.rendered}
+              {activePreview?.rendered}
             </pre>
           </DialogBody>
           <DialogFooter>
             <Button
               variant="outline"
               disabled={busy === "apply"}
-              onClick={() => setPreview(undefined)}
+              onClick={closePreview}
             >
               取消
             </Button>
             <Button
               disabled={Boolean(busy)}
               onClick={() =>
-                preview &&
+                activePreview &&
                 void run(
                   "apply",
                   () =>
                     call("settings_apply_activation", {
-                      operationId: preview.operationId,
+                      operationId: activePreview.operationId,
                     }),
                   {
                     success: "配置已应用",
                     onSuccess: () => {
                       onRefresh()
-                      setPreview(undefined)
+                      closePreview()
                     },
                   }
                 )

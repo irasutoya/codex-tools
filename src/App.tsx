@@ -189,38 +189,49 @@ export default function App() {
     if (!sharedStateActive) return
     if (loadedStateRevision.current === refreshRevision) return
     let cancelled = false
-    void Promise.all([call("dashboard_get"), call("connections_list")])
-      .then(([nextDashboard, nextConnections]) => {
+    void Promise.allSettled([call("dashboard_get"), call("connections_list")])
+      .then(([dashboardResult, connectionsResult]) => {
         if (cancelled) return
-        setDashboard(nextDashboard)
-        setConnections(nextConnections)
-        loadedStateRevision.current = refreshRevision
-        setStateError(undefined)
-        setSelectedConnection((current) => {
-          const allConnections = [
-            ...nextConnections.officialAccounts,
-            ...nextConnections.providers,
-          ]
-          if (current && allConnections.some((item) => item.id === current)) {
-            return current
-          }
-          return (
-            nextConnections.officialAccounts.find((account) => account.active)
-              ?.id ??
-            nextConnections.providers.find((provider) => provider.active)?.id ??
-            allConnections[0]?.id
+        if (dashboardResult.status === "fulfilled") {
+          setDashboard(dashboardResult.value)
+        }
+        if (connectionsResult.status === "fulfilled") {
+          const nextConnections = connectionsResult.value
+          setConnections(nextConnections)
+          setSelectedConnection((current) => {
+            const allConnections = [
+              ...nextConnections.officialAccounts,
+              ...nextConnections.providers,
+            ]
+            if (current && allConnections.some((item) => item.id === current)) {
+              return current
+            }
+            return (
+              nextConnections.officialAccounts.find((account) => account.active)
+                ?.id ??
+              nextConnections.providers.find((provider) => provider.active)
+                ?.id ??
+              allConnections[0]?.id
+            )
+          })
+        }
+        const errors = [dashboardResult, connectionsResult]
+          .filter(
+            (result): result is PromiseRejectedResult =>
+              result.status === "rejected"
           )
-        })
-      })
-      .catch((reason) => {
-        if (cancelled) return
-        const message = errorMessage(reason)
-        setStateError(message)
-        toast.add({
-          title: "无法读取应用状态",
-          description: message,
-          type: "error",
-        })
+          .map((result) => errorMessage(result.reason))
+        const message = errors.join("；")
+        setStateError(message || undefined)
+        if (errors.length) {
+          toast.add({
+            title: "部分应用状态读取失败",
+            description: message,
+            type: "error",
+          })
+        } else {
+          loadedStateRevision.current = refreshRevision
+        }
       })
       .finally(() => {
         if (!cancelled) setStateLoading(false)
