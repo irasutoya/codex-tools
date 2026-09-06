@@ -3312,7 +3312,7 @@ pub fn list_database_sessions_from_paths(
 }
 
 pub fn rollout_files(codex_home: &Path) -> Vec<PathBuf> {
-    [
+    let mut output = [
         codex_home.join("sessions"),
         codex_home.join("archived_sessions"),
     ]
@@ -3329,7 +3329,12 @@ pub fn rollout_files(codex_home: &Path) -> Vec<PathBuf> {
                     .is_some_and(|extension| extension == "jsonl")
             })
     })
-    .collect()
+    .collect::<Vec<_>>();
+    // 确定性处理顺序：修复/回滚按路径排序写入，避免不同平台文件系统迭代
+    // 顺序不一致导致写序与回滚行为差异（例如外部写入目标被意外覆盖）。
+    output.sort();
+    output.dedup();
+    output
 }
 
 pub fn database_paths(codex_home: &Path) -> Vec<PathBuf> {
@@ -3540,6 +3545,12 @@ mod tests {
                 recovery_reason: Some(HistoryRecoveryReason::ProjectionInvalid),
             }],
         }
+    }
+
+    #[cfg(unix)]
+    fn make_executable(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     fn assert_sqlite_integrity(path: &Path) {
@@ -6409,14 +6420,41 @@ mod tests {
                 .join(format!("rollout-2026-09-05T12-01-00-{logical}.jsonl")),
             false,
         );
-        let app = temp.path().join("Custom/Codex.exe");
-        let cli = temp.path().join("Custom/resources/codex.exe");
-        fs::create_dir_all(cli.parent().unwrap()).unwrap();
-        fs::write(&app, b"desktop").unwrap();
-        fs::write(&cli, b"cli").unwrap();
+        // 跨平台构建 Codex 应用/CLI 夹具：Windows 用 .exe + resources CLI，
+        // macOS 用 .app bundle，其余 Unix 直接用可执行文件；Unix 需显式设置
+        // 可执行位，否则权限校验会拒绝普通文件。
+        let configured_app = {
+            #[cfg(windows)]
+            {
+                let app = temp.path().join("Custom/Codex.exe");
+                let cli = temp.path().join("Custom/resources/codex.exe");
+                fs::create_dir_all(cli.parent().unwrap()).unwrap();
+                fs::write(&app, b"desktop").unwrap();
+                fs::write(&cli, b"cli").unwrap();
+                app
+            }
+            #[cfg(target_os = "macos")]
+            {
+                let bundle = temp.path().join("Custom.app");
+                let cli = bundle.join("Contents/Resources/codex");
+                fs::create_dir_all(bundle.join("Contents/MacOS")).unwrap();
+                fs::create_dir_all(cli.parent().unwrap()).unwrap();
+                fs::write(&cli, b"cli").unwrap();
+                make_executable(&cli);
+                bundle
+            }
+            #[cfg(all(unix, not(target_os = "macos")))]
+            {
+                let app = temp.path().join("Custom/codex");
+                fs::create_dir_all(app.parent().unwrap()).unwrap();
+                fs::write(&app, b"cli").unwrap();
+                make_executable(&app);
+                app
+            }
+        };
         let command = codex_history_migration_command(
             temp.path(),
-            Some(app.to_string_lossy().as_ref()),
+            Some(configured_app.to_string_lossy().as_ref()),
             &[first, second],
         )
         .unwrap();
